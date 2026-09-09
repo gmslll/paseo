@@ -15,10 +15,31 @@ import {
   PluginIdSchema,
   PluginSourceSchema,
   TerminalProfileSchema,
+  OrganizationIdSchema,
+  NodeIdSchema,
 } from "@getpaseo/protocol/messages";
 import { PaseoServicePortAllocationSchema } from "@getpaseo/protocol/paseo-config-schema";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
+export const EnterpriseMultiUserSchema = z.discriminatedUnion("enabled", [
+  z.object({ enabled: z.literal(false) }).strict(),
+  z
+    .object({
+      enabled: z.literal(true),
+      organizationId: OrganizationIdSchema,
+      nodeId: NodeIdSchema,
+      managementMode: z.literal("standalone"),
+      legacyRecords: z.literal("owner_only"),
+    })
+    .strict(),
+]);
+export function normalizeEnterpriseMultiUser(
+  value: unknown,
+): Readonly<z.infer<typeof EnterpriseMultiUserSchema> | undefined> {
+  const parsed =
+    value === undefined ? undefined : EnterpriseMultiUserSchema.parse(structuredClone(value));
+  return parsed ? Object.freeze({ ...parsed }) : undefined;
+}
 export const LogFormatSchema = z.enum(["pretty", "json"]);
 
 const LogConfigSchema = z
@@ -324,6 +345,7 @@ export const PersistedConfigSchema = z
       .optional(),
     features: z
       .object({
+        enterpriseMultiUser: EnterpriseMultiUserSchema.optional(),
         dictation: FeatureDictationSchema.optional(),
         voiceMode: FeatureVoiceModeSchema.optional(),
         webUi: FeatureWebUiSchema.optional(),

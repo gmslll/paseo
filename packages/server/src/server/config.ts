@@ -12,6 +12,7 @@ import {
   LogLevelSchema,
   type PersistedConfig,
 } from "./persisted-config.js";
+export { normalizeEnterpriseMultiUser } from "./persisted-config.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
 import type {
   AgentProviderRuntimeSettingsMap,
