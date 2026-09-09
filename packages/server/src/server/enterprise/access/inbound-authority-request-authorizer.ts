@@ -7,8 +7,11 @@ import {
 import type { SessionInboundMessage } from "../../messages.js";
 import {
   SessionAuthorization,
-  consumeCurrentInboundDaemonAuthorizationDecision,
+  activateCurrentInboundDaemonAuthorizationDecision,
+  closeActiveInboundDaemonAuthorization,
   consumeInboundDaemonAuthorizationDecision,
+  isActiveInboundDaemonAuthorizationCurrent,
+  type ActiveInboundDaemonAuthorization,
   type ConsumedInboundDaemonAuthorizationDecision,
   type InboundDaemonAuthorizationDecision,
 } from "../../authorization/index.js";
@@ -17,9 +20,15 @@ import { authorityReceiptPolicyForRequestType } from "./event-action-map.js";
 import type { PrincipalGrantVersionGuard } from "./resource-authorization.js";
 
 declare const inboundAuthoritySuccessEvidenceBrand: unique symbol;
+declare const activeAuthorizedRequestHandleBrand: unique symbol;
 
 export interface InboundAuthoritySuccessEvidence {
   readonly [inboundAuthoritySuccessEvidenceBrand]: true;
+}
+
+/** Opaque request-lifetime capability. It is not an outbound receipt. */
+export interface ActiveAuthorizedRequestHandle {
+  readonly [activeAuthorizedRequestHandleBrand]: true;
 }
 
 export interface ConsumedInboundAuthoritySuccessEvidence {
@@ -30,6 +39,7 @@ export interface ConsumedInboundAuthoritySuccessEvidence {
   readonly grantVersion: string;
   readonly requestType: SessionInboundMessage["type"];
   readonly requestId: string;
+  readonly activeRequestHandle: ActiveAuthorizedRequestHandle;
   readonly authorization: {
     readonly succeeded: true;
     readonly daemonPermission: PermissionRequirement;
@@ -49,10 +59,33 @@ interface InboundAuthoritySuccessEvidenceState {
   readonly requestType: SessionInboundMessage["type"];
   readonly requestId: string;
   readonly daemonAuthorization: ConsumedInboundDaemonAuthorizationDecision;
-  readonly consumed: ConsumedInboundAuthoritySuccessEvidence;
+  readonly consumed: Omit<ConsumedInboundAuthoritySuccessEvidence, "activeRequestHandle">;
+}
+
+interface ActiveAuthorizedRequestHandleState {
+  readonly authorizer: InboundAuthorityRequestAuthorizer;
+  readonly sessionAuthorization: SessionAuthorization;
+  readonly daemonAuthorization: ActiveInboundDaemonAuthorization;
+  readonly isGrantCurrent: () => boolean;
+  readonly principal: PrincipalContext;
+  readonly requestType: SessionInboundMessage["type"];
+  readonly requestId: string;
+  readonly authorization: ConsumedInboundAuthoritySuccessEvidence["authorization"];
+}
+
+/** Internal projection returned only after an emission authorizer claims the handle. */
+export interface ClaimedActiveAuthorizedRequest {
+  readonly principal: PrincipalContext;
+  readonly requestType: SessionInboundMessage["type"];
+  readonly requestId: string;
+  readonly authorization: ConsumedInboundAuthoritySuccessEvidence["authorization"];
+  isDaemonAuthorizationCurrent(): boolean;
+  isGrantCurrent(): boolean;
+  close(): void;
 }
 
 const issuedEvidence = new WeakMap<object, InboundAuthoritySuccessEvidenceState>();
+const issuedActiveRequestHandles = new WeakMap<object, ActiveAuthorizedRequestHandleState>();
 
 /**
  * Converts a one-use daemon decision into a pending receipt-registration handle.
@@ -77,7 +110,7 @@ export class InboundAuthorityRequestAuthorizer {
     decision: InboundDaemonAuthorizationDecision,
   ): InboundAuthoritySuccessEvidence | null {
     try {
-      if (!this.isCurrent()) return null;
+      if (!this.isPrincipalGrantCurrent()) return null;
       const daemonAuthorization = consumeInboundDaemonAuthorizationDecision(
         this.sessionAuthorization,
         message,
@@ -94,7 +127,7 @@ export class InboundAuthorityRequestAuthorizer {
       ) {
         return null;
       }
-      if (!this.isCurrent()) return null;
+      if (!this.isPrincipalGrantCurrent()) return null;
 
       const consumed = deepFreeze({
         organizationId: this.principal.organizationId,
@@ -109,7 +142,7 @@ export class InboundAuthorityRequestAuthorizer {
           daemonPermission: clonePermissionRequirement(policy.daemonPermission),
           enterpriseActions: [...policy.enterpriseActions],
         },
-      }) as ConsumedInboundAuthoritySuccessEvidence;
+      }) as Omit<ConsumedInboundAuthoritySuccessEvidence, "activeRequestHandle">;
       const evidence = Object.freeze(
         Object.create(null) as object,
       ) as unknown as InboundAuthoritySuccessEvidence;
@@ -140,8 +173,8 @@ export class InboundAuthorityRequestAuthorizer {
       issuedEvidence.delete(evidence);
       const requestType = inboundRequestType(message);
       const requestId = inboundRequestId(message);
-      const grantVersionIsCurrent = this.isCurrent();
-      const daemonAuthorizationIsCurrent = consumeCurrentInboundDaemonAuthorizationDecision(
+      const grantVersionIsCurrent = this.isPrincipalGrantCurrent();
+      const activeDaemonAuthorization = activateCurrentInboundDaemonAuthorizationDecision(
         this.sessionAuthorization,
         message,
         requestType,
@@ -152,24 +185,95 @@ export class InboundAuthorityRequestAuthorizer {
         issued.message !== message ||
         issued.requestType !== requestType ||
         issued.requestId !== requestId ||
-        !daemonAuthorizationIsCurrent ||
+        !activeDaemonAuthorization ||
         !grantVersionIsCurrent
       ) {
+        if (activeDaemonAuthorization) {
+          closeActiveInboundDaemonAuthorization(
+            this.sessionAuthorization,
+            activeDaemonAuthorization,
+          );
+        }
         return null;
       }
-      return issued.consumed;
+      const activeRequestHandle = Object.freeze(
+        Object.create(null) as object,
+      ) as unknown as ActiveAuthorizedRequestHandle;
+      issuedActiveRequestHandles.set(activeRequestHandle, {
+        authorizer: this,
+        sessionAuthorization: this.sessionAuthorization,
+        daemonAuthorization: activeDaemonAuthorization,
+        isGrantCurrent: this.isPrincipalGrantCurrent.bind(this),
+        principal: this.principal,
+        requestType: issued.requestType,
+        requestId: issued.requestId,
+        authorization: issued.consumed.authorization,
+      });
+      return deepFreeze({ ...issued.consumed, activeRequestHandle });
     } catch {
       return null;
     }
   }
 
-  private isCurrent(): boolean {
+  /** @internal Used by the claimed request handle without exposing the guard. */
+  isPrincipalGrantCurrent(): boolean {
     try {
       return this.isCurrentGrantVersion(this.principal) === true;
     } catch {
       return false;
     }
   }
+}
+
+/** @internal Claimed handles are removed before any caller-controlled validation. */
+export function claimActiveAuthorizedRequestHandle(
+  handle: ActiveAuthorizedRequestHandle,
+  authorizer: InboundAuthorityRequestAuthorizer,
+  sessionAuthorization: SessionAuthorization,
+): ClaimedActiveAuthorizedRequest | null {
+  try {
+    if ((typeof handle !== "object" && typeof handle !== "function") || handle === null) {
+      return null;
+    }
+    const active = issuedActiveRequestHandles.get(handle);
+    if (!active) return null;
+    issuedActiveRequestHandles.delete(handle);
+    if (active.authorizer !== authorizer || active.sessionAuthorization !== sessionAuthorization) {
+      return null;
+    }
+    let closed = false;
+    return Object.freeze({
+      principal: active.principal,
+      requestType: active.requestType,
+      requestId: active.requestId,
+      authorization: active.authorization,
+      isDaemonAuthorizationCurrent: () =>
+        !closed &&
+        isActiveInboundDaemonAuthorizationCurrent(
+          sessionAuthorization,
+          active.daemonAuthorization,
+          active.requestType,
+          active.authorization.daemonPermission,
+        ),
+      isGrantCurrent: () => !closed && active.isGrantCurrent(),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        closeActiveInboundDaemonAuthorization(sessionAuthorization, active.daemonAuthorization);
+      },
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function isActiveAuthorizedRequestHandle(
+  value: unknown,
+): value is ActiveAuthorizedRequestHandle {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    issuedActiveRequestHandles.has(value)
+  );
 }
 
 export function isInboundAuthoritySuccessEvidence(

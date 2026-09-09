@@ -25,6 +25,7 @@ export const OWNER_PERMISSIONS: readonly DaemonPermission[] = DAEMON_PERMISSIONS
 
 declare const inboundDaemonAuthorizationDecisionBrand: unique symbol;
 declare const consumedInboundDaemonAuthorizationDecisionBrand: unique symbol;
+declare const activeInboundDaemonAuthorizationBrand: unique symbol;
 
 export interface InboundDaemonAuthorizationDecision {
   readonly [inboundDaemonAuthorizationDecisionBrand]: true;
@@ -34,6 +35,10 @@ export interface ConsumedInboundDaemonAuthorizationDecision {
   readonly [consumedInboundDaemonAuthorizationDecisionBrand]: true;
   readonly requestType: SessionInboundMessage["type"];
   readonly daemonPermission: PermissionRequirement;
+}
+
+export interface ActiveInboundDaemonAuthorization {
+  readonly [activeInboundDaemonAuthorizationBrand]: true;
 }
 
 interface SessionAuthorizationState {
@@ -55,6 +60,10 @@ const inboundDaemonAuthorizationDecisionStates = new WeakMap<
   InboundDaemonAuthorizationDecisionState
 >();
 const consumedInboundDaemonAuthorizationDecisionStates = new WeakMap<
+  object,
+  InboundDaemonAuthorizationDecisionState
+>();
+const activeInboundDaemonAuthorizationStates = new WeakMap<
   object,
   InboundDaemonAuthorizationDecisionState
 >();
@@ -177,6 +186,72 @@ export function consumeCurrentInboundDaemonAuthorizationDecision(
   );
 }
 
+/**
+ * Converts the second-stage one-use decision into a request-lifetime proof.
+ * The proof exposes no generation or permission data and can only be checked
+ * against the exact SessionAuthorization that issued the original decision.
+ */
+export function activateCurrentInboundDaemonAuthorizationDecision(
+  authorization: SessionAuthorization,
+  message: SessionInboundMessage,
+  requestType: string | null,
+  decision: ConsumedInboundDaemonAuthorizationDecision,
+): ActiveInboundDaemonAuthorization | null {
+  if ((typeof decision !== "object" && typeof decision !== "function") || decision === null) {
+    return null;
+  }
+  const consumed = consumedInboundDaemonAuthorizationDecisionStates.get(decision);
+  if (!consumed) return null;
+  consumedInboundDaemonAuthorizationDecisionStates.delete(decision);
+  const current = sessionAuthorizationStates.get(authorization);
+  if (
+    !current ||
+    consumed.issuer !== authorization ||
+    consumed.message !== message ||
+    consumed.requestType !== requestType ||
+    consumed.generation !== current.generation ||
+    !allowsRequirement(current.permissions, consumed.daemonPermission)
+  ) {
+    return null;
+  }
+  const active = Object.freeze(
+    Object.create(null) as object,
+  ) as unknown as ActiveInboundDaemonAuthorization;
+  activeInboundDaemonAuthorizationStates.set(active, consumed);
+  return active;
+}
+
+export function isActiveInboundDaemonAuthorizationCurrent(
+  authorization: SessionAuthorization,
+  active: ActiveInboundDaemonAuthorization,
+  requestType: string,
+  daemonPermission: PermissionRequirement,
+): boolean {
+  if ((typeof active !== "object" && typeof active !== "function") || active === null) {
+    return false;
+  }
+  const issued = activeInboundDaemonAuthorizationStates.get(active);
+  const current = sessionAuthorizationStates.get(authorization);
+  return Boolean(
+    issued &&
+    current &&
+    issued.issuer === authorization &&
+    issued.requestType === requestType &&
+    issued.generation === current.generation &&
+    samePermissionRequirement(issued.daemonPermission, daemonPermission) &&
+    allowsRequirement(current.permissions, issued.daemonPermission),
+  );
+}
+
+export function closeActiveInboundDaemonAuthorization(
+  authorization: SessionAuthorization,
+  active: ActiveInboundDaemonAuthorization,
+): void {
+  if ((typeof active !== "object" && typeof active !== "function") || active === null) return;
+  const issued = activeInboundDaemonAuthorizationStates.get(active);
+  if (issued?.issuer === authorization) activeInboundDaemonAuthorizationStates.delete(active);
+}
+
 function sessionAuthorizationState(authorization: SessionAuthorization): SessionAuthorizationState {
   const state = sessionAuthorizationStates.get(authorization);
   if (!state) throw new Error("Invalid SessionAuthorization receiver");
@@ -218,6 +293,18 @@ function clonePermissionRequirement(requirement: PermissionRequirement): Permiss
   return typeof requirement === "object" && requirement !== null
     ? Object.freeze([...requirement])
     : requirement;
+}
+
+function samePermissionRequirement(
+  left: PermissionRequirement,
+  right: PermissionRequirement,
+): boolean {
+  if (left === null || right === null) return left === right;
+  const leftValues = typeof left === "string" ? [left] : [...left];
+  const rightValues = typeof right === "string" ? [right] : [...right];
+  if (new Set(leftValues).size !== leftValues.length) return false;
+  if (new Set(rightValues).size !== rightValues.length) return false;
+  return [...leftValues].sort().join("\0") === [...rightValues].sort().join("\0");
 }
 
 const LEGACY_HUB_EXECUTION_SCOPE = "hub.execution.*";

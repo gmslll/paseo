@@ -25,18 +25,21 @@ export interface OutboundAuthorityReceiptPolicy {
   readonly requestType: SessionInboundMessage["type"];
   readonly daemonPermission: PermissionRequirement;
   readonly enterpriseActions: readonly EnterpriseAction[];
+  readonly emission: "repeatable" | "terminal";
 }
 
 function authorityReceiptPolicy(
   event: SessionOutboundMessage["type"],
   requestType: SessionInboundMessage["type"],
   enterpriseActions: readonly EnterpriseAction[] = noActions,
+  emission: OutboundAuthorityReceiptPolicy["emission"] = "terminal",
 ): OutboundAuthorityReceiptPolicy {
   return Object.freeze({
     event,
     requestType,
     daemonPermission: clonePermissionRequirement(INBOUND_PERMISSION[requestType]),
     enterpriseActions: Object.freeze([...enterpriseActions]),
+    emission,
   });
 }
 
@@ -401,7 +404,12 @@ export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
   authorityReceiptPolicy("daemon.config.reload.response", "daemon.config.reload.request"),
   authorityReceiptPolicy("daemon.get_pairing_offer.response", "daemon.get_pairing_offer.request"),
   authorityReceiptPolicy("daemon.get_status.response", "daemon.get_status.request"),
-  authorityReceiptPolicy("daemon.update.progress", "daemon.update.request"),
+  authorityReceiptPolicy(
+    "daemon.update.progress",
+    "daemon.update.request",
+    noActions,
+    "repeatable",
+  ),
   authorityReceiptPolicy("daemon.update.response", "daemon.update.request"),
   authorityReceiptPolicy("diagnostics.response", "diagnostics.request"),
   authorityReceiptPolicy(
@@ -473,6 +481,7 @@ export const OUTBOUND_STATUS_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
     requestType: "restart_server_request",
     daemonPermission: clonePermissionRequirement(INBOUND_PERMISSION.restart_server_request),
     enterpriseActions: noActions,
+    emission: "terminal",
   }),
   Object.freeze({
     event: "status",
@@ -480,6 +489,7 @@ export const OUTBOUND_STATUS_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
     requestType: "shutdown_server_request",
     daemonPermission: clonePermissionRequirement(INBOUND_PERMISSION.shutdown_server_request),
     enterpriseActions: noActions,
+    emission: "terminal",
   }),
 ] as const satisfies readonly OutboundAuthorityReceiptPolicy[]);
 
@@ -556,10 +566,12 @@ export function authorityReceiptPolicyForEvent(
   event: SessionOutboundMessage,
 ): OutboundAuthorityReceiptPolicy | null {
   if (event.type === "rpc_error") {
-    return event.payload.requestType
-      ? (outboundAuthorityReceiptPolicyByRequestType.get(
-          event.payload.requestType as SessionInboundMessage["type"],
-        ) ?? null)
+    if (!event.payload.requestType) return null;
+    const requestPolicy = outboundAuthorityReceiptPolicyByRequestType.get(
+      event.payload.requestType as SessionInboundMessage["type"],
+    );
+    return requestPolicy
+      ? Object.freeze({ ...requestPolicy, event: "rpc_error", emission: "terminal" })
       : null;
   }
   if (event.type === "status") {

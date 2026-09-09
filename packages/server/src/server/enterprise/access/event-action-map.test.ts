@@ -62,6 +62,7 @@ describe("outbound enterprise event-action map", () => {
         daemonPermission: policy.daemonPermission,
         enterpriseActions: policy.enterpriseActions,
       });
+      expect(["repeatable", "terminal"]).toContain(policy.emission);
       expect(Object.isFrozen(policy)).toBe(true);
       expect(Object.isFrozen(policy.enterpriseActions)).toBe(true);
       if (Array.isArray(policy.daemonPermission)) {
@@ -90,6 +91,39 @@ describe("outbound enterprise event-action map", () => {
         payload: { status: "daemon_config_changed", config: {} },
       } as never),
     ).toBeNull();
+
+    expect(
+      authorityReceiptPolicyForEvent({
+        type: "daemon.update.progress",
+        payload: { requestId: "request", phase: "installing" },
+      }),
+    ).toMatchObject({ requestType: "daemon.update.request", emission: "repeatable" });
+    expect(
+      authorityReceiptPolicyForEvent({
+        type: "daemon.update.response",
+        payload: {
+          requestId: "request",
+          success: true,
+          error: null,
+          previousVersion: "1",
+          newVersion: "2",
+        },
+      }),
+    ).toMatchObject({ requestType: "daemon.update.request", emission: "terminal" });
+    expect(
+      authorityReceiptPolicyForEvent({
+        type: "rpc_error",
+        payload: {
+          requestId: "request",
+          requestType: "daemon.update.request",
+          error: "redacted",
+        },
+      }),
+    ).toMatchObject({
+      event: "rpc_error",
+      requestType: "daemon.update.request",
+      emission: "terminal",
+    });
   });
 
   test("keeps content, runtime, and execution-resource actions distinct", () => {

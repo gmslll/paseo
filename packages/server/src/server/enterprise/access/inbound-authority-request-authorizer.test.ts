@@ -17,6 +17,7 @@ import {
 } from "./event-action-map.js";
 import {
   InboundAuthorityRequestAuthorizer,
+  isActiveAuthorizedRequestHandle,
   isInboundAuthoritySuccessEvidence,
 } from "./inbound-authority-request-authorizer.js";
 import type { PrincipalGrantVersionGuard } from "./resource-authorization.js";
@@ -110,6 +111,7 @@ describe("InboundAuthorityRequestAuthorizer", () => {
       grantVersion: "grant-a",
       requestType: "daemon.get_status.request",
       requestId: "request-a",
+      activeRequestHandle: evidence.activeRequestHandle,
       authorization: {
         succeeded: true,
         daemonPermission: "daemon.read",
@@ -117,6 +119,9 @@ describe("InboundAuthorityRequestAuthorizer", () => {
       },
     });
     expect(evidence).not.toHaveProperty("receiptId");
+    expect(Object.keys(evidence.activeRequestHandle)).toEqual([]);
+    expect(Object.isFrozen(evidence.activeRequestHandle)).toBe(true);
+    expect(isActiveAuthorizedRequestHandle(evidence.activeRequestHandle)).toBe(true);
     expect(isInboundAuthoritySuccessEvidence(pending)).toBe(false);
     expect(Object.isFrozen(evidence)).toBe(true);
     expect(Object.isFrozen(evidence.authorization)).toBe(true);
