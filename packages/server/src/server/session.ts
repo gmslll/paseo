@@ -166,6 +166,11 @@ import {
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
 import type { AuthoritySessionBindingLifecycle } from "./session/enterprise-authority-receipt-state.js";
+import { AuthorizedRequestReceiptSchema } from "./enterprise/access/authority-receipt-verifier.js";
+import { InboundAuthorityRequestAuthorizer } from "./enterprise/access/inbound-authority-request-authorizer.js";
+import type { PrincipalGrantVersionGuard } from "./enterprise/access/resource-authorization.js";
+import { authorityReceiptPolicyForRequestType } from "./enterprise/access/event-action-map.js";
+import type { PermissionRequirement } from "./authorization/operation-permissions.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
@@ -174,6 +179,23 @@ import {
   setProjectCustomIcon,
 } from "../utils/project-custom-icon.js";
 import { VoiceSession } from "./session/voice/voice-session.js";
+
+function samePermissionRequirement(
+  left: PermissionRequirement,
+  right: PermissionRequirement,
+): boolean {
+  if (left === null || right === null) return left === right;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return [...left].sort().every((permission, index) => permission === [...right].sort()[index]);
+  }
+  return left === right;
+}
+
+function sameEnterpriseActions(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  return [...left].sort().every((action, index) => action === [...right].sort()[index]);
+}
 import { CheckoutSession } from "./session/checkout/checkout-session.js";
 import {
   createWorkspaceGitObserverService,
@@ -459,6 +481,7 @@ export interface SessionOptions {
   enterpriseContext?: EnterpriseSessionContext;
   enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
   authorityReceiptState?: AuthoritySessionBindingLifecycle;
+  principalGrantVersionGuard?: PrincipalGrantVersionGuard;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -671,6 +694,19 @@ export class Session {
   private readonly enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
   private readonly authorityReceiptState?: AuthoritySessionBindingLifecycle;
   private readonly enterpriseSessionBindingKey?: string;
+  private readonly inboundAuthorityRequestAuthorizer?: InboundAuthorityRequestAuthorizer;
+  private readonly pendingAuthorityRequests = new Map<
+    string,
+    Readonly<{
+      receiptId: string;
+      requestId: string;
+      requestType: string;
+      sessionBindingKey: string;
+      sessionBindingGeneration: string;
+    }>
+  >();
+  private readonly reservedAuthorityRequestIds = new Set<string>();
+  private authoritySubsystemFailed = false;
   private authorityBindingReleased = false;
   private readonly clientId: string;
   private readonly authorization: SessionAuthorization;
@@ -781,6 +817,7 @@ export class Session {
       enterpriseContext,
       enterpriseAgentContextRegistry,
       authorityReceiptState,
+      principalGrantVersionGuard,
       permissions,
       appVersion,
       clientCapabilities,
@@ -845,6 +882,8 @@ export class Session {
       throw new Error(
         "Enterprise context, registry, and authority receipt state must be configured together",
       );
+    if (Boolean(enterpriseContext) !== Boolean(principalGrantVersionGuard))
+      throw new Error("Enterprise grant guard must be configured with enterprise context");
     this.enterpriseContext = enterpriseContext
       ? normalizeEnterpriseSessionContext(enterpriseContext)
       : undefined;
@@ -852,6 +891,12 @@ export class Session {
     this.authorityReceiptState = authorityReceiptState;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
+    if (this.enterpriseContext && principalGrantVersionGuard)
+      this.inboundAuthorityRequestAuthorizer = new InboundAuthorityRequestAuthorizer({
+        sessionAuthorization: this.authorization,
+        principal: this.enterpriseContext.principal,
+        grantVersionGuard: principalGrantVersionGuard,
+      });
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = uuidv4();
@@ -1312,6 +1357,7 @@ export class Session {
     return source ? this.supportsForSource(capability, source) : this.supports(capability);
   }
 
+  // oxlint-disable-next-line complexity -- delivery fan-out has explicit capability branches.
   private forwardAgentStream(
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
@@ -2017,11 +2063,14 @@ export class Session {
   /**
    * Main entry point for processing session messages
    */
+  // oxlint-disable-next-line complexity -- inbound authorization and receipt lifecycle are one transaction.
   public async handleMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
     this.inflightRequests++;
     if (this.inflightRequests > this.peakInflightRequests) {
       this.peakInflightRequests = this.inflightRequests;
     }
+    let registeredRequestId: string | null = null;
+    let reservedRequestId: string | null = null;
     try {
       this.sessionLogger.trace(
         {
@@ -2030,7 +2079,8 @@ export class Session {
         },
         "agent.session.inbound",
       );
-      if (!this.authorization.allowsInbound(msg)) {
+      const daemonDecision = this.authorization.authorizeInbound(msg);
+      if (!daemonDecision) {
         const requestId = sessionRequestId(msg);
         if (requestId) {
           this.emit({
@@ -2044,6 +2094,136 @@ export class Session {
           });
         }
         return;
+      }
+      if (
+        this.inboundAuthorityRequestAuthorizer &&
+        this.authorityReceiptState &&
+        this.enterpriseContext &&
+        this.enterpriseSessionBindingKey
+      ) {
+        const requestId = sessionRequestId(msg);
+        const policy = authorityReceiptPolicyForRequestType(msg.type);
+        if (policy) {
+          if (this.authoritySubsystemFailed) return;
+          if (
+            !requestId ||
+            this.pendingAuthorityRequests.has(requestId) ||
+            this.reservedAuthorityRequestIds.has(requestId)
+          )
+            return;
+          this.reservedAuthorityRequestIds.add(requestId);
+          reservedRequestId = requestId;
+          let receiptReturned = false;
+          try {
+            const evidence = this.inboundAuthorityRequestAuthorizer.authorize(msg, daemonDecision);
+            const consumed = evidence
+              ? this.inboundAuthorityRequestAuthorizer.consumeForRegistration(msg, evidence)
+              : null;
+            // oxlint-disable-next-line max-depth -- authorization transaction keeps reservation and registration adjacent.
+            if (!consumed) {
+              return;
+            }
+            // oxlint-disable-next-line max-depth -- request correlation is checked inside the registration transaction.
+            if (consumed.requestId !== requestId || consumed.requestType !== policy.requestType) {
+              return;
+            }
+            const binding = this.enterpriseContext;
+            const receipt = this.authorityReceiptState.registerAuthorizedRequest({
+              sessionId: this.sessionId,
+              sessionBindingKey: this.enterpriseSessionBindingKey,
+              sessionBindingGeneration: binding.sessionBindingGeneration,
+              organizationId: binding.principal.organizationId,
+              principalId: binding.principal.principalId,
+              principalType: binding.principal.principalType,
+              credentialId: binding.principal.credentialId,
+              grantVersion: binding.principal.grantVersion,
+              nodeId: binding.node.nodeId,
+              clientId: this.clientId,
+              requestId,
+              requestType: consumed.requestType,
+              authorization: {
+                succeeded: true,
+                daemonPermission: consumed.authorization.daemonPermission,
+                enterpriseActions: consumed.authorization.enterpriseActions,
+              },
+            });
+            receiptReturned = true;
+            const parsedReceipt = AuthorizedRequestReceiptSchema.parse(structuredClone(receipt));
+            // oxlint-disable-next-line max-depth -- receipt binding comparison remains atomic with registration.
+            if (
+              parsedReceipt.sessionId !== this.sessionId ||
+              parsedReceipt.sessionBindingKey !== this.enterpriseSessionBindingKey ||
+              parsedReceipt.sessionBindingGeneration !== binding.sessionBindingGeneration ||
+              parsedReceipt.organizationId !== binding.principal.organizationId ||
+              parsedReceipt.principalId !== binding.principal.principalId ||
+              parsedReceipt.principalType !== binding.principal.principalType ||
+              parsedReceipt.credentialId !== binding.principal.credentialId ||
+              parsedReceipt.grantVersion !== binding.principal.grantVersion ||
+              parsedReceipt.nodeId !== binding.node.nodeId ||
+              parsedReceipt.clientId !== this.clientId ||
+              parsedReceipt.requestId !== requestId ||
+              parsedReceipt.requestType !== consumed.requestType ||
+              !samePermissionRequirement(
+                parsedReceipt.authorization.daemonPermission,
+                consumed.authorization.daemonPermission,
+              ) ||
+              !sameEnterpriseActions(
+                parsedReceipt.authorization.enterpriseActions,
+                consumed.authorization.enterpriseActions,
+              )
+            )
+              throw new Error("Authority receipt binding mismatch");
+            this.pendingAuthorityRequests.set(
+              requestId,
+              Object.freeze({
+                receiptId: parsedReceipt.receiptId,
+                requestId,
+                requestType: consumed.requestType,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: binding.sessionBindingGeneration,
+              }),
+            );
+            this.reservedAuthorityRequestIds.delete(requestId);
+            reservedRequestId = null;
+            registeredRequestId = requestId;
+          } catch {
+            let endFailed = false;
+            // oxlint-disable-next-line max-depth -- terminal receipt cleanup is fail-closed and ordered.
+            try {
+              this.authorityReceiptState.endRequest({
+                sessionId: this.sessionId,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                requestId,
+              });
+            } catch {
+              endFailed = true;
+              this.authoritySubsystemFailed = true;
+            }
+            // oxlint-disable-next-line max-depth -- terminal receipt cleanup is fail-closed and ordered.
+            if (receiptReturned || endFailed) {
+              this.authoritySubsystemFailed = true;
+              // oxlint-disable-next-line max-depth -- release is nested to preserve exact binding cleanup.
+              try {
+                // oxlint-disable-next-line max-depth -- release guard is part of the exact-once fence.
+                if (!this.authorityBindingReleased) {
+                  this.authorityReceiptState.releaseSession({
+                    sessionId: this.sessionId,
+                    sessionBindingKey: this.enterpriseSessionBindingKey,
+                    sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                  });
+                  this.authorityBindingReleased = true;
+                }
+              } catch {
+                // Terminal state remains fail-closed; cleanup is retried by Session cleanup.
+              }
+            }
+            this.pendingAuthorityRequests.delete(requestId);
+            this.reservedAuthorityRequestIds.delete(requestId);
+            reservedRequestId = null;
+            return;
+          }
+        }
       }
       try {
         await this.dispatchInboundMessage(msg, source);
@@ -2080,7 +2260,45 @@ export class Session {
         });
       }
     } finally {
+      let endError: unknown;
+      if (
+        registeredRequestId &&
+        this.authorityReceiptState &&
+        this.enterpriseContext &&
+        this.enterpriseSessionBindingKey
+      ) {
+        try {
+          this.authorityReceiptState.endRequest({
+            sessionId: this.sessionId,
+            sessionBindingKey: this.enterpriseSessionBindingKey,
+            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+            requestId: registeredRequestId,
+          });
+        } catch (error) {
+          endError = error;
+          this.authoritySubsystemFailed = true;
+          try {
+            // oxlint-disable-next-line max-depth -- release must remain inside the failure fence.
+            if (!this.authorityBindingReleased) {
+              this.authorityReceiptState.releaseSession({
+                sessionId: this.sessionId,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+              });
+              this.authorityBindingReleased = true;
+            }
+          } catch (releaseError) {
+            endError = new AggregateError([endError, releaseError], "Authority teardown failed", {
+              cause: endError,
+            });
+          }
+        }
+      }
+      if (registeredRequestId) this.pendingAuthorityRequests.delete(registeredRequestId);
+      if (reservedRequestId) this.reservedAuthorityRequestIds.delete(reservedRequestId);
       this.inflightRequests--;
+      // oxlint-disable-next-line no-unsafe-finally -- terminal authority failure must surface after cleanup.
+      if (endError) throw endError;
     }
   }
 

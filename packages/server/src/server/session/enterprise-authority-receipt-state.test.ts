@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { MemoryAuthorityReceiptState } from "./enterprise-authority-receipt-state.js";
+import {
+  AUTHORITY_RECEIPT_TTL_MAX_MS,
+  MemoryAuthorityReceiptState,
+} from "./enterprise-authority-receipt-state.js";
 import type { AuthoritySessionBindingRecord } from "../enterprise/access/authority-receipt-verifier.js";
 
 const binding: AuthoritySessionBindingRecord = {
@@ -18,7 +21,6 @@ const input = {
   ...binding,
   requestId: "request-a",
   requestType: "enterprise.identity.get_current.request",
-  expiresAt: 100,
   authorization: { succeeded: true as const, daemonPermission: null, enterpriseActions: [] },
 };
 describe("MemoryAuthorityReceiptState", () => {
@@ -59,7 +61,7 @@ describe("MemoryAuthorityReceiptState", () => {
       },
     });
     state.registerSessionBinding(binding);
-    const receipt = state.registerAuthorizedRequest({ ...input, expiresAt: 11 });
+    const receipt = state.registerAuthorizedRequest(input);
     fail = true;
     await expect(state.consumeAuthorizedRequest(receipt.receiptId)).rejects.toThrow("clock");
     fail = false;
@@ -163,6 +165,84 @@ describe("MemoryAuthorityReceiptState", () => {
         extra: "x",
       } as never),
     ).toBeNull();
+  });
+
+  it.each([
+    ["receiptId", { receiptId: "caller" }],
+    ["expiresAt", { expiresAt: 1 }],
+  ])("strictly rejects caller %s before sampling clock or factory", (_field, extra) => {
+    let clockCalls = 0;
+    let factoryCalls = 0;
+    const state = new MemoryAuthorityReceiptState({
+      clock: { now: () => ++clockCalls },
+      receiptIdFactory: () => {
+        factoryCalls += 1;
+        return "receipt-aaaaaaaaaaaaaaa";
+      },
+    });
+    state.registerSessionBinding(binding);
+    clockCalls = 0;
+    expect(() => state.registerAuthorizedRequest({ ...input, ...extra } as never)).toThrow();
+    expect(clockCalls).toBe(0);
+    expect(factoryCalls).toBe(0);
+  });
+
+  it("generates the exact bounded TTL and rejects invalid TTL configuration", async () => {
+    let now = 100;
+    const state = new MemoryAuthorityReceiptState({
+      clock: { now: () => now },
+      receiptTtlMs: 5,
+      receiptIdFactory: () => "receipt-bbbbbbbbbbbbbbb",
+    });
+    state.registerSessionBinding(binding);
+    const receipt = state.registerAuthorizedRequest(input);
+    expect(receipt.expiresAt).toBe(105);
+    now = 104;
+    await expect(state.consumeAuthorizedRequest(receipt.receiptId)).resolves.not.toBeNull();
+
+    for (const ttl of [
+      0,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      -1,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER + 1,
+      AUTHORITY_RECEIPT_TTL_MAX_MS + 1,
+    ]) {
+      expect(() => new MemoryAuthorityReceiptState({ receiptTtlMs: ttl })).toThrow();
+    }
+  });
+
+  it("rejects expiry overflow before factory and leaves an empty state", async () => {
+    let factoryCalls = 0;
+    const state = new MemoryAuthorityReceiptState({
+      clock: { now: () => Number.MAX_SAFE_INTEGER },
+      receiptTtlMs: 1,
+      receiptIdFactory: () => {
+        factoryCalls += 1;
+        return "receipt-ddddddddddddddd";
+      },
+    });
+    state.registerSessionBinding(binding);
+    expect(() => state.registerAuthorizedRequest(input)).toThrow("overflow");
+    expect(factoryCalls).toBe(0);
+    await expect(state.consumeAuthorizedRequest("missing")).resolves.toBeNull();
+  });
+
+  it("rejects a receipt exactly at its expiry boundary", async () => {
+    let now = 10;
+    const state = new MemoryAuthorityReceiptState({
+      clock: { now: () => now },
+      receiptTtlMs: 1,
+      receiptIdFactory: () => "receipt-ccccccccccccccc",
+    });
+    state.registerSessionBinding(binding);
+    const receipt = state.registerAuthorizedRequest(input);
+    expect(receipt.expiresAt).toBe(11);
+    now = 11;
+    await expect(state.consumeAuthorizedRequest(receipt.receiptId)).resolves.toBeNull();
   });
   it("keeps same request ids and grants isolated across principals and binding replacement", async () => {
     let now = 10;
@@ -334,14 +414,12 @@ describe("MemoryAuthorityReceiptState", () => {
       maxReceipts: 1,
       clock: { now: () => now },
       receiptIdFactory: () => "receipt-aaaaaaaa",
+      receiptTtlMs: 1,
     });
     state.registerSessionBinding(binding);
-    expect(() => state.registerAuthorizedRequest({ ...input, expiresAt: 10 })).toThrow("Expired");
-    state.registerAuthorizedRequest({ ...input, expiresAt: 11 });
+    state.registerAuthorizedRequest(input);
     now = 11;
-    expect(() =>
-      state.registerAuthorizedRequest({ ...input, requestId: "blocked", expiresAt: 12 }),
-    ).not.toThrow();
+    expect(() => state.registerAuthorizedRequest({ ...input, requestId: "blocked" })).not.toThrow();
     now = 12;
     expect(await state.consumeAuthorizedRequest("receipt-aaaaaaaa")).toBeNull();
   });

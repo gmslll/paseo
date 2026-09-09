@@ -340,8 +340,11 @@ interface SessionForTestOptions {
   enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
   authorityReceiptState?: SessionOptions["authorityReceiptState"];
   autoAuthorityReceiptState?: boolean;
+  principalGrantVersionGuard?: SessionOptions["principalGrantVersionGuard"];
+  autoPrincipalGrantVersionGuard?: boolean;
 }
 
+// oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
   const logger = pino({ level: "silent" });
   const github = options.github ?? {
@@ -453,6 +456,11 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       options.enterpriseAgentContextRegistry
         ? new MemoryAuthorityReceiptState()
         : undefined),
+    principalGrantVersionGuard:
+      options.principalGrantVersionGuard ??
+      (options.autoPrincipalGrantVersionGuard !== false && options.enterpriseContext
+        ? { isCurrent: () => true }
+        : undefined),
   };
   return new Session(sessionOptions);
 }
@@ -507,20 +515,30 @@ test.each([
   );
 });
 
-test("Session rejects every partial enterprise three-piece configuration", () => {
+test("Session rejects every partial enterprise four-piece configuration", () => {
   const registry = createEnterpriseAgentSessionContextRegistry();
   const authorityReceiptState = new MemoryAuthorityReceiptState();
   const context = enterpriseContext();
-  const partials = [
-    { enterpriseContext: context },
-    { enterpriseAgentContextRegistry: registry },
-    { authorityReceiptState },
-    { enterpriseContext: context, enterpriseAgentContextRegistry: registry },
-    { enterpriseContext: context, authorityReceiptState },
-    { enterpriseAgentContextRegistry: registry, authorityReceiptState },
-  ] as const;
+  const principalGrantVersionGuard = { isCurrent: () => true };
+  const partials = Array.from({ length: 16 }, (_, mask) => mask)
+    .filter((mask) => mask !== 0 && mask !== 15)
+    .map((mask) => {
+      const partial: SessionForTestOptions = {};
+      if (mask & 1) partial.enterpriseContext = context;
+      if (mask & 2) partial.enterpriseAgentContextRegistry = registry;
+      if (mask & 4) partial.authorityReceiptState = authorityReceiptState;
+      if (mask & 8) partial.principalGrantVersionGuard = principalGrantVersionGuard;
+      return partial;
+    });
+  expect(partials).toHaveLength(14);
   for (const partial of partials)
-    expect(() => createSessionForTest({ ...partial, autoAuthorityReceiptState: false })).toThrow();
+    expect(() =>
+      createSessionForTest({
+        ...partial,
+        autoAuthorityReceiptState: false,
+        autoPrincipalGrantVersionGuard: false,
+      }),
+    ).toThrow();
 });
 
 test("Session registers exact authority binding and releases it exactly once", async () => {
@@ -645,6 +663,398 @@ test("Session construction fails closed when authority binding registration fail
   expect(subscribeAgent).toHaveBeenCalled();
   expect(unsubscribeAgent).toHaveBeenCalledTimes(1);
   expect(unsubscribeHub).toHaveBeenCalledTimes(1);
+});
+
+test("enterprise authorized request registers exact receipt before handler and ends exactly once", async () => {
+  const state = new MemoryAuthorityReceiptState({ clock: { now: () => 1 } });
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const end = vi.spyOn(state, "endRequest");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    paseoHome: "/tmp/paseo-authority-test",
+    serverId: "srv-test",
+    daemonVersion: "1.0.0",
+    daemonRuntimeConfig: { listen: "127.0.0.1:6767", getRelayConfig: () => null },
+    enterpriseContext: enterpriseContext("generation-request"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "authority-1" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(register.mock.calls[0]?.[0]).toEqual({
+    sessionId: session.getSessionId(),
+    sessionBindingKey: session.getEnterpriseSessionBindingKey(),
+    sessionBindingGeneration: "generation-request",
+    organizationId: "org_aaaaaaaaaaaaaaaa",
+    principalId: "usr_aaaaaaaaaaaaaaaa",
+    principalType: "human",
+    credentialId: "cred_a",
+    grantVersion: "grant-v1",
+    nodeId: "nod_aaaaaaaaaaaaaaaa",
+    clientId: "test-client",
+    requestId: "authority-1",
+    requestType: "daemon.get_status.request",
+    authorization: {
+      succeeded: true,
+      daemonPermission: "daemon.read",
+      enterpriseActions: [],
+    },
+  });
+  const receipt = register.mock.results[0]?.value as { receiptId: string; expiresAt: number };
+  expect(Object.isFrozen(receipt)).toBe(true);
+  expect(receipt.receiptId).toEqual(expect.any(String));
+  expect(receipt.expiresAt).toBe(30001);
+  expect(register.mock.invocationCallOrder[0]).toBeLessThan(end.mock.invocationCallOrder[0]!);
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(register.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]!);
+  expect(dispatch.mock.invocationCallOrder[0]).toBeLessThan(end.mock.invocationCallOrder[0]!);
+  expect(end.mock.calls[0]?.[0]).toEqual({
+    sessionId: session.getSessionId(),
+    sessionBindingKey: session.getEnterpriseSessionBindingKey(),
+    sessionBindingGeneration: "generation-request",
+    requestId: "authority-1",
+  });
+  expect(
+    messages.some(
+      (message) => (message as { type?: string }).type === "daemon.get_status.response",
+    ),
+  ).toBe(true);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("malformed returned receipt fails closed, releases binding, and gates later authority requests", async () => {
+  const state = new MemoryAuthorityReceiptState({ clock: { now: () => 1 } });
+  const originalRegister = state.registerAuthorizedRequest.bind(state);
+  const register = vi.spyOn(state, "registerAuthorizedRequest").mockImplementation((input) => {
+    const receipt = originalRegister(input);
+    return { ...receipt, requestId: "wrong-request" };
+  });
+  const release = vi.spyOn(state, "releaseSession");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-malformed-receipt"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "bad-receipt" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(
+    messages.some(
+      (message) => (message as { type?: string }).type === "daemon.get_status.response",
+    ),
+  ).toBe(false);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "after-terminal" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(release).toHaveBeenCalledTimes(1);
+  await session.cleanup();
+});
+
+test("throwing receipt getter fails closed and releases the exact binding", async () => {
+  const state = new MemoryAuthorityReceiptState({ clock: { now: () => 1 } });
+  let getterCalls = 0;
+  const originalRegister = state.registerAuthorizedRequest.bind(state);
+  const register = vi.spyOn(state, "registerAuthorizedRequest").mockImplementation((input) => {
+    const receipt = originalRegister(input);
+    const malformed = { ...receipt } as Record<string, unknown>;
+    Object.defineProperty(malformed, "requestId", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("receipt getter");
+      },
+    });
+    return malformed as never;
+  });
+  const release = vi.spyOn(state, "releaseSession");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-throwing-receipt"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "throwing-receipt" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(getterCalls).toBe(1);
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(messages).toHaveLength(0);
+  await session.cleanup();
+});
+
+test("stale Grant guard fails closed without registering", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-stale"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    principalGrantVersionGuard: { isCurrent: () => false },
+  });
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "stale" });
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
+  await session.cleanup();
+});
+
+test("same-value permission generation replacement before registration fails closed", async () => {
+  let grantChecks = 0;
+  let session!: Session;
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const messages: unknown[] = [];
+  session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-permission-replaced"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    principalGrantVersionGuard: {
+      isCurrent: () => {
+        grantChecks += 1;
+        if (grantChecks === 1) session.setPermissions(session.getPermissions());
+        return true;
+      },
+    },
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "stale-permission" });
+  expect(grantChecks).toBe(1);
+  expect(register).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
+  await session.cleanup();
+});
+
+test("mutable request id changed during Grant check fails closed before registration", async () => {
+  let message: { type: "daemon.get_status.request"; requestId: string } = {
+    type: "daemon.get_status.request",
+    requestId: "request-a",
+  };
+  let firstCheck = true;
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-request-mutation"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    principalGrantVersionGuard: {
+      isCurrent: () => {
+        if (firstCheck) {
+          firstCheck = false;
+          message.requestId = "request-b";
+        }
+        return true;
+      },
+    },
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage(message);
+  expect(register).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("missing and empty request ids fail closed with current Grant", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-missing-id"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({ type: "daemon.get_status.request" } as never);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "" });
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
+  await session.cleanup();
+});
+
+test("register failure releases reservation so the same request id can retry", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const originalRegister = state.registerAuthorizedRequest.bind(state);
+  const register = vi
+    .spyOn(state, "registerAuthorizedRequest")
+    .mockImplementationOnce(() => {
+      throw new Error("register failed");
+    })
+    .mockImplementation((input) => originalRegister(input));
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-retry"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "retry" });
+  expect(messages).toHaveLength(0);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "retry" });
+  expect(register).toHaveBeenCalledTimes(2);
+  expect(
+    messages.some(
+      (message) => (message as { type?: string }).type === "daemon.get_status.response",
+    ),
+  ).toBe(true);
+  await session.cleanup();
+});
+
+test("duplicate request id is reserved while handler is blocked and reusable after completion", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const end = vi.spyOn(state, "endRequest");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-duplicate"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  let finish!: () => void;
+  const dispatch = vi
+    .spyOn(session as never, "dispatchInboundMessage" as never)
+    .mockImplementationOnce(() => new Promise<void>((resolve) => (finish = resolve)));
+  const first = session.handleMessage({
+    type: "daemon.get_status.request",
+    requestId: "duplicate",
+  });
+  await Promise.resolve();
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "duplicate" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  finish();
+  await first;
+  expect(end).toHaveBeenCalledTimes(1);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "duplicate" });
+  expect(register).toHaveBeenCalledTimes(2);
+  expect(dispatch).toHaveBeenCalledTimes(2);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("handler failure still ends the exact registered request", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const end = vi.spyOn(state, "endRequest");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-handler-error"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  vi.spyOn(session as never, "dispatchInboundMessage" as never).mockRejectedValueOnce(
+    new Error("handler"),
+  );
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "handler-error" });
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(end.mock.calls[0]?.[0]).toEqual(
+    expect.objectContaining({
+      requestId: "handler-error",
+      sessionBindingGeneration: "generation-handler-error",
+    }),
+  );
+  await session.cleanup();
+});
+
+test("end failure releases once and makes later authority requests fail closed", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const end = vi.spyOn(state, "endRequest").mockImplementation(() => {
+    throw new Error("end failed");
+  });
+  const release = vi.spyOn(state, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-end-error"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await expect(
+    session.handleMessage({ type: "daemon.get_status.request", requestId: "end-error" }),
+  ).rejects.toThrow("end failed");
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "after-end-error" });
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(register).toHaveBeenCalledTimes(1);
+  await session.cleanup();
+});
+
+test("end and release failures preserve AggregateError primary/cause", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  vi.spyOn(state, "endRequest").mockImplementation(() => {
+    throw new Error("end primary");
+  });
+  vi.spyOn(state, "releaseSession").mockImplementation(() => {
+    throw new Error("release cleanup");
+  });
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-end-release"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await expect(
+    session.handleMessage({ type: "daemon.get_status.request", requestId: "end-release" }),
+  ).rejects.toMatchObject({
+    cause: expect.objectContaining({ message: "end primary" }),
+    errors: [
+      expect.objectContaining({ message: "end primary" }),
+      expect.objectContaining({ message: "release cleanup" }),
+    ],
+  });
+  await session.handleMessage({
+    type: "daemon.get_status.request",
+    requestId: "after-double-error",
+  });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  await session.cleanup().catch(() => undefined);
+});
+
+test("resource-scoped request keeps handler behavior without authority receipt registration", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-resource"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "resource-1",
+    filter: {},
+  });
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toContainEqual(expect.objectContaining({ type: "fetch_workspaces_response" }));
+  await session.cleanup();
+});
+
+test("identity-self request reaches its handler without authority receipt registration", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "registerAuthorizedRequest");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-identity-self"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage({
+    type: "enterprise.identity.get_current.request",
+    requestId: "identity-self-1",
+  });
+  expect(register).not.toHaveBeenCalled();
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  dispatch.mockRestore();
+  await session.cleanup();
 });
 
 test("construction rollback preserves registration and release errors", () => {

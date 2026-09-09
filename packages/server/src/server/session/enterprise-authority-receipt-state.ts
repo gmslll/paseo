@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { OrganizationIdSchema, PrincipalIdSchema } from "@getpaseo/protocol/messages";
+import type { EnterpriseAction } from "@getpaseo/protocol/messages";
+import type { PermissionRequirement } from "../authorization/operation-permissions.js";
 /* oxlint-disable max-depth -- binding replacement prunes nested session records atomically. */
 import {
   AuthorizedRequestReceiptSchema,
@@ -12,7 +14,10 @@ import type {
   AuthorityReceiptStatePort,
 } from "../enterprise/access/authority-receipt-verifier.js";
 
-const RegisterInputSchema = AuthorizedRequestReceiptSchema.omit({ receiptId: true }).strict();
+const RegisterInputSchema = AuthorizedRequestReceiptSchema.omit({
+  receiptId: true,
+  expiresAt: true,
+}).strict();
 const BindingLookupSchema = z
   .object({ sessionBindingKey: z.string().min(1), sessionBindingGeneration: z.string().min(1) })
   .strict();
@@ -49,13 +54,29 @@ const GrantSchema = z
   })
   .strict();
 const HARD_MAX_RECEIPTS = 10_000;
+export const AUTHORITY_RECEIPT_TTL_MAX_MS = 60_000;
 export const AUTHORITY_RECEIPT_ID_MIN_LENGTH = 16;
 export const AUTHORITY_RECEIPT_ID_MAX_LENGTH = 256;
-export type AuthorityReceiptRegisterInput = z.input<typeof RegisterInputSchema>;
+export type AuthorityReceiptRegisterInput = Readonly<
+  Omit<z.input<typeof RegisterInputSchema>, "authorization">
+> & {
+  readonly authorization: {
+    readonly succeeded: true;
+    readonly daemonPermission: PermissionRequirement;
+    readonly enterpriseActions: readonly EnterpriseAction[];
+  };
+};
 
 /** Minimal Session-owned binding lifecycle seam; receipt consumption remains W2-owned. */
 export interface AuthoritySessionBindingLifecycle {
   registerSessionBinding(input: AuthoritySessionBindingRecord): AuthoritySessionBindingRecord;
+  registerAuthorizedRequest(input: AuthorityReceiptRegisterInput): AuthorizedRequestReceipt;
+  endRequest(input: {
+    sessionId: string;
+    sessionBindingKey: string;
+    sessionBindingGeneration: string;
+    requestId: string;
+  }): void;
   releaseSession(input: {
     sessionId: string;
     sessionBindingKey: string;
@@ -67,6 +88,7 @@ export interface AuthorityReceiptStateOptions {
   readonly maxReceipts?: number;
   readonly clock?: AuthorityReceiptClock;
   readonly receiptIdFactory?: () => string;
+  readonly receiptTtlMs?: number;
 }
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object") {
@@ -95,6 +117,7 @@ export class MemoryAuthorityReceiptState
   private readonly maxReceipts: number;
   private readonly clock: AuthorityReceiptClock;
   private readonly receiptIdFactory: () => string;
+  private readonly receiptTtlMs: number;
   private lastClock: number | undefined;
 
   constructor(options: AuthorityReceiptStateOptions = {}) {
@@ -112,6 +135,13 @@ export class MemoryAuthorityReceiptState
       throw new Error("Receipt ID factory unavailable");
     const factory = options.receiptIdFactory ?? defaultRandomUUID.bind(globalThis.crypto);
     this.receiptIdFactory = factory.bind(undefined);
+    this.receiptTtlMs = options.receiptTtlMs ?? 30_000;
+    if (
+      !Number.isSafeInteger(this.receiptTtlMs) ||
+      this.receiptTtlMs < 1 ||
+      this.receiptTtlMs > AUTHORITY_RECEIPT_TTL_MAX_MS
+    )
+      throw new Error("Invalid receipt TTL");
   }
 
   // oxlint-disable-next-line max-depth -- replacement atomically prunes prior session receipts.
@@ -148,7 +178,9 @@ export class MemoryAuthorityReceiptState
   registerAuthorizedRequest(input: AuthorityReceiptRegisterInput): AuthorizedRequestReceipt {
     const parsed = RegisterInputSchema.parse(structuredClone(input));
     const now = this.now();
-    if (parsed.expiresAt <= now) throw new Error("Expired authority receipt");
+    if (now > Number.MAX_SAFE_INTEGER - this.receiptTtlMs)
+      throw new Error("Receipt expiry overflow");
+    const expiresAt = now + this.receiptTtlMs;
     const binding = this.bindings
       .get(parsed.sessionBindingKey)
       ?.get(parsed.sessionBindingGeneration);
@@ -172,7 +204,7 @@ export class MemoryAuthorityReceiptState
       }
     }
     if (!receiptId) throw new Error("Authority receipt collision");
-    const receipt = AuthorizedRequestReceiptSchema.parse({ ...parsed, receiptId });
+    const receipt = AuthorizedRequestReceiptSchema.parse({ ...parsed, expiresAt, receiptId });
     if (this.receipts.has(receiptId)) throw new Error("Authority receipt collision");
     this.receipts.set(receiptId, clone(receipt));
     return clone(receipt);
