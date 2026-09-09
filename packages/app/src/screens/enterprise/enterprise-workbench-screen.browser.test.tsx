@@ -233,7 +233,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={identity}
           patModel={{} as any}
           bossStore={bossStore}
@@ -284,7 +288,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={identity}
           patModel={{} as never}
           bossStore={bossStore}
@@ -325,7 +333,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={identity}
           patModel={{} as any}
           bossStore={bossStore}
@@ -355,7 +367,11 @@ describe("enterprise workbench screen", () => {
       act(() =>
         root.render(
           <EnterpriseWorkbenchScreen
-            capability={{ enterpriseIdentityV1: true }}
+            capability={{
+              enterpriseIdentityV1: true,
+              enterpriseResourceAuthorizationV1: true,
+              enterpriseBrowserProfilesV1: true,
+            }}
             identity={{ target, state, serverId: "server-a" }}
             patModel={{} as never}
             bossStore={bossStore}
@@ -407,7 +423,7 @@ describe("enterprise workbench screen", () => {
       logoutAll: vi.fn(async () => undefined),
       refreshScope: vi.fn(async () => undefined),
     };
-    let stateReads = 0;
+    let descriptorReads = 0;
     const changingIdentity = new Proxy(
       {
         target: "enterprise_host",
@@ -415,19 +431,23 @@ describe("enterprise workbench screen", () => {
         state: "signed_out",
       },
       {
-        get(target, key, receiver) {
-          if (key === "state") {
-            stateReads += 1;
-            if (stateReads > 1) throw new Error("identity state read twice");
-          }
-          return Reflect.get(target, key, receiver);
+        get() {
+          throw new Error("identity getter should not run");
+        },
+        getOwnPropertyDescriptor(target, key) {
+          descriptorReads += 1;
+          return Reflect.getOwnPropertyDescriptor(target, key);
         },
       },
     );
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={changingIdentity}
           patModel={{} as never}
           bossStore={bossStore}
@@ -437,7 +457,7 @@ describe("enterprise workbench screen", () => {
         />,
       ),
     );
-    expect(stateReads).toBe(1);
+    expect(descriptorReads).toBe(3);
     expect(container.textContent).toContain("login");
 
     const projectionInput = {
@@ -454,7 +474,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={signedInInput}
           patModel={{} as never}
           bossStore={bossStore}
@@ -479,8 +503,62 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={throwingOwnKeys}
+          patModel={{} as never}
+          bossStore={bossStore}
+          generation="g1"
+          uiPort={uiPort}
+          legacyContent={<span>legacy</span>}
+        />,
+      ),
+    );
+    expect(container.textContent).toBe("");
+
+    const accessorIdentity: Record<string, unknown> = {
+      target: "enterprise_host",
+      serverId: "server-a",
+    };
+    Object.defineProperty(accessorIdentity, "state", {
+      enumerable: true,
+      get: () => "signed_out",
+    });
+    act(() =>
+      root.render(
+        <EnterpriseWorkbenchScreen
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
+          identity={accessorIdentity}
+          patModel={{} as never}
+          bossStore={bossStore}
+          generation="g1"
+          uiPort={uiPort}
+          legacyContent={<span>legacy</span>}
+        />,
+      ),
+    );
+    expect(container.textContent).toBe("");
+
+    const inheritedIdentity = Object.create({ target: "enterprise_host" });
+    Object.assign(inheritedIdentity, { state: "signed_out", serverId: "server-a" });
+    Object.defineProperty(inheritedIdentity, "future", { value: "secret", enumerable: false });
+    inheritedIdentity[Symbol("future")] = "secret";
+    act(() =>
+      root.render(
+        <EnterpriseWorkbenchScreen
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
+          identity={inheritedIdentity}
           patModel={{} as never}
           bossStore={bossStore}
           generation="g1"
@@ -494,7 +572,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={{
             target: "enterprise_host",
             state: "signed_out",
@@ -532,7 +614,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={identity}
           resourceStatuses={[...statuses, { status: "unknown", futureSecret: "secret" }, null]}
           patModel={{} as never}
@@ -602,7 +688,57 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: false,
+            enterpriseBrowserProfilesV1: true,
+          }}
+          identity={identity}
+          patModel={{} as never}
+          bossStore={bossStore}
+          generation="g1"
+          uiPort={uiPort}
+          grantEditor={grantEditor}
+          browserBinding={browserBinding}
+          legacyContent={<span>legacy</span>}
+        />,
+      ),
+    );
+    expect(container.querySelector('[data-testid="enterprise-boss-metadata"]')).toBeNull();
+    expect(container.querySelector('[data-testid="enterprise-admin-projections"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="enterprise-admin-load-grants"]')).toBeNull();
+    expect(
+      container.querySelector('[data-testid="enterprise-admin-load-profiles"]'),
+    ).not.toBeNull();
+    act(() =>
+      root.render(
+        <EnterpriseWorkbenchScreen
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: false,
+          }}
+          identity={identity}
+          patModel={{} as never}
+          bossStore={bossStore}
+          generation="g1"
+          uiPort={uiPort}
+          grantEditor={grantEditor}
+          browserBinding={browserBinding}
+          legacyContent={<span>legacy</span>}
+        />,
+      ),
+    );
+    expect(container.querySelector('[data-testid="enterprise-admin-load-grants"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="enterprise-admin-load-profiles"]')).toBeNull();
+    act(() =>
+      root.render(
+        <EnterpriseWorkbenchScreen
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={limited}
           patModel={{} as never}
           bossStore={bossStore}
@@ -619,7 +755,11 @@ describe("enterprise workbench screen", () => {
     act(() =>
       root.render(
         <EnterpriseWorkbenchScreen
-          capability={{ enterpriseIdentityV1: true }}
+          capability={{
+            enterpriseIdentityV1: true,
+            enterpriseResourceAuthorizationV1: true,
+            enterpriseBrowserProfilesV1: true,
+          }}
           identity={identity}
           patModel={{} as never}
           bossStore={bossStore}

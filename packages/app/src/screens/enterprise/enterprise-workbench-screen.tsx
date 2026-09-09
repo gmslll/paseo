@@ -1,4 +1,4 @@
-/* oxlint-disable react/jsx-no-useless-fragment, react-perf/jsx-no-new-function-as-prop */
+/* oxlint-disable complexity, react/jsx-no-useless-fragment, react-perf/jsx-no-new-function-as-prop */
 import {
   CurrentIdentityProjectionSchema,
   EnterpriseFeatureFlagsWireSchema,
@@ -53,16 +53,18 @@ function parseIdentity(value: unknown): IdentityView | undefined {
   try {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
     const record = value as Record<string, unknown>;
-    if (
-      Object.keys(record).some(
-        (key) => !["projection", "serverId", "state", "target"].includes(key),
-      )
-    )
-      return undefined;
-    const target = record.target;
-    const state = record.state;
-    const serverId = record.serverId;
-    const rawProjection = record.projection;
+    const ownKeys = Reflect.ownKeys(record);
+    if (ownKeys.some((key) => typeof key !== "string")) return undefined;
+    const captured = new Map<string, unknown>();
+    for (const key of ownKeys) {
+      if (typeof key !== "string") return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(record, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) return undefined;
+      captured.set(key, descriptor.value);
+    }
+    const target = captured.get("target");
+    const state = captured.get("state");
+    const serverId = captured.get("serverId");
     if (
       (target !== "legacy_passthrough" && target !== "enterprise_host") ||
       (state !== "booting" &&
@@ -73,17 +75,29 @@ function parseIdentity(value: unknown): IdentityView | undefined {
       serverId.length === 0
     )
       return undefined;
+    const expectedKeys =
+      state === "signed_in"
+        ? ["projection", "serverId", "state", "target"]
+        : ["serverId", "state", "target"];
+    if (captured.size !== expectedKeys.length || expectedKeys.some((key) => !captured.has(key)))
+      return undefined;
+    const capturedProjection = captured.get("projection");
     const projection =
       state === "signed_in"
-        ? CurrentIdentityProjectionSchema.safeParse(rawProjection)
+        ? CurrentIdentityProjectionSchema.safeParse(capturedProjection)
         : { success: true as const, data: undefined };
     if (!projection.success) return undefined;
+    const freezeRecursively = (current: unknown): unknown => {
+      if (typeof current !== "object" || current === null || Object.isFrozen(current))
+        return current;
+      for (const key of Reflect.ownKeys(current)) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (descriptor && "value" in descriptor) freezeRecursively(descriptor.value);
+      }
+      return Object.freeze(current);
+    };
     const frozenProjection = projection.data
-      ? Object.freeze({
-          ...projection.data,
-          navigation: Object.freeze([...projection.data.navigation]),
-          allowedOperations: Object.freeze([...projection.data.allowedOperations]),
-        })
+      ? (freezeRecursively(projection.data) as CurrentIdentityProjection)
       : undefined;
     return Object.freeze({
       target,
@@ -386,9 +400,8 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
   const identity = parseIdentity(rawIdentity);
   if (!identity) return null;
   const capabilitySnapshot = parseCapability(capability);
-  const enabled =
-    capabilitySnapshot !== undefined &&
-    normalizeEnterpriseFeatureFlags(capabilitySnapshot).enterpriseIdentityV1;
+  const normalizedCapability = normalizeEnterpriseFeatureFlags(capabilitySnapshot);
+  const enabled = normalizedCapability.enterpriseIdentityV1;
   if (identity.target === "legacy_passthrough") return <>{legacyContent}</>;
   if (!enabled)
     return (
@@ -427,13 +440,17 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
   }
   if (!identity.projection) return null;
   const policy = getIdentityDisplayPolicyFromParsed(identity.projection);
-  const canViewResources = policy.allowedOperations.includes("organization.resources.view");
+  const canViewResources =
+    normalizedCapability.enterpriseResourceAuthorizationV1 &&
+    policy.allowedOperations.includes("organization.resources.view");
   const canViewGrants =
-    policy.allowedOperations.includes("access.grants.view") ||
-    policy.allowedOperations.includes("access.grants.manage");
+    normalizedCapability.enterpriseResourceAuthorizationV1 &&
+    (policy.allowedOperations.includes("access.grants.view") ||
+      policy.allowedOperations.includes("access.grants.manage"));
   const canViewProfiles =
-    policy.allowedOperations.includes("browser.profiles.view") ||
-    policy.allowedOperations.includes("browser.profiles.bind");
+    normalizedCapability.enterpriseBrowserProfilesV1 &&
+    (policy.allowedOperations.includes("browser.profiles.view") ||
+      policy.allowedOperations.includes("browser.profiles.bind"));
   const canLogoutAll = policy.allowedOperations.includes("identity.logout_all");
   const clearSensitiveState = () => {
     bossStore.clearSensitiveState();
