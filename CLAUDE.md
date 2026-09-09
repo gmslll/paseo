@@ -4,6 +4,14 @@ Paseo is a mobile app for monitoring and controlling your local AI coding agents
 
 **Supported agents:** Claude Code, Codex, GitHub Copilot, OpenCode, and Pi.
 
+## Enterprise multi-user project
+
+Before making any change for the enterprise multi-user project, read
+`ENTERPRISE_IMPLEMENTATION_MASTER.md` completely. Work only inside the assigned W0–W8
+workstream and obey its exclusive file ownership. If a requested change crosses a workstream
+boundary or conflicts with the master spec, stop that part, create a `DECISION_REQUIRED` ADR
+draft, and hand it to the integration owner. No test evidence means the work is not complete.
+
 ## Repository map
 
 This is an npm workspace monorepo:
