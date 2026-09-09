@@ -10,6 +10,7 @@ import {
   loadPersistedConfig,
   LogFormatSchema,
   LogLevelSchema,
+  normalizeEnterpriseMultiUser,
   type PersistedConfig,
 } from "./persisted-config.js";
 export { normalizeEnterpriseMultiUser } from "./persisted-config.js";
@@ -642,6 +643,7 @@ export function resolveConfigFromPersisted(
     metadataGeneration: persisted.agents?.metadataGeneration,
     providerOverrides,
     log: resolveLogConfigFromEnv(env, persisted),
+    enterpriseMultiUser: normalizeEnterpriseMultiUser(persisted.features?.enterpriseMultiUser),
     configReload: {
       env: { ...env },
       cli: cli ? { ...cli } : undefined,

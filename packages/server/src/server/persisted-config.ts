@@ -33,6 +33,7 @@ export const EnterpriseMultiUserSchema = z.discriminatedUnion("enabled", [
     })
     .strict(),
 ]);
+export type EnterpriseMultiUserConfig = Readonly<z.infer<typeof EnterpriseMultiUserSchema>>;
 export function normalizeEnterpriseMultiUser(
   value: unknown,
 ): Readonly<z.infer<typeof EnterpriseMultiUserSchema> | undefined> {

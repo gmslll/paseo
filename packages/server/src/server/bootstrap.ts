@@ -184,7 +184,11 @@ import type {
   AgentProviderRuntimeSettingsMap,
   ProviderOverride,
 } from "./agent/provider-launch-config.js";
-import { loadPersistedConfig, type PersistedConfig } from "./persisted-config.js";
+import {
+  loadPersistedConfig,
+  type PersistedConfig,
+  type EnterpriseMultiUserConfig,
+} from "./persisted-config.js";
 import { createServiceProxySubsystem, type ServiceProxySubsystem } from "./service-proxy.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { ScriptHealthMonitor } from "./script-health-monitor.js";
@@ -457,6 +461,7 @@ export interface PaseoDaemonConfig {
     relayEnabledFallback: boolean;
     startupPersisted: PersistedConfig;
   };
+  enterpriseMultiUser?: EnterpriseMultiUserConfig;
 }
 
 export interface PaseoDaemon {
