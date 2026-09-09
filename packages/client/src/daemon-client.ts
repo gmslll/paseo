@@ -1,4 +1,5 @@
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
+import { NodeIdSchema, OrganizationIdSchema, PrincipalIdSchema } from "@getpaseo/protocol/messages";
 import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
 import {
   ConnectionSubscriptions,
@@ -6,6 +7,50 @@ import {
   type TimelineSubscription,
 } from "./connection/index.js";
 import type { z } from "zod";
+
+export interface PrincipalScopeKey {
+  readonly organizationId: string;
+  readonly nodeId: string;
+  readonly paseoServerId: string;
+  readonly principalId: string;
+}
+declare const lifecycleGenerationBrand: unique symbol;
+export type LifecycleGeneration = string & {
+  readonly [lifecycleGenerationBrand]: "LifecycleGeneration";
+};
+export function createLifecycleGeneration(): LifecycleGeneration {
+  if (typeof globalThis.crypto?.randomUUID !== "function")
+    throw new Error("Secure lifecycle generation unavailable");
+  return globalThis.crypto.randomUUID() as LifecycleGeneration;
+}
+export function createPrincipalScopeKey(input: PrincipalScopeKey): PrincipalScopeKey {
+  if (
+    !OrganizationIdSchema.safeParse(input.organizationId).success ||
+    !NodeIdSchema.safeParse(input.nodeId).success ||
+    !PrincipalIdSchema.safeParse(input.principalId).success ||
+    !input.paseoServerId
+  )
+    throw new Error("Invalid enterprise principal scope");
+  return Object.freeze({
+    organizationId: input.organizationId,
+    nodeId: input.nodeId,
+    paseoServerId: input.paseoServerId,
+    principalId: input.principalId,
+  });
+}
+export function samePrincipalScope(
+  a: PrincipalScopeKey | undefined,
+  b: PrincipalScopeKey | undefined,
+): boolean {
+  return (
+    !!a &&
+    !!b &&
+    a.organizationId === b.organizationId &&
+    a.nodeId === b.nodeId &&
+    a.paseoServerId === b.paseoServerId &&
+    a.principalId === b.principalId
+  );
+}
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import { parsePluginSourceReference } from "@getpaseo/protocol/plugin-source-reference";
