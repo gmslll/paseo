@@ -506,6 +506,25 @@ export const AuditEventSchema = z.object({
   eventHash: z.string().min(1).optional(),
 });
 
+// This is an internal Port input, not a WebSocket shape. Strict parsing prevents callers from
+// supplying event identity, time, node, ordering, or hash-chain fields owned by the AuditSink.
+export const AuditEventInputSchema = AuditEventSchema.omit({
+  eventId: true,
+  occurredAt: true,
+  nodeId: true,
+  nodeEventSeq: true,
+  previousHash: true,
+  eventHash: true,
+}).strict();
+
+export const AUDIT_DURABILITIES = ["required", "buffered"] as const;
+export const AuditDurabilitySchema = z.enum(AUDIT_DURABILITIES);
+export const AuditAppendOptionsSchema = z
+  .object({
+    durability: AuditDurabilitySchema,
+  })
+  .strict();
+
 export const EnterpriseNodeStatusSchema = z.enum([
   "registered",
   "active",
@@ -715,6 +734,9 @@ export type EnterpriseResourceStatusProjection = z.infer<
 export type ResourceLease = z.infer<typeof ResourceLeaseSchema>;
 export type FencedLease = z.infer<typeof FencedLeaseSchema>;
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+export type AuditEventInput = z.infer<typeof AuditEventInputSchema>;
+export type AuditDurability = z.infer<typeof AuditDurabilitySchema>;
+export type AuditAppendOptions = z.infer<typeof AuditAppendOptionsSchema>;
 export type EnterpriseNodeRecord = z.infer<typeof EnterpriseNodeRecordSchema>;
 export type GlobalResourceRef = z.infer<typeof GlobalResourceRefSchema>;
 export type OutboundAuthorizationContext = z.infer<typeof OutboundAuthorizationContextSchema>;
@@ -796,8 +818,40 @@ export interface LeaseCoordinator {
   release(input: LeaseReleaseInput): Promise<void>;
 }
 
+export type AuditHashInput = Omit<AuditEvent, "eventHash">;
+
+export interface AuditClock {
+  now(): string;
+}
+
+export interface AuditIdSource {
+  next(): string;
+}
+
+export interface AuditHash {
+  hash(event: Readonly<AuditHashInput>): Promise<string>;
+}
+
+export interface AuditSequence {
+  next(previousSequence: number | null): Promise<number>;
+}
+
+export interface AuditStorage {
+  readAll(): Promise<readonly AuditEvent[]>;
+  append(event: Readonly<AuditEvent>): Promise<void>;
+}
+
+export interface AuditSinkDependencies {
+  readonly node: NodeContext;
+  readonly clock: AuditClock;
+  readonly idSource: AuditIdSource;
+  readonly hash: AuditHash;
+  readonly sequence: AuditSequence;
+  readonly storage: AuditStorage;
+}
+
 export interface AuditSink {
-  append(event: AuditEvent): Promise<void>;
+  append(input: AuditEventInput, options: AuditAppendOptions): Promise<AuditEvent>;
 }
 
 export type StandaloneNodeContext = NodeContext & { mode: "standalone" };
@@ -831,6 +885,10 @@ export interface LocalAuditSinkContract extends AuditSink {
   readonly adapterKind: "local";
   readonly node: StandaloneNodeContext;
 }
+
+export type LocalAuditSinkDependencies = Omit<AuditSinkDependencies, "node"> & {
+  readonly node: StandaloneNodeContext;
+};
 
 export interface LocalEnterprisePorts {
   readonly node: StandaloneNodeContext;

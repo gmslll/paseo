@@ -56,6 +56,26 @@ daemon or derive a node from a path or resource ID.
 Typed Port plus typed in-memory adapter tests are accepted contract evidence. Runtime integration
 evidence follows [ADR 0009](decisions/0009-p0-evidence-and-capacity-gates.md).
 
+### Audit authority and durability
+
+`AuditEvent` remains the finalized wire and query shape. Callers submit the strict, non-wire
+`AuditEventInput` and cannot include `eventId`, `occurredAt`, `nodeId`, `nodeEventSeq`,
+`previousHash`, or `eventHash`. `AuditSink` owns those fields and returns the finalized event from
+`append(input, options)`.
+
+`AuditAppendOptions.durability` is either `required` or `buffered`. `required` resolves only after
+durable append and rejects on failure. Use it for Boss content reads and high-risk actions so the
+operation can fail closed. `buffered` resolves only after the finalized event enters the bounded,
+ordered memory queue; a full queue or an ordering failure rejects. Replay persists that same event
+without regenerating authority or chain fields.
+
+W7 constructs the local Sink with `NodeContext`, `AuditClock`, `AuditIdSource`, `AuditHash`,
+`AuditSequence`, and `AuditStorage`. W1, W2, W4, and W5 submit business input plus durability; they
+do not generate finalized event fields. `AuditStorage.readAll()` restores the persisted chain in
+order, and `AuditSequence.next(lastSequence)` continues from the verified tail. Storage append
+accepts only the finalized event. See
+[ADR 0016](decisions/0016-audit-sink-authority-and-durability.md).
+
 ## Ownership, Profiles, and leases
 
 Legacy Agent and Workspace owner fields remain optional on the wire. Call
