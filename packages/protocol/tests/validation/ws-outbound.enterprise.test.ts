@@ -189,6 +189,16 @@ const enterpriseResponses = [
 ] as const;
 
 describe("generated enterprise outbound validation", () => {
+  test("does not require the non-wire outbound authorization context", () => {
+    const message = envelope(enterpriseResponses[0]);
+
+    expect(GeneratedWSOutboundMessageSchema.safeParse(message)).toEqual({
+      success: true,
+      data: message,
+    });
+    expect(message.message).not.toHaveProperty("outboundAuthorizationContext");
+  });
+
   test("preserves enterprise server_info Feature Flags", () => {
     const message = envelope({
       type: "status",

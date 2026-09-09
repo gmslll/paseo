@@ -15,6 +15,7 @@ import {
   CurrentIdentityProjectionSchema,
   EnterpriseFeatureFlagsWireSchema,
   ENTERPRISE_ACTIONS,
+  ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST,
   ENTERPRISE_RUNTIME_ACTIONS_REQUIRING_EXPLICIT_GRANT,
   ENTERPRISE_MULTI_USER_SERVICE_PROXY_POLICY,
   ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST,
@@ -264,6 +265,9 @@ class MemoryResourceAuthorization implements ResourceAuthorization {
   ): Promise<boolean> {
     if (context.kind === "resources") {
       return context.resources.every((resource) => resource.organizationId === ORGANIZATION_ID);
+    }
+    if (context.kind === "authority") {
+      return false;
     }
     if (context.control === "pong") {
       return event.type === "pong";
@@ -653,7 +657,7 @@ describe("enterprise resource contracts", () => {
     expect(authorization.filterWorkspaces(PRINCIPAL, rows)).toEqual([rows[0]]);
   });
 
-  test("outbound authorization requires resources or an explicit transport-control allowlist", async () => {
+  test("outbound authorization preserves resource and transport-control contexts", async () => {
     const authorization = new MemoryResourceAuthorization(new Map(), new Set());
     const event = SessionOutboundMessageSchema.parse({
       type: "enterprise.resource.status",
@@ -679,8 +683,13 @@ describe("enterprise resource contracts", () => {
         },
       ],
     });
+    const transportControl = {
+      kind: "transport_control",
+      control: "server_info",
+    } as const;
 
     expect(ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST).toEqual(["pong", "server_info"]);
+    expect(OutboundAuthorizationContextSchema.parse(transportControl)).toEqual(transportControl);
     expect(
       OutboundAuthorizationContextSchema.safeParse({ kind: "resources", resources: [] }).success,
     ).toBe(false);
@@ -694,6 +703,16 @@ describe("enterprise resource contracts", () => {
       OutboundAuthorizationContextSchema.safeParse({
         kind: "transport_control",
         control: "rpc_error",
+      }).success,
+    ).toBe(false);
+    expect(
+      OutboundAuthorizationContextSchema.safeParse({ ...resources, unexpected: true }).success,
+    ).toBe(false);
+    expect(
+      OutboundAuthorizationContextSchema.safeParse({
+        kind: "transport_control",
+        control: "pong",
+        unexpected: true,
       }).success,
     ).toBe(false);
     await expect(authorization.canEmit(PRINCIPAL, event, resources)).resolves.toBe(true);
@@ -736,6 +755,155 @@ describe("enterprise resource contracts", () => {
         control: "server_info",
       }),
     ).resolves.toBe(false);
+  });
+
+  test("authorized-request authority carries a strict server receipt and open request type", () => {
+    const context = {
+      kind: "authority",
+      authority: {
+        kind: "authorized_request",
+        receiptId: "opaque-receipt-1",
+        requestId: "req-global-1",
+        requestType: "future.global.operation.request",
+        sessionBindingKey: "binding-key-1",
+        sessionBindingGeneration: "generation-1",
+      },
+    } as const;
+
+    expect(OutboundAuthorizationContextSchema.parse(context)).toEqual(context);
+
+    for (const value of [
+      { kind: "authority" },
+      { ...context, unexpected: true },
+      { ...context, authority: { ...context.authority, unexpected: true } },
+      { ...context, authority: { ...context.authority, receiptId: "" } },
+      { ...context, authority: { ...context.authority, requestId: "" } },
+      { ...context, authority: { ...context.authority, requestType: "" } },
+      { ...context, authority: { ...context.authority, sessionBindingKey: "" } },
+      { ...context, authority: { ...context.authority, sessionBindingGeneration: "" } },
+      { ...context, authority: { ...context.authority, receiptId: 1 } },
+      { ...context, authority: { ...context.authority, requestType: false } },
+    ]) {
+      expect(OutboundAuthorizationContextSchema.safeParse(value).success).toBe(false);
+    }
+  });
+
+  test("identity-self authority has an exact response and event allowlist", () => {
+    expect(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST).toEqual([
+      "enterprise.identity.get_current.response",
+      "enterprise.identity.logout_all.response",
+      "enterprise.identity.scope_refreshed",
+      "enterprise.identity.credential_revoked",
+    ]);
+
+    const binding = {
+      sessionBindingKey: "binding-key-1",
+      sessionBindingGeneration: "generation-1",
+    } as const;
+    const accepted = [
+      {
+        kind: "authority",
+        authority: {
+          kind: "identity_self",
+          ...binding,
+          message: {
+            type: "enterprise.identity.get_current.response",
+            requestId: "req-current",
+          },
+        },
+      },
+      {
+        kind: "authority",
+        authority: {
+          kind: "identity_self",
+          ...binding,
+          message: {
+            type: "enterprise.identity.logout_all.response",
+            requestId: "req-logout",
+          },
+        },
+      },
+      {
+        kind: "authority",
+        authority: {
+          kind: "identity_self",
+          ...binding,
+          message: { type: "enterprise.identity.scope_refreshed" },
+        },
+      },
+      {
+        kind: "authority",
+        authority: {
+          kind: "identity_self",
+          ...binding,
+          message: { type: "enterprise.identity.credential_revoked" },
+        },
+      },
+    ] as const;
+
+    for (const context of accepted) {
+      expect(OutboundAuthorizationContextSchema.parse(context)).toEqual(context);
+    }
+
+    for (const context of [
+      {
+        ...accepted[0],
+        unexpected: true,
+      },
+      {
+        ...accepted[0],
+        authority: {
+          ...accepted[0].authority,
+          message: { type: "enterprise.identity.get_current.response" },
+        },
+      },
+      {
+        ...accepted[0],
+        authority: {
+          ...accepted[0].authority,
+          message: { type: "enterprise.identity.get_current.response", requestId: "" },
+        },
+      },
+      {
+        ...accepted[2],
+        authority: {
+          ...accepted[2].authority,
+          message: { type: "enterprise.identity.scope_refreshed", requestId: "req-not-allowed" },
+        },
+      },
+      {
+        ...accepted[2],
+        authority: {
+          ...accepted[2].authority,
+          message: { type: "enterprise.identity.list_principals.response", requestId: "req-1" },
+        },
+      },
+      {
+        ...accepted[2],
+        authority: {
+          ...accepted[2].authority,
+          message: { type: "rpc_error", requestId: "req-1" },
+        },
+      },
+      {
+        ...accepted[2],
+        authority: { ...accepted[2].authority, message: null },
+      },
+      {
+        ...accepted[2],
+        authority: { ...accepted[2].authority, unexpected: true },
+      },
+      {
+        ...accepted[2],
+        authority: { ...accepted[2].authority, sessionBindingKey: "" },
+      },
+      {
+        ...accepted[2],
+        authority: { ...accepted[2].authority, sessionBindingGeneration: 1 },
+      },
+    ]) {
+      expect(OutboundAuthorizationContextSchema.safeParse(context).success).toBe(false);
+    }
   });
 
   test("enterprise mode denies a public Workspace Service Proxy request without a principal", () => {
@@ -1080,6 +1248,14 @@ describe("enterprise resource contracts", () => {
         localResourceId: appSlot.appSlotId,
       }).success,
     ).toBe(false);
+    expect(
+      GlobalResourceRefSchema.safeParse({
+        organizationId: ORGANIZATION_ID,
+        nodeId: NODE_ID,
+        resourceKind: "organization",
+        localResourceId: ORGANIZATION_ID,
+      }).success,
+    ).toBe(false);
   });
 
   test("V1 enums reject future values until a V2 capability is introduced", () => {
@@ -1312,6 +1488,33 @@ describe("enterprise RPC contracts", () => {
       agentId: "agent-1",
       resourceKind: "browser_profile",
       mode: "write",
+    });
+  });
+
+  test("outbound authorization context is not a wire message or client authority field", () => {
+    const authorityContext = {
+      kind: "authority",
+      authority: {
+        kind: "authorized_request",
+        receiptId: "opaque-receipt-1",
+        requestId: "req-current",
+        requestType: "enterprise.identity.get_current.request",
+        sessionBindingKey: "binding-key-1",
+        sessionBindingGeneration: "generation-1",
+      },
+    } as const;
+
+    expect(SessionInboundMessageSchema.safeParse(authorityContext).success).toBe(false);
+    expect(SessionOutboundMessageSchema.safeParse(authorityContext).success).toBe(false);
+    expect(
+      SessionInboundMessageSchema.parse({
+        type: "enterprise.identity.get_current.request",
+        requestId: "req-current",
+        outboundAuthorizationContext: authorityContext,
+      }),
+    ).toEqual({
+      type: "enterprise.identity.get_current.request",
+      requestId: "req-current",
     });
   });
 

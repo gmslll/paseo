@@ -43,8 +43,26 @@ type; an enterprise adapter quarantines missing or partial ownership. `assertWor
 
 Every outbound authorization call also receives a non-wire `OutboundAuthorizationContext`.
 Resource-bearing output requires at least one server-resolved `GlobalResourceRef`. The only
-transport-control bypasses are a matching `pong` and `server_info`. `rpc_error` inherits the
-request's resource context or becomes a fixed redacted protocol error.
+transport-control bypasses are a matching `pong` and `server_info`.
+
+Non-resource output uses the strict `authority` branch. `authorized_request` carries a
+server-minted opaque receipt ID, request ID, open request type, Session binding key, and Session
+generation. W3 registers it only after inbound authorization succeeds. The registry binds the
+exact organization, Principal, credential, Grant version, node, Session, client, generation, and
+request type/ID. W2 exhaustively validates the event/request pair, verifies that the receipt is
+current, and rechecks the original permission, enterprise action, and current Grant guard in
+`canEmit`. The receipt expires after use or when the request ends. Clients never submit this
+context.
+
+`identity_self` carries the current Session binding key/generation and a strict `message` object.
+It is limited to that bound Session and exactly four message types:
+`enterprise.identity.get_current.response`, `enterprise.identity.logout_all.response`,
+`enterprise.identity.scope_refreshed`, and `enterprise.identity.credential_revoked`. Responses
+require their matching request ID; events have none. Unknown fields, empty required strings, and
+wrong types fail strict parsing. `GlobalResourceRef` gains no authority-only resource kinds, and
+`authority` is not a general bypass. `rpc_error` still inherits the request's resource context or
+becomes a fixed redacted protocol error. See
+[ADR 0014](decisions/0014-outbound-authorization-context.md).
 
 ## Replaceable Ports
 
@@ -102,6 +120,13 @@ construct identity and Browser Profile summaries field by field. Organization re
 metadata-only discriminated union. Open navigation, operation, and reason-code strings are display
 inputs; filter unknown values with `normalizeEnterpriseDisplayStrings` and never treat them as
 authorization.
+
+V1 adds no Browser/App metadata-read action. Organization-wide metadata uses
+`workspace.metadata.read` with an `organization` selector. A Browser Profile or App Slot row may
+also be visible through a Workspace already authorized for metadata read. Profile binding changes
+require `browser.profile.manage`; Browser and App execution require `browser.use` and `app.use`.
+Hide an unbound row when neither organization metadata authority nor an authorized Workspace
+binding applies.
 
 Enterprise events are `enterprise.identity.scope_refreshed`,
 `enterprise.identity.credential_revoked`, `enterprise.resource.waiting`, and

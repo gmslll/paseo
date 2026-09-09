@@ -667,15 +667,76 @@ export const EnterpriseOrganizationResourceProjectionSchema = z.discriminatedUni
 ]);
 
 export const ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST = ["pong", "server_info"] as const;
+export const ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST = [
+  "enterprise.identity.get_current.response",
+  "enterprise.identity.logout_all.response",
+  "enterprise.identity.scope_refreshed",
+  "enterprise.identity.credential_revoked",
+] as const;
+
+const OutboundSessionBindingAuthorityShape = {
+  sessionBindingKey: z.string().min(1),
+  sessionBindingGeneration: z.string().min(1),
+};
+
+const IdentitySelfOutboundMessageAuthoritySchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[0]),
+      requestId: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[1]),
+      requestId: z.string().min(1),
+    })
+    .strict(),
+  z.object({ type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[2]) }).strict(),
+  z.object({ type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[3]) }).strict(),
+]);
+
+export const OutboundAuthoritySchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("authorized_request"),
+      // This is a server-minted lookup key. Its value has no client-visible semantics.
+      receiptId: z.string().min(1),
+      requestId: z.string().min(1),
+      // Kept open so W2 can own the exhaustive request/response authorization table.
+      requestType: z.string().min(1),
+      ...OutboundSessionBindingAuthorityShape,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("identity_self"),
+      ...OutboundSessionBindingAuthorityShape,
+      message: IdentitySelfOutboundMessageAuthoritySchema,
+    })
+    .strict(),
+]);
+
+// Internal authorization state only. Never attach this context to a Session wire message.
 export const OutboundAuthorizationContextSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("resources"),
-    resources: z.array(GlobalResourceRefSchema).min(1),
-  }),
-  z.object({
-    kind: z.literal("transport_control"),
-    control: z.enum(ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST),
-  }),
+  z
+    .object({
+      kind: z.literal("resources"),
+      resources: z.array(GlobalResourceRefSchema).min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("authority"),
+      authority: OutboundAuthoritySchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("transport_control"),
+      control: z.enum(ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST),
+    })
+    .strict(),
 ]);
 
 const LeaseAcquireSharedShape = {
