@@ -56,10 +56,9 @@ export interface IdentityDisplayPolicy {
   readonly allowedOperations: readonly EnterpriseOperationDisplay[];
 }
 
-export function getIdentityDisplayPolicy(projection: unknown): IdentityDisplayPolicy | undefined {
-  const parsed = CurrentIdentityProjectionSchema.safeParse(projection);
-  if (!parsed.success) return undefined;
-  const identity: CurrentIdentityProjection = parsed.data;
+export function getIdentityDisplayPolicyFromParsed(
+  identity: CurrentIdentityProjection,
+): IdentityDisplayPolicy {
   return Object.freeze({
     navigation: Object.freeze(
       normalizeEnterpriseDisplayStrings(
@@ -74,6 +73,12 @@ export function getIdentityDisplayPolicy(projection: unknown): IdentityDisplayPo
       ) as EnterpriseOperationDisplay[],
     ),
   });
+}
+
+export function getIdentityDisplayPolicy(projection: unknown): IdentityDisplayPolicy | undefined {
+  const parsed = CurrentIdentityProjectionSchema.safeParse(projection);
+  if (!parsed.success) return undefined;
+  return getIdentityDisplayPolicyFromParsed(parsed.data);
 }
 
 export function normalizeEnterpriseIdentityReason(
