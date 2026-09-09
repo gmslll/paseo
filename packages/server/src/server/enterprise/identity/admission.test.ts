@@ -1,10 +1,15 @@
 import { mkdtemp } from "node:fs/promises";
+import { rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { hash } from "bcryptjs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { EnterpriseAdmission } from "./admission.js";
-import type { EnterpriseAuditSink } from "./admission.js";
+import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
+import { productionAuditCapabilityIssuer } from "../audit/production-audit-runtime.js";
 import { nodeIdentityRegistryFs } from "./fs-port.js";
 interface AuthStub {
   authenticateBearer: (token: string, context: unknown) => Promise<unknown>;
@@ -14,7 +19,61 @@ interface GuardStub {
 }
 
 const node = { nodeId: "nod_0123456789abcdef", paseoServerId: "srv", mode: "standalone" as const };
-const base = (audit: EnterpriseAuditSink) => ({
+const executeFile = promisify(execFile);
+let buildDirectory: string;
+let addonPath: string;
+const issuedCapabilities = new Set<ProductionAuditCapability>();
+const caseDirectories = new Set<string>();
+beforeAll(async () => {
+  if (process.platform !== "darwin") return;
+  buildDirectory = await mkdtemp(path.join(os.tmpdir(), "admission-addon-"));
+  addonPath = path.join(buildDirectory, "darwin-audit-fs.node");
+  await executeFile(process.execPath, [
+    fileURLToPath(new URL("../audit/native/build-darwin-audit-fs.mjs", import.meta.url)),
+    "--output",
+    addonPath,
+  ]);
+});
+
+test("structural fake proxy reads only audit", () => {
+  const reads: string[] = [];
+  const fake = { append: async () => ({}) };
+  const options = new Proxy(
+    { ...base(fake as unknown as ProductionAuditCapability) },
+    {
+      get(target, key, receiver) {
+        reads.push(String(key));
+        if (key !== "audit") throw new Error("unexpected read");
+        return key === "audit" ? fake : Reflect.get(target, key, receiver);
+      },
+    },
+  );
+  expect(() => new EnterpriseAdmission(options as never)).toThrow(
+    "current runtime-issued production audit capability required",
+  );
+  expect(reads).toEqual(["audit"]);
+});
+afterEach(async () => {
+  for (const capability of issuedCapabilities) await capability.close().catch(() => undefined);
+  issuedCapabilities.clear();
+  for (const dir of caseDirectories) await rm(dir, { recursive: true, force: true });
+  caseDirectories.clear();
+});
+afterAll(async () => {
+  if (buildDirectory) await rm(buildDirectory, { recursive: true, force: true });
+});
+async function issueAudit(parent: string): Promise<ProductionAuditCapability> {
+  if (process.platform !== "darwin") throw new Error("Darwin audit capability unavailable");
+  const capability = await productionAuditCapabilityIssuer.issue({
+    node,
+    auditRoot: path.join(parent, "audit"),
+    nativeAddonPath: addonPath,
+  });
+  issuedCapabilities.add(capability);
+  caseDirectories.add(parent);
+  return capability;
+}
+const base = (audit: ProductionAuditCapability) => ({
   filePath: path.join(os.tmpdir(), "admission.json"),
   principalSource: { resolvePrincipal: async () => null },
   node,
@@ -44,25 +103,15 @@ describe("EnterpriseAdmission", () => {
     expect(
       () =>
         new EnterpriseAdmission({ ...base({ append: async () => ({}), releaseReady: false }), fs }),
-    ).toThrow("release-ready");
+    ).toThrow("current runtime-issued production audit capability required");
     expect(calls).toEqual({ mkdir: 0, open: 0, read: 0 });
-    expect(
-      () =>
-        new EnterpriseAdmission({
-          ...base({ append: async () => ({}), releaseReady: true }),
-          node: { ...node, nodeId: "bad" } as never,
-        }),
-    ).toThrow();
-    expect(
-      () =>
-        new EnterpriseAdmission({
-          ...base({ append: async () => ({}), releaseReady: true }),
-          organizationId: "bad",
-        }),
-    ).toThrow();
   });
+});
 
-  test("invalid node and organization reject before wrapped fs calls", () => {
+describe.runIf(process.platform === "darwin")("EnterpriseAdmission with production audit", () => {
+  test("invalid node and organization reject before wrapped fs calls", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
     const calls = { mkdir: 0, open: 0, read: 0 };
     const fs = {
       ...nodeIdentityRegistryFs,
@@ -82,7 +131,7 @@ describe("EnterpriseAdmission", () => {
     expect(
       () =>
         new EnterpriseAdmission({
-          ...base({ append: async () => ({}), releaseReady: true }),
+          ...base(audit),
           fs,
           node: { ...node, nodeId: "bad" } as never,
         }),
@@ -94,7 +143,7 @@ describe("EnterpriseAdmission", () => {
     expect(
       () =>
         new EnterpriseAdmission({
-          ...base({ append: async () => ({}), releaseReady: true }),
+          ...base(audit),
           fs,
           organizationId: "bad",
         }),
@@ -105,7 +154,7 @@ describe("EnterpriseAdmission", () => {
   test("accepts release-ready audit and rejects invalid connection", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
     const admission = new EnterpriseAdmission({
-      ...base({ append: async () => ({}), releaseReady: true }),
+      ...base(await issueAudit(root)),
       filePath: path.join(root, "credentials.json"),
     });
     await expect(
@@ -120,7 +169,7 @@ describe("EnterpriseAdmission", () => {
   test("guard false denies PAT and returned context is deeply frozen", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
     const admission = new EnterpriseAdmission({
-      ...base({ append: async () => ({}), releaseReady: true }),
+      ...base(await issueAudit(root)),
       filePath: path.join(root, "credentials.json"),
     });
     const principal = {
@@ -164,7 +213,7 @@ describe("EnterpriseAdmission", () => {
   ])("real bcrypt break-glass %s/%s", async (transport, peer, allowed) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "admission-bg-"));
     const admission = new EnterpriseAdmission({
-      ...base({ append: async () => ({}), releaseReady: true }),
+      ...base(await issueAudit(root)),
       filePath: path.join(root, "credentials.json"),
       daemonPassword: await hash("pw", 4),
     });
@@ -194,7 +243,7 @@ describe("EnterpriseAdmission", () => {
   test("authentication receives a call-time immutable connection snapshot", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "admission-snapshot-"));
     const admission = new EnterpriseAdmission({
-      ...base({ append: async () => ({}), releaseReady: true }),
+      ...base(await issueAudit(root)),
       filePath: path.join(root, "credentials.json"),
     });
     let seen: unknown;
@@ -257,7 +306,7 @@ describe("EnterpriseAdmission", () => {
   test("deferred guard snapshots principal and rejects malformed raw", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "admission-deferred-"));
     const admission = new EnterpriseAdmission({
-      ...base({ append: async () => ({}), releaseReady: true }),
+      ...base(await issueAudit(root)),
       filePath: path.join(root, "credentials.json"),
     });
     let release!: () => void;
@@ -339,5 +388,302 @@ describe("EnterpriseAdmission", () => {
     await expect(
       admission.authenticate("token", { node, transport: "direct", peer: "loopback" }),
     ).resolves.toBeNull();
+  });
+
+  test("rejects spread capability synchronously", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const spread = { ...audit } as unknown as ProductionAuditCapability;
+    expect(() => new EnterpriseAdmission(base(spread))).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+  });
+
+  test("rejects closed capability synchronously", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    await audit.close();
+    expect(() => new EnterpriseAdmission(base(audit))).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+  });
+
+  test("closed capability rejects public calls synchronously", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const admission = new EnterpriseAdmission(base(audit));
+    let authCalls = 0;
+    let guardCalls = 0;
+    (admission.authenticator as unknown as AuthStub).authenticateBearer = async () => {
+      authCalls++;
+      return null;
+    };
+    (admission.authenticator as unknown as GuardStub).isCurrentPrincipalContext = async () => {
+      guardCalls++;
+      return false;
+    };
+    await audit.close();
+    expect(() =>
+      admission.authenticate("token", { node, transport: "direct", peer: "loopback" }),
+    ).toThrow("current runtime-issued production audit capability required");
+    expect(() => admission.isCurrentPrincipalContext({} as never)).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(authCalls).toBe(0);
+    expect(guardCalls).toBe(0);
+  });
+
+  test("close during authenticate bearer rejects pending", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const admission = new EnterpriseAdmission(base(audit));
+    let started!: () => void;
+    const signal = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const principal = {
+      principalType: "human",
+      principalId: "usr_0123456789abcdef",
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef01234567",
+      grantVersion: "1",
+      grants: [],
+    } as const;
+    (admission.authenticator as unknown as AuthStub).authenticateBearer = async () => {
+      started();
+      await gate;
+      return principal;
+    };
+    let published = 0;
+    const pending = admission
+      .authenticate("token", {
+        node,
+        transport: "direct",
+        peer: "loopback",
+      })
+      .then((value) => {
+        published++;
+        return value;
+      });
+    await signal;
+    await audit.close();
+    release();
+    await expect(pending).rejects.toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(published).toBe(0);
+  });
+
+  test("close during current guard rejects pending", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const admission = new EnterpriseAdmission(base(audit));
+    const principal = {
+      principalType: "human",
+      principalId: "usr_0123456789abcdef",
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef01234567",
+      grantVersion: "1",
+      grants: [],
+    } as const;
+    let started!: () => void;
+    const signal = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    (admission.authenticator as unknown as AuthStub).authenticateBearer = async () => principal;
+    (admission.authenticator as unknown as GuardStub).isCurrentPrincipalContext = async () => {
+      started();
+      await gate;
+      return true;
+    };
+    let published = 0;
+    const pending = admission
+      .authenticate("token", {
+        node,
+        transport: "direct",
+        peer: "loopback",
+      })
+      .then((value) => {
+        published++;
+        return value;
+      });
+    await signal;
+    await audit.close();
+    release();
+    await expect(pending).rejects.toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(published).toBe(0);
+  });
+
+  test("constructor reads captured options once", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const reads: string[] = [];
+    const options = new Proxy(base(audit), {
+      get(target, key, receiver) {
+        reads.push(String(key));
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    void new EnterpriseAdmission(options);
+    for (const key of [
+      "audit",
+      "filePath",
+      "principalSource",
+      "node",
+      "organizationId",
+      "invalidation",
+      "clock",
+      "credentialIds",
+      "secrets",
+      "hasher",
+      "verifier",
+      "fs",
+      "daemonPassword",
+    ])
+      expect(reads.filter((value) => value === key)).toHaveLength(1);
+    expect(reads[0]).toBe("audit");
+  });
+
+  test("closed capability proxy reads only audit", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    await audit.close();
+    const reads: string[] = [];
+    const options = new Proxy(base(audit), {
+      get(target, key, receiver) {
+        reads.push(String(key));
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(() => new EnterpriseAdmission(options)).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(reads).toEqual(["audit"]);
+  });
+
+  test("guard false after capability close rejects", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const admission = new EnterpriseAdmission(base(audit));
+    const principal = {
+      principalType: "human",
+      principalId: "usr_0123456789abcdef",
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef01234567",
+      grantVersion: "1",
+      grants: [],
+    } as const;
+    let started!: () => void;
+    const signal = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    (admission.authenticator as unknown as AuthStub).authenticateBearer = async () => principal;
+    (admission.authenticator as unknown as GuardStub).isCurrentPrincipalContext = async () => {
+      started();
+      await gate;
+      return false;
+    };
+    const pending = admission.authenticate("token", {
+      node,
+      transport: "direct",
+      peer: "loopback",
+    });
+    await signal;
+    await audit.close();
+    release();
+    await expect(pending).rejects.toThrow(
+      "current runtime-issued production audit capability required",
+    );
+  });
+
+  test("structural readiness fakes are rejected", () => {
+    const fake = {
+      append: async () => ({}),
+      releaseReady: true,
+    } as unknown as ProductionAuditCapability;
+    expect(() => new EnterpriseAdmission(base(fake))).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+  });
+
+  test("options close after audit check prevents consumers", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const reads: string[] = [];
+    const options = new Proxy(base(audit), {
+      get(target, key, receiver) {
+        reads.push(String(key));
+        const value = Reflect.get(target, key, receiver);
+        if (key === "audit") void audit.close();
+        return value;
+      },
+    });
+    expect(() => new EnterpriseAdmission(options)).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(reads[0]).toBe("audit");
+  });
+
+  test("reflect replacement of audit is rejected", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const other = await issueAudit(root + "-other");
+    const admission = new EnterpriseAdmission(base(audit));
+    expect(Reflect.set(admission, "audit", other)).toBe(false);
+    expect(admission.audit).toBe(audit);
+    await audit.close();
+    expect(() => admission.authenticate("token", {})).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(() => productionAuditCapabilityIssuer.requireCurrent(other)).not.toThrow();
+  });
+
+  test("release-ready structural fake does not read close or filesystem", () => {
+    const calls = { mkdir: 0, open: 0, read: 0, close: 0 };
+    const fs = {
+      ...nodeIdentityRegistryFs,
+      mkdir: (...args: Parameters<typeof nodeIdentityRegistryFs.mkdir>) => {
+        calls.mkdir++;
+        return nodeIdentityRegistryFs.mkdir(...args);
+      },
+      open: (...args: Parameters<typeof nodeIdentityRegistryFs.open>) => {
+        calls.open++;
+        return nodeIdentityRegistryFs.open(...args);
+      },
+      read: (...args: Parameters<typeof nodeIdentityRegistryFs.read>) => {
+        calls.read++;
+        return nodeIdentityRegistryFs.read(...args);
+      },
+    };
+    const fake = new Proxy(
+      { append: async () => ({}), releaseReady: true } as unknown as ProductionAuditCapability,
+      {
+        get(target, key, receiver) {
+          if (key === "close") {
+            calls.close++;
+            throw new Error("close getter read");
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    expect(() => new EnterpriseAdmission({ ...base(fake), fs })).toThrow(
+      "current runtime-issued production audit capability required",
+    );
+    expect(calls).toEqual({ mkdir: 0, open: 0, read: 0, close: 0 });
   });
 });

@@ -33,6 +33,9 @@ export class EnterprisePrincipalAuthenticator implements PrincipalAuthenticator 
   private readonly organizationId: string;
   private readonly breakGlassGeneration = randomUUID();
   private readonly audit: AuditSink;
+  get configuredOrganizationId(): string {
+    return this.organizationId;
+  }
 
   constructor(options: EnterprisePrincipalAuthenticatorOptions) {
     this.registry = options.registry;
