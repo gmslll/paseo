@@ -5,8 +5,10 @@ import type {
 } from "@getpaseo/protocol/messages";
 import { describe, expect, it } from "vitest";
 import {
+  DOWNLOAD_TOKEN_CAPACITY_HARD_MAX,
   DownloadTokenPolicy,
   DownloadTokenPolicyError,
+  type DownloadTokenCleanupScope,
   type DownloadFileIdentity,
   type DownloadTokenBinding,
   type DownloadTokenClock,
@@ -23,6 +25,13 @@ const NODE_ID = "nod_0123456789abcdef";
 const OTHER_NODE_ID = "nod_fedcba9876543210";
 const PRINCIPAL_ID = "usr_0123456789abcdef";
 const OTHER_PRINCIPAL_ID = "usr_fedcba9876543210";
+const SERVICE_PRINCIPAL_ID = "svc_0123456789abcdef";
+const CREDENTIAL_ID = "credential-one";
+const OTHER_CREDENTIAL_ID = "credential-two";
+const GRANT_VERSION = "grant-version-one";
+const OTHER_GRANT_VERSION = "grant-version-two";
+const SESSION_GENERATION = "session-generation-one";
+const OTHER_SESSION_GENERATION = "session-generation-two";
 const WORKSPACE_ID = "workspace-one";
 const OTHER_WORKSPACE_ID = "workspace-two";
 const RELATIVE_PATH = "reports/quarter.csv";
@@ -38,6 +47,8 @@ const FILE_IDENTITY: DownloadFileIdentity = {
 interface PrincipalOverrides {
   organizationId?: string;
   principalId?: string;
+  credentialId?: string;
+  grantVersion?: string;
 }
 
 function principal(overrides: PrincipalOverrides = {}): PrincipalContext {
@@ -45,8 +56,8 @@ function principal(overrides: PrincipalOverrides = {}): PrincipalContext {
     principalType: "human",
     principalId: overrides.principalId ?? PRINCIPAL_ID,
     organizationId: overrides.organizationId ?? ORGANIZATION_ID,
-    credentialId: "credential-one",
-    grantVersion: "grant-version-one",
+    credentialId: overrides.credentialId ?? CREDENTIAL_ID,
+    grantVersion: overrides.grantVersion ?? GRANT_VERSION,
     grants: [
       {
         action: "workspace.content.read",
@@ -56,11 +67,26 @@ function principal(overrides: PrincipalOverrides = {}): PrincipalContext {
   };
 }
 
-function node(nodeId = NODE_ID): NodeContext {
+function servicePrincipal(): PrincipalContext {
+  return {
+    principalType: "service",
+    principalId: SERVICE_PRINCIPAL_ID,
+    organizationId: ORGANIZATION_ID,
+    credentialId: CREDENTIAL_ID,
+    grantVersion: GRANT_VERSION,
+    grants: principal().grants,
+  };
+}
+
+function node(
+  nodeId = NODE_ID,
+  paseoServerId = "server-one",
+  mode: NodeContext["mode"] = "standalone",
+): NodeContext {
   return {
     nodeId,
-    paseoServerId: "server-one",
-    mode: "standalone",
+    paseoServerId,
+    mode,
   };
 }
 
@@ -68,14 +94,16 @@ interface WorkspaceOverrides {
   organizationId?: string;
   nodeId?: string;
   workspaceId?: string;
+  ownerPrincipalId?: string;
+  createdByPrincipalId?: string;
 }
 
 function workspace(overrides: WorkspaceOverrides = {}): AuthorizedWorkspace {
   return {
     organizationId: overrides.organizationId ?? ORGANIZATION_ID,
     nodeId: overrides.nodeId ?? NODE_ID,
-    ownerPrincipalId: PRINCIPAL_ID,
-    createdByPrincipalId: PRINCIPAL_ID,
+    ownerPrincipalId: overrides.ownerPrincipalId ?? PRINCIPAL_ID,
+    createdByPrincipalId: overrides.createdByPrincipalId ?? PRINCIPAL_ID,
     workspaceId: overrides.workspaceId ?? WORKSPACE_ID,
   };
 }
@@ -170,8 +198,33 @@ function issueInput() {
   return {
     principal: principal(),
     node: node(),
+    sessionBindingGeneration: SESSION_GENERATION,
     workspaceId: WORKSPACE_ID,
     relativePath: RELATIVE_PATH,
+  };
+}
+
+function cleanupScope(
+  kind: DownloadTokenCleanupScope["kind"],
+  input = issueInput(),
+): DownloadTokenCleanupScope {
+  const base = {
+    organizationId: input.principal.organizationId,
+    node: input.node,
+    principalType: input.principal.principalType,
+    principalId: input.principal.principalId,
+  };
+  if (kind === "principal") return { kind, ...base };
+  if (kind === "credential") {
+    return { kind, ...base, credentialId: input.principal.credentialId };
+  }
+  if (kind === "grant") return { kind, ...base, grantVersion: input.principal.grantVersion };
+  return {
+    kind,
+    ...base,
+    credentialId: input.principal.credentialId,
+    grantVersion: input.principal.grantVersion,
+    sessionBindingGeneration: input.sessionBindingGeneration,
   };
 }
 
@@ -180,6 +233,7 @@ interface ConsumeOverrides {
   node?: NodeContext;
   workspaceId?: string;
   relativePath?: string;
+  sessionBindingGeneration?: string;
 }
 
 function consumeInput(token: string, overrides: ConsumeOverrides = {}): DownloadTokenConsumeInput {
@@ -187,6 +241,7 @@ function consumeInput(token: string, overrides: ConsumeOverrides = {}): Download
     token,
     principal: overrides.principal ?? principal(),
     node: overrides.node ?? node(),
+    sessionBindingGeneration: overrides.sessionBindingGeneration ?? SESSION_GENERATION,
     workspaceId: overrides.workspaceId ?? WORKSPACE_ID,
     relativePath: overrides.relativePath ?? RELATIVE_PATH,
   };
@@ -195,12 +250,101 @@ function consumeInput(token: string, overrides: ConsumeOverrides = {}): Download
 function expectedBinding(expiresAt: number): DownloadTokenBinding {
   return {
     organizationId: ORGANIZATION_ID,
-    nodeId: NODE_ID,
+    node: node(),
+    principalType: "human",
     principalId: PRINCIPAL_ID,
+    credentialId: CREDENTIAL_ID,
+    grantVersion: GRANT_VERSION,
+    sessionBindingGeneration: SESSION_GENERATION,
     workspace: workspace(),
     relativePath: RELATIVE_PATH,
     fileIdentity: FILE_IDENTITY,
     expiresAt,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+interface CleanupMatrixTokens {
+  readonly base: string;
+  readonly otherSession: string;
+  readonly otherCredential: string;
+  readonly otherGrant: string;
+  readonly otherNode: string;
+  readonly otherPaseoServer: string;
+  readonly otherNodeMode: string;
+  readonly otherPrincipal: string;
+  readonly otherPrincipalType: string;
+  readonly otherOrganization: string;
+}
+
+function createCleanupScopePolicy(): DownloadTokenPolicy {
+  return createPolicy({
+    capacity: 16,
+    resolver: createResolver((input) =>
+      target({
+        workspace: workspace({
+          organizationId: input.principal.organizationId,
+          nodeId: input.node.nodeId,
+          workspaceId: input.workspaceId,
+        }),
+      }),
+    ),
+  });
+}
+
+async function issueCleanupMatrix(policy: DownloadTokenPolicy): Promise<CleanupMatrixTokens> {
+  const base = await policy.issue(issueInput());
+  const otherSession = await policy.issue({
+    ...issueInput(),
+    sessionBindingGeneration: OTHER_SESSION_GENERATION,
+  });
+  const otherCredential = await policy.issue({
+    ...issueInput(),
+    principal: principal({ credentialId: OTHER_CREDENTIAL_ID }),
+  });
+  const otherGrant = await policy.issue({
+    ...issueInput(),
+    principal: principal({ grantVersion: OTHER_GRANT_VERSION }),
+  });
+  const otherNode = await policy.issue({ ...issueInput(), node: node(OTHER_NODE_ID) });
+  const otherPaseoServer = await policy.issue({
+    ...issueInput(),
+    node: node(NODE_ID, "server-two"),
+  });
+  const otherNodeMode = await policy.issue({
+    ...issueInput(),
+    node: node(NODE_ID, "server-one", "managed"),
+  });
+  const otherPrincipal = await policy.issue({
+    ...issueInput(),
+    principal: principal({ principalId: OTHER_PRINCIPAL_ID }),
+  });
+  const otherPrincipalType = await policy.issue({
+    ...issueInput(),
+    principal: servicePrincipal(),
+  });
+  const otherOrganization = await policy.issue({
+    ...issueInput(),
+    principal: principal({ organizationId: OTHER_ORGANIZATION_ID }),
+  });
+  return {
+    base: base.token,
+    otherSession: otherSession.token,
+    otherCredential: otherCredential.token,
+    otherGrant: otherGrant.token,
+    otherNode: otherNode.token,
+    otherPaseoServer: otherPaseoServer.token,
+    otherNodeMode: otherNodeMode.token,
+    otherPrincipal: otherPrincipal.token,
+    otherPrincipalType: otherPrincipalType.token,
+    otherOrganization: otherOrganization.token,
   };
 }
 
@@ -215,6 +359,89 @@ async function expectPolicyError(
 }
 
 describe("DownloadTokenPolicy", () => {
+  it("captures and binds the resolver once before caller mutation", async () => {
+    interface StatefulResolver extends DownloadTokenResolver {
+      calls: number;
+    }
+
+    const original: StatefulResolver = {
+      calls: 0,
+      async resolve() {
+        this.calls += 1;
+        return target();
+      },
+    };
+    const replacement: StatefulResolver = {
+      calls: 0,
+      async resolve() {
+        this.calls += 1;
+        throw new Error("replacement resolver must not run");
+      },
+    };
+    let selectedResolver: DownloadTokenResolver = original;
+    let resolverReads = 0;
+    const policy = new DownloadTokenPolicy({
+      ttlMs: 60_000,
+      capacity: 1,
+      get resolver() {
+        resolverReads += 1;
+        return selectedResolver;
+      },
+      clock: new TestClock(1_000),
+      randomSource: new IncrementingRandomSource(),
+    });
+
+    selectedResolver = replacement;
+    original.resolve = replacement.resolve;
+    const issued = await policy.issue(issueInput());
+    await expect(policy.consume(consumeInput(issued.token))).resolves.toEqual(
+      expectedBinding(61_000),
+    );
+    expect(resolverReads).toBe(1);
+    expect(original.calls).toBe(2);
+    expect(replacement.calls).toBe(0);
+  });
+
+  it.each(["resolver", "resolve"] as const)(
+    "fails construction when the %s getter throws without reading later dependencies",
+    (boundary) => {
+      const failure = new Error(`${boundary} getter failed`);
+      let resolverReads = 0;
+      let resolveReads = 0;
+      let clockReads = 0;
+      let randomReads = 0;
+      const throwingResolver = Object.defineProperty({}, "resolve", {
+        get(): DownloadTokenResolver["resolve"] {
+          resolveReads += 1;
+          throw failure;
+        },
+      }) as DownloadTokenResolver;
+      const options = {
+        ttlMs: 1,
+        capacity: 1,
+        get resolver(): DownloadTokenResolver {
+          resolverReads += 1;
+          if (boundary === "resolver") throw failure;
+          return throwingResolver;
+        },
+        get clock(): DownloadTokenClock {
+          clockReads += 1;
+          return new TestClock(0);
+        },
+        get randomSource(): DownloadTokenRandomSource {
+          randomReads += 1;
+          return new IncrementingRandomSource();
+        },
+      };
+
+      expect(() => new DownloadTokenPolicy(options)).toThrow(failure);
+      expect(resolverReads).toBe(1);
+      expect(resolveReads).toBe(boundary === "resolve" ? 1 : 0);
+      expect(clockReads).toBe(0);
+      expect(randomReads).toBe(0);
+    },
+  );
+
   it("parses authenticated context before resolving and issues only a canonical token and expiry", async () => {
     const resolver = createResolver();
     const randomSource = new IncrementingRandomSource();
@@ -225,6 +452,7 @@ describe("DownloadTokenPolicy", () => {
     const issued = await policy.issue({
       principal: rawPrincipal,
       node: rawNode,
+      sessionBindingGeneration: SESSION_GENERATION,
       workspaceId: WORKSPACE_ID,
       relativePath: RELATIVE_PATH,
     });
@@ -247,6 +475,25 @@ describe("DownloadTokenPolicy", () => {
     expect(Object.isFrozen(resolverInput.principal)).toBe(true);
     expect(Object.isFrozen(resolverInput.principal.grants)).toBe(true);
     expect(Object.isFrozen(resolverInput.node)).toBe(true);
+  });
+
+  it("binds principal type and the complete node context in the returned capability", async () => {
+    const resolver = createResolver((input) =>
+      target({ workspace: workspace({ nodeId: input.node.nodeId }) }),
+    );
+    const policy = createPolicy({ resolver });
+    const input = {
+      ...issueInput(),
+      principal: servicePrincipal(),
+      node: node(NODE_ID, "managed-server", "managed"),
+    };
+    const issued = await policy.issue(input);
+
+    await expect(policy.consume({ ...input, token: issued.token })).resolves.toMatchObject({
+      principalType: "service",
+      principalId: SERVICE_PRINCIPAL_ID,
+      node: input.node,
+    });
   });
 
   it.each([
@@ -277,8 +524,32 @@ describe("DownloadTokenPolicy", () => {
       policy.consume(
         consumeInput(issued.token, { principal: principal({ principalId: "attacker" }) }),
       ),
-    ).rejects.toMatchObject({ name: "ZodError" });
+    ).resolves.toBeNull();
     expect(resolver.calls).toHaveLength(1);
+    await expect(policy.consume(consumeInput(issued.token))).resolves.toBeNull();
+    expect(resolver.calls).toHaveLength(1);
+  });
+
+  it("reads the token getter once and burns before another getter throws", async () => {
+    const resolver = createResolver();
+    const policy = createPolicy({ resolver });
+    const issued = await policy.issue(issueInput());
+    const input = consumeInput(issued.token);
+    let tokenReads = 0;
+    Object.defineProperty(input, "token", {
+      get() {
+        tokenReads += 1;
+        return issued.token;
+      },
+    });
+    Object.defineProperty(input, "workspaceId", {
+      get() {
+        throw new Error("throwing getter");
+      },
+    });
+
+    await expect(policy.consume(input)).resolves.toBeNull();
+    expect(tokenReads).toBe(1);
     await expect(policy.consume(consumeInput(issued.token))).resolves.toBeNull();
     expect(resolver.calls).toHaveLength(1);
   });
@@ -289,9 +560,23 @@ describe("DownloadTokenPolicy", () => {
       override: { principal: principal({ organizationId: OTHER_ORGANIZATION_ID }) },
     },
     { label: "node", override: { node: node(OTHER_NODE_ID) } },
+    { label: "Paseo server", override: { node: node(NODE_ID, "server-two") } },
+    { label: "node mode", override: { node: node(NODE_ID, "server-one", "managed") } },
     {
       label: "principal",
       override: { principal: principal({ principalId: OTHER_PRINCIPAL_ID }) },
+    },
+    {
+      label: "credential",
+      override: { principal: principal({ credentialId: OTHER_CREDENTIAL_ID }) },
+    },
+    {
+      label: "Grant version",
+      override: { principal: principal({ grantVersion: OTHER_GRANT_VERSION }) },
+    },
+    {
+      label: "Session generation",
+      override: { sessionBindingGeneration: OTHER_SESSION_GENERATION },
     },
     { label: "workspace", override: { workspaceId: OTHER_WORKSPACE_ID } },
     { label: "relative path", override: { relativePath: OTHER_RELATIVE_PATH } },
@@ -363,21 +648,57 @@ describe("DownloadTokenPolicy", () => {
     },
   );
 
-  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
-    "rejects invalid capacity %s",
-    (capacity) => {
-      expect(
-        () =>
-          new DownloadTokenPolicy({
-            ttlMs: 1,
-            capacity,
-            clock: new TestClock(0),
-            randomSource: new IncrementingRandomSource(),
-            resolver: createResolver(),
-          }),
-      ).toThrowError(DownloadTokenPolicyError);
-    },
-  );
+  it.each([
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    DOWNLOAD_TOKEN_CAPACITY_HARD_MAX + 1,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])("rejects invalid capacity %s", (capacity) => {
+    expect(
+      () =>
+        new DownloadTokenPolicy({
+          ttlMs: 1,
+          capacity,
+          clock: new TestClock(0),
+          randomSource: new IncrementingRandomSource(),
+          resolver: createResolver(),
+        }),
+    ).toThrowError(DownloadTokenPolicyError);
+  });
+
+  it("accepts the exported hard capacity maximum", () => {
+    expect(() => createPolicy({ capacity: DOWNLOAD_TOKEN_CAPACITY_HARD_MAX })).not.toThrow();
+  });
+
+  it("rejects capacity above the hard maximum before reading any dependency", () => {
+    let resolverReads = 0;
+    let clockReads = 0;
+    let randomReads = 0;
+    const options = {
+      ttlMs: 1,
+      capacity: DOWNLOAD_TOKEN_CAPACITY_HARD_MAX + 1,
+      get resolver(): DownloadTokenResolver {
+        resolverReads += 1;
+        return createResolver();
+      },
+      get clock(): DownloadTokenClock {
+        clockReads += 1;
+        return new TestClock(0);
+      },
+      get randomSource(): DownloadTokenRandomSource {
+        randomReads += 1;
+        return new IncrementingRandomSource();
+      },
+    };
+
+    expect(() => new DownloadTokenPolicy(options)).toThrowError(DownloadTokenPolicyError);
+    expect(resolverReads).toBe(0);
+    expect(clockReads).toBe(0);
+    expect(randomReads).toBe(0);
+  });
 
   it.each([
     Number.NaN,
@@ -447,6 +768,23 @@ describe("DownloadTokenPolicy", () => {
     expect(resolver.calls).toHaveLength(2);
   });
 
+  it.each(["ownerPrincipalId", "createdByPrincipalId"] as const)(
+    "burns a token when canonical workspace %s is rebound",
+    async (field) => {
+      const resolver = createResolver((_input, callNumber) =>
+        callNumber === 1
+          ? target()
+          : target({ workspace: workspace({ [field]: OTHER_PRINCIPAL_ID }) }),
+      );
+      const policy = createPolicy({ resolver });
+      const issued = await policy.issue(issueInput());
+
+      await expect(policy.consume(consumeInput(issued.token))).resolves.toBeNull();
+      await expect(policy.consume(consumeInput(issued.token))).resolves.toBeNull();
+      expect(resolver.calls).toHaveLength(2);
+    },
+  );
+
   it("rejects a resolver mismatch during issue before drawing randomness", async () => {
     const randomSource = new IncrementingRandomSource();
     const resolver = createResolver(() =>
@@ -515,6 +853,20 @@ describe("DownloadTokenPolicy", () => {
     );
   });
 
+  it("reserves capacity before a blocked resolver can publish", async () => {
+    const gate = deferred<DownloadTokenResolvedTarget>();
+    const resolver = createResolver(() => gate.promise);
+    const randomSource = new IncrementingRandomSource();
+    const policy = createPolicy({ capacity: 1, resolver, randomSource });
+    const first = policy.issue(issueInput());
+
+    await expectPolicyError(policy.issue(issueInput()), "capacity_exceeded");
+    expect(resolver.calls).toHaveLength(1);
+    expect(randomSource.requestedSizes).toEqual([]);
+    gate.resolve(target());
+    await expect(first).resolves.toMatchObject({ token: expect.any(String) });
+  });
+
   it("clones and freezes caller, resolver, and returned binding data field by field", async () => {
     let releaseResolution: () => void = () => undefined;
     const resolutionGate = new Promise<void>((resolve) => {
@@ -541,6 +893,7 @@ describe("DownloadTokenPolicy", () => {
 
     const issued = await issuing;
     expect(Reflect.set(issuedTarget.workspace, "workspaceId", OTHER_WORKSPACE_ID)).toBe(true);
+    expect(Reflect.set(issuedTarget.workspace, "ownerPrincipalId", OTHER_PRINCIPAL_ID)).toBe(true);
     expect(Reflect.set(issuedTarget.fileIdentity, "ino", 999)).toBe(true);
 
     const binding = await policy.consume(consumeInput(issued.token));
@@ -549,10 +902,12 @@ describe("DownloadTokenPolicy", () => {
       throw new Error("Expected a download binding");
     }
     expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.node)).toBe(true);
     expect(Object.isFrozen(binding.workspace)).toBe(true);
     expect(Object.isFrozen(binding.fileIdentity)).toBe(true);
     expect(Object.hasOwn(binding, "token")).toBe(false);
     expect(Reflect.set(binding, "principalId", OTHER_PRINCIPAL_ID)).toBe(false);
+    expect(Reflect.set(binding.node, "paseoServerId", "other-server")).toBe(false);
     expect(Reflect.set(binding.workspace, "workspaceId", OTHER_WORKSPACE_ID)).toBe(false);
     expect(Reflect.set(binding.fileIdentity, "ino", 999)).toBe(false);
 
@@ -608,5 +963,190 @@ describe("DownloadTokenPolicy", () => {
       expectedBinding(61_000),
     );
     expect(firstResolver.calls).toHaveLength(2);
+  });
+
+  it("does not retain consumed token history in exact-scope cleanup", async () => {
+    const policy = createPolicy({ capacity: 4 });
+
+    for (let index = 0; index < 20; index += 1) {
+      const issued = await policy.issue(issueInput());
+      await expect(policy.consume(consumeInput(issued.token))).resolves.not.toBeNull();
+    }
+
+    expect(
+      policy.burnScope({
+        kind: "session",
+        organizationId: ORGANIZATION_ID,
+        node: node(),
+        principalType: "human",
+        principalId: PRINCIPAL_ID,
+        credentialId: CREDENTIAL_ID,
+        grantVersion: GRANT_VERSION,
+        sessionBindingGeneration: SESSION_GENERATION,
+      }),
+    ).toBe(0);
+  });
+
+  it.each([
+    {
+      label: "session",
+      scope: {
+        kind: "session" as const,
+        organizationId: ORGANIZATION_ID,
+        node: node(),
+        principalType: "human" as const,
+        principalId: PRINCIPAL_ID,
+        credentialId: CREDENTIAL_ID,
+        grantVersion: GRANT_VERSION,
+        sessionBindingGeneration: SESSION_GENERATION,
+      },
+      burned: ["base"] as const,
+    },
+    {
+      label: "credential",
+      scope: {
+        kind: "credential" as const,
+        organizationId: ORGANIZATION_ID,
+        node: node(),
+        principalType: "human" as const,
+        principalId: PRINCIPAL_ID,
+        credentialId: CREDENTIAL_ID,
+      },
+      burned: ["base", "otherSession", "otherGrant"] as const,
+    },
+    {
+      label: "grant",
+      scope: {
+        kind: "grant" as const,
+        organizationId: ORGANIZATION_ID,
+        node: node(),
+        principalType: "human" as const,
+        principalId: PRINCIPAL_ID,
+        grantVersion: GRANT_VERSION,
+      },
+      burned: ["base", "otherSession", "otherCredential"] as const,
+    },
+    {
+      label: "principal",
+      scope: {
+        kind: "principal" as const,
+        organizationId: ORGANIZATION_ID,
+        node: node(),
+        principalType: "human" as const,
+        principalId: PRINCIPAL_ID,
+      },
+      burned: ["base", "otherSession", "otherCredential", "otherGrant"] as const,
+    },
+  ])("burns only the strict $label lifecycle scope", async ({ scope, burned }) => {
+    const policy = createCleanupScopePolicy();
+    const tokens = await issueCleanupMatrix(policy);
+
+    expect(policy.burnScope(scope)).toBe(burned.length);
+    const burnedKeys = new Set<keyof CleanupMatrixTokens>(burned);
+    for (const [key, token] of Object.entries(tokens) as [keyof CleanupMatrixTokens, string][]) {
+      expect(policy.burn(token), key).toBe(!burnedKeys.has(key));
+    }
+  });
+
+  it("rejects a non-strict cleanup scope without burning any token", async () => {
+    const policy = createPolicy();
+    const issued = await policy.issue(issueInput());
+
+    expect(
+      policy.burnScope({
+        kind: "session",
+        organizationId: ORGANIZATION_ID,
+        node: node(),
+        principalType: "human",
+        principalId: PRINCIPAL_ID,
+        credentialId: CREDENTIAL_ID,
+        grantVersion: GRANT_VERSION,
+        sessionBindingGeneration: SESSION_GENERATION,
+        unexpected: true,
+      } as never),
+    ).toBe(0);
+    expect(policy.burn(issued.token)).toBe(true);
+  });
+
+  it.each([
+    {
+      kind: "session" as const,
+      survivor: { ...issueInput(), sessionBindingGeneration: OTHER_SESSION_GENERATION },
+    },
+    {
+      kind: "credential" as const,
+      survivor: {
+        ...issueInput(),
+        principal: principal({ credentialId: OTHER_CREDENTIAL_ID }),
+      },
+    },
+    {
+      kind: "grant" as const,
+      survivor: {
+        ...issueInput(),
+        principal: principal({ grantVersion: OTHER_GRANT_VERSION }),
+      },
+    },
+    {
+      kind: "principal" as const,
+      survivor: {
+        ...issueInput(),
+        principal: principal({ principalId: OTHER_PRINCIPAL_ID }),
+      },
+    },
+  ])(
+    "$kind cleanup synchronously invalidates a blocked issue and leaves another scope alive",
+    async ({ kind, survivor }) => {
+      const targetGate = deferred<DownloadTokenResolvedTarget>();
+      const survivorGate = deferred<DownloadTokenResolvedTarget>();
+      const resolver = createResolver((_input, callNumber) =>
+        callNumber === 1 ? targetGate.promise : survivorGate.promise,
+      );
+      const randomSource = new IncrementingRandomSource();
+      const policy = createPolicy({ capacity: 2, resolver, randomSource });
+      const blocked = policy.issue(issueInput());
+      const surviving = policy.issue(survivor);
+
+      const cleanup = policy.cleanupScope(cleanupScope(kind));
+      let cleanupSettled = false;
+      cleanup.then(() => {
+        cleanupSettled = true;
+        return undefined;
+      });
+      targetGate.resolve(target());
+      await expect(blocked).rejects.toMatchObject({ code: "issue_invalidated" });
+      await expect(cleanup).resolves.toBe(1);
+      expect(cleanupSettled).toBe(true);
+      expect(randomSource.requestedSizes).toEqual([]);
+
+      survivorGate.resolve(
+        target({
+          workspace: workspace({
+            organizationId: survivor.principal.organizationId,
+            nodeId: survivor.node.nodeId,
+            workspaceId: survivor.workspaceId,
+          }),
+        }),
+      );
+      const issued = await surviving;
+      await expect(policy.consume({ ...survivor, token: issued.token })).resolves.not.toBeNull();
+      expect(randomSource.requestedSizes).toEqual([32]);
+    },
+  );
+
+  it.each([
+    { label: "Paseo server", issueNode: node(NODE_ID, "server-two") },
+    { label: "node mode", issueNode: node(NODE_ID, "server-one", "managed") },
+  ])("session cleanup leaves a blocked issue on another $label alive", async ({ issueNode }) => {
+    const gate = deferred<DownloadTokenResolvedTarget>();
+    const resolver = createResolver(() => gate.promise);
+    const policy = createPolicy({ resolver });
+    const input = { ...issueInput(), node: issueNode };
+    const issuing = policy.issue(input);
+
+    await expect(policy.cleanupScope(cleanupScope("session"))).resolves.toBe(0);
+    gate.resolve(target({ workspace: workspace({ nodeId: issueNode.nodeId }) }));
+    const issued = await issuing;
+    await expect(policy.consume({ ...input, token: issued.token })).resolves.not.toBeNull();
   });
 });

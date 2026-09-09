@@ -3,7 +3,9 @@ import { randomBytes } from "node:crypto";
 import {
   EnterpriseResourceOwnerSchema,
   NodeContextSchema,
+  OrganizationIdSchema,
   PrincipalContextSchema,
+  PrincipalIdSchema,
   type AuthorizedWorkspace,
   type NodeContext,
   type PrincipalContext,
@@ -13,6 +15,7 @@ import {
 import { z } from "zod";
 
 const MAX_DOWNLOAD_TOKEN_TTL_MS = 60_000;
+export const DOWNLOAD_TOKEN_CAPACITY_HARD_MAX = 10_000;
 const DOWNLOAD_TOKEN_BYTES = 32;
 const DOWNLOAD_TOKEN_LENGTH = 43;
 const TOKEN_GENERATION_ATTEMPTS = 3;
@@ -35,6 +38,7 @@ const DownloadTokenResolveInputSchema = z
   .object({
     principal: PrincipalContextSchema,
     node: NodeContextSchema,
+    sessionBindingGeneration: z.string().min(1),
     workspaceId: z.string().min(1),
     relativePath: z.string().min(1),
   })
@@ -43,6 +47,40 @@ const DownloadTokenResolveInputSchema = z
 const DownloadTokenConsumeInputSchema = DownloadTokenResolveInputSchema.extend({
   token: z.string().min(1),
 }).strict();
+
+const DownloadTokenCleanupNodeShape = {
+  organizationId: OrganizationIdSchema,
+  node: NodeContextSchema,
+  principalType: z.enum(["human", "service", "break_glass_owner"]),
+  principalId: PrincipalIdSchema,
+};
+
+const DownloadTokenCleanupScopeSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("session"),
+      ...DownloadTokenCleanupNodeShape,
+      credentialId: z.string().min(1),
+      grantVersion: z.string().min(1),
+      sessionBindingGeneration: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("credential"),
+      ...DownloadTokenCleanupNodeShape,
+      credentialId: z.string().min(1),
+    })
+    .strict(),
+  z.object({ kind: z.literal("principal"), ...DownloadTokenCleanupNodeShape }).strict(),
+  z
+    .object({
+      kind: z.literal("grant"),
+      ...DownloadTokenCleanupNodeShape,
+      grantVersion: z.string().min(1),
+    })
+    .strict(),
+]);
 
 const DownloadTokenResolvedTargetSchema = z
   .object({
@@ -61,6 +99,7 @@ export interface DownloadFileIdentity {
 export interface DownloadTokenResolveInput {
   readonly principal: PrincipalContext;
   readonly node: NodeContext;
+  readonly sessionBindingGeneration: string;
   readonly workspaceId: string;
   readonly relativePath: string;
 }
@@ -68,6 +107,8 @@ export interface DownloadTokenResolveInput {
 export interface DownloadTokenConsumeInput extends DownloadTokenResolveInput {
   readonly token: string;
 }
+
+export type DownloadTokenCleanupScope = z.infer<typeof DownloadTokenCleanupScopeSchema>;
 
 export interface DownloadTokenResolvedTarget {
   readonly workspace: AuthorizedWorkspace;
@@ -93,8 +134,12 @@ export interface DownloadTokenIssue {
 
 export interface DownloadTokenBinding {
   readonly organizationId: string;
-  readonly nodeId: string;
+  readonly node: NodeContext;
+  readonly principalType: PrincipalContext["principalType"];
   readonly principalId: string;
+  readonly credentialId: string;
+  readonly grantVersion: string;
+  readonly sessionBindingGeneration: string;
   readonly workspace: AuthorizedWorkspace;
   readonly relativePath: string;
   readonly fileIdentity: DownloadFileIdentity;
@@ -109,6 +154,7 @@ export type DownloadTokenPolicyErrorCode =
   | "capacity_exceeded"
   | "invalid_random_bytes"
   | "token_collision"
+  | "issue_invalidated"
   | "resolved_target_mismatch";
 
 export class DownloadTokenPolicyError extends Error {
@@ -131,12 +177,23 @@ export interface DownloadTokenPolicyOptions {
 
 interface DownloadTokenRecord {
   readonly organizationId: string;
-  readonly nodeId: string;
+  readonly node: NodeContext;
+  readonly principalType: PrincipalContext["principalType"];
   readonly principalId: string;
-  readonly workspaceId: string;
+  readonly credentialId: string;
+  readonly grantVersion: string;
+  readonly sessionBindingGeneration: string;
+  readonly workspace: AuthorizedWorkspace;
   readonly relativePath: string;
   readonly fileIdentity: DownloadFileIdentity;
   readonly expiresAt: number;
+}
+
+interface DownloadTokenIssueOperation {
+  readonly request: DownloadTokenResolveInput;
+  active: boolean;
+  readonly settled: Promise<void>;
+  readonly settle: () => void;
 }
 
 const SYSTEM_CLOCK: DownloadTokenClock = Object.freeze({
@@ -154,92 +211,128 @@ const SECURE_RANDOM_SOURCE: DownloadTokenRandomSource = Object.freeze({
 export class DownloadTokenPolicy {
   private readonly ttlMs: number;
   private readonly capacity: number;
-  private readonly resolver: DownloadTokenResolver;
-  private readonly clock: DownloadTokenClock;
-  private readonly randomSource: DownloadTokenRandomSource;
+  private readonly resolve: DownloadTokenResolver["resolve"];
+  private readonly now: DownloadTokenClock["now"];
+  private readonly randomBytes: DownloadTokenRandomSource["randomBytes"];
   private readonly records = new Map<string, DownloadTokenRecord>();
+  private readonly issuing = new Set<DownloadTokenIssueOperation>();
   private lastObservedNow: number | null = null;
 
   public constructor(options: DownloadTokenPolicyOptions) {
-    if (
-      !Number.isSafeInteger(options.ttlMs) ||
-      options.ttlMs <= 0 ||
-      options.ttlMs > MAX_DOWNLOAD_TOKEN_TTL_MS
-    ) {
+    const ttlMs = options.ttlMs;
+    const capacity = options.capacity;
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > MAX_DOWNLOAD_TOKEN_TTL_MS) {
       throw new DownloadTokenPolicyError(
         "invalid_configuration",
         `Download token TTL must be a positive safe integer no greater than ${MAX_DOWNLOAD_TOKEN_TTL_MS}.`,
       );
     }
-    if (!Number.isSafeInteger(options.capacity) || options.capacity <= 0) {
+    if (
+      !Number.isSafeInteger(capacity) ||
+      capacity <= 0 ||
+      capacity > DOWNLOAD_TOKEN_CAPACITY_HARD_MAX
+    ) {
       throw new DownloadTokenPolicyError(
         "invalid_configuration",
-        "Download token capacity must be a positive safe integer.",
+        `Download token capacity must be a positive safe integer no greater than ${DOWNLOAD_TOKEN_CAPACITY_HARD_MAX}.`,
       );
     }
-    this.ttlMs = options.ttlMs;
-    this.capacity = options.capacity;
-    this.resolver = options.resolver;
-    this.clock = options.clock ?? SYSTEM_CLOCK;
-    this.randomSource = options.randomSource ?? SECURE_RANDOM_SOURCE;
+    this.ttlMs = ttlMs;
+    this.capacity = capacity;
+    const resolver = options.resolver;
+    this.resolve = resolver.resolve.bind(resolver);
+    const clock = options.clock ?? SYSTEM_CLOCK;
+    const randomSource = options.randomSource ?? SECURE_RANDOM_SOURCE;
+    this.now = clock.now.bind(clock);
+    this.randomBytes = randomSource.randomBytes.bind(randomSource);
   }
 
   public async issue(input: DownloadTokenResolveInput): Promise<DownloadTokenIssue> {
     const request = parseResolveInput(input);
-    const target = parseResolvedTarget(await this.resolver.resolve(cloneResolveInput(request)));
-    if (!resolvedWorkspaceMatchesRequest(request, target.workspace)) {
-      throw new DownloadTokenPolicyError(
-        "resolved_target_mismatch",
-        "Resolved download target does not match the authenticated request.",
-      );
-    }
-
-    const now = this.readClock();
-    const expiresAt = now + this.ttlMs;
-    if (!Number.isSafeInteger(expiresAt)) {
-      throw new DownloadTokenPolicyError(
-        "expiry_overflow",
-        "Download token expiry exceeds the safe clock range.",
-      );
-    }
-    this.pruneExpired(now);
-    if (this.records.size >= this.capacity) {
+    const reservationNow = this.readClock();
+    this.pruneExpired(reservationNow);
+    if (this.records.size + this.issuing.size >= this.capacity) {
       throw new DownloadTokenPolicyError(
         "capacity_exceeded",
         "Download token capacity is exhausted.",
       );
     }
+    const operation = createIssueOperation(request);
+    this.issuing.add(operation);
+    try {
+      const target = parseResolvedTarget(await this.resolve(cloneResolveInput(request)));
+      this.assertIssueCurrent(operation);
+      if (!resolvedWorkspaceMatchesRequest(request, target.workspace)) {
+        throw new DownloadTokenPolicyError(
+          "resolved_target_mismatch",
+          "Resolved download target does not match the authenticated request.",
+        );
+      }
 
-    const token = this.createUniqueToken();
-    const record = freezeRecord({
-      organizationId: request.principal.organizationId,
-      nodeId: request.node.nodeId,
-      principalId: request.principal.principalId,
-      workspaceId: request.workspaceId,
-      relativePath: request.relativePath,
-      fileIdentity: target.fileIdentity,
-      expiresAt,
-    });
-    this.records.set(token, record);
-    return Object.freeze({ token, expiresAt });
+      const now = this.readClock();
+      const expiresAt = now + this.ttlMs;
+      if (!Number.isSafeInteger(expiresAt)) {
+        throw new DownloadTokenPolicyError(
+          "expiry_overflow",
+          "Download token expiry exceeds the safe clock range.",
+        );
+      }
+      this.pruneExpired(now);
+      this.assertIssueCurrent(operation);
+      const token = this.createUniqueToken();
+      const record = freezeRecord({
+        organizationId: request.principal.organizationId,
+        node: request.node,
+        principalType: request.principal.principalType,
+        principalId: request.principal.principalId,
+        credentialId: request.principal.credentialId,
+        grantVersion: request.principal.grantVersion,
+        sessionBindingGeneration: request.sessionBindingGeneration,
+        workspace: target.workspace,
+        relativePath: request.relativePath,
+        fileIdentity: target.fileIdentity,
+        expiresAt,
+      });
+      this.assertIssueCurrent(operation);
+      this.records.set(token, record);
+      return Object.freeze({ token, expiresAt });
+    } finally {
+      this.issuing.delete(operation);
+      operation.active = false;
+      operation.settle();
+    }
   }
 
   public async consume(input: DownloadTokenConsumeInput): Promise<DownloadTokenBinding | null> {
-    const record = this.records.get(input.token);
+    let token: string;
+    try {
+      token = input.token;
+    } catch {
+      return null;
+    }
+    const record = this.records.get(token);
     if (!record) {
       return null;
     }
-    this.records.delete(input.token);
+    this.remove(token);
 
-    const parsed = DownloadTokenConsumeInputSchema.parse(input);
+    let parsed: z.infer<typeof DownloadTokenConsumeInputSchema>;
+    try {
+      parsed = DownloadTokenConsumeInputSchema.parse(snapshotConsumeInput(input, token));
+    } catch {
+      return null;
+    }
     const request = cloneResolveInput(parsed);
     const now = this.readClock();
     if (record.expiresAt <= now || !recordMatchesRequest(record, request)) {
       return null;
     }
 
-    const target = parseResolvedTarget(await this.resolver.resolve(cloneResolveInput(request)));
-    if (!resolvedWorkspaceMatchesRequest(request, target.workspace)) {
+    const target = parseResolvedTarget(await this.resolve(cloneResolveInput(request)));
+    if (
+      !resolvedWorkspaceMatchesRequest(request, target.workspace) ||
+      !workspaceMatches(record.workspace, target.workspace)
+    ) {
       return null;
     }
     if (!fileIdentityMatches(record.fileIdentity, target.fileIdentity)) {
@@ -248,8 +341,62 @@ export class DownloadTokenPolicy {
     return freezeBinding(record, target);
   }
 
+  /** Burns an opaque token when the outer HTTP envelope cannot be parsed safely. */
+  public burn(token: string): boolean {
+    if (typeof token !== "string" || token.length === 0) return false;
+    return this.remove(token);
+  }
+
+  /** Synchronously burns active tokens matching one parsed lifecycle scope. */
+  public burnScope(input: DownloadTokenCleanupScope): number {
+    return this.startScopeCleanup(input).affected;
+  }
+
+  /** Invalidates synchronously, then waits for matching issue reservations to settle. */
+  public cleanupScope(input: DownloadTokenCleanupScope): Promise<number> {
+    const cleanup = this.startScopeCleanup(input);
+    return Promise.all(cleanup.issues.map((operation) => operation.settled)).then(
+      () => cleanup.affected,
+    );
+  }
+
+  private startScopeCleanup(input: DownloadTokenCleanupScope): {
+    readonly affected: number;
+    readonly issues: readonly DownloadTokenIssueOperation[];
+  } {
+    let scope: DownloadTokenCleanupScope;
+    try {
+      scope = DownloadTokenCleanupScopeSchema.parse(input);
+    } catch {
+      return { affected: 0, issues: [] };
+    }
+    let affected = 0;
+    for (const [token, record] of this.records) {
+      if (recordMatchesCleanupScope(record, scope) && this.remove(token)) affected += 1;
+    }
+    const issues: DownloadTokenIssueOperation[] = [];
+    for (const operation of this.issuing) {
+      if (!requestMatchesCleanupScope(operation.request, scope)) continue;
+      issues.push(operation);
+      if (operation.active) {
+        operation.active = false;
+        affected += 1;
+      }
+    }
+    return { affected, issues };
+  }
+
+  private assertIssueCurrent(operation: DownloadTokenIssueOperation): void {
+    if (!operation.active) {
+      throw new DownloadTokenPolicyError(
+        "issue_invalidated",
+        "Download token issue is no longer current.",
+      );
+    }
+  }
+
   private readClock(): number {
-    const now = this.clock.now();
+    const now = this.now();
     if (!Number.isSafeInteger(now) || now < 0) {
       throw new DownloadTokenPolicyError(
         "invalid_clock",
@@ -266,14 +413,18 @@ export class DownloadTokenPolicy {
   private pruneExpired(now: number): void {
     for (const [token, record] of this.records) {
       if (record.expiresAt <= now) {
-        this.records.delete(token);
+        this.remove(token);
       }
     }
   }
 
+  private remove(token: string): boolean {
+    return this.records.delete(token);
+  }
+
   private createUniqueToken(): string {
     for (let attempt = 0; attempt < TOKEN_GENERATION_ATTEMPTS; attempt += 1) {
-      const bytes = this.randomSource.randomBytes(DOWNLOAD_TOKEN_BYTES);
+      const bytes = this.randomBytes(DOWNLOAD_TOKEN_BYTES);
       if (!(bytes instanceof Uint8Array) || bytes.byteLength !== DOWNLOAD_TOKEN_BYTES) {
         throw new DownloadTokenPolicyError(
           "invalid_random_bytes",
@@ -306,6 +457,20 @@ function parseResolveInput(input: DownloadTokenResolveInput): DownloadTokenResol
   return cloneResolveInput(DownloadTokenResolveInputSchema.parse(input));
 }
 
+function snapshotConsumeInput(
+  input: DownloadTokenConsumeInput,
+  token: string,
+): DownloadTokenConsumeInput {
+  return {
+    principal: input.principal,
+    node: input.node,
+    sessionBindingGeneration: input.sessionBindingGeneration,
+    workspaceId: input.workspaceId,
+    relativePath: input.relativePath,
+    token,
+  };
+}
+
 function parseResolvedTarget(input: DownloadTokenResolvedTarget): DownloadTokenResolvedTarget {
   const parsed = DownloadTokenResolvedTargetSchema.parse(input);
   const frozenWorkspace = freezeWorkspace(parsed.workspace);
@@ -317,6 +482,7 @@ function cloneResolveInput(input: DownloadTokenResolveInput): DownloadTokenResol
   const cloned: DownloadTokenResolveInput = {
     principal: freezePrincipal(input.principal),
     node: freezeNode(input.node),
+    sessionBindingGeneration: input.sessionBindingGeneration,
     workspaceId: input.workspaceId,
     relativePath: input.relativePath,
   };
@@ -409,9 +575,13 @@ function freezeFileIdentity(input: DownloadFileIdentity): DownloadFileIdentity {
 function freezeRecord(input: DownloadTokenRecord): DownloadTokenRecord {
   const cloned: DownloadTokenRecord = {
     organizationId: input.organizationId,
-    nodeId: input.nodeId,
+    node: freezeNode(input.node),
+    principalType: input.principalType,
     principalId: input.principalId,
-    workspaceId: input.workspaceId,
+    credentialId: input.credentialId,
+    grantVersion: input.grantVersion,
+    sessionBindingGeneration: input.sessionBindingGeneration,
+    workspace: freezeWorkspace(input.workspace),
     relativePath: input.relativePath,
     fileIdentity: freezeFileIdentity(input.fileIdentity),
     expiresAt: input.expiresAt,
@@ -425,14 +595,64 @@ function freezeBinding(
 ): DownloadTokenBinding {
   const binding: DownloadTokenBinding = {
     organizationId: record.organizationId,
-    nodeId: record.nodeId,
+    node: freezeNode(record.node),
+    principalType: record.principalType,
     principalId: record.principalId,
-    workspace: freezeWorkspace(target.workspace),
+    credentialId: record.credentialId,
+    grantVersion: record.grantVersion,
+    sessionBindingGeneration: record.sessionBindingGeneration,
+    workspace: freezeWorkspace(record.workspace),
     relativePath: record.relativePath,
     fileIdentity: freezeFileIdentity(target.fileIdentity),
     expiresAt: record.expiresAt,
   };
   return Object.freeze(binding);
+}
+
+function recordMatchesCleanupScope(
+  record: DownloadTokenRecord,
+  scope: DownloadTokenCleanupScope,
+): boolean {
+  if (
+    record.organizationId !== scope.organizationId ||
+    !nodeMatches(record.node, scope.node) ||
+    record.principalType !== scope.principalType ||
+    record.principalId !== scope.principalId
+  ) {
+    return false;
+  }
+  if (scope.kind === "principal") return true;
+  if (scope.kind === "credential") return record.credentialId === scope.credentialId;
+  if (scope.kind === "grant") return record.grantVersion === scope.grantVersion;
+  return (
+    record.credentialId === scope.credentialId &&
+    record.grantVersion === scope.grantVersion &&
+    record.sessionBindingGeneration === scope.sessionBindingGeneration
+  );
+}
+
+function requestMatchesCleanupScope(
+  request: DownloadTokenResolveInput,
+  scope: DownloadTokenCleanupScope,
+): boolean {
+  if (
+    request.principal.organizationId !== scope.organizationId ||
+    !nodeMatches(request.node, scope.node) ||
+    request.principal.principalType !== scope.principalType ||
+    request.principal.principalId !== scope.principalId
+  ) {
+    return false;
+  }
+  if (scope.kind === "principal") return true;
+  if (scope.kind === "credential") {
+    return request.principal.credentialId === scope.credentialId;
+  }
+  if (scope.kind === "grant") return request.principal.grantVersion === scope.grantVersion;
+  return (
+    request.principal.credentialId === scope.credentialId &&
+    request.principal.grantVersion === scope.grantVersion &&
+    request.sessionBindingGeneration === scope.sessionBindingGeneration
+  );
 }
 
 function resolvedWorkspaceMatchesRequest(
@@ -452,11 +672,45 @@ function recordMatchesRequest(
 ): boolean {
   return (
     record.organizationId === request.principal.organizationId &&
-    record.nodeId === request.node.nodeId &&
+    nodeMatches(record.node, request.node) &&
+    record.principalType === request.principal.principalType &&
     record.principalId === request.principal.principalId &&
-    record.workspaceId === request.workspaceId &&
+    record.credentialId === request.principal.credentialId &&
+    record.grantVersion === request.principal.grantVersion &&
+    record.sessionBindingGeneration === request.sessionBindingGeneration &&
+    record.workspace.workspaceId === request.workspaceId &&
     record.relativePath === request.relativePath
   );
+}
+
+function nodeMatches(expected: NodeContext, actual: NodeContext): boolean {
+  return (
+    expected.nodeId === actual.nodeId &&
+    expected.paseoServerId === actual.paseoServerId &&
+    expected.mode === actual.mode
+  );
+}
+
+function workspaceMatches(expected: AuthorizedWorkspace, actual: AuthorizedWorkspace): boolean {
+  return (
+    expected.organizationId === actual.organizationId &&
+    expected.nodeId === actual.nodeId &&
+    expected.ownerPrincipalId === actual.ownerPrincipalId &&
+    expected.createdByPrincipalId === actual.createdByPrincipalId &&
+    expected.workspaceId === actual.workspaceId
+  );
+}
+
+function createIssueOperation(request: DownloadTokenResolveInput): DownloadTokenIssueOperation {
+  let resolveSettled!: () => void;
+  return {
+    request,
+    active: true,
+    settled: new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    }),
+    settle: () => resolveSettled(),
+  };
 }
 
 function fileIdentityMatches(

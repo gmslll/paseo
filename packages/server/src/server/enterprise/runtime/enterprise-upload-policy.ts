@@ -20,6 +20,7 @@ import type { SafeWorkspaceFsPort, WorkspacePathIdentity } from "./workspace-pat
 const UPLOAD_ID_BYTES = 32;
 const UPLOAD_ID_LENGTH = 43;
 const UPLOAD_ID_GENERATION_ATTEMPTS = 3;
+const MAX_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 const CANONICAL_BASE64URL_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const UPLOAD_ACCESS_DENIED_MESSAGE = "Upload access denied.";
 
@@ -68,6 +69,11 @@ const EnterpriseUploadIssueInputSchema = z
 
 const EnterpriseUploadUseInputSchema = EnterpriseUploadIssueInputSchema.extend({
   uploadId: z.string().min(1),
+}).strict();
+
+const EnterpriseUploadAppendInputSchema = EnterpriseUploadUseInputSchema.extend({
+  offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  bytes: z.instanceof(Uint8Array).refine((value) => value.byteLength <= MAX_UPLOAD_CHUNK_BYTES),
 }).strict();
 
 const CleanupNodeShape = {
@@ -129,13 +135,22 @@ export interface EnterpriseUploadFinalizedTarget extends EnterpriseUploadCapabil
 
 export interface EnterpriseUploadSafeFsPort extends Pick<
   SafeWorkspaceFsPort,
-  "supportsDirectoryRelativeOperations"
+  "releaseReady" | "supportsDirectoryRelativeOperations"
 > {
   prepare(input: {
     readonly workspace: AuthorizedWorkspace;
     readonly relativePath: string;
     readonly signal: AbortSignal;
   }): Promise<EnterpriseUploadCapability>;
+
+  append(
+    capability: EnterpriseUploadCapability,
+    input: {
+      readonly offset: number;
+      readonly bytes: Uint8Array;
+      readonly signal: AbortSignal;
+    },
+  ): Promise<void>;
 
   /**
    * Keep the result reversible through abort(capability) until this promise returns and the policy
@@ -160,6 +175,11 @@ export interface EnterpriseUploadIssueInput {
 
 export interface EnterpriseUploadFinalizeInput extends EnterpriseUploadIssueInput {
   readonly uploadId: string;
+}
+
+export interface EnterpriseUploadAppendInput extends EnterpriseUploadFinalizeInput {
+  readonly offset: number;
+  readonly bytes: Uint8Array;
 }
 
 export interface EnterpriseUploadAbortInput extends EnterpriseUploadFinalizeInput {}
@@ -226,6 +246,11 @@ interface ParsedUploadUseRequest extends ParsedUploadRequest {
   readonly uploadId: string;
 }
 
+interface ParsedUploadAppendRequest extends ParsedUploadUseRequest {
+  readonly offset: number;
+  readonly bytes: Uint8Array;
+}
+
 interface OwnedUploadCapability {
   readonly organizationId: string;
   readonly node: NodeContext;
@@ -262,6 +287,7 @@ interface InFlightOperation extends DeferredOperation {
 
 type AssertWorkspace = ResourceAuthorization["assertWorkspace"];
 type PrepareCapability = EnterpriseUploadSafeFsPort["prepare"];
+type AppendCapability = EnterpriseUploadSafeFsPort["append"];
 type FinalizeCapability = EnterpriseUploadSafeFsPort["finalize"];
 type AbortCapability = EnterpriseUploadSafeFsPort["abort"];
 
@@ -280,9 +306,11 @@ const SECURE_RANDOM_SOURCE: EnterpriseUploadRandomSource = Object.freeze({
 export class EnterpriseUploadPolicy {
   private readonly ttlMs: number;
   private readonly capacity: number;
+  private readonly releaseReady: boolean;
   private readonly supportsDirectoryRelativeOperations: boolean;
   private readonly assertWorkspace: AssertWorkspace;
   private readonly prepareCapability: PrepareCapability;
+  private readonly appendCapability: AppendCapability;
   private readonly finalizeCapability: FinalizeCapability;
   private readonly abortCapability: AbortCapability;
   private readonly now: EnterpriseUploadClock["now"];
@@ -320,10 +348,12 @@ export class EnterpriseUploadPolicy {
     const randomSource = options.randomSource ?? SECURE_RANDOM_SOURCE;
     this.ttlMs = options.ttlMs;
     this.capacity = options.capacity;
+    this.releaseReady = options.safeFs.releaseReady === true;
     this.supportsDirectoryRelativeOperations =
       options.safeFs.supportsDirectoryRelativeOperations === true;
     this.assertWorkspace = options.authorization.assertWorkspace.bind(options.authorization);
     this.prepareCapability = options.safeFs.prepare.bind(options.safeFs);
+    this.appendCapability = options.safeFs.append.bind(options.safeFs);
     this.finalizeCapability = options.safeFs.finalize.bind(options.safeFs);
     this.abortCapability = options.safeFs.abort.bind(options.safeFs);
     this.now = clock.now.bind(clock);
@@ -338,7 +368,7 @@ export class EnterpriseUploadPolicy {
       throw accessDenied();
     }
     this.assertCanStartIssue();
-    if (!this.supportsDirectoryRelativeOperations) throw accessDenied();
+    if (!this.releaseReady || !this.supportsDirectoryRelativeOperations) throw accessDenied();
 
     const operation = createIssueOperation(request);
     this.issuing.add(operation);
@@ -427,6 +457,80 @@ export class EnterpriseUploadPolicy {
     } finally {
       this.issuing.delete(operation);
       operation.settle();
+    }
+  }
+
+  /** Writes one ordered binary frame without exposing the underlying safe-FS capability. */
+  public async append(input: EnterpriseUploadAppendInput): Promise<boolean> {
+    const operation = this.beginInFlight(input);
+    if (operation === null) return false;
+
+    let preserve = false;
+    try {
+      let request: ParsedUploadAppendRequest;
+      try {
+        request = parseAppendInput(snapshotAppendInput(input, operation.uploadId));
+      } catch {
+        return false;
+      }
+      if (!this.inFlightIsCurrent(operation) || !recordMatchesRequest(operation.record, request)) {
+        return false;
+      }
+
+      let currentWorkspace: AuthorizedWorkspace;
+      try {
+        currentWorkspace = parseWorkspace(
+          await this.assertWorkspace(request.principal, "workspace.write", request.workspaceId),
+        );
+      } catch {
+        return false;
+      }
+      if (
+        !this.inFlightIsCurrent(operation) ||
+        !workspaceMatchesRequest(request, currentWorkspace) ||
+        !workspaceIdentityMatches(operation.record.workspace, currentWorkspace) ||
+        operation.record.expiresAt <= this.readClock()
+      ) {
+        return false;
+      }
+
+      try {
+        await this.appendCapability(cloneCapability(operation.record.capability), {
+          offset: request.offset,
+          bytes: new Uint8Array(request.bytes),
+          signal: operation.controller.signal,
+        });
+      } catch {
+        return false;
+      }
+      if (!this.inFlightIsCurrent(operation)) return false;
+
+      let postAppendWorkspace: AuthorizedWorkspace;
+      try {
+        postAppendWorkspace = parseWorkspace(
+          await this.assertWorkspace(request.principal, "workspace.write", request.workspaceId),
+        );
+      } catch {
+        return false;
+      }
+      if (
+        !this.inFlightIsCurrent(operation) ||
+        !workspaceMatchesRequest(request, postAppendWorkspace) ||
+        !workspaceIdentityMatches(operation.record.workspace, postAppendWorkspace) ||
+        operation.record.expiresAt <= this.readClock()
+      ) {
+        return false;
+      }
+
+      this.records.set(operation.uploadId, operation.record);
+      preserve = true;
+      return true;
+    } finally {
+      try {
+        if (!preserve) await this.releaseOrQuarantine(operation.record);
+      } finally {
+        this.finishInFlight(operation);
+      }
     }
   }
 
@@ -838,6 +942,20 @@ function parseUseInput(input: EnterpriseUploadFinalizeInput): ParsedUploadUseReq
   });
 }
 
+function parseAppendInput(input: EnterpriseUploadAppendInput): ParsedUploadAppendRequest {
+  const parsed = EnterpriseUploadAppendInputSchema.parse(input);
+  return Object.freeze({
+    uploadId: parsed.uploadId,
+    principal: freezePrincipal(parsed.principal),
+    node: freezeNode(parsed.node),
+    sessionBindingGeneration: parsed.sessionBindingGeneration,
+    workspaceId: parsed.workspaceId,
+    relativePath: parseRelativePath(parsed.relativePath),
+    offset: parsed.offset,
+    bytes: new Uint8Array(parsed.bytes),
+  });
+}
+
 function snapshotUseInput(
   input: EnterpriseUploadFinalizeInput,
   uploadId: string,
@@ -847,6 +965,22 @@ function snapshotUseInput(
       return property === "uploadId" ? uploadId : Reflect.get(target, property, receiver);
     },
   });
+}
+
+function snapshotAppendInput(
+  input: EnterpriseUploadAppendInput,
+  uploadId: string,
+): EnterpriseUploadAppendInput {
+  return {
+    principal: input.principal,
+    node: input.node,
+    sessionBindingGeneration: input.sessionBindingGeneration,
+    workspaceId: input.workspaceId,
+    relativePath: input.relativePath,
+    uploadId,
+    offset: input.offset,
+    bytes: input.bytes,
+  };
 }
 
 function parseRelativePath(input: string): string {

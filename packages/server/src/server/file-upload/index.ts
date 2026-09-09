@@ -8,6 +8,29 @@ import type { FileUploadRequest, FileUploadResponse } from "../messages.js";
 interface FileUploadStoreOptions {
   paseoHome: string;
   staleUploadTimeoutMs?: number;
+  enterprise?: EnterpriseFileUploadStorePort;
+}
+
+export interface EnterpriseFileUploadBeginInput {
+  readonly workspaceId: string;
+  readonly relativePath: string;
+  readonly requestId: string;
+  readonly fileName: string;
+  readonly mimeType: string;
+  readonly size: number;
+  readonly modifiedAt: string;
+}
+
+export type EnterpriseStagedFileUploadBeginInput = Omit<
+  EnterpriseFileUploadBeginInput,
+  "relativePath"
+>;
+
+export interface EnterpriseFileUploadStorePort {
+  begin(input: EnterpriseFileUploadBeginInput): void;
+  beginStaged(input: EnterpriseStagedFileUploadBeginInput): void;
+  receiveFrame(frame: FileTransferFrame): Promise<FileUploadResponse | null>;
+  cleanup(reason: "session-closed" | "generation-replaced"): Promise<void>;
 }
 
 interface PendingUpload {
@@ -29,15 +52,20 @@ export class FileUploadStore {
 
   private readonly paseoHome: string;
   private readonly staleUploadTimeoutMs: number;
+  private readonly enterprise: EnterpriseFileUploadStorePort | null;
   private readonly pending = new Map<string, PendingUpload>();
 
   constructor(options: FileUploadStoreOptions) {
     this.paseoHome = options.paseoHome;
+    this.enterprise = options.enterprise ?? null;
     this.staleUploadTimeoutMs =
       options.staleUploadTimeoutMs ?? FileUploadStore.defaultStaleUploadTimeoutMs;
   }
 
   beginUpload(request: FileUploadRequest): void {
+    if (this.enterprise) {
+      throw new Error("Enterprise uploads require canonical workspace input.");
+    }
     const existingUpload = this.pending.get(request.requestId);
     if (existingUpload) {
       this.clearPendingUpload(existingUpload);
@@ -64,7 +92,22 @@ export class FileUploadStore {
     this.pending.set(request.requestId, upload);
   }
 
+  beginEnterpriseUpload(input: EnterpriseFileUploadBeginInput): void {
+    if (!this.enterprise) {
+      throw new Error("Enterprise upload runtime is unavailable.");
+    }
+    this.enterprise.begin(input);
+  }
+
+  beginEnterpriseStagedUpload(input: EnterpriseStagedFileUploadBeginInput): void {
+    if (!this.enterprise) {
+      throw new Error("Enterprise upload runtime is unavailable.");
+    }
+    this.enterprise.beginStaged(input);
+  }
+
   async receiveFrame(frame: FileTransferFrame): Promise<FileUploadResponse | null> {
+    if (this.enterprise) return this.enterprise.receiveFrame(frame);
     const upload = this.pending.get(frame.requestId);
     if (!upload) {
       return null;
@@ -77,6 +120,10 @@ export class FileUploadStore {
       () => undefined,
     );
     return operation;
+  }
+
+  cleanupEnterprise(reason: "session-closed" | "generation-replaced"): Promise<void> {
+    return this.enterprise?.cleanup(reason) ?? Promise.resolve();
   }
 
   private async applyFrame(

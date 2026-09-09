@@ -16,6 +16,7 @@ function fakeFs(supported: boolean): SafeWorkspaceFsPort {
     close: async () => undefined,
   };
   return {
+    releaseReady: true,
     supportsDirectoryRelativeOperations: supported,
     openWorkspaceRoot: async () => handle,
     read: async () => ({
@@ -23,6 +24,7 @@ function fakeFs(supported: boolean): SafeWorkspaceFsPort {
       read: async () => new Uint8Array(),
       close: async () => undefined,
     }),
+    stat: async () => ({ dev: 1, ino: 2, size: 1, mtimeMs: 1, kind: "file" }),
     list: async (_root, path) => (path.length === 0 ? ["src"] : ["main.ts"]),
     listRoot: async () => ["src"],
     write: async () => undefined,
@@ -35,6 +37,33 @@ function fakeFs(supported: boolean): SafeWorkspaceFsPort {
 }
 
 describe("WorkspacePathPolicy safe facade", () => {
+  it("fails closed before authorization when the safe FS is not release ready", async () => {
+    let authorized = 0;
+    let opened = 0;
+    const base = fakeFs(true);
+    const policy = new WorkspacePathPolicy({
+      authorizeWorkspace: async () => {
+        authorized += 1;
+        return workspace;
+      },
+      resolveCanonicalRoot: async () => "/workspace",
+      fs: {
+        ...base,
+        releaseReady: false,
+        openWorkspaceRoot: async () => {
+          opened += 1;
+          return base.openWorkspaceRoot("/workspace");
+        },
+      },
+    });
+
+    await expect(policy.read(workspace.workspaceId, "src/main.ts")).rejects.toThrow(
+      "safe-FS port is unavailable",
+    );
+    expect(authorized).toBe(0);
+    expect(opened).toBe(0);
+  });
+
   it("fails closed when directory-relative safe FS is unavailable", async () => {
     const policy = new WorkspacePathPolicy({
       authorizeWorkspace: async () => workspace,
@@ -155,7 +184,9 @@ describe("WorkspacePathPolicy safe facade", () => {
       resolveCanonicalRoot: async () => "/workspace",
       fs,
     });
-    await policy.write(workspace.workspaceId, "a.txt", new Uint8Array([1]));
+    await policy.write(workspace.workspaceId, "a.txt", new Uint8Array([1]), {
+      modifiedAt: "2026-09-10T00:00:00.000Z",
+    });
     await policy.create(workspace.workspaceId, "b.txt", "file");
     await policy.create(workspace.workspaceId, "dir", "directory");
     await policy.rename(workspace.workspaceId, "a.txt", "c.txt");
@@ -249,6 +280,10 @@ describe("WorkspacePathPolicy safe facade", () => {
         args.push(["read", p]);
         return await base.read(_r, p);
       },
+      stat: async (_r, p) => {
+        args.push(["stat", p]);
+        return await base.stat(_r, p);
+      },
       watch: async (_r, p) => {
         args.push(["watch", p]);
         return { [Symbol.asyncDispose]: async () => undefined };
@@ -263,16 +298,26 @@ describe("WorkspacePathPolicy safe facade", () => {
       fs,
     });
     await policy.read(workspace.workspaceId, "a/b").then((h) => h.close());
+    await expect(policy.stat(workspace.workspaceId, "a/b")).resolves.toEqual({
+      dev: 1,
+      ino: 2,
+      size: 1,
+      mtimeMs: 1,
+      kind: "file",
+    });
     await policy.list(workspace.workspaceId, "a/b");
     await policy.listRoot(workspace.workspaceId);
     const watch = await policy.watch(workspace.workspaceId, "a/b");
     await watch[Symbol.asyncDispose]();
-    await policy.write(workspace.workspaceId, "a/b", new Uint8Array([1, 2]));
+    await policy.write(workspace.workspaceId, "a/b", new Uint8Array([1, 2]), {
+      modifiedAt: "2026-09-10T00:00:00.000Z",
+    });
     await policy.create(workspace.workspaceId, "c", "directory");
     await policy.rename(workspace.workspaceId, "a", "b");
     await policy.copy(workspace.workspaceId, "a", "b");
     await policy.delete(workspace.workspaceId, "a");
     expect(actions).toEqual([
+      "workspace-1:workspace.content.read",
       "workspace-1:workspace.content.read",
       "workspace-1:workspace.content.read",
       "workspace-1:workspace.content.read",
@@ -286,6 +331,7 @@ describe("WorkspacePathPolicy safe facade", () => {
     expect(args).toContainEqual(["write", ["a", "b"], [1, 2]]);
     expect(args).toContainEqual(["create", ["c"], "directory"]);
     expect(args).toContainEqual(["read", ["a", "b"]]);
+    expect(args).toContainEqual(["stat", ["a", "b"]]);
     expect(args).toContainEqual(["list", ["a", "b"]]);
     expect(args).toContainEqual(["listRoot"]);
     expect(args).toContainEqual(["watch", ["a", "b"]]);
@@ -315,9 +361,11 @@ describe("WorkspacePathPolicy safe facade", () => {
       resolveCanonicalRoot: async () => "/workspace",
       fs,
     });
-    await expect(policy.write(workspace.workspaceId, "x", new Uint8Array())).rejects.toThrow(
-      "operation",
-    );
+    await expect(
+      policy.write(workspace.workspaceId, "x", new Uint8Array(), {
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+      }),
+    ).rejects.toThrow("operation");
     expect(rootClosed).toBe(1);
     const h = await new WorkspacePathPolicy({
       authorizeWorkspace: async () => workspace,

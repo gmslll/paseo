@@ -11,6 +11,7 @@ import {
   EnterpriseUploadPolicy,
   EnterpriseUploadPolicyError,
   type EnterpriseUploadAbortInput,
+  type EnterpriseUploadAppendInput,
   type EnterpriseUploadCapability,
   type EnterpriseUploadCleanupInput,
   type EnterpriseUploadClock,
@@ -187,17 +188,26 @@ interface PrepareCall {
 }
 
 class TestSafeFs implements EnterpriseUploadSafeFsPort {
+  public releaseReady = true;
   public supportsDirectoryRelativeOperations = true;
   public readonly prepareCalls: PrepareCall[] = [];
+  public readonly appendCalls: Array<{
+    capability: EnterpriseUploadCapability;
+    offset: number;
+    bytes: Uint8Array;
+    signal: AbortSignal;
+  }> = [];
   public readonly finalizeCalls: EnterpriseUploadCapability[] = [];
   public readonly finalizeSignals: AbortSignal[] = [];
   public readonly abortCalls: EnterpriseUploadCapability[] = [];
   public prepareError: unknown;
+  public appendError: unknown;
   public finalizeError: unknown;
   public abortError: unknown;
   public prepareResult: EnterpriseUploadCapability | undefined;
   public finalizeResult: EnterpriseUploadFinalizedTarget | undefined;
   public prepareGate: Promise<void> | undefined;
+  public appendGate: Promise<void> | undefined;
   public finalizeGate: Promise<void> | undefined;
   public abortGate: Promise<void> | undefined;
   private nextCapability = 1;
@@ -216,6 +226,20 @@ class TestSafeFs implements EnterpriseUploadSafeFsPort {
         relativePath: input.relativePath,
       })
     );
+  }
+
+  public async append(
+    input: EnterpriseUploadCapability,
+    options: { readonly offset: number; readonly bytes: Uint8Array; readonly signal: AbortSignal },
+  ): Promise<void> {
+    this.appendCalls.push({
+      capability: input,
+      offset: options.offset,
+      bytes: options.bytes,
+      signal: options.signal,
+    });
+    await this.appendGate;
+    if (this.appendError !== undefined) throw this.appendError;
   }
 
   public async finalize(
@@ -289,6 +313,17 @@ function abortInput(
   return finalizeInput(uploadId, overrides);
 }
 
+function appendInput(
+  uploadId: string,
+  overrides: Partial<EnterpriseUploadAppendInput> = {},
+): EnterpriseUploadAppendInput {
+  return {
+    ...finalizeInput(uploadId, overrides),
+    offset: overrides.offset ?? 0,
+    bytes: overrides.bytes ?? new Uint8Array([1, 2, 3]),
+  };
+}
+
 async function expectPolicyError(
   promise: Promise<unknown>,
   code: EnterpriseUploadPolicyError["code"],
@@ -300,6 +335,37 @@ async function expectPolicyError(
 }
 
 describe("EnterpriseUploadPolicy", () => {
+  it("appends through the owned safe-FS capability and preserves the upload for finalize", async () => {
+    const safeFs = new TestSafeFs();
+    const policy = createPolicy({ safeFs });
+    const issued = await policy.issue(issueInput());
+
+    await expect(policy.append(appendInput(issued.uploadId))).resolves.toBe(true);
+    await expect(policy.finalize(finalizeInput(issued.uploadId))).resolves.not.toBeNull();
+
+    expect(safeFs.appendCalls).toHaveLength(1);
+    expect(safeFs.appendCalls[0]).toMatchObject({ offset: 0 });
+    expect(safeFs.appendCalls[0]?.bytes).toEqual(new Uint8Array([1, 2, 3]));
+    expect(safeFs.appendCalls[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(safeFs.finalizeCalls).toHaveLength(1);
+  });
+
+  it("burns before append when session generation is wrong", async () => {
+    const safeFs = new TestSafeFs();
+    const policy = createPolicy({ safeFs });
+    const issued = await policy.issue(issueInput());
+
+    await expect(
+      policy.append(
+        appendInput(issued.uploadId, { sessionBindingGeneration: OTHER_SESSION_GENERATION }),
+      ),
+    ).resolves.toBe(false);
+    await expect(policy.append(appendInput(issued.uploadId))).resolves.toBe(false);
+
+    expect(safeFs.appendCalls).toHaveLength(0);
+    expect(safeFs.abortCalls).toHaveLength(1);
+  });
+
   it("captures finalize and abort uploadId getters exactly once", async () => {
     const policy = createPolicy();
     for (const kind of ["finalize", "abort"] as const) {
@@ -468,6 +534,17 @@ describe("EnterpriseUploadPolicy", () => {
     failingFs.prepareError = new Error("secret path failure");
     const failingPolicy = createPolicy({ safeFs: failingFs });
     await expectPolicyError(failingPolicy.issue(issueInput()), "upload_access_denied");
+  });
+
+  it("fails closed before authorization and prepare when safe-FS is not release ready", async () => {
+    const authorization = createAuthorization();
+    const safeFs = new TestSafeFs();
+    safeFs.releaseReady = false;
+    const policy = createPolicy({ authorization, safeFs });
+
+    await expectPolicyError(policy.issue(issueInput()), "upload_access_denied");
+    expect(authorization.calls).toEqual([]);
+    expect(safeFs.prepareCalls).toEqual([]);
   });
 
   it.each([
@@ -1158,6 +1235,44 @@ describe("EnterpriseUploadPolicy", () => {
 
     await expectPolicyError(pending, "upload_access_denied");
     await expect(cleanup).resolves.toEqual({ cleaned: 1 });
+    expect(safeFs.abortCalls).toHaveLength(1);
+  });
+
+  it("cleanup invalidates an in-flight append before it can restore the capability", async () => {
+    let releaseAppend!: () => void;
+    let markAppendStarted!: () => void;
+    const appendStarted = new Promise<void>((resolve) => {
+      markAppendStarted = resolve;
+    });
+    const safeFs = new TestSafeFs();
+    safeFs.appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const originalAppend = safeFs.append.bind(safeFs);
+    safeFs.append = async (input, options) => {
+      markAppendStarted();
+      return originalAppend(input, options);
+    };
+    const policy = createPolicy({ safeFs });
+    const issued = await policy.issue(issueInput());
+    const append = policy.append(appendInput(issued.uploadId));
+    await appendStarted;
+
+    const cleanup = policy.cleanup({
+      reason: "generation-replaced",
+      organizationId: ORGANIZATION_ID,
+      node: node(),
+      principalId: PRINCIPAL_ID,
+      credentialId: CREDENTIAL_ID,
+      grantVersion: GRANT_VERSION,
+      sessionBindingGeneration: SESSION_GENERATION,
+    });
+    expect(safeFs.appendCalls[0]?.signal.aborted).toBe(true);
+    releaseAppend();
+
+    await expect(append).resolves.toBe(false);
+    await expect(cleanup).resolves.toEqual({ cleaned: 1 });
+    await expect(policy.finalize(finalizeInput(issued.uploadId))).resolves.toBeNull();
     expect(safeFs.abortCalls).toHaveLength(1);
   });
 

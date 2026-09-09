@@ -22,6 +22,9 @@ import {
 } from "./workspace-files-session.js";
 import { DownloadTokenStore } from "../../file-download/token-store.js";
 import type { SessionOutboundMessage } from "../../messages.js";
+import type { EnterpriseFileUploadBeginInput } from "../../file-upload/index.js";
+import type { EnterpriseStagedFileUploadBeginInput } from "../../file-upload/index.js";
+import type { EnterpriseWorkspaceFilesRuntime } from "../../enterprise/runtime/workspace-files-runtime.js";
 
 const tempDirs: string[] = [];
 
@@ -41,6 +44,7 @@ function makeSubsystem(
   options: {
     hasBinaryChannel?: boolean;
     emitBinary?: (frame: Uint8Array) => Promise<void> | void;
+    enterpriseRuntime?: EnterpriseWorkspaceFilesRuntime;
   } = {},
 ) {
   const emitted: SessionOutboundMessage[] = [];
@@ -60,6 +64,7 @@ function makeSubsystem(
     downloadTokenStore: new DownloadTokenStore({ ttlMs: 60_000 }),
     paseoHome,
     logger: pino({ level: "silent" }),
+    enterpriseRuntime: options.enterpriseRuntime,
   });
   return {
     subsystem,
@@ -72,6 +77,126 @@ function makeSubsystem(
   };
 }
 
+class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
+  public readonly listCalls: unknown[] = [];
+  public readonly downloadCalls: unknown[] = [];
+  public readonly uploadBegins: EnterpriseFileUploadBeginInput[] = [];
+  public readonly stagedUploadBegins: EnterpriseStagedFileUploadBeginInput[] = [];
+  public readonly cleanupCalls: Array<"session-closed" | "generation-replaced"> = [];
+  public watchCalls = 0;
+  public statCalls = 0;
+  public watchDisposeCalls = 0;
+  public readonly statGates: Array<Promise<void> | undefined> = [];
+  public readonly watchGates: Array<Promise<void> | undefined> = [];
+  public readonly watchCallbacks: Array<() => void> = [];
+  public watchDisposeGate: Promise<void> | undefined;
+  public watchDisposeError: unknown;
+  public cleanupError: unknown;
+
+  public async stat() {
+    const call = this.statCalls;
+    this.statCalls += 1;
+    await this.statGates[call];
+    return { kind: "file" as const, dev: 1, ino: 2, size: 5, mtimeMs: 1_000 };
+  }
+
+  public async list(input: unknown) {
+    this.listCalls.push(input);
+    return [
+      {
+        kind: "file" as const,
+        dev: 1,
+        ino: 2,
+        size: 5,
+        mtimeMs: 1_000,
+        relativePath: "reports/quarter.csv",
+        name: "quarter.csv",
+      },
+    ];
+  }
+
+  public async openRead() {
+    return {
+      kind: "file" as const,
+      dev: 1,
+      ino: 2,
+      size: 5,
+      mtimeMs: 1_000,
+      workspaceId: "workspace-one",
+      relativePath: "reports/quarter.csv",
+      read: async (offset: number, length: number) =>
+        new TextEncoder().encode("hello").subarray(offset, offset + length),
+      close: async () => undefined,
+    };
+  }
+
+  public async write(): Promise<void> {}
+  public async create(): Promise<void> {}
+  public async rename(): Promise<void> {}
+  public async copy(): Promise<void> {}
+  public async delete(): Promise<void> {}
+
+  public async watch(_input: unknown, onChange: () => void) {
+    const call = this.watchCalls;
+    this.watchCalls += 1;
+    this.watchCallbacks.push(onChange);
+    await this.watchGates[call];
+    return {
+      [Symbol.asyncDispose]: async () => {
+        this.watchDisposeCalls += 1;
+        await this.watchDisposeGate;
+        if (this.watchDisposeError !== undefined) throw this.watchDisposeError;
+      },
+    };
+  }
+
+  public async issueDownloadToken(input: unknown) {
+    this.downloadCalls.push(input);
+    return {
+      kind: "file" as const,
+      dev: 1,
+      ino: 2,
+      size: 5,
+      mtimeMs: 1_000,
+      workspaceId: "workspace-one",
+      relativePath: "reports/quarter.csv",
+      token: "download-token",
+      expiresAt: 2_000,
+    };
+  }
+
+  public createUploadStore() {
+    return {
+      begin: (input: EnterpriseFileUploadBeginInput) => this.uploadBegins.push(input),
+      beginStaged: (input: EnterpriseStagedFileUploadBeginInput) =>
+        this.stagedUploadBegins.push(input),
+      receiveFrame: async () => null,
+      cleanup: async () => undefined,
+    };
+  }
+
+  public async cleanup(reason: "session-closed" | "generation-replaced"): Promise<void> {
+    this.cleanupCalls.push(reason);
+    if (this.cleanupError !== undefined) throw this.cleanupError;
+  }
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error("Timed out waiting for test operation.");
+}
+
 function uploadFrame(args: Parameters<typeof encodeFileTransferFrame>[0]): FileTransferFrame {
   const frame = decodeFileTransferFrame(encodeFileTransferFrame(args));
   if (!frame) {
@@ -81,6 +206,337 @@ function uploadFrame(args: Parameters<typeof encodeFileTransferFrame>[0]): FileT
 }
 
 describe("WorkspaceFilesSession", () => {
+  test("enterprise explorer dispatch ignores cwd and sends only workspace-relative input", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, emitted } = makeSubsystem({ enterpriseRuntime });
+
+    await subsystem.handleFileExplorerRequest({
+      type: "file_explorer_request",
+      cwd: "/caller/claimed/root",
+      workspaceId: "workspace-one",
+      path: "reports",
+      mode: "list",
+      requestId: "request-enterprise-list",
+    });
+
+    expect(enterpriseRuntime.listCalls).toEqual([
+      {
+        workspaceId: "workspace-one",
+        relativePath: "reports",
+        requestId: "request-enterprise-list",
+      },
+    ]);
+    expect(JSON.stringify(enterpriseRuntime.listCalls)).not.toContain("caller/claimed/root");
+    expect(emitted[0]).toMatchObject({
+      type: "file_explorer_response",
+      payload: { cwd: "", path: "reports", error: null },
+    });
+  });
+
+  test("enterprise explorer fails closed without workspaceId and never calls the runtime", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, emitted } = makeSubsystem({ enterpriseRuntime });
+
+    await subsystem.handleFileExplorerRequest({
+      type: "file_explorer_request",
+      cwd: "/caller/claimed/root",
+      path: "/etc/passwd",
+      mode: "file",
+      requestId: "request-enterprise-denied",
+    });
+
+    expect(enterpriseRuntime.listCalls).toHaveLength(0);
+    expect(emitted[0]).toMatchObject({
+      type: "file_explorer_response",
+      payload: { cwd: "", error: "Enterprise file access denied." },
+    });
+  });
+
+  test("enterprise download token dispatch never touches the legacy absolute-path store", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, emitted } = makeSubsystem({ enterpriseRuntime });
+
+    await subsystem.handleFileDownloadTokenRequest({
+      type: "file_download_token_request",
+      cwd: "/caller/claimed/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      requestId: "request-enterprise-download",
+    });
+
+    expect(enterpriseRuntime.downloadCalls).toEqual([
+      {
+        workspaceId: "workspace-one",
+        relativePath: "reports/quarter.csv",
+        requestId: "request-enterprise-download",
+      },
+    ]);
+    expect(emitted[0]).toMatchObject({
+      type: "file_download_token_response",
+      payload: { cwd: "", token: "download-token", path: "reports/quarter.csv" },
+    });
+    expect(JSON.stringify(emitted[0])).not.toContain("caller/claimed/root");
+  });
+
+  test("enterprise upload uses server staging for the wire shape and keeps explicit paths typed", () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, emitted } = makeSubsystem({ enterpriseRuntime });
+
+    subsystem.handleFileUploadRequest({
+      type: "file.upload.request",
+      workspaceId: "workspace-one",
+      fileName: "quarter.csv",
+      mimeType: "text/csv",
+      size: 5,
+      modifiedAt: "2026-09-10T00:00:00.000Z",
+      requestId: "request-old-upload-shape",
+    });
+    subsystem.handleEnterpriseFileUploadRequest({
+      workspaceId: "workspace-one",
+      relativePath: "uploads/quarter.csv",
+      fileName: "quarter.csv",
+      mimeType: "text/csv",
+      size: 5,
+      modifiedAt: "2026-09-10T00:00:00.000Z",
+      requestId: "request-enterprise-upload",
+    });
+
+    expect(emitted).toHaveLength(0);
+    expect(enterpriseRuntime.stagedUploadBegins).toEqual([
+      {
+        workspaceId: "workspace-one",
+        fileName: "quarter.csv",
+        mimeType: "text/csv",
+        size: 5,
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        requestId: "request-old-upload-shape",
+      },
+    ]);
+    expect(enterpriseRuntime.uploadBegins).toEqual([
+      {
+        workspaceId: "workspace-one",
+        relativePath: "uploads/quarter.csv",
+        fileName: "quarter.csv",
+        mimeType: "text/csv",
+        size: 5,
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        requestId: "request-enterprise-upload",
+      },
+    ]);
+  });
+
+  test("enterprise watch replacement waits for exactly-once async teardown", async () => {
+    let releaseDispose!: () => void;
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem } = makeSubsystem({ enterpriseRuntime });
+    const request = {
+      type: "fs.file.subscribe.request" as const,
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-one",
+    };
+    await subsystem.handleFileSubscribeRequest(request);
+    enterpriseRuntime.watchDisposeGate = new Promise<void>((resolve) => {
+      releaseDispose = resolve;
+    });
+
+    const replacement = subsystem.handleFileSubscribeRequest({
+      ...request,
+      requestId: "request-two",
+    });
+    await Promise.resolve();
+    expect(enterpriseRuntime.watchCalls).toBe(1);
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+    releaseDispose();
+    await replacement;
+    expect(enterpriseRuntime.watchCalls).toBe(2);
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+  });
+
+  test("enterprise unsubscribe and cleanup share exactly-once teardown", async () => {
+    let releaseDispose!: () => void;
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem } = makeSubsystem({ enterpriseRuntime });
+    await subsystem.handleFileSubscribeRequest({
+      type: "fs.file.subscribe.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-one",
+    });
+    enterpriseRuntime.watchDisposeGate = new Promise<void>((resolve) => {
+      releaseDispose = resolve;
+    });
+
+    const unsubscribe = subsystem.handleFileUnsubscribeRequest({
+      type: "fs.file.unsubscribe.request",
+      subscriptionId: "subscription-one",
+      requestId: "request-unsubscribe",
+    });
+    const cleanupOne = subsystem.cleanupEnterprise("session-closed");
+    const cleanupTwo = subsystem.cleanupEnterprise("generation-replaced");
+    expect(cleanupOne).toBe(cleanupTwo);
+    await Promise.resolve();
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+    releaseDispose();
+
+    await expect(unsubscribe).resolves.toBeUndefined();
+    await expect(cleanupOne).resolves.toBeUndefined();
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+    expect(enterpriseRuntime.cleanupCalls).toEqual(["session-closed"]);
+  });
+
+  test("enterprise cleanup preserves watch and runtime teardown failures", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.watchDisposeError = new Error("watch cleanup failed");
+    enterpriseRuntime.cleanupError = new Error("runtime cleanup failed");
+    const { subsystem } = makeSubsystem({ enterpriseRuntime });
+    await subsystem.handleFileSubscribeRequest({
+      type: "fs.file.subscribe.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-one",
+    });
+
+    const cleanup = subsystem.dispose();
+    expect(cleanup).toBe(subsystem.cleanupEnterprise("generation-replaced"));
+    await expect(cleanup).rejects.toMatchObject({
+      errors: expect.arrayContaining([
+        enterpriseRuntime.watchDisposeError,
+        enterpriseRuntime.cleanupError,
+      ]),
+    });
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+  });
+
+  test("enterprise cleanup invalidates a subscription blocked in stat without a late emit", async () => {
+    const statGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.statGates[0] = statGate.promise;
+    const { emitted, subsystem } = makeSubsystem({ enterpriseRuntime });
+    const subscribing = subsystem.handleFileSubscribeRequest({
+      type: "fs.file.subscribe.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-one",
+    });
+    await waitUntil(() => enterpriseRuntime.statCalls === 1);
+
+    const cleanup = subsystem.cleanupEnterprise("generation-replaced");
+    let settled = false;
+    cleanup.then(() => {
+      settled = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    statGate.resolve();
+
+    await expect(subscribing).resolves.toBeUndefined();
+    await expect(cleanup).resolves.toBeUndefined();
+    expect(enterpriseRuntime.watchCalls).toBe(0);
+    expect(emitted).toEqual([]);
+  });
+
+  test("enterprise cleanup disposes a late watch once and preserves its failure", async () => {
+    const watchGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.watchGates[0] = watchGate.promise;
+    enterpriseRuntime.watchDisposeError = new Error("late watch dispose failed");
+    const { emitted, subsystem } = makeSubsystem({ enterpriseRuntime });
+    const subscribing = subsystem.handleFileSubscribeRequest({
+      type: "fs.file.subscribe.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-one",
+    });
+    await waitUntil(() => enterpriseRuntime.watchCalls === 1);
+
+    const cleanup = subsystem.cleanupEnterprise("generation-replaced");
+    watchGate.resolve();
+
+    await expect(subscribing).resolves.toBeUndefined();
+    await expect(cleanup).rejects.toMatchObject({
+      errors: expect.arrayContaining([enterpriseRuntime.watchDisposeError]),
+    });
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+    enterpriseRuntime.watchCallbacks[0]?.();
+    await Promise.resolve();
+    expect(emitted).toEqual([]);
+  });
+
+  test("a replacement invalidates an older stat attempt before the new route starts", async () => {
+    const oldStatGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.statGates[0] = oldStatGate.promise;
+    const { emitted, subsystem } = makeSubsystem({ enterpriseRuntime });
+    const request = {
+      type: "fs.file.subscribe.request" as const,
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-old",
+    };
+    const old = subsystem.handleFileSubscribeRequest(request);
+    await waitUntil(() => enterpriseRuntime.statCalls === 1);
+    const replacement = subsystem.handleFileSubscribeRequest({
+      ...request,
+      requestId: "request-new",
+    });
+    oldStatGate.resolve();
+
+    await expect(old).resolves.toBeUndefined();
+    await expect(replacement).resolves.toBeUndefined();
+    expect(enterpriseRuntime.statCalls).toBe(2);
+    expect(enterpriseRuntime.watchCalls).toBe(1);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({ payload: { requestId: "request-new" } });
+    await subsystem.dispose();
+  });
+
+  test("a replacement waits for and disposes an older late watch before publishing", async () => {
+    const oldWatchGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.watchGates[0] = oldWatchGate.promise;
+    const { emitted, subsystem } = makeSubsystem({ enterpriseRuntime });
+    const request = {
+      type: "fs.file.subscribe.request" as const,
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-old",
+    };
+    const old = subsystem.handleFileSubscribeRequest(request);
+    await waitUntil(() => enterpriseRuntime.watchCalls === 1);
+    const replacement = subsystem.handleFileSubscribeRequest({
+      ...request,
+      requestId: "request-new",
+    });
+    oldWatchGate.resolve();
+
+    await expect(old).resolves.toBeUndefined();
+    await expect(replacement).resolves.toBeUndefined();
+    expect(enterpriseRuntime.watchCalls).toBe(2);
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(1);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({ payload: { requestId: "request-new" } });
+    enterpriseRuntime.watchCallbacks[0]?.();
+    await Promise.resolve();
+    expect(emitted).toHaveLength(1);
+    await subsystem.dispose();
+    expect(enterpriseRuntime.watchDisposeCalls).toBe(2);
+  });
   test("creates an entry and emits the complete success response", async () => {
     const cwd = makeDir("workspace-files-create-");
     const { subsystem, emitted } = makeSubsystem();

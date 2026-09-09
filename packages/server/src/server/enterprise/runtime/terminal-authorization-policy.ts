@@ -278,14 +278,22 @@ interface ParsedTerminalWorkspaceListInput {
 }
 
 export class TerminalAuthorizationPolicy {
-  private readonly resolver: CanonicalTerminalResolver;
-  private readonly authorization: Pick<ResourceAuthorization, "assertWorkspace">;
-  private readonly sessionBindings: CurrentTerminalSessionBindings;
+  private readonly resolveTerminal: CanonicalTerminalResolver["resolve"];
+  private readonly listWorkspaceTerminals: CanonicalTerminalResolver["listWorkspace"];
+  private readonly assertWorkspace: ResourceAuthorization["assertWorkspace"];
+  private readonly hasTerminalSubscription: CurrentTerminalSessionBindings["hasTerminalSubscription"];
+  private readonly hasWorkspaceSubscription: CurrentTerminalSessionBindings["hasWorkspaceSubscription"];
 
   public constructor(options: TerminalAuthorizationPolicyOptions) {
-    this.resolver = options.resolver;
-    this.authorization = options.authorization;
-    this.sessionBindings = options.sessionBindings;
+    this.resolveTerminal = options.resolver.resolve.bind(options.resolver);
+    this.listWorkspaceTerminals = options.resolver.listWorkspace.bind(options.resolver);
+    this.assertWorkspace = options.authorization.assertWorkspace.bind(options.authorization);
+    this.hasTerminalSubscription = options.sessionBindings.hasTerminalSubscription.bind(
+      options.sessionBindings,
+    );
+    this.hasWorkspaceSubscription = options.sessionBindings.hasWorkspaceSubscription.bind(
+      options.sessionBindings,
+    );
   }
 
   public async authorizeCreate(input: TerminalCreateInput): Promise<AuthorizedTerminalCreate> {
@@ -307,7 +315,7 @@ export class TerminalAuthorizationPolicy {
       const parsed = freezeWorkspaceListInput(request);
       const workspace = await this.authorizeWorkspace(parsed, parsed.workspaceId);
       const records = (
-        await this.resolver.listWorkspace({
+        await this.listWorkspaceTerminals({
           workspaceId: workspace.workspaceId,
           nodeId: workspace.nodeId,
         })
@@ -373,7 +381,7 @@ export class TerminalAuthorizationPolicy {
   public decideTerminalUnsubscribe(input: TerminalCleanupInput): TerminalCleanupDecision {
     try {
       const request = TerminalCleanupInputSchema.parse(input);
-      if (!this.sessionBindings.hasTerminalSubscription(request.terminalId)) {
+      if (!this.hasTerminalSubscription(request.terminalId)) {
         return cleanupDenied();
       }
       const binding: TerminalCleanupBinding = Object.freeze({
@@ -389,7 +397,7 @@ export class TerminalAuthorizationPolicy {
   public decideWorkspaceUnsubscribe(input: TerminalWorkspaceCleanupInput): TerminalCleanupDecision {
     try {
       const request = TerminalWorkspaceCleanupInputSchema.parse(input);
-      if (!this.sessionBindings.hasWorkspaceSubscription(request.workspaceId)) {
+      if (!this.hasWorkspaceSubscription(request.workspaceId)) {
         return cleanupDenied();
       }
       const binding: TerminalWorkspaceCleanupBinding = Object.freeze({
@@ -408,7 +416,7 @@ export class TerminalAuthorizationPolicy {
   ): Promise<AuthorizedTerminalAccess> {
     try {
       const request = parseAccessInput(input);
-      const resolved = await this.resolver.resolve(request.terminalId);
+      const resolved = await this.resolveTerminal(request.terminalId);
       if (resolved === null) {
         throw accessDenied();
       }
@@ -431,7 +439,7 @@ export class TerminalAuthorizationPolicy {
     workspaceId: string,
   ): Promise<AuthorizedWorkspace> {
     const workspace = AuthorizedWorkspaceSchema.parse(
-      await this.authorization.assertWorkspace(request.principal, "terminal.use", workspaceId),
+      await this.assertWorkspace(request.principal, "terminal.use", workspaceId),
     );
     if (
       workspace.organizationId !== request.principal.organizationId ||
