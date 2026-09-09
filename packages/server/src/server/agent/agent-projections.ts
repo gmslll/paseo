@@ -3,6 +3,10 @@ import type {
   AgentSnapshotPayload,
   RecentProviderSessionDescriptorPayload,
 } from "../messages.js";
+import {
+  normalizeEnterpriseResourceOwner,
+  type AgentOwnershipEnvelope,
+} from "@getpaseo/protocol/messages";
 import type { SerializableAgentConfig, StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentCapabilityFlags,
@@ -74,6 +78,7 @@ export function toStoredAgentRecord(
     provider: agent.provider,
     cwd: agent.cwd,
     workspaceId: agent.workspaceId,
+    ...projectEnterpriseOwner(agent.enterpriseOwnership, agent.workspaceId),
     createdAt,
     updatedAt: agent.updatedAt.toISOString(),
     lastActivityAt: agent.updatedAt.toISOString(),
@@ -113,6 +118,7 @@ export function toAgentPayload(
     provider: agent.provider,
     cwd: agent.cwd,
     ...(agent.workspaceId ? { workspaceId: agent.workspaceId } : {}),
+    ...projectEnterpriseOwner(agent.enterpriseOwnership, agent.workspaceId),
     model: agent.config.model ?? null,
     thinkingOptionId,
     effectiveThinkingOptionId,
@@ -216,12 +222,14 @@ export function buildStoredAgentPayload(
   const persistence = projectPersistenceHandleForWire(
     buildStoredPersistenceHandle(record, validProviders),
   );
+  const enterpriseOwnership = storedRecordEnterpriseOwnership(record);
 
   return {
     id: record.id,
     provider: record.provider,
     cwd: record.cwd,
     ...(record.workspaceId ? { workspaceId: record.workspaceId } : {}),
+    ...projectEnterpriseOwner(enterpriseOwnership, record.workspaceId),
     model: record.config?.model ?? null,
     thinkingOptionId: record.config?.thinkingOptionId ?? null,
     effectiveThinkingOptionId: resolveEffectiveThinkingOptionId({
@@ -246,6 +254,26 @@ export function buildStoredAgentPayload(
     labels: normalizeLabels(record.labels),
     ...(providerAvailable ? {} : { providerUnavailable: true }),
   };
+}
+
+function storedRecordEnterpriseOwnership(
+  record: StoredAgentRecord,
+): AgentOwnershipEnvelope | undefined {
+  const owner = normalizeEnterpriseResourceOwner(record);
+  if (!owner) return undefined;
+  if (!record.workspaceId) throw new Error("Enterprise Agent ownership requires workspaceId");
+  return { workspaceId: record.workspaceId, ...owner };
+}
+
+function projectEnterpriseOwner(
+  ownership: AgentOwnershipEnvelope | undefined,
+  workspaceId: string | undefined,
+): Omit<AgentOwnershipEnvelope, "workspaceId"> | Record<string, never> {
+  if (!ownership) return {};
+  if (ownership.workspaceId !== workspaceId)
+    throw new Error("Agent ownership workspaceId must match the Agent Workspace");
+  const { workspaceId: _workspaceId, ...owner } = ownership;
+  return owner;
 }
 
 export function toAgentListItemPayload(agent: AgentSnapshotPayload): AgentListItemPayload {

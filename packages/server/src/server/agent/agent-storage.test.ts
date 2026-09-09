@@ -8,12 +8,21 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentStorage } from "./agent-storage.js";
 import { buildConfigOverrides, buildSessionConfig } from "../persistence-hooks.js";
 import type { ManagedAgent } from "./agent-manager.js";
+import type { AgentOwnershipEnvelope } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
   AgentProvider,
   AgentSession,
   AgentSessionConfig,
 } from "./agent-sdk-types.js";
+
+const enterpriseOwnership = {
+  workspaceId: "workspace-enterprise",
+  organizationId: "org_0123456789abcdef",
+  nodeId: "nod_0123456789abcdef",
+  ownerPrincipalId: "usr_0123456789abcdef",
+  createdByPrincipalId: "usr_0123456789abcdef",
+} as const satisfies AgentOwnershipEnvelope;
 
 type ManagedAgentOverrides = Omit<
   Partial<ManagedAgent>,
@@ -103,6 +112,8 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     provider: core.provider,
     cwd: core.cwd,
     workspaceId: overrides.workspaceId,
+    enterpriseOwnership: overrides.enterpriseOwnership,
+    owner: overrides.owner,
     session: core.session,
     capabilities: overrides.capabilities ?? buildDefaultCapabilities(),
     config: core.config,
@@ -193,6 +204,67 @@ describe("AgentStorage", () => {
     const [persisted] = await reloaded.list();
     expect(persisted.cwd).toBe("/tmp/project");
     expect(persisted.config?.providerOptions).toEqual({ allowedTools: ["Read"] });
+  });
+
+  test("persists the complete enterprise ownership envelope on the first snapshot", async () => {
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: "agent-enterprise",
+        workspaceId: enterpriseOwnership.workspaceId,
+        enterpriseOwnership,
+      }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await expect(reloaded.get("agent-enterprise")).resolves.toMatchObject(enterpriseOwnership);
+  });
+
+  test("does not erase persisted ownership when a legacy loader omits the runtime envelope", async () => {
+    const first = createManagedAgent({
+      id: "agent-enterprise-reload",
+      workspaceId: enterpriseOwnership.workspaceId,
+      enterpriseOwnership,
+    });
+    await storage.applySnapshot(first);
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: first.id,
+        workspaceId: enterpriseOwnership.workspaceId,
+      }),
+    );
+
+    await expect(storage.get(first.id)).resolves.toMatchObject(enterpriseOwnership);
+  });
+
+  test("rejects partial ownership and ownership without its matching Workspace", async () => {
+    const base = {
+      id: "agent-invalid-owner",
+      provider: "codex",
+      cwd: "/tmp/project",
+      createdAt: "2026-09-10T00:00:00.000Z",
+      updatedAt: "2026-09-10T00:00:00.000Z",
+      labels: {},
+      lastStatus: "closed" as const,
+      config: null,
+      persistence: null,
+    };
+    await expect(
+      storage.upsert({
+        ...base,
+        workspaceId: enterpriseOwnership.workspaceId,
+        organizationId: enterpriseOwnership.organizationId,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      storage.upsert({
+        ...base,
+        id: "agent-missing-workspace",
+        organizationId: enterpriseOwnership.organizationId,
+        nodeId: enterpriseOwnership.nodeId,
+        ownerPrincipalId: enterpriseOwnership.ownerPrincipalId,
+        createdByPrincipalId: enterpriseOwnership.createdByPrincipalId,
+      }),
+    ).rejects.toThrow("requires workspaceId");
   });
 
   test("applySnapshot stores and reloads featureValues when present", async () => {

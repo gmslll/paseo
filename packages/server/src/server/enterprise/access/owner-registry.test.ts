@@ -158,4 +158,24 @@ describe("OwnerRegistry", () => {
       ...owner,
     });
   });
+
+  test("quarantines cached Agents when canonical Workspace ownership changes", () => {
+    const registry = new OwnerRegistry();
+    registry.registerWorkspace(workspace("wks_owned"));
+    registry.registerAgent({ id: "agent_owned", workspaceId: "wks_owned", ...owner });
+
+    registry.registerWorkspace({
+      id: "wks_owned",
+      ...owner,
+      ownerPrincipalId: "usr_fedcba9876543210",
+      createdByPrincipalId: "usr_fedcba9876543210",
+    });
+
+    expect(registry.getAgent("agent_owned")).toBeNull();
+    expect(registry.quarantined()).toContainEqual({
+      kind: "agent",
+      id: "agent_owned",
+      reason: "owner_mismatch",
+    });
+  });
 });

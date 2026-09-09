@@ -3453,6 +3453,44 @@ test("createAgent fails when cwd does not exist", async () => {
   ).rejects.toThrow("Working directory does not exist");
 });
 
+test("createAgent validates and persists enterprise ownership before publishing", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-enterprise-owner-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000199",
+  });
+  const ownership = {
+    workspaceId: "workspace-enterprise",
+    organizationId: "org_0123456789abcdef",
+    nodeId: "nod_0123456789abcdef",
+    ownerPrincipalId: "usr_0123456789abcdef",
+    createdByPrincipalId: "usr_0123456789abcdef",
+  } as const;
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: ownership.workspaceId,
+      enterpriseOwnership: ownership,
+    });
+    await expect(storage.get(agent.id)).resolves.toMatchObject(ownership);
+
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: "workspace-other",
+        enterpriseOwnership: ownership,
+      }),
+    ).rejects.toThrow("must match");
+    expect(client.createdConfigs).toHaveLength(1);
+    await manager.closeAgent(agent.id);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("createAgent reports configured providers when provider is unknown", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");

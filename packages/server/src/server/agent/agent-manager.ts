@@ -18,6 +18,10 @@ import {
 import type { Logger } from "pino";
 import type { ProviderOptions, ToolPolicy } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import {
+  AgentOwnershipEnvelopeSchema,
+  type AgentOwnershipEnvelope,
+} from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
@@ -53,7 +57,11 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import {
+  storedAgentOwnership,
+  type StoredAgentRecord,
+  type AgentStorage,
+} from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -285,6 +293,7 @@ export interface CreateAgentOptions {
   initialTitle?: string | null;
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
+  enterpriseOwnership?: AgentOwnershipEnvelope;
   owner?: AgentOwner;
 }
 
@@ -378,6 +387,7 @@ interface ManagedAgentBase {
    * Null/undefined for legacy agents created before ownership stamping.
    */
   workspaceId?: string;
+  enterpriseOwnership?: AgentOwnershipEnvelope;
   owner?: AgentOwner;
   capabilities: AgentCapabilityFlags;
   config: AgentSessionConfig;
@@ -572,6 +582,26 @@ function abortMessage(reason: unknown, fallbackMessage: string): string {
 function createAbortError(signal: AbortSignal | undefined, fallbackMessage: string): Error {
   const message = abortMessage(signal?.reason, fallbackMessage);
   return Object.assign(new Error(message), { name: "AbortError" });
+}
+
+function validateAgentOwnership(
+  workspaceId: string | undefined,
+  ownership: AgentOwnershipEnvelope | undefined,
+): AgentOwnershipEnvelope | undefined {
+  if (!ownership) return undefined;
+  const parsed = AgentOwnershipEnvelopeSchema.parse(ownership);
+  if (workspaceId !== parsed.workspaceId) {
+    throw new Error("Agent ownership workspaceId must match the Agent Workspace");
+  }
+  return parsed;
+}
+
+function projectAgentOwnership(
+  ownership: AgentOwnershipEnvelope | undefined,
+): Omit<AgentOwnershipEnvelope, "workspaceId"> | Record<string, never> {
+  if (!ownership) return {};
+  const { workspaceId: _workspaceId, ...owner } = ownership;
+  return owner;
 }
 
 function validateAgentId(agentId: string, source: string): string {
@@ -1197,6 +1227,10 @@ export class AgentManager {
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    const enterpriseOwnership = validateAgentOwnership(
+      options.workspaceId,
+      options.enterpriseOwnership,
+    );
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
     if (this.pluginLifecycle && !config.internal) {
       const request = await this.pluginLifecycle.before("agent.create", {
@@ -1233,6 +1267,7 @@ export class AgentManager {
       labels: options.labels,
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
+      enterpriseOwnership,
       owner: options.owner,
       historyPrimed: true,
     });
@@ -1264,6 +1299,7 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
       owner?: AgentOwner;
     },
     resumeOptions?: AgentResumeSessionOptions,
@@ -1283,11 +1319,16 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
       owner?: AgentOwner;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    const enterpriseOwnership = validateAgentOwnership(
+      options?.workspaceId,
+      options?.enterpriseOwnership,
+    );
     const resolvedAgentId = validateAgentId(
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
@@ -1333,6 +1374,7 @@ export class AgentManager {
     await this.requireExternalMcpSupport(session, storedConfig);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
+      enterpriseOwnership,
       persistence: handle,
     });
   }
@@ -1342,6 +1384,7 @@ export class AgentManager {
     providerHandleId: string;
     cwd: string;
     workspaceId: string;
+    enterpriseOwnership?: AgentOwnershipEnvelope;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(this.importProviderSessionInternal(input));
@@ -1352,9 +1395,14 @@ export class AgentManager {
     providerHandleId: string;
     cwd: string;
     workspaceId: string;
+    enterpriseOwnership?: AgentOwnershipEnvelope;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    const enterpriseOwnership = validateAgentOwnership(
+      input.workspaceId,
+      input.enterpriseOwnership,
+    );
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
 
@@ -1399,6 +1447,7 @@ export class AgentManager {
       const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
         labels: input.labels,
         workspaceId: input.workspaceId,
+        enterpriseOwnership,
         timelineRows,
         timelineNextSeq: timelineRows.length + 1,
         persistence: imported.persistence,
@@ -1515,6 +1564,7 @@ export class AgentManager {
       return this.registerSession(session, storedConfig, agentId, {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
+        enterpriseOwnership: existing.enterpriseOwnership,
         owner: existing.owner,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
@@ -1818,6 +1868,7 @@ export class AgentManager {
         provider: record.provider,
         cwd: record.cwd,
         workspaceId: record.workspaceId,
+        enterpriseOwnership: storedAgentOwnership(record),
         owner: record.owner,
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
@@ -2129,7 +2180,11 @@ export class AgentManager {
 
   async unarchiveSnapshot(
     agentId: string,
-    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
+    updates?: {
+      workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
+      labels?: AgentLabelPatch;
+    },
   ): Promise<boolean> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
@@ -2141,9 +2196,16 @@ export class AgentManager {
     await this.closeAgent(agentId);
     await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
+    const workspaceId = updates?.workspaceId ?? record.workspaceId;
+    const enterpriseOwnership = validateAgentOwnership(
+      workspaceId,
+      updates?.enterpriseOwnership ?? storedAgentOwnership(record),
+    );
+
     await registry.upsert({
       ...record,
-      ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+      ...projectAgentOwnership(enterpriseOwnership),
       ...(updates?.labels ? { labels: applyLabelPatch(record.labels, updates.labels) } : {}),
       archivedAt: null,
       updatedAt: new Date().toISOString(),
@@ -3354,6 +3416,7 @@ export class AgentManager {
       initialTitle?: string | null;
       publishWhenReady?: boolean;
       workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
       owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
@@ -3505,16 +3568,21 @@ export class AgentManager {
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
+          enterpriseOwnership?: AgentOwnershipEnvelope;
           owner?: AgentOwner;
         }
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const enterpriseOwnership = options
+      ? validateAgentOwnership(options.workspaceId, options.enterpriseOwnership)
+      : undefined;
     return {
       id: resolvedAgentId,
       provider: config.provider,
       cwd: config.cwd,
       workspaceId: options?.workspaceId,
+      enterpriseOwnership,
       owner: options?.owner,
       session,
       capabilities: session.capabilities,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { AgentOwnershipEnvelope } from "@getpaseo/protocol/messages";
 
 import { AGENT_LIFECYCLE_STATUSES } from "./agent-manager.js";
 import {
@@ -21,6 +22,14 @@ type ManagedAgentOverrides = Omit<Partial<ManagedAgent>, "config" | "pendingPerm
   config?: Partial<AgentSessionConfig>;
   pendingPermissions?: Map<string, AgentPermissionRequest>;
 };
+
+const enterpriseOwnership = {
+  workspaceId: "workspace-enterprise",
+  organizationId: "org_0123456789abcdef",
+  nodeId: "nod_0123456789abcdef",
+  ownerPrincipalId: "usr_0123456789abcdef",
+  createdByPrincipalId: "usr_0123456789abcdef",
+} as const satisfies AgentOwnershipEnvelope;
 
 function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent {
   const now = new Date("2025-01-01T00:00:00.000Z");
@@ -111,6 +120,18 @@ it("projects the daemon-owned active turn identity", () => {
     turnId: "test-turn-id",
     startedAt: "2025-01-01T00:00:01.000Z",
   });
+});
+
+it("retains the flat enterprise ownership envelope in storage and wire projections", () => {
+  const agent = createManagedAgent({
+    workspaceId: enterpriseOwnership.workspaceId,
+    enterpriseOwnership,
+  });
+  const record = toStoredAgentRecord(agent);
+
+  expect(record).toMatchObject(enterpriseOwnership);
+  expect(toAgentPayload(agent)).toMatchObject(enterpriseOwnership);
+  expect(buildStoredAgentPayload(record, ["claude"])).toMatchObject(enterpriseOwnership);
 });
 
 function createPermission(overrides: Partial<AgentPermissionRequest> = {}): AgentPermissionRequest {

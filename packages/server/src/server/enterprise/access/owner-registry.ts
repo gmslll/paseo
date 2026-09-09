@@ -47,6 +47,15 @@ export class OwnerRegistry {
 
     this.workspaces.set(record.id, { workspaceId: record.id, ...result.owner });
     this.quarantine.delete(key);
+    for (const [agentId, agent] of this.agents) {
+      if (agent.workspaceId !== record.id || ownersMatch(agent, result.owner)) continue;
+      this.agents.delete(agentId);
+      this.quarantine.set(resourceKey("agent", agentId), {
+        kind: "agent",
+        id: agentId,
+        reason: "owner_mismatch",
+      });
+    }
   }
 
   registerAgent(record: EnterpriseAgentAuthorizationRecord): void {
@@ -106,7 +115,29 @@ export class OwnerRegistry {
   }
 
   getAgent(agentId: string): OwnedAgent | null {
-    return this.agents.get(agentId) ?? null;
+    const agent = this.agents.get(agentId);
+    if (!agent) return null;
+    const workspace = this.workspaces.get(agent.workspaceId);
+    if (!workspace) {
+      this.agents.delete(agentId);
+      this.quarantine.set(resourceKey("agent", agentId), {
+        kind: "agent",
+        id: agentId,
+        reason: "workspace_unavailable",
+      });
+      return null;
+    }
+    if (!ownersMatch(agent, workspace)) {
+      this.agents.delete(agentId);
+      this.quarantine.set(resourceKey("agent", agentId), {
+        kind: "agent",
+        id: agentId,
+        reason: "owner_mismatch",
+      });
+      return null;
+    }
+    this.quarantine.delete(resourceKey("agent", agentId));
+    return agent;
   }
 
   quarantined(): QuarantinedResource[] {

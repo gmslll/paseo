@@ -5,7 +5,7 @@ type InboundOperation = SessionInboundMessage["type"];
 type OutboundOperation = SessionOutboundMessage["type"];
 export type PermissionRequirement = DaemonPermission | readonly DaemonPermission[] | null;
 
-const INBOUND_PERMISSION = {
+export const INBOUND_PERMISSION = {
   abort_request: "workspace.write",
   "agent.config.apply.request": ["workspace.write", "hub.execute"],
   "agent.detach.request": "workspace.write",
@@ -220,7 +220,7 @@ const INBOUND_PERMISSION = {
   write_project_config_request: "workspace.write",
 } as const satisfies Record<InboundOperation, PermissionRequirement>;
 
-const OUTBOUND_PERMISSION = {
+export const OUTBOUND_PERMISSION = {
   activity_log: "workspace.read",
   "agent.config.apply.response": ["workspace.write", "hub.execute"],
   "agent.detach.response": "workspace.write",

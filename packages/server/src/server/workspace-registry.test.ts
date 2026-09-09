@@ -449,6 +449,35 @@ describe("workspace registries", () => {
     expect(await workspaceRegistry.list()).toEqual([]);
   });
 
+  test("persists complete Workspace ownership and rejects partial mutation envelopes", async () => {
+    await workspaceRegistry.initialize();
+    const record = createPersistedWorkspaceRecord({
+      workspaceId: "workspace-enterprise",
+      projectId: "project-enterprise",
+      cwd: "/tmp/enterprise",
+      kind: "directory",
+      displayName: "enterprise",
+      createdAt: "2026-09-10T00:00:00.000Z",
+      updatedAt: "2026-09-10T00:00:00.000Z",
+    });
+    const owner = {
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    } as const;
+
+    await workspaceRegistry.upsert({ ...record, ...owner });
+    await expect(workspaceRegistry.get(record.workspaceId)).resolves.toMatchObject(owner);
+    await expect(
+      workspaceRegistry.upsert({
+        ...record,
+        workspaceId: "workspace-partial",
+        organizationId: owner.organizationId,
+      }),
+    ).rejects.toThrow();
+  });
+
   test("refreshes workspace archive timestamps when an archive is repeated", async () => {
     await workspaceRegistry.initialize();
     await workspaceRegistry.upsert(
