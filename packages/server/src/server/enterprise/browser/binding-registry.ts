@@ -1,16 +1,17 @@
-import { promises as fs } from "node:fs";
 import {
   BrowserProfileBindingSchema,
   BrowserProfileRecordSchema,
   EnterpriseResourceOwnerSchema,
-  PrincipalIdSchema,
+  PrincipalContextSchema,
   type AuthorizedAgent,
   type AuthorizedBrowserProfile,
   type AuthorizedWorkspace,
   type BrowserProfileBinding,
+  type BrowserProfileRecord,
+  type PrincipalContext,
 } from "@getpaseo/protocol/messages";
 import { z } from "zod";
-import { writeJsonFileAtomic } from "../../atomic-file.js";
+import { readSecureJsonFile, writeSecureJsonFile } from "./secure-json-file.js";
 
 const StrictBrowserProfileBindingSchema = BrowserProfileBindingSchema.strict();
 const AuthorizedWorkspaceSchema = EnterpriseResourceOwnerSchema.extend({
@@ -24,8 +25,7 @@ const BindBrowserProfileInputSchema = z
   .object({
     workspace: AuthorizedWorkspaceSchema,
     profile: BrowserProfileRecordSchema.strict(),
-    boundByPrincipalId: PrincipalIdSchema,
-    boundAt: z.string().min(1),
+    actor: PrincipalContextSchema,
   })
   .strict();
 const BrowserProfileBindingRegistrySnapshotSchema = z
@@ -44,6 +44,24 @@ export interface BrowserProfileBindingStorage {
   write(snapshot: BrowserProfileBindingRegistrySnapshot): Promise<void>;
 }
 
+export interface BrowserProfileBindingProfileResolver {
+  get(browserProfileId: string): Promise<BrowserProfileRecord | null>;
+}
+
+export type BrowserProfileBindingQuarantineReason =
+  | "profile_missing"
+  | "profile_mismatch"
+  | "profile_registry_unavailable";
+
+export interface BrowserProfileBindingQuarantineNotice {
+  binding: BrowserProfileBinding;
+  reason: BrowserProfileBindingQuarantineReason;
+}
+
+export interface BrowserProfileBindingQuarantineSink {
+  quarantine(notice: BrowserProfileBindingQuarantineNotice): void | Promise<void>;
+}
+
 export class BrowserProfileBindingRegistryCorruptError extends Error {
   public constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -51,22 +69,23 @@ export class BrowserProfileBindingRegistryCorruptError extends Error {
   }
 }
 
+export class BrowserProfileBindingQuarantinedError extends Error {
+  public constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "BrowserProfileBindingQuarantinedError";
+  }
+}
+
 export class JsonFileBrowserProfileBindingStorage implements BrowserProfileBindingStorage {
   public constructor(private readonly filePath: string) {}
 
   public async read(): Promise<unknown | null> {
-    let contents: string;
     try {
-      contents = await fs.readFile(this.filePath, "utf8");
+      return await readSecureJsonFile(this.filePath);
     } catch (error) {
-      if (isFileNotFoundError(error)) {
-        return null;
+      if (!(error instanceof SyntaxError)) {
+        throw error;
       }
-      throw error;
-    }
-    try {
-      return JSON.parse(contents) as unknown;
-    } catch (error) {
       throw new BrowserProfileBindingRegistryCorruptError(
         "Browser Profile binding registry contains invalid JSON.",
         { cause: error },
@@ -75,7 +94,7 @@ export class JsonFileBrowserProfileBindingStorage implements BrowserProfileBindi
   }
 
   public write(snapshot: BrowserProfileBindingRegistrySnapshot): Promise<void> {
-    return writeJsonFileAtomic(this.filePath, snapshot);
+    return writeSecureJsonFile(this.filePath, snapshot);
   }
 }
 
@@ -86,7 +105,14 @@ export class BrowserProfileBindingRegistry {
   private initialized = false;
   private mutationTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly options: { storage: BrowserProfileBindingStorage }) {}
+  public constructor(
+    private readonly options: {
+      storage: BrowserProfileBindingStorage;
+      profiles: BrowserProfileBindingProfileResolver;
+      quarantine?: BrowserProfileBindingQuarantineSink;
+      now?: () => string;
+    },
+  ) {}
 
   public async initialize(): Promise<void> {
     if (this.corruptError) {
@@ -115,8 +141,7 @@ export class BrowserProfileBindingRegistry {
   public bind(input: {
     workspace: AuthorizedWorkspace;
     profile: AuthorizedBrowserProfile;
-    boundByPrincipalId: string;
-    boundAt: string;
+    actor: PrincipalContext;
   }): Promise<BrowserProfileBinding> {
     return this.mutate(async () => {
       const parsed = BindBrowserProfileInputSchema.safeParse(input);
@@ -125,14 +150,17 @@ export class BrowserProfileBindingRegistry {
           `Invalid Browser Profile binding input: ${parsed.error.issues[0]?.message}`,
         );
       }
+      if (parsed.data.actor.organizationId !== parsed.data.workspace.organizationId) {
+        throw new Error("Browser Profile binding actor organization does not match the Workspace.");
+      }
       assertWorkspaceCanBindProfile(parsed.data.workspace, parsed.data.profile);
       const binding = StrictBrowserProfileBindingSchema.parse({
         organizationId: parsed.data.workspace.organizationId,
         nodeId: parsed.data.workspace.nodeId,
         workspaceId: parsed.data.workspace.workspaceId,
         browserProfileId: parsed.data.profile.browserProfileId,
-        boundByPrincipalId: parsed.data.boundByPrincipalId,
-        boundAt: parsed.data.boundAt,
+        boundByPrincipalId: parsed.data.actor.principalId,
+        boundAt: (this.options.now ?? (() => new Date().toISOString()))(),
       });
       const key = bindingKey(binding);
       const next = new Map(this.bindings).set(key, binding);
@@ -172,7 +200,20 @@ export class BrowserProfileBindingRegistry {
     const agent = AuthorizedAgentSchema.parse(input.agent);
     assertCanonicalAgentWorkspace(agent, workspace);
     const binding = this.bindings.get(bindingKey(workspace));
-    return binding ? cloneBinding(binding) : null;
+    if (!binding) {
+      return null;
+    }
+    const profile = await this.resolveBoundProfile(binding);
+    try {
+      assertWorkspaceCanBindProfile(workspace, profile);
+    } catch (error) {
+      await this.quarantine(binding, "profile_mismatch");
+      throw new BrowserProfileBindingQuarantinedError(
+        `Browser Profile binding for ${workspace.workspaceId} no longer matches its canonical Profile.`,
+        { cause: error },
+      );
+    }
+    return cloneBinding(binding);
   }
 
   private async load(): Promise<void> {
@@ -217,6 +258,39 @@ export class BrowserProfileBindingRegistry {
       version: 1,
       bindings: Array.from(bindings.values(), cloneBinding),
     });
+  }
+
+  private async resolveBoundProfile(binding: BrowserProfileBinding): Promise<BrowserProfileRecord> {
+    let profile: BrowserProfileRecord | null;
+    try {
+      profile = await this.options.profiles.get(binding.browserProfileId);
+    } catch (error) {
+      await this.quarantine(binding, "profile_registry_unavailable");
+      throw new BrowserProfileBindingQuarantinedError(
+        `Browser Profile binding for ${binding.workspaceId} cannot resolve its Profile registry.`,
+        { cause: error },
+      );
+    }
+    if (!profile) {
+      await this.quarantine(binding, "profile_missing");
+      throw new BrowserProfileBindingQuarantinedError(
+        `Browser Profile binding for ${binding.workspaceId} references a missing Profile.`,
+      );
+    }
+    if (profile.browserProfileId !== binding.browserProfileId) {
+      await this.quarantine(binding, "profile_mismatch");
+      throw new BrowserProfileBindingQuarantinedError(
+        `Browser Profile binding for ${binding.workspaceId} resolved a mismatched Profile.`,
+      );
+    }
+    return profile;
+  }
+
+  private async quarantine(
+    binding: BrowserProfileBinding,
+    reason: BrowserProfileBindingQuarantineReason,
+  ): Promise<void> {
+    await this.options.quarantine?.quarantine({ binding: cloneBinding(binding), reason });
   }
 
   private mutate<T>(operation: () => Promise<T>): Promise<T> {
@@ -270,13 +344,4 @@ function bindingKey(
 
 function cloneBinding(binding: BrowserProfileBinding): BrowserProfileBinding {
   return StrictBrowserProfileBindingSchema.parse(binding);
-}
-
-function isFileNotFoundError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "ENOENT"
-  );
 }

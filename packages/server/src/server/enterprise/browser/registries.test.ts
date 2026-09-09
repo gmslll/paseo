@@ -1,19 +1,27 @@
-import { describe, expect, test } from "vitest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, test } from "vitest";
 import type {
   AuthorizedAgent,
   AuthorizedBrowserProfile,
   AuthorizedWorkspace,
   BrowserProfileBinding,
   BrowserProfileRecord,
+  PrincipalContext,
 } from "@getpaseo/protocol/messages";
 import {
   BrowserProfileBindingRegistry,
+  JsonFileBrowserProfileBindingStorage,
   type BrowserProfileBindingRegistrySnapshot,
+  type BrowserProfileBindingProfileResolver,
+  type BrowserProfileBindingQuarantineNotice,
   type BrowserProfileBindingStorage,
 } from "./binding-registry.js";
 import {
   BrowserProfileRegistry,
   BrowserProfileRegistryCorruptError,
+  JsonFileBrowserProfileStorage,
   type BrowserProfileCanonicalResolver,
   type BrowserProfileRegistrySnapshot,
   type BrowserProfileStorage,
@@ -27,6 +35,15 @@ const BINDER_ID = "usr_3333333333333333";
 const PROFILE_ID = "brp_1111111111111111";
 const SECOND_PROFILE_ID = "brp_2222222222222222";
 const WORKSPACE_ID = "workspace-1";
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => fs.rm(directory, { recursive: true, force: true })),
+  );
+});
 
 class MemoryProfileStorage implements BrowserProfileStorage {
   public failWrites = false;
@@ -59,6 +76,21 @@ class MemoryBindingStorage implements BrowserProfileBindingStorage {
       throw new Error("binding storage unavailable");
     }
     this.value = structuredClone(snapshot);
+  }
+}
+
+class MemoryProfileResolver implements BrowserProfileBindingProfileResolver {
+  public error: Error | null = null;
+
+  public constructor(public profile: BrowserProfileRecord | null = profileRecord()) {}
+
+  public async get(browserProfileId: string): Promise<BrowserProfileRecord | null> {
+    if (this.error) {
+      throw this.error;
+    }
+    return this.profile?.browserProfileId === browserProfileId
+      ? structuredClone(this.profile)
+      : null;
   }
 }
 
@@ -116,6 +148,39 @@ function authorizedAgent(overrides: Partial<AuthorizedAgent> = {}): AuthorizedAg
     createdByPrincipalId: CREATOR_ID,
     ...overrides,
   };
+}
+
+function principalContext(overrides: Partial<PrincipalContext> = {}): PrincipalContext {
+  return {
+    organizationId: ORGANIZATION_ID,
+    principalType: "human",
+    principalId: BINDER_ID,
+    grants: [],
+    credentialId: "credential-1",
+    grantVersion: "grant-version-1",
+    ...overrides,
+  };
+}
+
+function createBindingRegistry(
+  options: {
+    storage?: BrowserProfileBindingStorage;
+    profiles?: BrowserProfileBindingProfileResolver;
+    quarantine?: BrowserProfileBindingQuarantineNotice[];
+  } = {},
+): BrowserProfileBindingRegistry {
+  return new BrowserProfileBindingRegistry({
+    storage: options.storage ?? new MemoryBindingStorage(),
+    profiles: options.profiles ?? new MemoryProfileResolver(),
+    quarantine: options.quarantine
+      ? {
+          quarantine: (notice) => {
+            options.quarantine?.push(notice);
+          },
+        }
+      : undefined,
+    now: () => "2026-09-09T11:00:00.000Z",
+  });
 }
 
 describe("BrowserProfileRegistry", () => {
@@ -271,13 +336,12 @@ describe("BrowserProfileRegistry", () => {
 describe("BrowserProfileBindingRegistry", () => {
   test("persists bindings independently and resolves only through canonical authorized context", async () => {
     const storage = new MemoryBindingStorage();
-    const registry = new BrowserProfileBindingRegistry({ storage });
+    const registry = createBindingRegistry({ storage });
 
     const binding = await registry.bind({
       workspace: authorizedWorkspace(),
       profile: profileRecord(),
-      boundByPrincipalId: BINDER_ID,
-      boundAt: "2026-09-09T11:00:00.000Z",
+      actor: principalContext(),
     });
     expect(binding).toEqual({
       organizationId: ORGANIZATION_ID,
@@ -288,7 +352,7 @@ describe("BrowserProfileBindingRegistry", () => {
       boundAt: "2026-09-09T11:00:00.000Z",
     });
 
-    const restarted = new BrowserProfileBindingRegistry({ storage });
+    const restarted = createBindingRegistry({ storage });
     await expect(
       restarted.resolveForAgent({
         workspace: authorizedWorkspace(),
@@ -304,32 +368,78 @@ describe("BrowserProfileBindingRegistry", () => {
   });
 
   test("rejects cross-organization, cross-node, and cross-owner Profile binding", async () => {
-    const registry = new BrowserProfileBindingRegistry({ storage: new MemoryBindingStorage() });
+    const registry = createBindingRegistry();
 
     await expect(
       registry.bind({
         workspace: authorizedWorkspace(),
         profile: profileRecord({ organizationId: "org_2222222222222222" }),
-        boundByPrincipalId: BINDER_ID,
-        boundAt: "2026-09-09T11:00:00.000Z",
+        actor: principalContext(),
       }),
     ).rejects.toThrow(/organization/i);
     await expect(
       registry.bind({
         workspace: authorizedWorkspace(),
         profile: profileRecord({ homeNodeId: "nod_2222222222222222" }),
-        boundByPrincipalId: BINDER_ID,
-        boundAt: "2026-09-09T11:00:00.000Z",
+        actor: principalContext(),
       }),
     ).rejects.toThrow(/node/i);
     await expect(
       registry.bind({
         workspace: authorizedWorkspace(),
         profile: profileRecord({ ownerPrincipalId: "usr_4444444444444444" }),
-        boundByPrincipalId: BINDER_ID,
-        boundAt: "2026-09-09T11:00:00.000Z",
+        actor: principalContext(),
       }),
     ).rejects.toThrow(/owner/i);
+    await expect(
+      registry.bind({
+        workspace: authorizedWorkspace(),
+        profile: profileRecord(),
+        actor: principalContext({ organizationId: "org_2222222222222222" }),
+      }),
+    ).rejects.toThrow(/actor organization/i);
+  });
+
+  test.each([
+    {
+      name: "deleted",
+      prepare(resolver: MemoryProfileResolver) {
+        resolver.profile = null;
+      },
+      reason: "profile_missing",
+    },
+    {
+      name: "corrupt",
+      prepare(resolver: MemoryProfileResolver) {
+        resolver.error = new BrowserProfileRegistryCorruptError("corrupt Profile registry");
+      },
+      reason: "profile_registry_unavailable",
+    },
+    {
+      name: "cross-organization",
+      prepare(resolver: MemoryProfileResolver) {
+        resolver.profile = profileRecord({ organizationId: "org_2222222222222222" });
+      },
+      reason: "profile_mismatch",
+    },
+  ])("quarantines a binding whose Profile is $name instead of returning it", async (scenario) => {
+    const profiles = new MemoryProfileResolver();
+    const quarantine: BrowserProfileBindingQuarantineNotice[] = [];
+    const registry = createBindingRegistry({ profiles, quarantine });
+    await registry.bind({
+      workspace: authorizedWorkspace(),
+      profile: profileRecord(),
+      actor: principalContext(),
+    });
+    scenario.prepare(profiles);
+
+    await expect(
+      registry.resolveForAgent({
+        workspace: authorizedWorkspace(),
+        agent: authorizedAgent(),
+      }),
+    ).rejects.toThrow(/binding.*Profile/i);
+    expect(quarantine).toMatchObject([{ reason: scenario.reason }]);
   });
 
   test("fails closed on half-filled or duplicate persisted bindings", async () => {
@@ -341,7 +451,7 @@ describe("BrowserProfileBindingRegistry", () => {
       boundByPrincipalId: BINDER_ID,
       boundAt: "2026-09-09T11:00:00.000Z",
     };
-    const halfFilled = new BrowserProfileBindingRegistry({
+    const halfFilled = createBindingRegistry({
       storage: new MemoryBindingStorage({
         version: 1,
         bindings: [{ ...binding, boundAt: undefined }],
@@ -349,7 +459,7 @@ describe("BrowserProfileBindingRegistry", () => {
     });
     await expect(halfFilled.initialize()).rejects.toThrow(/corrupt/i);
 
-    const duplicate = new BrowserProfileBindingRegistry({
+    const duplicate = createBindingRegistry({
       storage: new MemoryBindingStorage({
         version: 1,
         bindings: [binding, { ...binding, browserProfileId: SECOND_PROFILE_ID }],
@@ -367,14 +477,13 @@ describe("BrowserProfileBindingRegistry", () => {
   test("does not publish a binding when durable storage fails", async () => {
     const storage = new MemoryBindingStorage();
     storage.failWrites = true;
-    const registry = new BrowserProfileBindingRegistry({ storage });
+    const registry = createBindingRegistry({ storage });
 
     await expect(
       registry.bind({
         workspace: authorizedWorkspace(),
         profile: profileRecord(),
-        boundByPrincipalId: BINDER_ID,
-        boundAt: "2026-09-09T11:00:00.000Z",
+        actor: principalContext(),
       }),
     ).rejects.toThrow("binding storage unavailable");
     storage.failWrites = false;
@@ -384,5 +493,74 @@ describe("BrowserProfileBindingRegistry", () => {
         agent: authorizedAgent(),
       }),
     ).resolves.toBeNull();
+  });
+});
+
+describe("secure Browser Profile registry files", () => {
+  test("use 0700 directories and 0600 files, tighten startup modes, and survive restart", async () => {
+    const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-browser-registry-"));
+    temporaryDirectories.push(temporaryDirectory);
+    const profileDirectory = path.join(temporaryDirectory, "profiles");
+    const bindingDirectory = path.join(temporaryDirectory, "bindings");
+    const profilePath = path.join(profileDirectory, "registry.json");
+    const bindingPath = path.join(bindingDirectory, "registry.json");
+    const profiles = new BrowserProfileRegistry({
+      storage: new JsonFileBrowserProfileStorage(profilePath),
+      canonicalResolver: canonicalResolver(),
+      createProfileId: () => PROFILE_ID,
+      now: () => "2026-09-09T10:00:00.000Z",
+    });
+    await profiles.create({
+      organizationId: ORGANIZATION_ID,
+      homeNodeId: NODE_ID,
+      businessIdentityId: "bid_1111111111111111",
+      ownerPrincipalId: OWNER_ID,
+      platform: "generic",
+      businessAccountKey: "merchant-opaque-key",
+      label: "Merchant account",
+      credentialRef: "secret-reference",
+      status: "ready",
+    });
+    const bindings = new BrowserProfileBindingRegistry({
+      storage: new JsonFileBrowserProfileBindingStorage(bindingPath),
+      profiles,
+      now: () => "2026-09-09T11:00:00.000Z",
+    });
+    await bindings.bind({
+      workspace: authorizedWorkspace(),
+      profile: profileRecord({ credentialRef: "secret-reference" }),
+      actor: principalContext(),
+    });
+
+    expect((await fs.stat(profileDirectory)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(bindingDirectory)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(profilePath)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
+
+    await Promise.all([
+      fs.chmod(profileDirectory, 0o777),
+      fs.chmod(bindingDirectory, 0o777),
+      fs.chmod(profilePath, 0o666),
+      fs.chmod(bindingPath, 0o666),
+    ]);
+    const restartedProfiles = new BrowserProfileRegistry({
+      storage: new JsonFileBrowserProfileStorage(profilePath),
+      canonicalResolver: canonicalResolver(),
+    });
+    const restartedBindings = new BrowserProfileBindingRegistry({
+      storage: new JsonFileBrowserProfileBindingStorage(bindingPath),
+      profiles: restartedProfiles,
+    });
+
+    await expect(
+      restartedBindings.resolveForAgent({
+        workspace: authorizedWorkspace(),
+        agent: authorizedAgent(),
+      }),
+    ).resolves.toMatchObject({ browserProfileId: PROFILE_ID });
+    expect((await fs.stat(profileDirectory)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(bindingDirectory)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(profilePath)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
   });
 });

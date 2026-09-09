@@ -1,9 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
 import path from "node:path";
 import { BrowserProfileRecordSchema, type BrowserProfileRecord } from "@getpaseo/protocol/messages";
 import { z } from "zod";
-import { writeJsonFileAtomic } from "../../atomic-file.js";
+import { readSecureJsonFile, writeSecureJsonFile } from "./secure-json-file.js";
 
 const StrictExpectedBrowserIdentitySchema = z
   .object({
@@ -85,18 +84,12 @@ export class JsonFileBrowserProfileStorage implements BrowserProfileStorage {
   public constructor(private readonly filePath: string) {}
 
   public async read(): Promise<unknown | null> {
-    let contents: string;
     try {
-      contents = await fs.readFile(this.filePath, "utf8");
+      return await readSecureJsonFile(this.filePath);
     } catch (error) {
-      if (isFileNotFoundError(error)) {
-        return null;
+      if (!(error instanceof SyntaxError)) {
+        throw error;
       }
-      throw error;
-    }
-    try {
-      return JSON.parse(contents) as unknown;
-    } catch (error) {
       throw new BrowserProfileRegistryCorruptError(
         "Browser Profile registry contains invalid JSON.",
         { cause: error },
@@ -105,7 +98,7 @@ export class JsonFileBrowserProfileStorage implements BrowserProfileStorage {
   }
 
   public write(snapshot: BrowserProfileRegistrySnapshot): Promise<void> {
-    return writeJsonFileAtomic(this.filePath, snapshot);
+    return writeSecureJsonFile(this.filePath, snapshot);
   }
 }
 
@@ -356,13 +349,4 @@ function getBrowserProfileUniqueKey(
     record.businessAccountKey,
     record.ownerPrincipalId,
   ]);
-}
-
-function isFileNotFoundError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "ENOENT"
-  );
 }
