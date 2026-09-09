@@ -20,6 +20,11 @@ import {
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
 import { Session } from "./session.js";
+import {
+  createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "./session/enterprise-agent-session-context-registry.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
@@ -329,6 +334,8 @@ interface SessionForTestOptions {
   pluginRuntime?: SessionOptions["pluginRuntime"];
   orchestrationSkills?: SessionOptions["orchestrationSkills"];
   workspaceLabelService?: WorkspaceLabelService;
+  enterpriseContext?: EnterpriseSessionContext;
+  enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
 }
 
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
@@ -433,9 +440,140 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
     permissions: options.permissions ?? OWNER_PERMISSIONS,
+    enterpriseContext: options.enterpriseContext,
+    enterpriseAgentContextRegistry: options.enterpriseAgentContextRegistry,
   };
   return new Session(sessionOptions);
 }
+
+function enterpriseContext(
+  generation = "generation-a",
+  overrides: Partial<EnterpriseSessionContext["principal"]> = {},
+  nodeOverrides: Partial<EnterpriseSessionContext["node"]> = {},
+): EnterpriseSessionContext {
+  return {
+    principal: {
+      principalType: "human",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      grants: [
+        {
+          action: "workspace.content.read",
+          selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+        },
+      ],
+      credentialId: "cred_a",
+      grantVersion: "grant-v1",
+      ...overrides,
+    },
+    node: {
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: "server-a",
+      mode: "standalone",
+      ...nodeOverrides,
+    },
+    sessionBindingGeneration: generation,
+  };
+}
+
+test("legacy Session has no enterprise context or agent resolution", () => {
+  const session = createSessionForTest();
+  expect(session.getEnterpriseSessionContext()).toBeUndefined();
+  expect(session.bindAgentPrincipalContext("agent-a")).toBeNull();
+  expect(session.resolveAgentPrincipalContext("agent-a")).toBeNull();
+});
+
+test.each([
+  ["context only", { enterpriseContext: enterpriseContext() }],
+  [
+    "registry only",
+    { enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry() },
+  ],
+])("Session rejects %s enterprise half-configuration", (_name, options) => {
+  expect(() => createSessionForTest(options)).toThrow(
+    "Enterprise context and registry must be configured together",
+  );
+});
+
+test("Session normalizes and recursively freezes caller enterprise context", () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const original = enterpriseContext();
+  const session = createSessionForTest({
+    enterpriseContext: original,
+    enterpriseAgentContextRegistry: registry,
+  });
+  original.principal.grants[0].selector.workspaceIds.push("wks_bbbbbbbbbbbbbbbb");
+  original.principal.grants.push({
+    action: "workspace.metadata.read",
+    selector: { kind: "workspace", workspaceIds: ["wks_bbbbbbbbbbbbbbbb"] },
+  });
+  const normalized = session.getEnterpriseSessionContext();
+  expect(normalized?.principal.grants).toHaveLength(1);
+  expect(normalized?.principal.grants[0].selector).toEqual({
+    kind: "workspace",
+    workspaceIds: ["wks_aaaaaaaaaaaaaaaa"],
+  });
+  expect(Object.isFrozen(normalized)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal.grants)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal.grants[0].selector)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal.grants[0].selector.workspaceIds)).toBe(true);
+});
+
+test("Session binds and resolves the exact enterprise agent context", () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: registry,
+  });
+  const handle = session.bindAgentPrincipalContext("agent-a");
+  expect(handle).not.toBeNull();
+  expect(session.resolveAgentPrincipalContext("agent-a")).toBe(handle);
+});
+
+test("replacement and cleanup are generation-scoped across Sessions", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const sessionA = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-a"),
+    enterpriseAgentContextRegistry: registry,
+  });
+  const sessionB = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-b", { principalId: "usr_bbbbbbbbbbbbbbbb" }),
+    enterpriseAgentContextRegistry: registry,
+  });
+  const handleA = sessionA.bindAgentPrincipalContext("agent-a");
+  const handleB = sessionB.bindAgentPrincipalContext("agent-a");
+  expect(sessionA.resolveAgentPrincipalContext("agent-a")).toBeNull();
+  expect(sessionB.resolveAgentPrincipalContext("agent-a")).toBe(handleB);
+  await sessionA.cleanup();
+  expect(sessionB.resolveAgentPrincipalContext("agent-a")).toBe(handleB);
+  await sessionB.cleanup();
+  await sessionB.cleanup();
+  expect(sessionB.resolveAgentPrincipalContext("agent-a")).toBeNull();
+  expect(handleA).not.toBeNull();
+});
+
+test.each([
+  ["credentialId", { credentialId: "cred-b" }, {}],
+  ["grantVersion", { grantVersion: "grant-v2" }, {}],
+  ["nodeId", {}, { nodeId: "nod_bbbbbbbbbbbbbbbb" }],
+  ["paseoServerId", {}, { paseoServerId: "server-b" }],
+  ["mode", {}, { mode: "managed" }],
+  ["principal", { principalId: "usr_bbbbbbbbbbbbbbbb" }, {}],
+])("Session rejects %s mismatch", (_field, principalOverrides, nodeOverrides) => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const base = enterpriseContext();
+  const session = createSessionForTest({
+    enterpriseContext: base,
+    enterpriseAgentContextRegistry: registry,
+  });
+  session.bindAgentPrincipalContext("agent-a");
+  registry.bind({
+    agentId: "agent-a",
+    context: enterpriseContext("generation-a", principalOverrides, nodeOverrides),
+  });
+  expect(session.resolveAgentPrincipalContext("agent-a")).toBeNull();
+});
 
 test("routes host-scoped agent skills requests through the daemon owner", async () => {
   const messages: SessionOutboundMessage[] = [];

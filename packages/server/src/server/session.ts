@@ -157,6 +157,13 @@ import {
   type WorkspaceMutation,
   type WorkspaceRegistry,
 } from "./workspace-registry.js";
+import {
+  isEnterpriseAgentContextCurrentForSession,
+  normalizeEnterpriseSessionContext,
+  type EnterpriseAgentContextHandle,
+  type EnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "./session/enterprise-agent-session-context-registry.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
@@ -447,6 +454,8 @@ type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
   clientId: string;
+  enterpriseContext?: EnterpriseSessionContext;
+  enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -655,6 +664,8 @@ function workspaceLabelErrorCode(error: unknown): string {
 }
 
 export class Session {
+  private readonly enterpriseContext?: EnterpriseSessionContext;
+  private readonly enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
   private readonly clientId: string;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
@@ -757,9 +768,12 @@ export class Session {
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
 
+  // oxlint-disable-next-line complexity -- Session constructor wires existing ports.
   constructor(options: SessionOptions) {
     const {
       clientId,
+      enterpriseContext,
+      enterpriseAgentContextRegistry,
       permissions,
       appVersion,
       clientCapabilities,
@@ -814,6 +828,15 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    if (
+      (enterpriseContext && !enterpriseAgentContextRegistry) ||
+      (!enterpriseContext && enterpriseAgentContextRegistry)
+    )
+      throw new Error("Enterprise context and registry must be configured together");
+    this.enterpriseContext = enterpriseContext
+      ? normalizeEnterpriseSessionContext(enterpriseContext)
+      : undefined;
+    this.enterpriseAgentContextRegistry = enterpriseAgentContextRegistry;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
     this.appVersion = appVersion ?? null;
@@ -7897,6 +7920,10 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
+    if (this.enterpriseContext)
+      this.enterpriseAgentContextRegistry?.releaseSession(
+        this.enterpriseContext.sessionBindingGeneration,
+      );
 
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();
@@ -7926,6 +7953,29 @@ export class Session {
 
     this.workspaceGitObserver.dispose();
     this.workspaceFilesSession.dispose();
+  }
+
+  public getEnterpriseSessionContext(): EnterpriseSessionContext | undefined {
+    return this.enterpriseContext;
+  }
+  public bindAgentPrincipalContext(agentId: string): EnterpriseAgentContextHandle | null {
+    if (
+      this.isCleanedUp ||
+      !this.enterpriseContext ||
+      !this.enterpriseAgentContextRegistry ||
+      !agentId
+    )
+      return null;
+    return this.enterpriseAgentContextRegistry.bind({ agentId, context: this.enterpriseContext });
+  }
+  public resolveAgentPrincipalContext(agentId: string): EnterpriseAgentContextHandle | null {
+    if (this.isCleanedUp || !this.enterpriseContext || !this.enterpriseAgentContextRegistry)
+      return null;
+    const handle = this.enterpriseAgentContextRegistry.resolve(agentId);
+    if (!handle || !this.enterpriseAgentContextRegistry.isCurrentHandle(handle)) return null;
+    return isEnterpriseAgentContextCurrentForSession(handle, this.enterpriseContext)
+      ? handle
+      : null;
   }
 }
 

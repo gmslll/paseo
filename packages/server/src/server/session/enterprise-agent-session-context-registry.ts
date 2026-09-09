@@ -36,7 +36,9 @@ function deepFreeze<T>(value: T): T {
   }
   return value;
 }
-function cloneContext(input: EnterpriseSessionContext): EnterpriseSessionContext {
+export function normalizeEnterpriseSessionContext(
+  input: EnterpriseSessionContext,
+): EnterpriseSessionContext {
   if (!input.sessionBindingGeneration) throw new Error("Invalid generation");
   const principal = PrincipalContextSchema.parse(input.principal);
   const node = NodeContextSchema.parse(input.node);
@@ -69,7 +71,7 @@ export function createEnterpriseAgentSessionContextRegistry(): EnterpriseAgentSe
       if (prior) prior.released = true;
       const entry = {
         agentId: input.agentId,
-        context: cloneContext(input.context),
+        context: normalizeEnterpriseSessionContext(input.context),
         released: false,
         handle: undefined as unknown as EnterpriseAgentContextHandle,
       };
