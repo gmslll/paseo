@@ -6,6 +6,9 @@ Start with [contracts.md](contracts.md). Accepted cross-workstream decisions liv
 The implementation baseline is commit `4879265f8`. W2 owns the machine-readable resource-entry
 inventory and its exhaustiveness checks.
 
+Track release evidence and unresolved production boundaries in the
+[P0 security gate checklist](p0-gate-checklist.md).
+
 ## Decision index
 
 - [ADR 0001: W0 contract test ownership](decisions/0001-w0-contract-test-ownership.md)

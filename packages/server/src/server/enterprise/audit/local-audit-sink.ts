@@ -47,6 +47,8 @@ const ALLOWED_METADATA_KEYS = new Set([
 export interface AuditFileStat {
   readonly size: number;
   readonly mode: number;
+  readonly dev: number;
+  readonly ino: number;
   isFile(): boolean;
   isDirectory(): boolean;
 }
@@ -64,7 +66,10 @@ export interface AuditFileHandle {
 export interface AuditDirectoryHandle {
   stat(): Promise<AuditFileStat>;
   chmod(mode: number): Promise<void>;
+  openFile(name: string, flags: number, mode?: number): Promise<AuditFileHandle>;
   readEntries(): Promise<readonly string[]>;
+  rename(sourceName: string, destinationName: string): Promise<void>;
+  unlink(name: string): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
 }
@@ -74,10 +79,7 @@ export interface AuditFileSystem {
   readonly releaseReady: boolean;
   readonly unsupportedReason?: string;
   ensureDirectory(directory: string, mode: number): Promise<void>;
-  openFile(file: string, flags: number, mode?: number): Promise<AuditFileHandle>;
   openDirectory(directory: string, flags: number): Promise<AuditDirectoryHandle>;
-  rename(source: string, destination: string): Promise<void>;
-  unlink(file: string): Promise<void>;
 }
 
 class NodeAuditDirectoryHandle implements AuditDirectoryHandle {
@@ -94,10 +96,31 @@ class NodeAuditDirectoryHandle implements AuditDirectoryHandle {
     return this.handle.chmod(mode);
   }
 
+  openFile(name: string, flags: number, mode?: number): Promise<AuditFileHandle> {
+    assertAuditEntryName(name);
+    // This path join is the portable adapter's release blocker. The Darwin adapter replaces it
+    // with openat(2) against the already validated directory descriptor.
+    return fs.open(path.join(this.directory, name), flags, mode);
+  }
+
   readEntries(): Promise<readonly string[]> {
     // Node has no portable readdir/openat operation relative to this validated handle. This is
     // the sole path reopen in the adapter and keeps it release-blocked by ADR 0019.
     return fs.readdir(this.directory);
+  }
+
+  async rename(sourceName: string, destinationName: string): Promise<void> {
+    assertAuditEntryName(sourceName);
+    assertAuditEntryName(destinationName);
+    await fs.rename(
+      path.join(this.directory, sourceName),
+      path.join(this.directory, destinationName),
+    );
+  }
+
+  async unlink(name: string): Promise<void> {
+    assertAuditEntryName(name);
+    await fs.unlink(path.join(this.directory, name));
   }
 
   sync(): Promise<void> {
@@ -122,21 +145,23 @@ export class NodeAuditFileSystem implements AuditFileSystem {
     await fs.mkdir(directory, { recursive: true, mode });
   }
 
-  openFile(file: string, flags: number, mode?: number): Promise<AuditFileHandle> {
-    return fs.open(file, flags, mode);
-  }
-
   async openDirectory(directory: string, flags: number): Promise<AuditDirectoryHandle> {
     const handle = await fs.open(directory, flags);
     return new NodeAuditDirectoryHandle(directory, handle);
   }
+}
 
-  async rename(source: string, destination: string): Promise<void> {
-    await fs.rename(source, destination);
-  }
-
-  async unlink(file: string): Promise<void> {
-    await fs.unlink(file);
+export function assertAuditEntryName(name: string): void {
+  if (
+    name.length < 1 ||
+    name === "." ||
+    name === ".." ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    name.includes("\0") ||
+    hasControlCharacter(name)
+  ) {
+    throw new Error("invalid audit directory entry name");
   }
 }
 
@@ -163,6 +188,14 @@ function assertRegularFile(stat: AuditFileStat, subject: string): void {
 function assertDirectoryStat(stat: AuditFileStat): void {
   if (!stat.isDirectory()) throw new Error("audit directory is not a directory");
   if (
+    !Number.isSafeInteger(stat.dev) ||
+    stat.dev < 0 ||
+    !Number.isSafeInteger(stat.ino) ||
+    stat.ino < 1
+  ) {
+    throw new Error("audit directory identity is invalid");
+  }
+  if (
     !Number.isSafeInteger(stat.mode) ||
     stat.mode < 0 ||
     (stat.mode & 0o7777) !== DIRECTORY_MODE
@@ -184,9 +217,13 @@ function pushError(errors: unknown[], error: unknown): void {
   errors.push(error);
 }
 
+function aggregateError(errors: readonly unknown[], message: string): AggregateError {
+  return new AggregateError(errors, message, { cause: errors[0] });
+}
+
 function throwCollected(errors: readonly unknown[], message: string): never {
   if (errors.length === 1) throw errors[0];
-  throw new AggregateError(errors, message);
+  throw aggregateError(errors, message);
 }
 
 function compareCanonicalEntries(left: [string, unknown], right: [string, unknown]): number {
@@ -312,6 +349,16 @@ interface AppendHandle {
   readonly created: boolean;
 }
 
+interface AuditDirectoryIdentity {
+  readonly dev: number;
+  readonly ino: number;
+}
+
+interface OpenedAuditDirectory {
+  readonly handle: AuditDirectoryHandle;
+  readonly identity: AuditDirectoryIdentity;
+}
+
 export class JsonlAuditStorage implements AuditStorage {
   readonly releaseReady: boolean;
   readonly unsupportedReason?: string;
@@ -328,19 +375,19 @@ export class JsonlAuditStorage implements AuditStorage {
     assertNoFollowFlag(this.noFollowFlag);
   }
 
-  private get poisonPath(): string {
-    return path.join(this.directory, ".audit-poisoned");
+  private get poisonName(): string {
+    return ".audit-poisoned";
   }
 
-  private get pendingPoisonPath(): string {
-    return path.join(this.directory, ".audit-poisoned.pending");
+  private get pendingPoisonName(): string {
+    return ".audit-poisoned.pending";
   }
 
   async readAll(): Promise<readonly AuditEvent[]> {
     this.assertNotPoisoned();
     let directoryHandle: AuditDirectoryHandle;
     try {
-      directoryHandle = await this.openDirectory(false);
+      directoryHandle = (await this.openDirectory(false)).handle;
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return [];
       throw error;
@@ -349,14 +396,14 @@ export class JsonlAuditStorage implements AuditStorage {
     const errors: unknown[] = [];
     const events: AuditEvent[] = [];
     try {
-      await this.assertNoPoisonMarker();
+      await this.assertNoPoisonMarker(directoryHandle);
       const names = (await directoryHandle.readEntries())
         .filter((name) => AUDIT_FILE_PATTERN.test(name))
         .sort();
       for (const name of names) {
         const date = AUDIT_FILE_PATTERN.exec(name)?.[1];
         if (!date) throw new Error("invalid audit file name");
-        const text = await this.readFile(path.join(this.directory, name));
+        const text = await this.readFile(directoryHandle, name);
         if (text && !text.endsWith("\n")) throw new Error("truncated audit line");
         for (const line of text.split("\n")) {
           if (!line) continue;
@@ -381,22 +428,28 @@ export class JsonlAuditStorage implements AuditStorage {
     this.assertNotPoisoned();
     const finalized = parseStoredEvent(event);
     const date = finalized.occurredAt.slice(0, 10);
-    const file = path.join(this.directory, `audit-${date}.jsonl`);
+    const fileName = `audit-${date}.jsonl`;
     const errors: unknown[] = [];
     let directoryHandle: AuditDirectoryHandle | null = null;
     let fileHandle: AuditFileHandle | null = null;
+    const markerErrors: unknown[] = [];
     let fileCloseAttempted = false;
     let directoryCloseAttempted = false;
     let created = false;
     let mutationStarted = false;
     let commitDurable = false;
     let needsPoison = false;
+    let poisonAttempted = false;
+    let poisonPersisted = false;
     let originalSize = 0;
+    let directoryIdentity: AuditDirectoryIdentity | null = null;
 
     try {
-      directoryHandle = await this.openDirectory(true);
-      await this.assertNoPoisonMarker();
-      const appendHandle = await this.openAppendHandle(file);
+      const openedDirectory = await this.openDirectory(true);
+      directoryHandle = openedDirectory.handle;
+      directoryIdentity = openedDirectory.identity;
+      await this.assertNoPoisonMarker(directoryHandle);
+      const appendHandle = await this.openAppendHandle(directoryHandle, fileName);
       fileHandle = appendHandle.handle;
       created = appendHandle.created;
       const stat = await fileHandle.stat();
@@ -444,7 +497,8 @@ export class JsonlAuditStorage implements AuditStorage {
           pushError(rollbackErrors, error);
         }
         try {
-          await this.fileSystem.unlink(file);
+          if (!directoryHandle) throw new Error("audit directory handle unavailable for rollback");
+          await directoryHandle.unlink(fileName);
         } catch (error) {
           pushError(rollbackErrors, error);
         }
@@ -471,6 +525,17 @@ export class JsonlAuditStorage implements AuditStorage {
         pushError(errors, error);
       }
     }
+
+    if (needsPoison && directoryHandle) {
+      this.poisoned = true;
+      poisonAttempted = true;
+      try {
+        await this.persistPoisonMarkerWithHandle(directoryHandle);
+        poisonPersisted = true;
+      } catch (error) {
+        pushError(markerErrors, error);
+      }
+    }
     if (directoryHandle && !directoryCloseAttempted) {
       directoryCloseAttempted = true;
       try {
@@ -482,7 +547,23 @@ export class JsonlAuditStorage implements AuditStorage {
     }
 
     if (commitDurable && errors.length > 0) needsPoison = true;
-    if (needsPoison) await this.poisonAndThrow(errors);
+    if (needsPoison && !poisonAttempted) {
+      this.poisoned = true;
+      try {
+        if (!directoryIdentity) throw new Error("audit directory identity unavailable for poison");
+        await this.persistPoisonMarker(directoryIdentity);
+        poisonPersisted = true;
+      } catch (error) {
+        pushError(markerErrors, error);
+      }
+    }
+    if (needsPoison) {
+      const orderedErrors = [...errors, ...markerErrors];
+      if (!poisonPersisted) {
+        throw aggregateError(orderedErrors, "audit failure and poison marker persistence failed");
+      }
+      throwCollected(orderedErrors, "audit storage poisoned after uncertain append");
+    }
     if (errors.length > 0) throwCollected(errors, "audit append failed");
   }
 
@@ -490,19 +571,23 @@ export class JsonlAuditStorage implements AuditStorage {
     if (this.poisoned) throw new Error("audit storage poisoned");
   }
 
-  private async openDirectory(create: boolean): Promise<AuditDirectoryHandle> {
+  private async openDirectory(create: boolean): Promise<OpenedAuditDirectory> {
     if (create) await this.fileSystem.ensureDirectory(this.directory, DIRECTORY_MODE);
     const handle = await this.fileSystem.openDirectory(
       this.directory,
-      fileConstants.O_RDONLY | this.noFollowFlag,
+      fileConstants.O_RDONLY | fileConstants.O_DIRECTORY | this.noFollowFlag,
     );
     const errors: unknown[] = [];
     try {
       const stat = await handle.stat();
       if (!stat.isDirectory()) throw new Error("audit directory is not a directory");
       await handle.chmod(DIRECTORY_MODE);
-      assertDirectoryStat(await handle.stat());
-      return handle;
+      const securedStat = await handle.stat();
+      assertDirectoryStat(securedStat);
+      return {
+        handle,
+        identity: Object.freeze({ dev: securedStat.dev, ino: securedStat.ino }),
+      };
     } catch (error) {
       pushError(errors, error);
     }
@@ -514,10 +599,13 @@ export class JsonlAuditStorage implements AuditStorage {
     throwCollected(errors, "audit directory validation failed");
   }
 
-  private async openAppendHandle(file: string): Promise<AppendHandle> {
+  private async openAppendHandle(
+    directoryHandle: AuditDirectoryHandle,
+    fileName: string,
+  ): Promise<AppendHandle> {
     try {
-      const handle = await this.fileSystem.openFile(
-        file,
+      const handle = await directoryHandle.openFile(
+        fileName,
         fileConstants.O_RDWR |
           fileConstants.O_APPEND |
           fileConstants.O_CREAT |
@@ -529,15 +617,18 @@ export class JsonlAuditStorage implements AuditStorage {
     } catch (error) {
       if (!hasErrorCode(error, "EEXIST")) throw error;
     }
-    const handle = await this.fileSystem.openFile(
-      file,
+    const handle = await directoryHandle.openFile(
+      fileName,
       fileConstants.O_RDWR | fileConstants.O_APPEND | this.noFollowFlag,
     );
     return { handle, created: false };
   }
 
-  private async readFile(file: string): Promise<string> {
-    const handle = await this.fileSystem.openFile(file, fileConstants.O_RDONLY | this.noFollowFlag);
+  private async readFile(directoryHandle: AuditDirectoryHandle, fileName: string): Promise<string> {
+    const handle = await directoryHandle.openFile(
+      fileName,
+      fileConstants.O_RDONLY | this.noFollowFlag,
+    );
     const errors: unknown[] = [];
     let text = "";
     try {
@@ -574,11 +665,14 @@ export class JsonlAuditStorage implements AuditStorage {
     return false;
   }
 
-  private async readMarker(markerPath: string): Promise<boolean> {
+  private async readMarker(
+    directoryHandle: AuditDirectoryHandle,
+    markerName: string,
+  ): Promise<boolean> {
     let handle: AuditFileHandle;
     try {
-      handle = await this.fileSystem.openFile(
-        markerPath,
+      handle = await directoryHandle.openFile(
+        markerName,
         fileConstants.O_RDONLY | this.noFollowFlag,
       );
     } catch (error) {
@@ -610,72 +704,33 @@ export class JsonlAuditStorage implements AuditStorage {
     return true;
   }
 
-  private async assertNoPoisonMarker(): Promise<void> {
+  private async assertNoPoisonMarker(directoryHandle: AuditDirectoryHandle): Promise<void> {
     const hasMarker =
-      (await this.readMarker(this.poisonPath)) || (await this.readMarker(this.pendingPoisonPath));
+      (await this.readMarker(directoryHandle, this.poisonName)) ||
+      (await this.readMarker(directoryHandle, this.pendingPoisonName));
     if (!hasMarker) return;
     this.poisoned = true;
     throw new Error("audit storage poisoned");
   }
 
-  private async poisonAndThrow(reasons: unknown[]): Promise<never> {
-    this.poisoned = true;
-    let markerFailure: unknown;
-    try {
-      await this.persistPoisonMarker();
-    } catch (error) {
-      markerFailure = error;
-    }
-    if (markerFailure !== undefined) {
-      pushError(reasons, markerFailure);
-      throw new AggregateError(reasons, "audit failure and poison marker persistence failed");
-    }
-    throwCollected(reasons, "audit storage poisoned after uncertain append");
-  }
-
-  private async persistPoisonMarker(): Promise<void> {
+  private async persistPoisonMarker(expectedIdentity: AuditDirectoryIdentity): Promise<void> {
     const errors: unknown[] = [];
     let directoryHandle: AuditDirectoryHandle | null = null;
-    let directoryCloseAttempted = false;
     try {
-      directoryHandle = await this.openDirectory(true);
-      if (await this.readMarker(this.poisonPath)) {
-        directoryCloseAttempted = true;
-        await directoryHandle.close();
-        return;
+      const openedDirectory = await this.openDirectory(false);
+      directoryHandle = openedDirectory.handle;
+      if (
+        openedDirectory.identity.dev !== expectedIdentity.dev ||
+        openedDirectory.identity.ino !== expectedIdentity.ino
+      ) {
+        throw new Error("audit directory identity changed before poison persistence");
       }
+      await this.persistPoisonMarkerWithHandle(directoryHandle);
     } catch (error) {
       pushError(errors, error);
     }
 
-    if (directoryHandle && errors.length === 0) {
-      let pendingExists = false;
-      try {
-        pendingExists = await this.readMarker(this.pendingPoisonPath);
-      } catch (error) {
-        pushError(errors, error);
-      }
-
-      if (!pendingExists && errors.length === 0) {
-        try {
-          await this.createPendingPoisonMarker();
-          pendingExists = true;
-        } catch (error) {
-          pushError(errors, error);
-        }
-      }
-
-      if (pendingExists && errors.length === 0) {
-        try {
-          await this.fileSystem.rename(this.pendingPoisonPath, this.poisonPath);
-          await directoryHandle.sync();
-        } catch (error) {
-          pushError(errors, error);
-        }
-      }
-    }
-
-    if (directoryHandle && !directoryCloseAttempted) {
+    if (directoryHandle) {
       try {
         await directoryHandle.close();
       } catch (error) {
@@ -683,16 +738,57 @@ export class JsonlAuditStorage implements AuditStorage {
       }
     }
     if (errors.length > 0) {
-      throw new AggregateError(errors, "failed to persist audit poison marker");
+      throw aggregateError(errors, "failed to persist audit poison marker");
     }
   }
 
-  private async createPendingPoisonMarker(): Promise<void> {
+  private async persistPoisonMarkerWithHandle(
+    directoryHandle: AuditDirectoryHandle,
+  ): Promise<void> {
+    const errors: unknown[] = [];
+    try {
+      if (await this.readMarker(directoryHandle, this.poisonName)) return;
+    } catch (error) {
+      pushError(errors, error);
+    }
+
+    let pendingExists = false;
+    if (errors.length === 0) {
+      try {
+        pendingExists = await this.readMarker(directoryHandle, this.pendingPoisonName);
+      } catch (error) {
+        pushError(errors, error);
+      }
+    }
+
+    if (!pendingExists && errors.length === 0) {
+      try {
+        await this.createPendingPoisonMarker(directoryHandle);
+        pendingExists = true;
+      } catch (error) {
+        pushError(errors, error);
+      }
+    }
+
+    if (pendingExists && errors.length === 0) {
+      try {
+        await directoryHandle.rename(this.pendingPoisonName, this.poisonName);
+        await directoryHandle.sync();
+      } catch (error) {
+        pushError(errors, error);
+      }
+    }
+    if (errors.length > 0) {
+      throw aggregateError(errors, "failed to persist audit poison marker");
+    }
+  }
+
+  private async createPendingPoisonMarker(directoryHandle: AuditDirectoryHandle): Promise<void> {
     const errors: unknown[] = [];
     let markerHandle: AuditFileHandle | null = null;
     try {
-      markerHandle = await this.fileSystem.openFile(
-        this.pendingPoisonPath,
+      markerHandle = await directoryHandle.openFile(
+        this.pendingPoisonName,
         fileConstants.O_CREAT | fileConstants.O_EXCL | fileConstants.O_RDWR | this.noFollowFlag,
         FILE_MODE,
       );
@@ -700,7 +796,7 @@ export class JsonlAuditStorage implements AuditStorage {
       pushError(errors, error);
     }
     if (!markerHandle) {
-      throw new AggregateError(errors, "failed to open audit poison marker");
+      throw aggregateError(errors, "failed to open audit poison marker");
     }
 
     try {
@@ -731,7 +827,7 @@ export class JsonlAuditStorage implements AuditStorage {
       pushError(errors, error);
     }
     if (errors.length > 0) {
-      throw new AggregateError(errors, "failed to prepare audit poison marker");
+      throw aggregateError(errors, "failed to prepare audit poison marker");
     }
   }
 }
@@ -1102,7 +1198,7 @@ export class LocalAuditSink implements LocalAuditSinkContract {
       return;
     }
     if (this.degradation) {
-      throw new AggregateError([this.degradation.error], "audit storage recovery is unverified");
+      throw aggregateError([this.degradation.error], "audit storage recovery is unverified");
     }
   }
 

@@ -228,17 +228,6 @@ class FaultFiles implements AuditFileSystem {
     this.throwAfter(fault, "ensure");
   }
 
-  async openFile(file: string, flags: number, mode?: number): Promise<AuditFileHandle> {
-    const kind = this.fileKind(file);
-    const fault = this.record(`${kind}.open`, `open:${kind}`);
-    this.opens.push({ kind: "file", name: path.basename(file), flags, mode });
-    this.throwBefore(fault, `${kind}.open`);
-    const handle = await this.node.openFile(file, flags, mode);
-    this.throwAfter(fault, `${kind}.open`);
-    const label = `${kind}${++this.nextHandleId}`;
-    return this.wrapFile(handle, kind, label);
-  }
-
   async openDirectory(directory: string, flags: number): Promise<AuditDirectoryHandle> {
     const fault = this.record("directory.open", "open:directory");
     this.opens.push({ kind: "directory", name: path.basename(directory), flags });
@@ -247,20 +236,6 @@ class FaultFiles implements AuditFileSystem {
     this.throwAfter(fault, "directory.open");
     const label = `directory${++this.nextHandleId}`;
     return this.wrapDirectory(handle, label);
-  }
-
-  async rename(source: string, destination: string): Promise<void> {
-    const fault = this.record("rename", "rename");
-    this.throwBefore(fault, "rename");
-    await this.node.rename(source, destination);
-    this.throwAfter(fault, "rename");
-  }
-
-  async unlink(file: string): Promise<void> {
-    const fault = this.record("unlink", "unlink");
-    this.throwBefore(fault, "unlink");
-    await this.node.unlink(file);
-    this.throwAfter(fault, "unlink");
   }
 
   private wrapFile(handle: AuditFileHandle, kind: string, label: string): AuditFileHandle {
@@ -331,12 +306,34 @@ class FaultFiles implements AuditFileSystem {
         await handle.chmod(mode);
         this.throwAfter(fault, "directory.chmod");
       },
+      openFile: async (name, flags, mode) => {
+        const kind = this.fileKind(name);
+        const fault = this.record(`${kind}.open`, `open:${kind}`);
+        this.opens.push({ kind: "file", name, flags, mode });
+        this.throwBefore(fault, `${kind}.open`);
+        const fileHandle = await handle.openFile(name, flags, mode);
+        this.throwAfter(fault, `${kind}.open`);
+        const fileLabel = `${kind}${++this.nextHandleId}`;
+        return this.wrapFile(fileHandle, kind, fileLabel);
+      },
       readEntries: async () => {
         const fault = this.record("directory.read", `${label}:read`);
         this.throwBefore(fault, "directory.read");
         const value = await handle.readEntries();
         this.throwAfter(fault, "directory.read");
         return value;
+      },
+      rename: async (sourceName, destinationName) => {
+        const fault = this.record("rename", "rename");
+        this.throwBefore(fault, "rename");
+        await handle.rename(sourceName, destinationName);
+        this.throwAfter(fault, "rename");
+      },
+      unlink: async (name) => {
+        const fault = this.record("unlink", "unlink");
+        this.throwBefore(fault, "unlink");
+        await handle.unlink(name);
+        this.throwAfter(fault, "unlink");
       },
       sync: async () => {
         const fault = this.record("directory.sync", `${label}:sync`);
@@ -1284,6 +1281,31 @@ describe("JsonlAuditStorage", () => {
     }
   });
 
+  it("closes exactly once and aggregates directory enumeration plus close failures", async () => {
+    const directory = await temporaryDirectory("paseo-audit-directory-errors-");
+    const files = new FaultFiles([
+      { operation: "directory.read" },
+      { operation: "directory.close", mode: "after" },
+    ]);
+    try {
+      let failure: unknown;
+      try {
+        await new JsonlAuditStorage(directory, files).readAll();
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(aggregateMessages(failure)).toEqual(["fault:directory.read", "fault:directory.close"]);
+      const aggregate = failure as AggregateError;
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
+      expect(files.trace.filter((entry) => entry === "directory1:close")).toEqual([
+        "directory1:close",
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("persists a strict poison marker when rollback fails and preserves the damaged tail", async () => {
     const directory = await temporaryDirectory("paseo-audit-poison-");
     const dataFile = path.join(directory, "audit-2026-01-01.jsonl");
@@ -1308,22 +1330,22 @@ describe("JsonlAuditStorage", () => {
       expect(damaged.endsWith("\n")).toBe(false);
       expect(await readFile(poisonFile, "utf8")).toBe("paseo-audit-poisoned-v1\n");
       expect(files.trace.slice(-16)).toEqual([
-        "open:directory",
-        "directory3:stat",
-        "directory3:chmod",
-        "directory3:stat",
+        "data2:write",
+        "data2:truncate",
+        "data2:sync",
+        "data2:close",
         "open:poison",
         "open:pending",
         "open:pending",
-        "pending4:stat",
-        "pending4:chmod",
-        "pending4:stat",
-        "pending4:write",
-        "pending4:sync",
-        "pending4:close",
+        "pending3:stat",
+        "pending3:chmod",
+        "pending3:stat",
+        "pending3:write",
+        "pending3:sync",
+        "pending3:close",
         "rename",
-        "directory3:sync",
-        "directory3:close",
+        "directory1:sync",
+        "directory1:close",
       ]);
       const pendingOpen = files.opens.find(
         (record) => record.name === ".audit-poisoned.pending" && record.mode === 0o600,
@@ -1424,7 +1446,7 @@ describe("JsonlAuditStorage", () => {
     }
   });
 
-  it("returns every rollback and marker failure in one AggregateError", async () => {
+  it("orders primary, rollback/close, and marker failures in one AggregateError", async () => {
     const directory = await temporaryDirectory("paseo-audit-marker-errors-");
     const files = new FaultFiles([
       { operation: "data.write", mode: "short" },
@@ -1432,7 +1454,7 @@ describe("JsonlAuditStorage", () => {
       { operation: "pending.write", mode: "short" },
       { operation: "pending.sync" },
       { operation: "pending.close", mode: "after" },
-      { operation: "directory.close", occurrence: 2, mode: "after" },
+      { operation: "directory.close", mode: "after" },
     ]);
     try {
       let failure: unknown;
@@ -1445,11 +1467,15 @@ describe("JsonlAuditStorage", () => {
       expect(aggregateMessages(failure)).toEqual([
         "audit short write",
         "fault:data.truncate",
+        "fault:directory.close",
         "audit poison marker short write",
         "fault:pending.sync",
         "fault:pending.close",
-        "fault:directory.close",
       ]);
+      const aggregate = failure as AggregateError;
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
+      expect(aggregate.cause).toBeInstanceOf(Error);
+      expect((aggregate.cause as Error).message).toBe("audit short write");
       expect(await readdir(directory)).toEqual([".audit-poisoned.pending"]);
     } finally {
       await rm(directory, { recursive: true, force: true });
