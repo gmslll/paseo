@@ -1,10 +1,12 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, expectTypeOf, test } from "vitest";
 import { z } from "zod";
 
 import {
   AgentSnapshotPayloadSchema,
   AgentOwnershipEnvelopeSchema,
   AppSlotRecordSchema,
+  AuditAppendOptionsSchema,
+  AuditEventInputSchema,
   AuditEventSchema,
   BrowserProfileRecordSchema,
   BrowserProfileBindingProjectionSchema,
@@ -46,8 +48,15 @@ import {
   type AuthorizedAppSlot,
   type AuthorizedBrowserProfile,
   type AuthorizedWorkspace,
+  type AuditAppendOptions,
+  type AuditEvent,
+  type AuditEventInput,
+  type AuditSequence,
+  type AuditStorage,
   type EnterpriseAction,
   type EnterpriseWorkspaceAuthorizationRecord,
+  type LocalAuditSinkContract,
+  type LocalAuditSinkDependencies,
   type PrincipalContext,
   type ResourceAuthorization,
   type SessionOutboundMessage,
@@ -270,6 +279,107 @@ class MemoryResourceAuthorization implements ResourceAuthorization {
 }
 
 describe("enterprise resource contracts", () => {
+  test("audit callers submit strict business input without sink-owned chain fields", () => {
+    const input = {
+      organizationId: ORGANIZATION_ID,
+      actorPrincipalId: OWNER_ID,
+      actorCredentialId: "credential-1",
+      sessionId: "session-1",
+      action: "browser.lease.acquired",
+      resource: { kind: "browser_profile", id: "brp_5555555555555555" },
+      workspaceId: "wks_1",
+      agentId: "agent-1",
+      outcome: "allowed",
+      reasonCode: "lease_acquired",
+      metadata: { mode: "write" },
+    } as const;
+
+    expect(AuditEventInputSchema.parse(input)).toEqual(input);
+
+    const sinkOwnedFields = {
+      eventId: "evt-1",
+      occurredAt: "2026-09-09T00:00:00.000Z",
+      nodeId: NODE_ID,
+      nodeEventSeq: 1,
+      previousHash: "previous-hash",
+      eventHash: "event-hash",
+    };
+    for (const [field, value] of Object.entries(sinkOwnedFields)) {
+      expect(AuditEventInputSchema.safeParse({ ...input, [field]: value }).success).toBe(false);
+    }
+  });
+
+  test("the Local AuditSink contract returns one finalized event for explicit durability", async () => {
+    const node = { nodeId: NODE_ID, paseoServerId: "srv_local", mode: "standalone" } as const;
+    const input: AuditEventInput = AuditEventInputSchema.parse({
+      organizationId: ORGANIZATION_ID,
+      actorPrincipalId: OWNER_ID,
+      action: "boss.content.viewed",
+      resource: { kind: "workspace", id: "wks_1" },
+      workspaceId: "wks_1",
+      outcome: "allowed",
+    });
+    const finalized: AuditEvent = AuditEventSchema.parse({
+      ...input,
+      eventId: "evt-1",
+      occurredAt: "2026-09-09T00:00:00.000Z",
+      nodeId: NODE_ID,
+      nodeEventSeq: 1,
+      eventHash: "event-hash",
+    });
+    const calls: Array<{ input: AuditEventInput; options: AuditAppendOptions }> = [];
+    const sink: LocalAuditSinkContract = {
+      adapterKind: "local",
+      node,
+      append: async (candidate, options) => {
+        calls.push({ input: candidate, options });
+        return finalized;
+      },
+    };
+
+    await expect(
+      sink.append(input, AuditAppendOptionsSchema.parse({ durability: "required" })),
+    ).resolves.toEqual(finalized);
+    expect(calls).toEqual([{ input, options: { durability: "required" } }]);
+    expect(AuditAppendOptionsSchema.parse({ durability: "buffered" })).toEqual({
+      durability: "buffered",
+    });
+    expect(AuditAppendOptionsSchema.safeParse({ durability: "best_effort" }).success).toBe(false);
+    expect(
+      AuditAppendOptionsSchema.safeParse({ durability: "required", extra: true }).success,
+    ).toBe(false);
+  });
+
+  test("Local AuditSink construction dependencies keep authority behind injected ports", async () => {
+    expectTypeOf<AuditStorage["readAll"]>().toEqualTypeOf<() => Promise<readonly AuditEvent[]>>();
+    expectTypeOf<AuditStorage["append"]>().toEqualTypeOf<
+      (event: Readonly<AuditEvent>) => Promise<void>
+    >();
+    expectTypeOf<AuditSequence["next"]>().toEqualTypeOf<
+      (previousSequence: number | null) => Promise<number>
+    >();
+
+    const node = { nodeId: NODE_ID, paseoServerId: "srv_local", mode: "standalone" } as const;
+    const dependencies: LocalAuditSinkDependencies = {
+      node,
+      clock: { now: () => "2026-09-09T00:00:00.000Z" },
+      idSource: { next: () => "evt-1" },
+      hash: { hash: async () => "event-hash" },
+      sequence: { next: async (previousSequence) => (previousSequence ?? 0) + 1 },
+      storage: {
+        readAll: async () => [],
+        append: async () => undefined,
+      },
+    };
+
+    expect(dependencies.node).toBe(node);
+    expect(dependencies.clock.now()).toBe("2026-09-09T00:00:00.000Z");
+    expect(dependencies.idSource.next()).toBe("evt-1");
+    await expect(dependencies.storage.readAll()).resolves.toEqual([]);
+    await expect(dependencies.sequence.next(null)).resolves.toBe(1);
+    await expect(dependencies.sequence.next(7)).resolves.toBe(8);
+  });
+
   test("UI identity and Profile projections omit authentication and browser storage fields", () => {
     const principal = PrincipalContextSchema.parse({
       ...PRINCIPAL,
