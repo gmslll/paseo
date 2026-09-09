@@ -90,6 +90,26 @@ describe("desktop packaging", () => {
     );
   });
 
+  it("builds, traces, and unpacks the Darwin audit native binding", () => {
+    const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
+    const serverPackage = readFileSync(join(packageRoot, "..", "server", "package.json"), "utf8");
+    const runtimeTrace = readFileSync(
+      join(packageRoot, "..", "..", "scripts", "trace-daemon.mjs"),
+      "utf8",
+    );
+    const bindingPath =
+      "packages/server/dist/server/server/enterprise/audit/native/darwin-audit-fs.node";
+
+    expect(serverPackage).toContain(
+      "node src/server/enterprise/audit/native/build-darwin-audit-fs.mjs",
+    );
+    expect(runtimeTrace).toContain('process.platform === "darwin"');
+    expect(runtimeTrace).toContain(`"${bindingPath}"`);
+    expect(config).toContain(
+      "node_modules/@getpaseo/server/dist/server/server/enterprise/audit/native/*.node",
+    );
+  });
+
   it("excludes package debug/source files from the packaged app", () => {
     const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
 

@@ -73,6 +73,9 @@ const additionalInputs = [
   // Copy the wrapper plus the host platform package explicitly.
   "node_modules/sherpa-onnx-node/**",
   `node_modules/${sherpaPlatformPackageName()}/**`,
+  ...(process.platform === "darwin"
+    ? ["packages/server/dist/server/server/enterprise/audit/native/darwin-audit-fs.node"]
+    : []),
   ...(traceDesktop
     ? [
         // The unpackaged Nix launcher resolves these beside desktop/dist.
