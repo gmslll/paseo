@@ -11,7 +11,12 @@ export type EnterpriseAgentAuthorizationRecord = EnterpriseResourceOwnerWire & {
   workspaceId?: string;
 };
 
-export type QuarantineReason = "legacy_owner_only" | "partial_owner" | "missing_workspace";
+export type QuarantineReason =
+  | "legacy_owner_only"
+  | "partial_owner"
+  | "missing_workspace"
+  | "workspace_unavailable"
+  | "owner_mismatch";
 
 export interface QuarantinedResource {
   kind: "workspace" | "agent";
@@ -52,10 +57,39 @@ export class OwnerRegistry {
       return;
     }
 
+    const workspace = this.workspaces.get(record.workspaceId);
+    if (!workspace) {
+      this.agents.delete(record.id);
+      this.quarantine.set(key, {
+        kind: "agent",
+        id: record.id,
+        reason: "workspace_unavailable",
+      });
+      return;
+    }
+
     const result = classifyOwner(record);
     if (result.kind === "quarantined") {
+      if (result.reason === "legacy_owner_only") {
+        this.agents.set(record.id, {
+          agentId: record.id,
+          workspaceId: record.workspaceId,
+          organizationId: workspace.organizationId,
+          nodeId: workspace.nodeId,
+          ownerPrincipalId: workspace.ownerPrincipalId,
+          createdByPrincipalId: workspace.createdByPrincipalId,
+        });
+        this.quarantine.delete(key);
+        return;
+      }
       this.agents.delete(record.id);
       this.quarantine.set(key, { kind: "agent", id: record.id, reason: result.reason });
+      return;
+    }
+
+    if (!ownersMatch(result.owner, workspace)) {
+      this.agents.delete(record.id);
+      this.quarantine.set(key, { kind: "agent", id: record.id, reason: "owner_mismatch" });
       return;
     }
 
@@ -99,4 +133,16 @@ function classifyOwner(
   } catch {
     return { kind: "quarantined", reason: "partial_owner" };
   }
+}
+
+function ownersMatch(
+  left: NonNullable<ReturnType<typeof normalizeEnterpriseResourceOwner>>,
+  right: NonNullable<ReturnType<typeof normalizeEnterpriseResourceOwner>>,
+): boolean {
+  return (
+    left.organizationId === right.organizationId &&
+    left.nodeId === right.nodeId &&
+    left.ownerPrincipalId === right.ownerPrincipalId &&
+    left.createdByPrincipalId === right.createdByPrincipalId
+  );
 }
