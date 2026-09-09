@@ -1,5 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { PASEO_BROWSER_PROFILE_PARTITION } from "../browser-profile.js";
+import {
+  getEnterpriseBrowserProfilePartition,
+  PASEO_BROWSER_PROFILE_PARTITION,
+  type BrowserProfileRuntimeAuthorization,
+} from "../browser-profile.js";
 import {
   getPaseoBrowserIdForWebContents,
   getPaseoBrowserWorkspaceId,
@@ -17,6 +21,15 @@ class FakeRenderer {
     return false;
   }
 }
+
+const enterpriseAuthorization: BrowserProfileRuntimeAuthorization = {
+  organizationId: "org_1111111111111111",
+  homeNodeId: "nod_1111111111111111",
+  workspaceId: "workspace-enterprise",
+  browserProfileId: "brp_1111111111111111",
+  bindingRevision: "binding-a",
+  lifecycleGeneration: "lifecycle-a",
+};
 
 class FakeBrowserGuest {
   public readonly backgroundThrottlingCalls: boolean[] = [];
@@ -64,6 +77,23 @@ describe("browser webview attachment", () => {
     ).toBe(false);
     expect(
       isPaseoBrowserWebviewAttach({ src: "https://example.com", partition: "persist:foreign" }),
+    ).toBe(false);
+  });
+
+  test("accepts an enterprise WebView only on its derived Profile partition", () => {
+    expect(
+      isPaseoBrowserWebviewAttach({
+        src: "https://example.com",
+        partition: getEnterpriseBrowserProfilePartition(enterpriseAuthorization.browserProfileId),
+        profileAuthorization: enterpriseAuthorization,
+      }),
+    ).toBe(true);
+    expect(
+      isPaseoBrowserWebviewAttach({
+        src: "https://example.com",
+        partition: PASEO_BROWSER_PROFILE_PARTITION,
+        profileAuthorization: enterpriseAuthorization,
+      }),
     ).toBe(false);
   });
 
@@ -122,6 +152,39 @@ describe("browser webview attachment", () => {
 
     expect(registered).toBe(false);
     expect(getPaseoBrowserIdForWebContents(guest)).toBeNull();
+  });
+
+  test("registers only the exact enterprise Profile session and host tuple", () => {
+    const renderer = new FakeRenderer(7);
+    const profileSession = {};
+    const guest = new FakeBrowserGuest(307, renderer, profileSession);
+
+    expect(
+      registerAttachedPaseoBrowser({
+        browserId: "browser-enterprise",
+        workspaceId: enterpriseAuthorization.workspaceId,
+        webContentsId: guest.id,
+        sender: renderer,
+        profileSession,
+        profileAuthorization: enterpriseAuthorization,
+        findWebContents: () => guest,
+      }),
+    ).toBe(true);
+    expect(() =>
+      registerAttachedPaseoBrowser({
+        browserId: "browser-enterprise",
+        workspaceId: enterpriseAuthorization.workspaceId,
+        webContentsId: 308,
+        sender: renderer,
+        profileSession,
+        profileAuthorization: {
+          ...enterpriseAuthorization,
+          browserProfileId: "brp_2222222222222222",
+        },
+        findWebContents: () => new FakeBrowserGuest(308, renderer, profileSession),
+      }),
+    ).toThrow(/cannot change/i);
+    unregisterPaseoBrowser("browser-enterprise");
   });
 
   test("concurrent windows cannot swap browser identities", () => {

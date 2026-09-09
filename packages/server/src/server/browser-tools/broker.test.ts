@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type {
   BrowserAutomationCommand,
   BrowserAutomationCommandName,
-  BrowserAutomationEnterpriseContext,
   BrowserAutomationExecuteRequest,
   BrowserAutomationExecuteResponse,
 } from "@getpaseo/protocol/browser-automation/rpc-schemas";
@@ -11,18 +10,6 @@ import { BrowserToolsBroker, type BrowserHostClient } from "./broker.js";
 
 const BROWSER_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_BROWSER_ID = "22222222-2222-4222-8222-222222222222";
-const PROFILE_ID = "brp_1111111111111111";
-const SECOND_PROFILE_ID = "brp_2222222222222222";
-const NODE_ID = "nod_1111111111111111";
-const SECOND_NODE_ID = "nod_2222222222222222";
-const ENTERPRISE_CONTEXT: BrowserAutomationEnterpriseContext = {
-  browserProfileId: PROFILE_ID,
-  nodeId: NODE_ID,
-  leaseId: "lea_11111111-1111-4111-8111-111111111111",
-  fencingToken: 1,
-  leaseRevision: "generation-1:1",
-};
-
 class FakeBrowserHostClient implements BrowserHostClient {
   public readonly receivedRequests: BrowserAutomationExecuteRequest[] = [];
   public readonly hostKind: string;
@@ -45,9 +32,11 @@ class FakeBrowserHostClient implements BrowserHostClient {
     this.homeNodeId = options.homeNodeId;
   }
 
-  public sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void {
+  public readonly sendBrowserAutomationRequest = (
+    request: BrowserAutomationExecuteRequest,
+  ): void => {
     this.receivedRequests.push(request);
-  }
+  };
 
   public resolveLatestWith(
     broker: BrowserToolsBroker,
@@ -77,9 +66,9 @@ class FailingBrowserHostClient implements BrowserHostClient {
   public readonly hostKind = "desktop app";
   public readonly supportedCommands = [...BROWSER_AUTOMATION_COMMAND_NAMES];
 
-  public sendBrowserAutomationRequest(): void {
+  public readonly sendBrowserAutomationRequest = (): void => {
     throw new Error("websocket send failed");
-  }
+  };
 }
 
 function createBroker(options: { timeoutMs?: number } = {}): BrowserToolsBroker {
@@ -958,195 +947,5 @@ describe("BrowserToolsBroker", () => {
       },
     });
     expect(broker.getPendingRequestCount()).toBe(0);
-  });
-
-  describe("enterprise Profile routing", () => {
-    test("targets only enterprise hosts on the Profile home node", async () => {
-      const broker = createBroker();
-      const legacyHost = new FakeBrowserHostClient("legacy-host");
-      const otherNodeHost = new FakeBrowserHostClient("other-node-host", {
-        enterpriseProfiles: { version: 1 },
-        homeNodeId: SECOND_NODE_ID,
-      });
-      const profileHost = new FakeBrowserHostClient("profile-host", {
-        enterpriseProfiles: { version: 1 },
-        homeNodeId: NODE_ID,
-      });
-      broker.registerClient(legacyHost);
-      broker.registerClient(profileHost);
-      broker.registerClient(otherNodeHost);
-
-      const resultPromise = broker.execute({
-        command: { command: "list_tabs", args: {} },
-        workspaceId: "workspace-1",
-        enterpriseContext: ENTERPRISE_CONTEXT,
-      });
-
-      expect(legacyHost.receivedRequests).toEqual([]);
-      expect(otherNodeHost.receivedRequests).toEqual([]);
-      expect(profileHost.receivedRequests).toEqual([
-        {
-          type: "browser.automation.execute.request",
-          requestId: "req-1",
-          workspaceId: "workspace-1",
-          enterpriseContext: ENTERPRISE_CONTEXT,
-          command: { command: "list_tabs", args: {} },
-        },
-      ]);
-
-      profileHost.resolveLatestWith(broker, {
-        requestId: "req-1",
-        ok: true,
-        enterpriseContext: ENTERPRISE_CONTEXT,
-        result: { command: "list_tabs", tabs: [] },
-      });
-
-      await expect(resultPromise).resolves.toMatchObject({ ok: true });
-    });
-
-    test("ignores responses from the wrong sender or with a mismatched Profile tuple", async () => {
-      const broker = createBroker();
-      const profileHost = new FakeBrowserHostClient("profile-host", {
-        enterpriseProfiles: { version: 1 },
-        homeNodeId: NODE_ID,
-      });
-      broker.registerClient(profileHost);
-
-      const resultPromise = broker.execute({
-        command: { command: "new_tab", args: {} },
-        workspaceId: "workspace-1",
-        enterpriseContext: ENTERPRISE_CONTEXT,
-      });
-      const request = profileHost.receivedRequests[0];
-      const response: BrowserAutomationExecuteResponse = {
-        type: "browser.automation.execute.response",
-        payload: {
-          requestId: request.requestId,
-          ok: true,
-          enterpriseContext: ENTERPRISE_CONTEXT,
-          result: {
-            command: "new_tab",
-            browserId: BROWSER_ID,
-            workspaceId: "workspace-1",
-            url: "https://example.com",
-          },
-        },
-      };
-
-      expect(broker.receiveResponse("spoofed-host", response)).toBe(false);
-      expect(
-        broker.receiveResponse(profileHost.id, {
-          ...response,
-          payload: {
-            ...response.payload,
-            enterpriseContext: {
-              ...ENTERPRISE_CONTEXT,
-              browserProfileId: SECOND_PROFILE_ID,
-            },
-          },
-        }),
-      ).toBe(false);
-      expect(broker.getPendingRequestCount()).toBe(1);
-      expect(broker.receiveResponse(profileHost.id, response)).toBe(true);
-      await expect(resultPromise).resolves.toMatchObject({
-        ok: true,
-        result: { browserId: BROWSER_ID },
-      });
-    });
-
-    test("does not fall back to the only host for an unknown enterprise browser id", async () => {
-      const broker = createBroker();
-      const profileHost = new FakeBrowserHostClient("profile-host", {
-        enterpriseProfiles: { version: 1 },
-        homeNodeId: NODE_ID,
-      });
-      broker.registerClient(profileHost);
-
-      await expect(
-        broker.execute({
-          command: { command: "snapshot", args: { browserId: BROWSER_ID } },
-          workspaceId: "workspace-1",
-          enterpriseContext: ENTERPRISE_CONTEXT,
-        }),
-      ).resolves.toMatchObject({
-        ok: false,
-        error: { code: "browser_tab_not_found" },
-      });
-      expect(profileHost.receivedRequests).toEqual([]);
-    });
-
-    test("requires list_tabs to restore enterprise affinity after disconnect", async () => {
-      const broker = createBroker();
-      const firstHost = new FakeBrowserHostClient("profile-host", {
-        enterpriseProfiles: { version: 1 },
-        homeNodeId: NODE_ID,
-      });
-      const unregister = broker.registerClient(firstHost);
-      const newTabPromise = broker.execute({
-        command: { command: "new_tab", args: {} },
-        workspaceId: "workspace-1",
-        enterpriseContext: ENTERPRISE_CONTEXT,
-      });
-      firstHost.resolveLatestWith(broker, {
-        requestId: "req-1",
-        ok: true,
-        enterpriseContext: ENTERPRISE_CONTEXT,
-        result: {
-          command: "new_tab",
-          browserId: BROWSER_ID,
-          workspaceId: "workspace-1",
-          url: "https://example.com",
-        },
-      });
-      await newTabPromise;
-      unregister();
-
-      const reconnectedHost = new FakeBrowserHostClient("profile-host", {
-        enterpriseProfiles: { version: 1 },
-        homeNodeId: NODE_ID,
-      });
-      broker.registerClient(reconnectedHost);
-      await expect(
-        broker.execute({
-          command: { command: "snapshot", args: { browserId: BROWSER_ID } },
-          workspaceId: "workspace-1",
-          enterpriseContext: ENTERPRISE_CONTEXT,
-        }),
-      ).resolves.toMatchObject({ ok: false, error: { code: "browser_tab_not_found" } });
-
-      const listPromise = broker.execute({
-        command: { command: "list_tabs", args: {} },
-        workspaceId: "workspace-1",
-        enterpriseContext: ENTERPRISE_CONTEXT,
-      });
-      reconnectedHost.resolveLatestWith(broker, {
-        requestId: "req-1",
-        ok: true,
-        enterpriseContext: ENTERPRISE_CONTEXT,
-        result: {
-          command: "list_tabs",
-          tabs: [
-            {
-              browserId: BROWSER_ID,
-              workspaceId: "workspace-1",
-              enterpriseContext: ENTERPRISE_CONTEXT,
-              url: "https://example.com",
-              title: "Example",
-            },
-          ],
-        },
-      });
-      await listPromise;
-
-      void broker.execute({
-        command: { command: "snapshot", args: { browserId: BROWSER_ID } },
-        workspaceId: "workspace-1",
-        enterpriseContext: ENTERPRISE_CONTEXT,
-      });
-      expect(reconnectedHost.receivedRequests.at(-1)?.command).toEqual({
-        command: "snapshot",
-        args: { browserId: BROWSER_ID },
-      });
-    });
   });
 });

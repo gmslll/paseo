@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { BrowserAutomationBrowserIdSchema } from "@getpaseo/protocol/browser-automation/rpc-schemas";
+import type { EnterpriseAgentContextHandle } from "../session/enterprise-agent-session-context-registry.js";
 import type { BrowserToolsBroker } from "./broker.js";
-import type { BrowserToolsResponsePayload } from "./errors.js";
+import { browserToolsFailure, type BrowserToolsResponsePayload } from "./errors.js";
 import type {
   PaseoToolConfig,
   PaseoToolExecutionContext,
@@ -24,9 +25,14 @@ export interface RegisterBrowserToolsOptions {
       context: PaseoToolExecutionContext,
     ) => Promise<PaseoToolResult>,
   ) => void;
-  broker: Pick<BrowserToolsBroker, "execute">;
+  broker: Pick<BrowserToolsBroker, "execute"> &
+    Partial<Pick<BrowserToolsBroker, "executeEnterprise">>;
   callerAgentId?: string;
   resolveCallerAgent: () => CallerAgentContext | null;
+  resolveEnterpriseBrowserContext?: () =>
+    | { handle: EnterpriseAgentContextHandle }
+    | null
+    | Promise<{ handle: EnterpriseAgentContextHandle } | null>;
 }
 
 const HTTP_URL_ONLY_MESSAGE = "URL must use http/https only";
@@ -64,6 +70,29 @@ const BrowserWaitInputSchema = z
   });
 
 export function registerBrowserTools(options: RegisterBrowserToolsOptions): void {
+  const configuredBroker = options.broker;
+  if (options.resolveEnterpriseBrowserContext) {
+    const resolveEnterpriseBrowserContext = options.resolveEnterpriseBrowserContext;
+    options = {
+      ...options,
+      broker: {
+        execute: async (input) => {
+          const enterprise = await resolveEnterpriseBrowserContext();
+          if (!enterprise || !configuredBroker.executeEnterprise) {
+            return browserToolsFailure({
+              requestId: "unknown",
+              code: "browser_denied",
+              message: "Enterprise browser authorization is unavailable.",
+            });
+          }
+          return configuredBroker.executeEnterprise({
+            handle: enterprise.handle,
+            command: input.command,
+          });
+        },
+      },
+    };
+  }
   options.registerTool(
     "browser_list_tabs",
     {

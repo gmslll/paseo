@@ -1,3 +1,8 @@
+import {
+  parseBrowserProfileRuntimeAuthorization,
+  type BrowserProfileRuntimeAuthorization,
+} from "../browser-profile.js";
+
 export interface BrowserWorkspaceRegistration {
   browserId: string;
   workspaceId: string;
@@ -6,6 +11,8 @@ export interface BrowserWorkspaceRegistration {
 export interface BrowserWebContentsRegistration {
   browserId: string;
   hostWebContentsId: number;
+  workspaceId?: string;
+  profileAuthorization?: BrowserProfileRuntimeAuthorization;
 }
 
 export class PaseoBrowserWebviewRegistry {
@@ -18,29 +25,52 @@ export class PaseoBrowserWebviewRegistry {
     webContentsId: number;
     browserId: string;
     hostWebContentsId: number;
+    workspaceId?: string;
+    profileAuthorization?: BrowserProfileRuntimeAuthorization;
   }): void {
-    const hostBrowserKey = this.hostBrowserKey(input.hostWebContentsId, input.browserId);
-    const replacedWebContentsId = this.webContentsIdsByHostAndBrowserId.get(hostBrowserKey);
-    const existingRegistration = this.registrationsByWebContentsId.get(input.webContentsId);
+    const snapshot = snapshotBrowserWebContentsRegistration(input);
     if (
-      replacedWebContentsId === input.webContentsId &&
-      existingRegistration?.browserId === input.browserId &&
-      existingRegistration.hostWebContentsId === input.hostWebContentsId
+      snapshot.profileAuthorization &&
+      snapshot.workspaceId !== snapshot.profileAuthorization.workspaceId
+    ) {
+      throw new Error("Browser registration Workspace does not match its Profile authorization.");
+    }
+    for (const registration of this.registrationsByWebContentsId.values()) {
+      if (
+        registration.browserId === snapshot.browserId &&
+        (registration.profileAuthorization !== undefined ||
+          snapshot.profileAuthorization !== undefined) &&
+        !browserRegistrationsShareRoute(registration, snapshot)
+      ) {
+        throw new Error("An existing Browser ID cannot change its host, Workspace, or Profile.");
+      }
+    }
+    const hostBrowserKey = this.hostBrowserKey(snapshot.hostWebContentsId, snapshot.browserId);
+    const replacedWebContentsId = this.webContentsIdsByHostAndBrowserId.get(hostBrowserKey);
+    const existingRegistration = this.registrationsByWebContentsId.get(snapshot.webContentsId);
+    if (
+      replacedWebContentsId === snapshot.webContentsId &&
+      existingRegistration?.browserId === snapshot.browserId &&
+      existingRegistration.hostWebContentsId === snapshot.hostWebContentsId
     ) {
       return;
     }
-    if (replacedWebContentsId !== undefined && replacedWebContentsId !== input.webContentsId) {
+    if (replacedWebContentsId !== undefined && replacedWebContentsId !== snapshot.webContentsId) {
       this.removeWebContents(replacedWebContentsId, { preserveActiveBrowser: true });
     }
-    if (this.registrationsByWebContentsId.has(input.webContentsId)) {
-      this.removeWebContents(input.webContentsId);
+    if (this.registrationsByWebContentsId.has(snapshot.webContentsId)) {
+      this.removeWebContents(snapshot.webContentsId);
     }
 
-    this.registrationsByWebContentsId.set(input.webContentsId, {
-      browserId: input.browserId,
-      hostWebContentsId: input.hostWebContentsId,
-    });
-    this.webContentsIdsByHostAndBrowserId.set(hostBrowserKey, input.webContentsId);
+    const registration = freezeBrowserWebContentsRegistration(snapshot);
+    this.registrationsByWebContentsId.set(snapshot.webContentsId, registration);
+    this.webContentsIdsByHostAndBrowserId.set(hostBrowserKey, snapshot.webContentsId);
+    if (snapshot.workspaceId) {
+      this.registerWorkspace({
+        browserId: snapshot.browserId,
+        workspaceId: snapshot.workspaceId,
+      });
+    }
   }
 
   public unregisterWebContents(webContentsId: number): void {
@@ -58,7 +88,8 @@ export class PaseoBrowserWebviewRegistry {
   public getRegistrationForWebContents(
     webContentsId: number,
   ): BrowserWebContentsRegistration | null {
-    return this.registrationsByWebContentsId.get(webContentsId) ?? null;
+    const registration = this.registrationsByWebContentsId.get(webContentsId);
+    return registration ? freezeBrowserWebContentsRegistration(registration) : null;
   }
 
   public getWebContentsIdForBrowserInHostWindow(
@@ -79,6 +110,10 @@ export class PaseoBrowserWebviewRegistry {
   }
 
   public registerWorkspace(input: BrowserWorkspaceRegistration): void {
+    const existingWorkspaceId = this.workspaceIdsByBrowserId.get(input.browserId);
+    if (existingWorkspaceId && existingWorkspaceId !== input.workspaceId) {
+      throw new Error("An existing Browser ID cannot change its Workspace.");
+    }
     this.workspaceIdsByBrowserId.set(input.browserId, input.workspaceId);
   }
 
@@ -131,6 +166,61 @@ export class PaseoBrowserWebviewRegistry {
     return this.listBrowserIds().filter(
       (browserId) => this.workspaceIdsByBrowserId.get(browserId) === workspaceId,
     );
+  }
+
+  public listBrowserIdsForProfile(input: {
+    hostWebContentsId: number;
+    authorization: BrowserProfileRuntimeAuthorization;
+  }): string[] {
+    const route = snapshotBrowserProfileRoute(input);
+    return Array.from(this.registrationsByWebContentsId.values())
+      .filter(
+        (registration) =>
+          registration.hostWebContentsId === route.hostWebContentsId &&
+          registration.profileAuthorization !== undefined &&
+          browserProfileAuthorizationsEqual(registration.profileAuthorization, route.authorization),
+      )
+      .map((registration) => registration.browserId)
+      .sort();
+  }
+
+  public getWebContentsIdForBrowserProfile(input: {
+    hostWebContentsId: number;
+    browserId: string;
+    authorization: BrowserProfileRuntimeAuthorization;
+  }): number | null {
+    const route = snapshotBrowserProfileRoute(input, true);
+    const contentsId = this.getWebContentsIdForBrowserInHostWindow(
+      route.hostWebContentsId,
+      route.browserId,
+    );
+    if (contentsId === null) {
+      return null;
+    }
+    const registration = this.registrationsByWebContentsId.get(contentsId);
+    return registration?.profileAuthorization &&
+      browserProfileAuthorizationsEqual(registration.profileAuthorization, route.authorization)
+      ? contentsId
+      : null;
+  }
+
+  public unregisterProfile(input: {
+    hostWebContentsId: number;
+    authorization: BrowserProfileRuntimeAuthorization;
+  }): number[] {
+    const route = snapshotBrowserProfileRoute(input);
+    const removedContentsIds: number[] = [];
+    for (const [contentsId, registration] of this.registrationsByWebContentsId) {
+      if (
+        registration.hostWebContentsId === route.hostWebContentsId &&
+        registration.profileAuthorization &&
+        browserProfileAuthorizationsEqual(registration.profileAuthorization, route.authorization)
+      ) {
+        removedContentsIds.push(contentsId);
+        this.removeWebContents(contentsId);
+      }
+    }
+    return removedContentsIds;
   }
 
   public setWorkspaceActiveBrowser(input: {
@@ -255,4 +345,180 @@ export class PaseoBrowserWebviewRegistry {
   private hostBrowserKey(hostWebContentsId: number, browserId: string): string {
     return `${hostWebContentsId}:${browserId}`;
   }
+}
+
+function snapshotBrowserWebContentsRegistration(input: unknown): {
+  webContentsId: number;
+  browserId: string;
+  hostWebContentsId: number;
+  workspaceId?: string;
+  profileAuthorization?: BrowserProfileRuntimeAuthorization;
+} {
+  const record = readStableRecord(
+    input,
+    ["browserId", "hostWebContentsId", "profileAuthorization", "webContentsId", "workspaceId"],
+    ["browserId", "hostWebContentsId", "webContentsId"],
+    "Browser WebContents registration",
+  );
+  const webContentsId = parsePositiveSafeInteger(record.webContentsId, "WebContents ID");
+  const hostWebContentsId = parsePositiveSafeInteger(
+    record.hostWebContentsId,
+    "host WebContents ID",
+  );
+  const browserId = parseNonEmptyString(record.browserId, "Browser ID");
+  const workspaceId =
+    record.workspaceId === undefined
+      ? undefined
+      : parseNonEmptyString(record.workspaceId, "Workspace ID");
+  const profileAuthorization =
+    record.profileAuthorization === undefined
+      ? undefined
+      : parseBrowserProfileRuntimeAuthorization(record.profileAuthorization);
+  return {
+    webContentsId,
+    browserId,
+    hostWebContentsId,
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(profileAuthorization ? { profileAuthorization } : {}),
+  };
+}
+
+function snapshotBrowserProfileRoute(input: unknown): {
+  hostWebContentsId: number;
+  authorization: BrowserProfileRuntimeAuthorization;
+};
+function snapshotBrowserProfileRoute(
+  input: unknown,
+  includeBrowserId: true,
+): {
+  hostWebContentsId: number;
+  browserId: string;
+  authorization: BrowserProfileRuntimeAuthorization;
+};
+function snapshotBrowserProfileRoute(
+  input: unknown,
+  includeBrowserId = false,
+):
+  | {
+      hostWebContentsId: number;
+      browserId: string;
+      authorization: BrowserProfileRuntimeAuthorization;
+    }
+  | {
+      hostWebContentsId: number;
+      authorization: BrowserProfileRuntimeAuthorization;
+    } {
+  const allowedKeys = includeBrowserId
+    ? ["authorization", "browserId", "hostWebContentsId"]
+    : ["authorization", "hostWebContentsId"];
+  const record = readStableRecord(input, allowedKeys, allowedKeys, "Browser Profile route");
+  const common = {
+    hostWebContentsId: parsePositiveSafeInteger(record.hostWebContentsId, "host WebContents ID"),
+    authorization: parseBrowserProfileRuntimeAuthorization(record.authorization),
+  };
+  return includeBrowserId
+    ? { ...common, browserId: parseNonEmptyString(record.browserId, "Browser ID") }
+    : common;
+}
+
+function freezeBrowserWebContentsRegistration(
+  input: BrowserWebContentsRegistration,
+): BrowserWebContentsRegistration {
+  return Object.freeze({
+    browserId: input.browserId,
+    hostWebContentsId: input.hostWebContentsId,
+    ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+    ...(input.profileAuthorization
+      ? {
+          profileAuthorization: parseBrowserProfileRuntimeAuthorization(input.profileAuthorization),
+        }
+      : {}),
+  });
+}
+
+function readStableRecord(
+  input: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  let descriptors: PropertyDescriptorMap;
+  let symbols: symbol[];
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(input);
+    symbols = Object.getOwnPropertySymbols(input);
+  } catch {
+    throw new Error(`${label} cannot be inspected.`);
+  }
+  const keys = Object.keys(descriptors);
+  if (
+    symbols.length > 0 ||
+    keys.some((key) => !allowedKeys.includes(key)) ||
+    requiredKeys.some((key) => !keys.includes(key))
+  ) {
+    throw new Error(`${label} has invalid fields.`);
+  }
+  const record: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || descriptor.get || descriptor.set || !("value" in descriptor)) {
+      throw new Error(`${label}.${key} must be a stable data property.`);
+    }
+    record[key] = descriptor.value;
+  }
+  return record;
+}
+
+function parsePositiveSafeInteger(input: unknown, label: string): number {
+  if (!Number.isSafeInteger(input) || (input as number) <= 0) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return input as number;
+}
+
+function parseNonEmptyString(input: unknown, label: string): string {
+  if (typeof input !== "string" || input.length === 0 || input.trim() !== input) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return input;
+}
+
+function browserRegistrationsShareRoute(
+  existing: BrowserWebContentsRegistration,
+  next: {
+    hostWebContentsId: number;
+    workspaceId?: string;
+    profileAuthorization?: BrowserProfileRuntimeAuthorization;
+  },
+): boolean {
+  if (
+    existing.hostWebContentsId !== next.hostWebContentsId ||
+    existing.workspaceId !== next.workspaceId
+  ) {
+    return false;
+  }
+  if (!existing.profileAuthorization || !next.profileAuthorization) {
+    return existing.profileAuthorization === next.profileAuthorization;
+  }
+  return browserProfileAuthorizationsEqual(
+    existing.profileAuthorization,
+    next.profileAuthorization,
+  );
+}
+
+function browserProfileAuthorizationsEqual(
+  left: BrowserProfileRuntimeAuthorization,
+  right: BrowserProfileRuntimeAuthorization,
+): boolean {
+  return (
+    left.organizationId === right.organizationId &&
+    left.homeNodeId === right.homeNodeId &&
+    left.workspaceId === right.workspaceId &&
+    left.browserProfileId === right.browserProfileId &&
+    left.bindingRevision === right.bindingRevision &&
+    left.lifecycleGeneration === right.lifecycleGeneration
+  );
 }

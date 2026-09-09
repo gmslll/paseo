@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "./broker.js";
 import type { BrowserToolsResponsePayload } from "./errors.js";
 import { registerBrowserTools, type RegisterBrowserToolsOptions } from "./tools.js";
+import type { EnterpriseAgentContextHandle } from "../session/enterprise-agent-session-context-registry.js";
 import type {
   PaseoToolConfig,
   PaseoToolExecutionContext,
@@ -534,6 +535,39 @@ const brokerErrorCases = [
 }>;
 
 describe("registerBrowserTools", () => {
+  test("dispatches enterprise tools with only the canonical handle and command", async () => {
+    const tools = new Map<string, RegisteredTool>();
+    const enterpriseCalls: unknown[] = [];
+    const handle = Object.freeze({}) as EnterpriseAgentContextHandle;
+    registerBrowserTools({
+      registerTool: (name, config, handler) => {
+        tools.set(name, { config, handler });
+      },
+      broker: {
+        execute: async () => {
+          throw new Error("legacy fallback must not run");
+        },
+        executeEnterprise: async (input) => {
+          enterpriseCalls.push(input);
+          return listTabsPayload();
+        },
+      },
+      callerAgentId: "agent-1",
+      resolveCallerAgent: () => ({
+        id: "agent-1",
+        cwd: "/repo",
+        workspaceId: "caller-workspace-must-not-be-authority",
+      }),
+      resolveEnterpriseBrowserContext: () => ({ handle }),
+    });
+    const tool = tools.get("browser_list_tabs");
+    if (!tool) throw new Error("Missing browser_list_tabs tool.");
+
+    await tool.handler({}, {});
+
+    expect(enterpriseCalls).toEqual([{ handle, command: { command: "list_tabs", args: {} } }]);
+  });
+
   test("registers the kept browser automation tools only", () => {
     const harness = new BrowserToolHarness();
 
