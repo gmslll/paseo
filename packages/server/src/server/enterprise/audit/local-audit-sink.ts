@@ -359,19 +359,44 @@ interface OpenedAuditDirectory {
   readonly identity: AuditDirectoryIdentity;
 }
 
+interface CapturedAuditFileSystem {
+  readonly noFollowFlag: number;
+  readonly releaseReady: boolean;
+  readonly unsupportedReason?: string;
+  readonly ensureDirectory: (directory: string, mode: number) => Promise<void>;
+  readonly openDirectory: (directory: string, flags: number) => Promise<AuditDirectoryHandle>;
+}
+
+function captureAuditFileSystem(fileSystem: AuditFileSystem): CapturedAuditFileSystem {
+  const noFollowFlag = fileSystem.noFollowFlag;
+  const releaseReady = fileSystem.releaseReady;
+  const unsupportedReason = fileSystem.unsupportedReason;
+  const ensureDirectory = fileSystem.ensureDirectory.bind(fileSystem);
+  const openDirectory = fileSystem.openDirectory.bind(fileSystem);
+  return Object.freeze({
+    noFollowFlag,
+    releaseReady,
+    unsupportedReason,
+    ensureDirectory,
+    openDirectory,
+  });
+}
+
 export class JsonlAuditStorage implements AuditStorage {
   readonly releaseReady: boolean;
   readonly unsupportedReason?: string;
   private readonly noFollowFlag: number;
+  private readonly files: CapturedAuditFileSystem;
   private poisoned = false;
 
   constructor(
     private readonly directory: string,
-    private readonly fileSystem: AuditFileSystem = new NodeAuditFileSystem(),
+    fileSystem: AuditFileSystem = new NodeAuditFileSystem(),
   ) {
-    this.noFollowFlag = this.fileSystem.noFollowFlag;
-    this.releaseReady = this.fileSystem.releaseReady;
-    this.unsupportedReason = this.fileSystem.unsupportedReason;
+    this.files = captureAuditFileSystem(fileSystem);
+    this.noFollowFlag = this.files.noFollowFlag;
+    this.releaseReady = this.files.releaseReady;
+    this.unsupportedReason = this.files.unsupportedReason;
     assertNoFollowFlag(this.noFollowFlag);
   }
 
@@ -572,8 +597,8 @@ export class JsonlAuditStorage implements AuditStorage {
   }
 
   private async openDirectory(create: boolean): Promise<OpenedAuditDirectory> {
-    if (create) await this.fileSystem.ensureDirectory(this.directory, DIRECTORY_MODE);
-    const handle = await this.fileSystem.openDirectory(
+    if (create) await this.files.ensureDirectory(this.directory, DIRECTORY_MODE);
+    const handle = await this.files.openDirectory(
       this.directory,
       fileConstants.O_RDONLY | fileConstants.O_DIRECTORY | this.noFollowFlag,
     );
