@@ -12,6 +12,11 @@ import {
   permissionsForLegacyHubScopes,
   parseDaemonPermissions,
 } from "./index.js";
+import {
+  type PermissionRequirement,
+  requiredPermissionForInbound,
+  requiredPermissionForOutbound,
+} from "./operation-permissions.js";
 
 function inboundOperationTypes(): SessionInboundMessage["type"][] {
   return SessionInboundMessageSchema.options.map((option) => option.shape.type.value);
@@ -35,6 +40,81 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
 }
 
 describe("SessionAuthorization", () => {
+  test("enterprise operations have explicit coarse permission requirements", () => {
+    const inboundRequirements = {
+      "enterprise.access.list_grants.request": "access.manage",
+      "enterprise.access.update_grants.request": "access.manage",
+      "enterprise.audit.list_events.request": "daemon.read",
+      "enterprise.browser.bind_profile.request": "access.manage",
+      "enterprise.browser.list_profiles.request": "workspace.read",
+      "enterprise.identity.get_current.request": null,
+      "enterprise.identity.list_principals.request": "access.manage",
+      "enterprise.identity.logout_all.request": null,
+      "enterprise.node.list_nodes.request": "daemon.read",
+      "enterprise.node.set_drain.request": "daemon.manage",
+      "enterprise.organization.list_resources.request": "workspace.read",
+      "enterprise.placement.resolve_workspace.request": "workspace.read",
+      "enterprise.resource.acquire_lease.request": "workspace.write",
+      "enterprise.resource.release_lease.request": "workspace.write",
+      "enterprise.resource.renew_lease.request": "workspace.write",
+    } as const satisfies Partial<Record<SessionInboundMessage["type"], PermissionRequirement>>;
+    const outboundRequirements = {
+      "enterprise.access.list_grants.response": "access.manage",
+      "enterprise.access.update_grants.response": "access.manage",
+      "enterprise.audit.list_events.response": "daemon.read",
+      "enterprise.browser.bind_profile.response": "access.manage",
+      "enterprise.browser.list_profiles.response": "workspace.read",
+      "enterprise.identity.credential_revoked": null,
+      "enterprise.identity.get_current.response": null,
+      "enterprise.identity.list_principals.response": "access.manage",
+      "enterprise.identity.logout_all.response": null,
+      "enterprise.identity.scope_refreshed": null,
+      "enterprise.node.list_nodes.response": "daemon.read",
+      "enterprise.node.set_drain.response": "daemon.manage",
+      "enterprise.organization.list_resources.response": "workspace.read",
+      "enterprise.placement.resolve_workspace.response": "workspace.read",
+      "enterprise.resource.acquire_lease.response": "workspace.write",
+      "enterprise.resource.release_lease.response": "workspace.write",
+      "enterprise.resource.renew_lease.response": "workspace.write",
+      "enterprise.resource.status": "workspace.read",
+      "enterprise.resource.waiting": "workspace.read",
+    } as const satisfies Partial<Record<SessionOutboundMessage["type"], PermissionRequirement>>;
+
+    for (const [operation, requirement] of Object.entries(inboundRequirements)) {
+      expect(requiredPermissionForInbound(operation as SessionInboundMessage["type"])).toEqual(
+        requirement,
+      );
+    }
+    for (const [operation, requirement] of Object.entries(outboundRequirements)) {
+      expect(
+        requiredPermissionForOutbound(outboundMessage(operation as SessionOutboundMessage["type"])),
+      ).toEqual(requirement);
+    }
+  });
+
+  test("authenticated sessions retain identity self-control after all coarse permissions are removed", () => {
+    const authorization = new SessionAuthorization([]);
+
+    expect(
+      authorization.allowsInbound(inboundMessage("enterprise.identity.get_current.request")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.get_current.response")),
+    ).toBe(true);
+    expect(
+      authorization.allowsInbound(inboundMessage("enterprise.identity.logout_all.request")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.logout_all.response")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.scope_refreshed")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.credential_revoked")),
+    ).toBe(true);
+  });
+
   test("owner authority covers every session operation", () => {
     const authorization = new SessionAuthorization(OWNER_PERMISSIONS);
 
