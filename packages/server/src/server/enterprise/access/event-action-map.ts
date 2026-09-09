@@ -32,15 +32,15 @@ function authorityReceiptPolicy(
   requestType: SessionInboundMessage["type"],
   enterpriseActions: readonly EnterpriseAction[] = noActions,
 ): OutboundAuthorityReceiptPolicy {
-  return {
+  return Object.freeze({
     event,
     requestType,
-    daemonPermission: INBOUND_PERMISSION[requestType],
-    enterpriseActions,
-  };
+    daemonPermission: clonePermissionRequirement(INBOUND_PERMISSION[requestType]),
+    enterpriseActions: Object.freeze([...enterpriseActions]),
+  });
 }
 
-const noActions = [] as const;
+const noActions = Object.freeze([]) as readonly [];
 
 function workspacePolicy(...actions: EnterpriseAction[]): OutboundResourceActionPolicy {
   return {
@@ -386,7 +386,7 @@ export const OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS = [
   "pong",
 ] as const satisfies readonly SessionOutboundMessage["type"][];
 
-export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = [
+export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
   authorityReceiptPolicy("agent.skills.get_status.response", "agent.skills.get_status.request"),
   authorityReceiptPolicy(
     "agent.skills.import_legacy_selection.response",
@@ -464,29 +464,29 @@ export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = [
   authorityReceiptPolicy("provider_diagnostic_response", "provider_diagnostic_request"),
   authorityReceiptPolicy("push.unregister.response", "push.unregister.request"),
   authorityReceiptPolicy("set_daemon_config_response", "set_daemon_config_request"),
-] as const satisfies readonly OutboundAuthorityReceiptPolicy[];
+] as const satisfies readonly OutboundAuthorityReceiptPolicy[]);
 
-export const OUTBOUND_STATUS_AUTHORITY_RECEIPT_POLICIES = [
-  {
+export const OUTBOUND_STATUS_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
+  Object.freeze({
     event: "status",
     status: "restart_requested",
     requestType: "restart_server_request",
-    daemonPermission: INBOUND_PERMISSION.restart_server_request,
+    daemonPermission: clonePermissionRequirement(INBOUND_PERMISSION.restart_server_request),
     enterpriseActions: noActions,
-  },
-  {
+  }),
+  Object.freeze({
     event: "status",
     status: "shutdown_requested",
     requestType: "shutdown_server_request",
-    daemonPermission: INBOUND_PERMISSION.shutdown_server_request,
+    daemonPermission: clonePermissionRequirement(INBOUND_PERMISSION.shutdown_server_request),
     enterpriseActions: noActions,
-  },
-] as const satisfies readonly OutboundAuthorityReceiptPolicy[];
+  }),
+] as const satisfies readonly OutboundAuthorityReceiptPolicy[]);
 
-export const ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES = [
+export const ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
   ...OUTBOUND_AUTHORITY_RECEIPT_POLICIES,
   ...OUTBOUND_STATUS_AUTHORITY_RECEIPT_POLICIES,
-] as const satisfies readonly OutboundAuthorityReceiptPolicy[];
+] as const satisfies readonly OutboundAuthorityReceiptPolicy[]);
 
 export const OUTBOUND_SELF_LIFECYCLE_EVENTS = [
   "enterprise.identity.credential_revoked",
@@ -526,9 +526,31 @@ export const OUTBOUND_RESOURCE_ACTION_MAP: ReadonlyMap<
 const outboundAuthorityReceiptPolicyMap = new Map(
   OUTBOUND_AUTHORITY_RECEIPT_POLICIES.map((policy) => [policy.event, policy] as const),
 );
-const outboundAuthorityReceiptPolicyByRequestType = new Map(
-  ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES.map((policy) => [policy.requestType, policy] as const),
-);
+const outboundAuthorityReceiptPolicyByRequestType = new Map<
+  SessionInboundMessage["type"],
+  OutboundAuthorityReceiptPolicy
+>();
+for (const policy of ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES) {
+  const existing = outboundAuthorityReceiptPolicyByRequestType.get(policy.requestType);
+  if (
+    existing &&
+    (!samePermissionRequirement(existing.daemonPermission, policy.daemonPermission) ||
+      !sameUniqueStrings(existing.enterpriseActions, policy.enterpriseActions))
+  ) {
+    throw new Error(`Conflicting authority receipt policy for ${policy.requestType}`);
+  }
+  if (!existing) outboundAuthorityReceiptPolicyByRequestType.set(policy.requestType, policy);
+}
+
+export function authorityReceiptPolicyForRequestType(
+  requestType: string,
+): OutboundAuthorityReceiptPolicy | null {
+  if (!Object.hasOwn(INBOUND_PERMISSION, requestType)) return null;
+  return (
+    outboundAuthorityReceiptPolicyByRequestType.get(requestType as SessionInboundMessage["type"]) ??
+    null
+  );
+}
 
 export function authorityReceiptPolicyForEvent(
   event: SessionOutboundMessage,
@@ -611,4 +633,23 @@ export function isMatchingTransportControl(
 ): boolean {
   if (control === "pong") return event.type === "pong";
   return event.type === "status" && event.payload.status === "server_info";
+}
+
+function clonePermissionRequirement(requirement: PermissionRequirement): PermissionRequirement {
+  return Array.isArray(requirement) ? Object.freeze([...requirement]) : requirement;
+}
+
+function samePermissionRequirement(
+  left: PermissionRequirement,
+  right: PermissionRequirement,
+): boolean {
+  if (left === null || right === null) return left === right;
+  const leftValues = typeof left === "string" ? [left] : [...left];
+  const rightValues = typeof right === "string" ? [right] : [...right];
+  return sameUniqueStrings(leftValues, rightValues);
+}
+
+function sameUniqueStrings(left: readonly string[], right: readonly string[]): boolean {
+  if (new Set(left).size !== left.length || new Set(right).size !== right.length) return false;
+  return [...left].sort().join("\0") === [...right].sort().join("\0");
 }

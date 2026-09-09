@@ -9,6 +9,8 @@ import {
   DAEMON_PERMISSIONS,
   OWNER_PERMISSIONS,
   SessionAuthorization,
+  consumeCurrentInboundDaemonAuthorizationDecision,
+  consumeInboundDaemonAuthorizationDecision,
   permissionsForLegacyHubScopes,
   parseDaemonPermissions,
 } from "./index.js";
@@ -215,5 +217,73 @@ describe("SessionAuthorization", () => {
   test("permission parsing validates against the shared registry and removes duplicates", () => {
     expect(parseDaemonPermissions(["hub.execute", "hub.execute"])).toEqual(["hub.execute"]);
     expect(() => parseDaemonPermissions(["hub.execution.*"])).toThrow("Invalid daemon permission");
+  });
+
+  test("issues an opaque exact-message decision when any required daemon permission succeeds", () => {
+    const authorization = new SessionAuthorization(["hub.execute"]);
+    const allowed = inboundMessage("create_agent_request");
+
+    const decision = authorization.authorizeInbound(allowed);
+
+    expect(decision).not.toBeNull();
+    expect(Object.keys(decision!)).toEqual([]);
+    expect(Object.isFrozen(decision)).toBe(true);
+    expect(authorization.authorizeInbound(inboundMessage("restart_server_request"))).toBeNull();
+    expect(new SessionAuthorization([]).authorizeInbound(allowed)).toBeNull();
+  });
+
+  test("consumes a daemon decision once for its exact message and permission generation", () => {
+    const authorization = new SessionAuthorization(["hub.execute"]);
+    const message = inboundMessage("create_agent_request");
+    const wrongMessageDecision = authorization.authorizeInbound(message)!;
+
+    expect(
+      consumeInboundDaemonAuthorizationDecision(
+        authorization,
+        inboundMessage("create_agent_request"),
+        wrongMessageDecision,
+      ),
+    ).toBeNull();
+    expect(
+      consumeInboundDaemonAuthorizationDecision(authorization, message, wrongMessageDecision),
+    ).toBeNull();
+
+    const replacedDecision = authorization.authorizeInbound(message)!;
+    authorization.replacePermissions(["hub.execute"]);
+    expect(
+      consumeInboundDaemonAuthorizationDecision(authorization, message, replacedDecision),
+    ).toBeNull();
+
+    const currentDecision = authorization.authorizeInbound(message)!;
+    const consumed = consumeInboundDaemonAuthorizationDecision(
+      authorization,
+      message,
+      currentDecision,
+    );
+    expect(consumed).toEqual({
+      requestType: "create_agent_request",
+      daemonPermission: ["workspace.write", "hub.execute"],
+    });
+    expect(Object.isFrozen(consumed)).toBe(true);
+    expect(Object.isFrozen(consumed?.daemonPermission)).toBe(true);
+    expect(
+      consumeCurrentInboundDaemonAuthorizationDecision(
+        authorization,
+        message,
+        message.type,
+        consumed!,
+      ),
+    ).toBe(true);
+    expect(
+      consumeCurrentInboundDaemonAuthorizationDecision(
+        authorization,
+        message,
+        message.type,
+        consumed!,
+      ),
+    ).toBe(false);
+    expect(
+      consumeInboundDaemonAuthorizationDecision(authorization, message, currentDecision),
+    ).toBeNull();
   });
 });

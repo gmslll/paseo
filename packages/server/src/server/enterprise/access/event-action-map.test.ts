@@ -9,6 +9,7 @@ import {
   OUTBOUND_RESOURCE_ACTION_MAP,
   OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS,
   authorityReceiptPolicyForEvent,
+  authorityReceiptPolicyForRequestType,
   isMatchingTransportControl,
   outboundActionsFor,
 } from "./event-action-map.js";
@@ -56,7 +57,20 @@ describe("outbound enterprise event-action map", () => {
     expect(new Set(keys).size).toBe(keys.length);
     for (const policy of ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES) {
       expect(policy.daemonPermission).toEqual(INBOUND_PERMISSION[policy.requestType]);
+      expect(authorityReceiptPolicyForRequestType(policy.requestType)).toMatchObject({
+        requestType: policy.requestType,
+        daemonPermission: policy.daemonPermission,
+        enterpriseActions: policy.enterpriseActions,
+      });
+      expect(Object.isFrozen(policy)).toBe(true);
+      expect(Object.isFrozen(policy.enterpriseActions)).toBe(true);
+      if (Array.isArray(policy.daemonPermission)) {
+        expect(Object.isFrozen(policy.daemonPermission)).toBe(true);
+      }
     }
+    expect(Object.isFrozen(ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES)).toBe(true);
+    expect(authorityReceiptPolicyForRequestType("fetch_agent_request")).toBeNull();
+    expect(authorityReceiptPolicyForRequestType("future.unknown.request")).toBeNull();
 
     expect(
       authorityReceiptPolicyForEvent({
