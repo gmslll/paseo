@@ -45,15 +45,37 @@ function makeSubsystem(
     hasBinaryChannel?: boolean;
     emitBinary?: (frame: Uint8Array) => Promise<void> | void;
     enterpriseRuntime?: EnterpriseWorkspaceFilesRuntime;
+    enterpriseRequired?: boolean;
   } = {},
 ) {
   const emitted: SessionOutboundMessage[] = [];
+  const legacyEmitted: SessionOutboundMessage[] = [];
   const binary: Uint8Array[] = [];
+  const legacyBinary: Uint8Array[] = [];
+  const enterpriseEmitted: Array<{
+    message: SessionOutboundMessage;
+    workspaceId: string;
+    source?: object;
+  }> = [];
+  const enterpriseBinary: Array<{ frame: Uint8Array; workspaceId: string; source?: object }> = [];
   let hasBinary = options.hasBinaryChannel ?? false;
   const host: WorkspaceFilesSessionHost = {
-    emit: (msg) => emitted.push(msg),
+    emit: (msg) => {
+      emitted.push(msg);
+      legacyEmitted.push(msg);
+    },
     emitBinary: async (frame) => {
       binary.push(frame);
+      legacyBinary.push(frame);
+      await options.emitBinary?.(frame);
+    },
+    emitWorkspace: (message, workspaceId, source) => {
+      emitted.push(message);
+      enterpriseEmitted.push({ message, workspaceId, source });
+    },
+    emitBinaryWorkspace: async (frame, workspaceId, source) => {
+      binary.push(frame);
+      enterpriseBinary.push({ frame, workspaceId, source });
       await options.emitBinary?.(frame);
     },
     hasBinaryChannel: () => hasBinary,
@@ -65,11 +87,17 @@ function makeSubsystem(
     paseoHome,
     logger: pino({ level: "silent" }),
     enterpriseRuntime: options.enterpriseRuntime,
+    enterpriseRequired: options.enterpriseRequired,
   });
   return {
     subsystem,
     emitted,
+    legacyEmitted,
     binary,
+    legacyBinary,
+    enterpriseEmitted,
+    enterpriseBinary,
+    host,
     paseoHome,
     setHasBinary: (value: boolean) => {
       hasBinary = value;
@@ -79,10 +107,17 @@ function makeSubsystem(
 
 class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
   public readonly listCalls: unknown[] = [];
+  public readonly writeCalls: unknown[] = [];
+  public readonly createCalls: unknown[] = [];
+  public readonly renameCalls: unknown[] = [];
+  public readonly copyCalls: unknown[] = [];
+  public readonly deleteCalls: unknown[] = [];
   public readonly downloadCalls: unknown[] = [];
   public readonly uploadBegins: EnterpriseFileUploadBeginInput[] = [];
   public readonly stagedUploadBegins: EnterpriseStagedFileUploadBeginInput[] = [];
   public readonly cleanupCalls: Array<"session-closed" | "generation-replaced"> = [];
+  public openReadCalls = 0;
+  public readCloseCalls = 0;
   public watchCalls = 0;
   public statCalls = 0;
   public watchDisposeCalls = 0;
@@ -92,6 +127,14 @@ class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
   public watchDisposeGate: Promise<void> | undefined;
   public watchDisposeError: unknown;
   public cleanupError: unknown;
+  public listGate: Promise<void> | undefined;
+  public readGate: Promise<void> | undefined;
+  public readCloseError: unknown;
+  public uploadFrameResponse: SessionOutboundMessage | null = null;
+  public uploadFrameGate: Promise<void> | undefined;
+  public uploadFrameCalls = 0;
+  public downloadWorkspaceId = "workspace-one";
+  public downloadRelativePath = "reports/quarter.csv";
 
   public async stat() {
     const call = this.statCalls;
@@ -102,6 +145,7 @@ class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
 
   public async list(input: unknown) {
     this.listCalls.push(input);
+    await this.listGate;
     return [
       {
         kind: "file" as const,
@@ -116,6 +160,7 @@ class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
   }
 
   public async openRead() {
+    this.openReadCalls += 1;
     return {
       kind: "file" as const,
       dev: 1,
@@ -124,17 +169,32 @@ class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
       mtimeMs: 1_000,
       workspaceId: "workspace-one",
       relativePath: "reports/quarter.csv",
-      read: async (offset: number, length: number) =>
-        new TextEncoder().encode("hello").subarray(offset, offset + length),
-      close: async () => undefined,
+      read: async (offset: number, length: number) => {
+        await this.readGate;
+        return new TextEncoder().encode("hello").subarray(offset, offset + length);
+      },
+      close: async () => {
+        this.readCloseCalls += 1;
+        if (this.readCloseError !== undefined) throw this.readCloseError;
+      },
     };
   }
 
-  public async write(): Promise<void> {}
-  public async create(): Promise<void> {}
-  public async rename(): Promise<void> {}
-  public async copy(): Promise<void> {}
-  public async delete(): Promise<void> {}
+  public async write(input: unknown): Promise<void> {
+    this.writeCalls.push(input);
+  }
+  public async create(input: unknown): Promise<void> {
+    this.createCalls.push(input);
+  }
+  public async rename(input: unknown): Promise<void> {
+    this.renameCalls.push(input);
+  }
+  public async copy(input: unknown): Promise<void> {
+    this.copyCalls.push(input);
+  }
+  public async delete(input: unknown): Promise<void> {
+    this.deleteCalls.push(input);
+  }
 
   public async watch(_input: unknown, onChange: () => void) {
     const call = this.watchCalls;
@@ -158,8 +218,8 @@ class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
       ino: 2,
       size: 5,
       mtimeMs: 1_000,
-      workspaceId: "workspace-one",
-      relativePath: "reports/quarter.csv",
+      workspaceId: this.downloadWorkspaceId,
+      relativePath: this.downloadRelativePath,
       token: "download-token",
       expiresAt: 2_000,
     };
@@ -170,7 +230,11 @@ class TestEnterpriseRuntime implements EnterpriseWorkspaceFilesRuntime {
       begin: (input: EnterpriseFileUploadBeginInput) => this.uploadBegins.push(input),
       beginStaged: (input: EnterpriseStagedFileUploadBeginInput) =>
         this.stagedUploadBegins.push(input),
-      receiveFrame: async () => null,
+      receiveFrame: async () => {
+        this.uploadFrameCalls += 1;
+        await this.uploadFrameGate;
+        return this.uploadFrameResponse;
+      },
       cleanup: async () => undefined,
     };
   }
@@ -206,6 +270,398 @@ function uploadFrame(args: Parameters<typeof encodeFileTransferFrame>[0]): FileT
 }
 
 describe("WorkspaceFilesSession", () => {
+  test("enterprise-required sessions reject every file entry class before legacy access", async () => {
+    const cwd = makeDir("workspace-files-required-");
+    writeFileSync(join(cwd, "notes.txt"), "unchanged");
+    const { subsystem, emitted, binary, paseoHome } = makeSubsystem({ enterpriseRequired: true });
+
+    await expect(
+      subsystem.handleFileExplorerRequest({
+        type: "file_explorer_request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: ".",
+        mode: "list",
+        requestId: "required-explorer",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileWriteRequest({
+        type: "fs.file.write.request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: "notes.txt",
+        content: "changed",
+        expectedModifiedAt: "2026-09-10T00:00:00.000Z",
+        requestId: "required-write",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileEntryCreateRequest({
+        type: "fs.entry.create.request",
+        cwd,
+        workspaceId: "workspace-one",
+        parentPath: ".",
+        name: "created.txt",
+        kind: "file",
+        requestId: "required-create",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileEntryRenameRequest({
+        type: "fs.entry.rename.request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: "notes.txt",
+        name: "renamed.txt",
+        requestId: "required-rename",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileEntryDuplicateRequest({
+        type: "fs.entry.duplicate.request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: "notes.txt",
+        requestId: "required-copy",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileEntryDeleteRequest({
+        type: "fs.entry.delete.request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: "notes.txt",
+        requestId: "required-delete",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileSubscribeRequest({
+        type: "fs.file.subscribe.request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: "notes.txt",
+        subscriptionId: "required-subscription",
+        requestId: "required-subscribe",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileUnsubscribeRequest({
+        type: "fs.file.unsubscribe.request",
+        subscriptionId: "required-subscription",
+        requestId: "required-unsubscribe",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileDownloadTokenRequest({
+        type: "file_download_token_request",
+        cwd,
+        workspaceId: "workspace-one",
+        path: "notes.txt",
+        requestId: "required-download",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    expect(() =>
+      subsystem.handleFileUploadRequest({
+        type: "file.upload.request",
+        workspaceId: "workspace-one",
+        fileName: "notes.txt",
+        mimeType: "text/plain",
+        size: 1,
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        requestId: "required-upload",
+      }),
+    ).toThrow("Enterprise workspace file runtime is required.");
+    expect(() =>
+      subsystem.handleEnterpriseFileUploadRequest({
+        workspaceId: "workspace-one",
+        relativePath: "uploads/notes.txt",
+        fileName: "notes.txt",
+        mimeType: "text/plain",
+        size: 1,
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        requestId: "required-explicit-upload",
+      }),
+    ).toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleFileTransferFrame(
+        uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "required-upload" }),
+      ),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+    await expect(
+      subsystem.handleProjectIconRequest({
+        type: "project_icon_request",
+        cwd,
+        workspaceId: "workspace-one",
+        requestId: "required-icon",
+      }),
+    ).rejects.toThrow("Enterprise workspace file runtime is required.");
+
+    expect(readFileSync(join(cwd, "notes.txt"), "utf8")).toBe("unchanged");
+    expect(existsSync(join(cwd, "created.txt"))).toBe(false);
+    expect(existsSync(join(cwd, "renamed.txt"))).toBe(false);
+    expect(existsSync(join(paseoHome, "uploads"))).toBe(false);
+    expect(emitted).toEqual([]);
+    expect(binary).toEqual([]);
+  });
+
+  test("enterprise JSON responses carry the exact call-time workspace snapshot", async () => {
+    const listGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.listGate = listGate.promise;
+    const { subsystem, enterpriseEmitted, legacyEmitted } = makeSubsystem({ enterpriseRuntime });
+    const request = {
+      type: "file_explorer_request" as const,
+      cwd: "/caller/claimed/root",
+      workspaceId: "workspace-original",
+      path: "reports",
+      mode: "list" as const,
+      requestId: "request-original",
+    };
+
+    const listing = subsystem.handleFileExplorerRequest(request);
+    await waitUntil(() => enterpriseRuntime.listCalls.length === 1);
+    request.workspaceId = "workspace-mutated";
+    request.path = "mutated";
+    request.requestId = "request-mutated";
+    listGate.resolve();
+    await listing;
+
+    expect(enterpriseRuntime.listCalls).toEqual([
+      {
+        workspaceId: "workspace-original",
+        relativePath: "reports",
+        requestId: "request-original",
+      },
+    ]);
+    expect(enterpriseEmitted).toEqual([
+      expect.objectContaining({
+        workspaceId: "workspace-original",
+        message: expect.objectContaining({
+          type: "file_explorer_response",
+          payload: expect.objectContaining({ path: "reports", requestId: "request-original" }),
+        }),
+      }),
+    ]);
+    expect(legacyEmitted).toEqual([]);
+  });
+
+  test("every enterprise mutation and token response uses its canonical workspace", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, enterpriseEmitted, legacyEmitted } = makeSubsystem({ enterpriseRuntime });
+
+    await subsystem.handleFileWriteRequest({
+      type: "fs.file.write.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-write",
+      path: "notes.txt",
+      content: "hello",
+      expectedModifiedAt: "2026-09-10T00:00:00.000Z",
+      requestId: "request-write",
+    });
+    await subsystem.handleFileEntryCreateRequest({
+      type: "fs.entry.create.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-create",
+      parentPath: ".",
+      name: "notes.txt",
+      kind: "file",
+      requestId: "request-create",
+    });
+    await subsystem.handleFileEntryRenameRequest({
+      type: "fs.entry.rename.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-rename",
+      path: "notes.txt",
+      name: "renamed.txt",
+      requestId: "request-rename",
+    });
+    await subsystem.handleFileEntryDuplicateRequest({
+      type: "fs.entry.duplicate.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-copy",
+      path: "notes.txt",
+      requestId: "request-copy",
+    });
+    await subsystem.handleFileEntryDeleteRequest({
+      type: "fs.entry.delete.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-delete",
+      path: "notes.txt",
+      requestId: "request-delete",
+    });
+    await subsystem.handleFileDownloadTokenRequest({
+      type: "file_download_token_request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      requestId: "request-download",
+    });
+    await subsystem.handleFileEntryCreateRequest({
+      type: "fs.entry.create.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-error",
+      parentPath: ".",
+      name: "../unsafe.txt",
+      kind: "file",
+      requestId: "request-error",
+    });
+
+    expect(enterpriseEmitted.map(({ workspaceId }) => workspaceId)).toEqual([
+      "workspace-write",
+      "workspace-create",
+      "workspace-rename",
+      "workspace-copy",
+      "workspace-delete",
+      "workspace-one",
+      "workspace-error",
+    ]);
+    expect(enterpriseEmitted.map(({ message }) => message.type)).toEqual([
+      "fs.file.write.response",
+      "fs.entry.create.response",
+      "fs.entry.rename.response",
+      "fs.entry.duplicate.response",
+      "fs.entry.delete.response",
+      "file_download_token_response",
+      "fs.entry.create.response",
+    ]);
+    expect(enterpriseRuntime.copyCalls).toEqual([]);
+    expect(enterpriseEmitted[3]?.message).toMatchObject({
+      payload: { success: false, duplicatedPath: null },
+    });
+    expect(enterpriseEmitted[6]?.message).toMatchObject({ payload: { success: false } });
+    expect(legacyEmitted).toEqual([]);
+  });
+
+  test("enterprise emitters are captured at construction", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, enterpriseEmitted, host } = makeSubsystem({ enterpriseRuntime });
+    const replacementCalls: string[] = [];
+    host.emitWorkspace = (_message, workspaceId) => replacementCalls.push(workspaceId);
+
+    await subsystem.handleFileEntryDeleteRequest({
+      type: "fs.entry.delete.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/old.csv",
+      requestId: "request-delete",
+    });
+
+    expect(replacementCalls).toEqual([]);
+    expect(enterpriseEmitted).toEqual([expect.objectContaining({ workspaceId: "workspace-one" })]);
+  });
+
+  test("constructor reads host, runtime, flag, and each host method exactly once", async () => {
+    const reads = {
+      host: 0,
+      runtime: 0,
+      enterpriseRequired: 0,
+      emit: 0,
+      emitBinary: 0,
+      emitWorkspace: 0,
+      emitBinaryWorkspace: 0,
+      hasBinaryChannel: 0,
+    };
+    const workspaceIds: string[] = [];
+    const host = {
+      get emit() {
+        reads.emit += 1;
+        return (_message: SessionOutboundMessage) => undefined;
+      },
+      get emitBinary() {
+        reads.emitBinary += 1;
+        return async (_frame: Uint8Array) => undefined;
+      },
+      get emitWorkspace() {
+        reads.emitWorkspace += 1;
+        return (_message: SessionOutboundMessage, workspaceId: string) => {
+          workspaceIds.push(workspaceId);
+        };
+      },
+      get emitBinaryWorkspace() {
+        reads.emitBinaryWorkspace += 1;
+        return async (_frame: Uint8Array, _workspaceId: string) => undefined;
+      },
+      get hasBinaryChannel() {
+        reads.hasBinaryChannel += 1;
+        return () => false;
+      },
+    };
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const subsystem = new WorkspaceFilesSession({
+      get host() {
+        reads.host += 1;
+        return host;
+      },
+      get enterpriseRuntime() {
+        reads.runtime += 1;
+        return enterpriseRuntime;
+      },
+      get enterpriseRequired() {
+        reads.enterpriseRequired += 1;
+        return true;
+      },
+      downloadTokenStore: new DownloadTokenStore({ ttlMs: 60_000 }),
+      paseoHome: makeDir("workspace-files-constructor-"),
+      logger: pino({ level: "silent" }),
+    });
+    enterpriseRuntime.delete = async () => {
+      throw new Error("replacement must not run");
+    };
+
+    await subsystem.handleFileEntryDeleteRequest({
+      type: "fs.entry.delete.request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "notes.txt",
+      requestId: "request-delete",
+    });
+
+    expect(reads).toEqual({
+      host: 1,
+      runtime: 1,
+      enterpriseRequired: 1,
+      emit: 1,
+      emitBinary: 1,
+      emitWorkspace: 1,
+      emitBinaryWorkspace: 1,
+      hasBinaryChannel: 1,
+    });
+    expect(workspaceIds).toEqual(["workspace-one"]);
+    expect(enterpriseRuntime.deleteCalls).toHaveLength(1);
+  });
+
+  test("missing or accessor workspace IDs perform no enterprise operation or emit", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, enterpriseEmitted, legacyEmitted } = makeSubsystem({ enterpriseRuntime });
+    let getterCalls = 0;
+    const accessorRequest = {
+      type: "fs.entry.delete.request" as const,
+      cwd: "/caller/root",
+      get workspaceId(): string {
+        getterCalls += 1;
+        throw new Error("caller getter must not run");
+      },
+      path: "reports/old.csv",
+      requestId: "request-delete",
+    };
+
+    await expect(subsystem.handleFileEntryDeleteRequest(accessorRequest)).resolves.toBeUndefined();
+    await expect(
+      subsystem.handleFileEntryDeleteRequest({
+        type: "fs.entry.delete.request",
+        cwd: "/caller/root",
+        path: "reports/old.csv",
+        requestId: "request-missing",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(getterCalls).toBe(0);
+    expect(enterpriseRuntime.deleteCalls).toEqual([]);
+    expect(enterpriseEmitted).toEqual([]);
+    expect(legacyEmitted).toEqual([]);
+  });
+
   test("enterprise explorer dispatch ignores cwd and sends only workspace-relative input", async () => {
     const enterpriseRuntime = new TestEnterpriseRuntime();
     const { subsystem, emitted } = makeSubsystem({ enterpriseRuntime });
@@ -246,10 +702,131 @@ describe("WorkspaceFilesSession", () => {
     });
 
     expect(enterpriseRuntime.listCalls).toHaveLength(0);
-    expect(emitted[0]).toMatchObject({
-      type: "file_explorer_response",
-      payload: { cwd: "", error: "Enterprise file access denied." },
+    expect(emitted).toEqual([]);
+  });
+
+  test("enterprise binary explorer frames retain one capability workspace correlation", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const source = {};
+    const { subsystem, enterpriseBinary, legacyBinary } = makeSubsystem({
+      enterpriseRuntime,
+      hasBinaryChannel: true,
     });
+
+    await subsystem.handleFileExplorerRequest(
+      {
+        type: "file_explorer_request",
+        cwd: "/caller/root",
+        workspaceId: "workspace-one",
+        path: "reports/quarter.csv",
+        mode: "file",
+        acceptBinary: true,
+        requestId: "request-binary",
+      },
+      source,
+    );
+
+    expect(enterpriseBinary.map(({ workspaceId }) => workspaceId)).toEqual([
+      "workspace-one",
+      "workspace-one",
+      "workspace-one",
+    ]);
+    expect(enterpriseBinary.map(({ source: emittedSource }) => emittedSource)).toEqual([
+      source,
+      source,
+      source,
+    ]);
+    expect(enterpriseBinary.map(({ frame }) => decodeFileTransferFrame(frame)?.opcode)).toEqual([
+      FileTransferOpcode.FileBegin,
+      FileTransferOpcode.FileChunk,
+      FileTransferOpcode.FileEnd,
+    ]);
+    expect(legacyBinary).toEqual([]);
+  });
+
+  test("enterprise cleanup waits for a blocked binary read and publishes no late frames", async () => {
+    const readGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.readGate = readGate.promise;
+    const { subsystem, enterpriseBinary } = makeSubsystem({
+      enterpriseRuntime,
+      hasBinaryChannel: true,
+    });
+    const transfer = subsystem.handleFileExplorerRequest({
+      type: "file_explorer_request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      mode: "file",
+      acceptBinary: true,
+      requestId: "request-binary-cleanup",
+    });
+    await waitUntil(() => enterpriseBinary.length === 1);
+
+    const cleanup = subsystem.cleanupEnterprise("generation-replaced");
+    let cleanupSettled = false;
+    cleanup.then(() => {
+      cleanupSettled = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(false);
+    readGate.resolve();
+
+    await expect(transfer).resolves.toBeUndefined();
+    await expect(cleanup).resolves.toBeUndefined();
+    expect(enterpriseBinary).toHaveLength(1);
+  });
+
+  test("inline explorer waits for close and emits one denied response when close fails", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.readCloseError = new Error("read close failed");
+    const { subsystem, enterpriseEmitted } = makeSubsystem({ enterpriseRuntime });
+
+    await subsystem.handleFileExplorerRequest({
+      type: "file_explorer_request",
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      mode: "file",
+      requestId: "request-inline-close",
+    });
+
+    expect(enterpriseRuntime.readCloseCalls).toBe(1);
+    expect(enterpriseEmitted).toEqual([
+      expect.objectContaining({
+        workspaceId: "workspace-one",
+        message: expect.objectContaining({
+          type: "file_explorer_response",
+          payload: expect.objectContaining({ file: null, error: "Enterprise file access denied." }),
+        }),
+      }),
+    ]);
+  });
+
+  test("binary explorer close failure is observable without a second JSON response", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.readCloseError = new Error("read close failed");
+    const { subsystem, enterpriseBinary, enterpriseEmitted } = makeSubsystem({
+      enterpriseRuntime,
+      hasBinaryChannel: true,
+    });
+
+    await expect(
+      subsystem.handleFileExplorerRequest({
+        type: "file_explorer_request",
+        cwd: "/caller/root",
+        workspaceId: "workspace-one",
+        path: "reports/quarter.csv",
+        mode: "file",
+        acceptBinary: true,
+        requestId: "request-binary-close",
+      }),
+    ).rejects.toBe(enterpriseRuntime.readCloseError);
+
+    expect(enterpriseRuntime.readCloseCalls).toBe(1);
+    expect(enterpriseBinary).toHaveLength(3);
+    expect(enterpriseEmitted).toEqual([]);
   });
 
   test("enterprise download token dispatch never touches the legacy absolute-path store", async () => {
@@ -276,6 +853,40 @@ describe("WorkspaceFilesSession", () => {
       payload: { cwd: "", token: "download-token", path: "reports/quarter.csv" },
     });
     expect(JSON.stringify(emitted[0])).not.toContain("caller/claimed/root");
+  });
+
+  test("rejects a download token whose returned path changes the request binding", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.downloadRelativePath = "reports/other.csv";
+    const { subsystem, enterpriseEmitted } = makeSubsystem({ enterpriseRuntime });
+
+    await subsystem.handleFileDownloadTokenRequest({
+      type: "file_download_token_request",
+      cwd: "/caller/claimed/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      requestId: "request-enterprise-download-path",
+    });
+
+    expect(enterpriseEmitted).toEqual([
+      {
+        workspaceId: "workspace-one",
+        source: undefined,
+        message: {
+          type: "file_download_token_response",
+          payload: {
+            cwd: "",
+            path: "reports/quarter.csv",
+            token: null,
+            fileName: null,
+            mimeType: null,
+            size: null,
+            error: "Enterprise file access denied.",
+            requestId: "request-enterprise-download-path",
+          },
+        },
+      },
+    ]);
   });
 
   test("enterprise upload uses server staging for the wire shape and keeps explicit paths typed", () => {
@@ -323,6 +934,128 @@ describe("WorkspaceFilesSession", () => {
         requestId: "request-enterprise-upload",
       },
     ]);
+  });
+
+  test("enterprise upload frames emit only through their authoritative request binding", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.uploadFrameResponse = {
+      type: "file.upload.response",
+      payload: {
+        requestId: "request-upload-frame",
+        uploadId: "upload-one",
+        workspaceId: "payload-must-not-authorize",
+        file: null,
+        error: "denied",
+      },
+    };
+    const { subsystem, enterpriseEmitted, legacyEmitted } = makeSubsystem({ enterpriseRuntime });
+    subsystem.handleEnterpriseFileUploadRequest({
+      workspaceId: "workspace-one",
+      relativePath: "uploads/report.csv",
+      fileName: "report.csv",
+      mimeType: "text/csv",
+      size: 0,
+      modifiedAt: "2026-09-10T00:00:00.000Z",
+      requestId: "request-upload-frame",
+    });
+
+    await subsystem.handleFileTransferFrame(
+      uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "request-upload-frame" }),
+    );
+    await subsystem.handleFileTransferFrame(
+      uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "unknown-request" }),
+    );
+
+    expect(enterpriseEmitted).toEqual([
+      expect.objectContaining({
+        workspaceId: "workspace-one",
+        message: {
+          type: "file.upload.response",
+          payload: {
+            requestId: "request-upload-frame",
+            workspaceId: "workspace-one",
+            file: null,
+            error: "Enterprise file access denied.",
+          },
+        },
+      }),
+    ]);
+    expect(legacyEmitted).toEqual([]);
+  });
+
+  test("enterprise cleanup invalidates an upload response blocked in the upload port", async () => {
+    const uploadGate = deferred();
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    enterpriseRuntime.uploadFrameGate = uploadGate.promise;
+    enterpriseRuntime.uploadFrameResponse = {
+      type: "file.upload.response",
+      payload: {
+        requestId: "request-upload-cleanup",
+        workspaceId: "workspace-one",
+        file: null,
+        error: "denied",
+      },
+    };
+    const { subsystem, enterpriseEmitted } = makeSubsystem({ enterpriseRuntime });
+    subsystem.handleEnterpriseFileUploadRequest({
+      workspaceId: "workspace-one",
+      relativePath: "uploads/report.csv",
+      fileName: "report.csv",
+      mimeType: "text/csv",
+      size: 0,
+      modifiedAt: "2026-09-10T00:00:00.000Z",
+      requestId: "request-upload-cleanup",
+    });
+    const receiving = subsystem.handleFileTransferFrame(
+      uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "request-upload-cleanup" }),
+    );
+    await waitUntil(() => enterpriseRuntime.uploadFrameCalls === 1);
+
+    const cleanup = subsystem.cleanupEnterprise("generation-replaced");
+    uploadGate.resolve();
+
+    await expect(receiving).resolves.toBeUndefined();
+    await expect(cleanup).resolves.toBeUndefined();
+    expect(enterpriseEmitted).toEqual([]);
+    await expect(
+      subsystem.handleFileTransferFrame(
+        uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "request-upload-cleanup" }),
+      ),
+    ).rejects.toThrow("Workspace file session is closed.");
+  });
+
+  test("enterprise subscription updates retain workspace correlation and stop after replacement", async () => {
+    const enterpriseRuntime = new TestEnterpriseRuntime();
+    const { subsystem, enterpriseEmitted } = makeSubsystem({ enterpriseRuntime });
+    const request = {
+      type: "fs.file.subscribe.request" as const,
+      cwd: "/caller/root",
+      workspaceId: "workspace-one",
+      path: "reports/quarter.csv",
+      subscriptionId: "subscription-one",
+      requestId: "request-old",
+    };
+    await subsystem.handleFileSubscribeRequest(request);
+    const oldCallback = enterpriseRuntime.watchCallbacks[0];
+    await subsystem.handleFileSubscribeRequest({ ...request, requestId: "request-new" });
+    oldCallback?.();
+    enterpriseRuntime.watchCallbacks[1]?.();
+    await waitUntil(() => enterpriseEmitted.length === 3);
+
+    expect(enterpriseEmitted.map(({ workspaceId }) => workspaceId)).toEqual([
+      "workspace-one",
+      "workspace-one",
+      "workspace-one",
+    ]);
+    expect(
+      enterpriseEmitted.map(({ message }) =>
+        "requestId" in message.payload ? message.payload.requestId : null,
+      ),
+    ).toEqual(["request-old", "request-new", null]);
+    await subsystem.cleanupEnterprise("generation-replaced");
+    enterpriseRuntime.watchCallbacks[1]?.();
+    await Promise.resolve();
+    expect(enterpriseEmitted).toHaveLength(3);
   });
 
   test("enterprise watch replacement waits for exactly-once async teardown", async () => {
