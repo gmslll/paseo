@@ -2440,6 +2440,7 @@ test("uploadFile sends metadata request and file bytes as binary chunks", async 
     bytes: new TextEncoder().encode("hello world"),
     modifiedAt: "2026-05-02T00:00:00.000Z",
     requestId: "req-upload",
+    workspaceId: "ws_upload",
     chunkSize: 5,
   });
 
@@ -2451,6 +2452,7 @@ test("uploadFile sends metadata request and file bytes as binary chunks", async 
       mimeType: "text/plain",
       size: 11,
       modifiedAt: "2026-05-02T00:00:00.000Z",
+      workspaceId: "ws_upload",
       requestId: "req-upload",
     },
   });
@@ -2519,6 +2521,213 @@ test("uploadFile sends metadata request and file bytes as binary chunks", async 
     },
     error: null,
   });
+});
+
+test("uploadFile snapshots workspace metadata and bytes before transport mutation", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const sourceBytes = new Uint8Array([65, 66, 67, 68]);
+  const input = {
+    fileName: "original.txt",
+    mimeType: "text/plain",
+    bytes: sourceBytes,
+    modifiedAt: "2026-05-02T00:00:00.000Z",
+    requestId: "req-upload-snapshot",
+    workspaceId: "ws_snapshot",
+    chunkSize: 2,
+  };
+  const originalSend = mock.transport.send;
+  let mutated = false;
+  mock.transport.send = (data) => {
+    originalSend(data);
+    if (!mutated && typeof data !== "string") {
+      mutated = true;
+      sourceBytes.fill(90);
+      input.fileName = "mutated.txt";
+      input.mimeType = "application/octet-stream";
+      input.workspaceId = "ws_mutated";
+    }
+  };
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+  const responsePromise = client.uploadFile(input);
+  expect(parseSentFrame(mock.sent[0])).toMatchObject({
+    fileName: "original.txt",
+    mimeType: "text/plain",
+    workspaceId: "ws_snapshot",
+  });
+  const chunks = mock.sent
+    .slice(1)
+    .map(assertUint8Array)
+    .map(decodeFileTransferFrame)
+    .filter((frame) => frame.opcode === FileTransferOpcode.FileChunk);
+  expect(chunks.map((frame) => Array.from(frame.payload))).toEqual([
+    [65, 66],
+    [67, 68],
+  ]);
+  expect(
+    (mock.sent[1] && decodeFileTransferFrame(assertUint8Array(mock.sent[1]))).metadata,
+  ).toMatchObject({
+    fileName: "original.txt",
+    mime: "text/plain",
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "file.upload.response",
+      payload: {
+        requestId: "req-upload-snapshot",
+        workspaceId: "ws_snapshot",
+        file: null,
+        error: null,
+      },
+    }),
+  );
+  await responsePromise;
+});
+
+test("requestDownloadToken forwards optional workspaceId", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+  const responsePromise = client.requestDownloadToken("/tmp/project", "notes.txt", "req-download", {
+    workspaceId: "ws_download",
+  });
+  expect(parseSentFrame(mock.sent[0])).toMatchObject({
+    type: "file_download_token_request",
+    workspaceId: "ws_download",
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "file_download_token_response",
+      payload: {
+        requestId: "req-download",
+        cwd: "",
+        path: "notes.txt",
+        token: "tok",
+        fileName: "notes.txt",
+        mimeType: "text/plain",
+        size: 1,
+        error: null,
+      },
+    }),
+  );
+  await responsePromise;
+});
+
+test("file subscription restores workspaceId", async () => {
+  const logger = createMockLogger();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transport = first.transport;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: true },
+    transportFactory: () => transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  first.triggerOpen();
+  await connectPromise;
+  const initial = client.subscribeFile(
+    { cwd: "/tmp/project", path: "notes.txt", workspaceId: "ws_sub" },
+    () => {},
+  );
+  const request = parseSentFrame(first.sent[0]);
+  expect(request).toMatchObject({
+    type: "fs.file.subscribe.request",
+    workspaceId: "ws_sub",
+  });
+  first.triggerMessage(
+    wrapSessionMessage({
+      type: "fs.file.subscribe.response",
+      payload: {
+        subscriptionId: request.subscriptionId,
+        requestId: request.requestId,
+        initial: {
+          status: "ready",
+          cwd: "/tmp/project",
+          path: "notes.txt",
+          size: 1,
+          modifiedAt: "2026-05-02T00:00:00.000Z",
+        },
+      },
+    }),
+  );
+  await initial;
+  transport = second.transport;
+  first.triggerClose();
+  const reconnect = client.connect();
+  second.triggerOpen();
+  await reconnect;
+  expect(parseSentFrame(second.sent[0])).toMatchObject({
+    type: "fs.file.subscribe.request",
+    workspaceId: "ws_sub",
+  });
+});
+
+test("file subscription omits workspaceId for legacy requests and restores", async () => {
+  const logger = createMockLogger();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transport = first.transport;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: true },
+    transportFactory: () => transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  first.triggerOpen();
+  await connectPromise;
+  const initial = client.subscribeFile({ cwd: "/tmp/project", path: "notes.txt" }, () => {});
+  const request = parseSentFrame(first.sent[0]);
+  expect(request).not.toHaveProperty("workspaceId");
+  first.triggerMessage(
+    wrapSessionMessage({
+      type: "fs.file.subscribe.response",
+      payload: {
+        subscriptionId: request.subscriptionId,
+        requestId: request.requestId,
+        initial: {
+          status: "ready",
+          cwd: "/tmp/project",
+          path: "notes.txt",
+          size: 1,
+          modifiedAt: "2026-05-02T00:00:00.000Z",
+        },
+      },
+    }),
+  );
+  await initial;
+  transport = second.transport;
+  first.triggerClose();
+  const reconnect = client.connect();
+  second.triggerOpen();
+  await reconnect;
+  expect(parseSentFrame(second.sent[0])).not.toHaveProperty("workspaceId");
 });
 
 test("normalizes workspace_setup_progress into a workspace-scoped daemon event", async () => {

@@ -501,6 +501,7 @@ export interface FileReadResult {
   revision?: string;
 }
 export interface FileUploadInput {
+  workspaceId?: string;
   fileName: string;
   mimeType: string;
   bytes: Uint8Array | ArrayBuffer;
@@ -1160,7 +1161,7 @@ export class DaemonClient {
   private terminalDirectorySubscriptions = new Map<string, { cwd: string; workspaceId?: string }>();
   private fileSubscriptions = new Map<
     string,
-    { cwd: string; path: string; onUpdate: (version: FileVersion) => void }
+    { cwd: string; path: string; workspaceId?: string; onUpdate: (version: FileVersion) => void }
   >();
   private readonly terminalStreams = new TerminalStreamRouter();
   private pendingBinaryFileReads = new Map<string, PendingBinaryFileRead>();
@@ -2579,6 +2580,9 @@ export class DaemonClient {
           cwd: subscription.cwd,
           path: subscription.path,
           subscriptionId,
+          ...(subscription.workspaceId === undefined
+            ? {}
+            : { workspaceId: subscription.workspaceId }),
         },
         responseType: "fs.file.subscribe.response",
       })
@@ -4572,18 +4576,20 @@ export class DaemonClient {
   }
 
   async subscribeFile(
-    input: { cwd: string; path: string },
+    input: { cwd: string; path: string; workspaceId?: string },
     onUpdate: (version: FileVersion) => void,
   ): Promise<{ initial: FileVersion; unsubscribe: () => void }> {
+    const { cwd, path, workspaceId } = input;
     const subscriptionId = this.createRequestId();
-    this.fileSubscriptions.set(subscriptionId, { ...input, onUpdate });
+    this.fileSubscriptions.set(subscriptionId, { cwd, path, workspaceId, onUpdate });
     try {
       const payload = await this.sendCorrelatedSessionRequest({
         message: {
           type: "fs.file.subscribe.request",
-          cwd: input.cwd,
-          path: input.path,
+          cwd,
+          path,
           subscriptionId,
+          ...(workspaceId === undefined ? {} : { workspaceId }),
         },
         responseType: "fs.file.subscribe.response",
       });
@@ -4666,18 +4672,25 @@ export class DaemonClient {
   }
 
   async uploadFile(input: FileUploadInput): Promise<FileUploadResult> {
-    const bytes = asUint8Array(input.bytes);
+    const workspaceId = input.workspaceId;
+    const fileName = input.fileName;
+    const mimeTypeValue = input.mimeType;
+    const modifiedAt = input.modifiedAt ?? new Date().toISOString();
+    const requestId = input.requestId;
+    const chunkSize = input.chunkSize ?? 1024 * 1024;
+    const sourceBytes = asUint8Array(input.bytes);
+    const bytes = sourceBytes ? new Uint8Array(sourceBytes) : null;
     if (!bytes) {
       throw new Error("File bytes are required.");
     }
-    const resolvedRequestId = this.createRequestId(input.requestId);
-    const modifiedAt = input.modifiedAt ?? new Date().toISOString();
+    const resolvedRequestId = this.createRequestId(requestId);
     const responsePromise = this.sendCorrelatedRequest({
       requestId: resolvedRequestId,
       message: {
         type: "file.upload.request",
-        fileName: input.fileName,
-        mimeType: input.mimeType,
+        fileName,
+        mimeType: mimeTypeValue,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
         size: bytes.byteLength,
         modifiedAt,
         requestId: resolvedRequestId,
@@ -4691,16 +4704,15 @@ export class DaemonClient {
         opcode: FileTransferOpcode.FileBegin,
         requestId: resolvedRequestId,
         metadata: {
-          mime: input.mimeType,
+          mime: mimeTypeValue,
           size: bytes.byteLength,
           encoding: "binary",
           modifiedAt,
-          fileName: input.fileName,
+          fileName,
         },
       }),
     );
 
-    const chunkSize = input.chunkSize ?? 1024 * 1024;
     for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
       this.sendBinaryFrame(
         encodeFileTransferFrame({
@@ -4725,13 +4737,16 @@ export class DaemonClient {
     cwd: string,
     path: string,
     requestId?: string,
+    options?: { workspaceId?: string },
   ): Promise<FileDownloadTokenPayload> {
+    const workspaceId = options?.workspaceId;
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "file_download_token_request",
         cwd,
         path,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
       },
       responseType: "file_download_token_response",
     });
