@@ -24,3 +24,4 @@ inventory and its exhaustiveness checks.
 - [ADR 0014: Persisted owner filtering and outbound authorization context](decisions/0014-outbound-authorization-context.md)
 - [ADR 0015: Register enterprise RPCs in the operation permission gate](decisions/0015-enterprise-operation-permission-registration.md)
 - [ADR 0016: Audit Sink authority and durability](decisions/0016-audit-sink-authority-and-durability.md)
+- [ADR 0017: Browser Profile runtime authorization](decisions/0017-browser-profile-runtime-authorization.md)

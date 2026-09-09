@@ -89,7 +89,10 @@ node, and TTL inputs belong to `LeaseCoordinator`.
 
 Browser automation declares optional `enterpriseProfiles: { version: 1 }`. Normalize host
 capabilities explicitly. Send the Profile/lease/fencing envelope only to a host declaring V1;
-Agent-visible command arguments never contain a Profile ID.
+Agent-visible command arguments never contain a Profile ID. Electron runtime authorization and
+node-local Profile paths follow
+[ADR 0017](decisions/0017-browser-profile-runtime-authorization.md); the renderer never supplies a
+partition or download path.
 
 ## UI projections
 

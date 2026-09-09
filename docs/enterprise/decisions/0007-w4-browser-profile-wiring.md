@@ -16,6 +16,9 @@ W4 may modify these browser-specific integration areas:
 - Desktop browser-automation IPC and service modules;
 - the browser Profile session, attach, popup, and download regions of `packages/desktop/src/main.ts`;
 - the browser bridge in `packages/app/src/desktop/host.ts`;
+- `createWorkspaceBrowser` call sites in
+  `packages/app/src/screens/workspace/workspace-screen.tsx`, only to pass the hydrated Workspace
+  and Profile authorization selected by W3;
 - the `enterprise-browser-profiles` Desktop capture-harness group.
 
 W3 retains `host-runtime` ownership. W6 retains enterprise UI ownership. W7 retains enterprise cross-module E2E and CI routing.
@@ -29,4 +32,5 @@ The security boundary depends on one server-selected Profile context reaching th
 - Agent tool input cannot accept `browserProfileId`, `leaseId`, or `fencingToken`.
 - The daemon resolves the authorized Profile and adds the protocol envelope.
 - Electron validates the Profile, lease, fencing token, Browser ID, and owning host before each operation.
+- Existing Browser IDs cannot be rebound to another Workspace or Profile.
 - W4 does not change Session filtering, Principal-scoped client caches, enterprise UI, or W7 test ownership.
