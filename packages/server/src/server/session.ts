@@ -1,4 +1,8 @@
-import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
+import type {
+  OutboundAuthorizationContext,
+  ResourceAuthorization,
+  SessionEventSubscription,
+} from "@getpaseo/protocol/messages";
 import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
@@ -25,6 +29,7 @@ import {
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
 } from "./messages.js";
+import { SessionOutboundMessageSchema } from "@getpaseo/protocol/messages";
 import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
@@ -166,11 +171,15 @@ import {
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
 import type { AuthoritySessionBindingLifecycle } from "./session/enterprise-authority-receipt-state.js";
-import { AuthorizedRequestReceiptSchema } from "./enterprise/access/authority-receipt-verifier.js";
-import { InboundAuthorityRequestAuthorizer } from "./enterprise/access/inbound-authority-request-authorizer.js";
+import type { AuthorityReceiptStatePort } from "./enterprise/access/authority-receipt-verifier.js";
+import {
+  InboundAuthorityRequestAuthorizer,
+  type ActiveAuthorizedRequestHandle,
+} from "./enterprise/access/inbound-authority-request-authorizer.js";
+import { OutboundAuthorityEmissionAuthorizer } from "./enterprise/access/outbound-authority-emission-authorizer.js";
+import type { OutboundAuthorityEmissionStatePort } from "./enterprise/access/outbound-authority-emission-authorizer.js";
 import type { PrincipalGrantVersionGuard } from "./enterprise/access/resource-authorization.js";
 import { authorityReceiptPolicyForRequestType } from "./enterprise/access/event-action-map.js";
-import type { PermissionRequirement } from "./authorization/operation-permissions.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
@@ -180,22 +189,14 @@ import {
 } from "../utils/project-custom-icon.js";
 import { VoiceSession } from "./session/voice/voice-session.js";
 
-function samePermissionRequirement(
-  left: PermissionRequirement,
-  right: PermissionRequirement,
-): boolean {
-  if (left === null || right === null) return left === right;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    return [...left].sort().every((permission, index) => permission === [...right].sort()[index]);
+function freezeOutbound<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value as Record<string, unknown>)) freezeOutbound(child);
+    Object.freeze(value);
   }
-  return left === right;
+  return value;
 }
 
-function sameEnterpriseActions(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) return false;
-  return [...left].sort().every((action, index) => action === [...right].sort()[index]);
-}
 import { CheckoutSession } from "./session/checkout/checkout-session.js";
 import {
   createWorkspaceGitObserverService,
@@ -480,8 +481,11 @@ export interface SessionOptions {
   clientId: string;
   enterpriseContext?: EnterpriseSessionContext;
   enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
-  authorityReceiptState?: AuthoritySessionBindingLifecycle;
+  authorityReceiptState?: AuthoritySessionBindingLifecycle &
+    AuthorityReceiptStatePort &
+    OutboundAuthorityEmissionStatePort;
   principalGrantVersionGuard?: PrincipalGrantVersionGuard;
+  resourceAuthorization?: ResourceAuthorization;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -692,20 +696,26 @@ function workspaceLabelErrorCode(error: unknown): string {
 export class Session {
   private readonly enterpriseContext?: EnterpriseSessionContext;
   private readonly enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
-  private readonly authorityReceiptState?: AuthoritySessionBindingLifecycle;
+  private readonly authorityReceiptState?: AuthoritySessionBindingLifecycle &
+    OutboundAuthorityEmissionStatePort;
+  private readonly resourceAuthorization?: ResourceAuthorization;
+  private readonly outboundAuthorityEmissionAuthorizer?: OutboundAuthorityEmissionAuthorizer;
   private readonly enterpriseSessionBindingKey?: string;
   private readonly inboundAuthorityRequestAuthorizer?: InboundAuthorityRequestAuthorizer;
   private readonly pendingAuthorityRequests = new Map<
     string,
     Readonly<{
-      receiptId: string;
       requestId: string;
       requestType: string;
       sessionBindingKey: string;
       sessionBindingGeneration: string;
+      activeRequestHandle: ActiveAuthorizedRequestHandle;
     }>
   >();
   private readonly reservedAuthorityRequestIds = new Set<string>();
+  private readonly outboundEmissionTasksByRequest = new Map<string, Set<Promise<void>>>();
+  private readonly outboundEmissionTailsByRequest = new Map<string, Promise<void>>();
+  private readonly outboundEmissionTasksWithoutRequest = new Set<Promise<void>>();
   private authoritySubsystemFailed = false;
   private authorityBindingReleased = false;
   private readonly clientId: string;
@@ -818,6 +828,7 @@ export class Session {
       enterpriseAgentContextRegistry,
       authorityReceiptState,
       principalGrantVersionGuard,
+      resourceAuthorization,
       permissions,
       appVersion,
       clientCapabilities,
@@ -873,14 +884,20 @@ export class Session {
       getWebSocketRuntimeMetrics,
     } = options;
     const enterpriseConfigured = Boolean(
-      enterpriseContext || enterpriseAgentContextRegistry || authorityReceiptState,
+      enterpriseContext ||
+      enterpriseAgentContextRegistry ||
+      authorityReceiptState ||
+      resourceAuthorization,
     );
     if (
       enterpriseConfigured &&
-      (!enterpriseContext || !enterpriseAgentContextRegistry || !authorityReceiptState)
+      (!enterpriseContext ||
+        !enterpriseAgentContextRegistry ||
+        !authorityReceiptState ||
+        !resourceAuthorization)
     )
       throw new Error(
-        "Enterprise context, registry, and authority receipt state must be configured together",
+        "Enterprise context, registry, and authority receipt state must be configured together with resource authorization",
       );
     if (Boolean(enterpriseContext) !== Boolean(principalGrantVersionGuard))
       throw new Error("Enterprise grant guard must be configured with enterprise context");
@@ -889,6 +906,7 @@ export class Session {
       : undefined;
     this.enterpriseAgentContextRegistry = enterpriseAgentContextRegistry;
     this.authorityReceiptState = authorityReceiptState;
+    this.resourceAuthorization = resourceAuthorization;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
     if (this.enterpriseContext && principalGrantVersionGuard)
@@ -1233,6 +1251,23 @@ export class Session {
           grantVersion: principal.grantVersion,
           nodeId: node.nodeId,
           clientId,
+        });
+      } catch (error) {
+        throw this.rollbackConstruction(error);
+      }
+    }
+    if (
+      this.enterpriseContext &&
+      this.inboundAuthorityRequestAuthorizer &&
+      resourceAuthorization &&
+      authorityReceiptState
+    ) {
+      try {
+        this.outboundAuthorityEmissionAuthorizer = new OutboundAuthorityEmissionAuthorizer({
+          inboundAuthorizer: this.inboundAuthorityRequestAuthorizer,
+          sessionAuthorization: this.authorization,
+          nodeId: this.enterpriseContext.node.nodeId,
+          state: authorityReceiptState,
         });
       } catch (error) {
         throw this.rollbackConstruction(error);
@@ -2113,7 +2148,7 @@ export class Session {
             return;
           this.reservedAuthorityRequestIds.add(requestId);
           reservedRequestId = requestId;
-          let receiptReturned = false;
+          let emissionRegisteredHandle: ActiveAuthorizedRequestHandle | null = null;
           try {
             const evidence = this.inboundAuthorityRequestAuthorizer.authorize(msg, daemonDecision);
             const consumed = evidence
@@ -2128,82 +2163,67 @@ export class Session {
               return;
             }
             const binding = this.enterpriseContext;
-            const receipt = this.authorityReceiptState.registerAuthorizedRequest({
-              sessionId: this.sessionId,
-              sessionBindingKey: this.enterpriseSessionBindingKey,
-              sessionBindingGeneration: binding.sessionBindingGeneration,
-              organizationId: binding.principal.organizationId,
-              principalId: binding.principal.principalId,
-              principalType: binding.principal.principalType,
-              credentialId: binding.principal.credentialId,
-              grantVersion: binding.principal.grantVersion,
-              nodeId: binding.node.nodeId,
-              clientId: this.clientId,
-              requestId,
-              requestType: consumed.requestType,
-              authorization: {
-                succeeded: true,
-                daemonPermission: consumed.authorization.daemonPermission,
-                enterpriseActions: consumed.authorization.enterpriseActions,
+            // oxlint-disable-next-line max-depth -- emission registration is part of the inbound transaction.
+            if (!this.outboundAuthorityEmissionAuthorizer)
+              throw new Error("Outbound authority unavailable");
+            const registeredEmission = await this.outboundAuthorityEmissionAuthorizer.register({
+              handle: consumed.activeRequestHandle,
+              principal: binding.principal,
+              binding: {
+                sessionId: this.sessionId,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: binding.sessionBindingGeneration,
+                organizationId: binding.principal.organizationId,
+                principalId: binding.principal.principalId,
+                principalType: binding.principal.principalType,
+                credentialId: binding.principal.credentialId,
+                grantVersion: binding.principal.grantVersion,
+                nodeId: binding.node.nodeId,
+                clientId: this.clientId,
               },
             });
-            receiptReturned = true;
-            const parsedReceipt = AuthorizedRequestReceiptSchema.parse(structuredClone(receipt));
-            // oxlint-disable-next-line max-depth -- receipt binding comparison remains atomic with registration.
-            if (
-              parsedReceipt.sessionId !== this.sessionId ||
-              parsedReceipt.sessionBindingKey !== this.enterpriseSessionBindingKey ||
-              parsedReceipt.sessionBindingGeneration !== binding.sessionBindingGeneration ||
-              parsedReceipt.organizationId !== binding.principal.organizationId ||
-              parsedReceipt.principalId !== binding.principal.principalId ||
-              parsedReceipt.principalType !== binding.principal.principalType ||
-              parsedReceipt.credentialId !== binding.principal.credentialId ||
-              parsedReceipt.grantVersion !== binding.principal.grantVersion ||
-              parsedReceipt.nodeId !== binding.node.nodeId ||
-              parsedReceipt.clientId !== this.clientId ||
-              parsedReceipt.requestId !== requestId ||
-              parsedReceipt.requestType !== consumed.requestType ||
-              !samePermissionRequirement(
-                parsedReceipt.authorization.daemonPermission,
-                consumed.authorization.daemonPermission,
-              ) ||
-              !sameEnterpriseActions(
-                parsedReceipt.authorization.enterpriseActions,
-                consumed.authorization.enterpriseActions,
-              )
-            )
-              throw new Error("Authority receipt binding mismatch");
+            // oxlint-disable-next-line max-depth -- pending correlation is committed after W2 registration.
+            if (!registeredEmission) throw new Error("Outbound authority registration failed");
+            emissionRegisteredHandle = consumed.activeRequestHandle;
             this.pendingAuthorityRequests.set(
               requestId,
               Object.freeze({
-                receiptId: parsedReceipt.receiptId,
                 requestId,
                 requestType: consumed.requestType,
                 sessionBindingKey: this.enterpriseSessionBindingKey,
                 sessionBindingGeneration: binding.sessionBindingGeneration,
+                activeRequestHandle: consumed.activeRequestHandle,
               }),
             );
             this.reservedAuthorityRequestIds.delete(requestId);
             reservedRequestId = null;
             registeredRequestId = requestId;
           } catch {
-            let endFailed = false;
-            // oxlint-disable-next-line max-depth -- terminal receipt cleanup is fail-closed and ordered.
-            try {
-              this.authorityReceiptState.endRequest({
-                sessionId: this.sessionId,
-                sessionBindingKey: this.enterpriseSessionBindingKey,
-                sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
-                requestId,
+            // oxlint-disable-next-line max-depth -- failed registration still closes the W2 active handle.
+            if (emissionRegisteredHandle && this.outboundAuthorityEmissionAuthorizer) {
+              await this.outboundAuthorityEmissionAuthorizer.close({
+                handle: emissionRegisteredHandle,
+                principal: this.enterpriseContext.principal,
+                binding: {
+                  sessionId: this.sessionId,
+                  sessionBindingKey: this.enterpriseSessionBindingKey,
+                  sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                  organizationId: this.enterpriseContext.principal.organizationId,
+                  principalId: this.enterpriseContext.principal.principalId,
+                  principalType: this.enterpriseContext.principal.principalType,
+                  credentialId: this.enterpriseContext.principal.credentialId,
+                  grantVersion: this.enterpriseContext.principal.grantVersion,
+                  nodeId: this.enterpriseContext.node.nodeId,
+                  clientId: this.clientId,
+                },
+                reason: "cancel",
               });
-            } catch {
-              endFailed = true;
-              this.authoritySubsystemFailed = true;
             }
-            // oxlint-disable-next-line max-depth -- terminal receipt cleanup is fail-closed and ordered.
-            if (receiptReturned || endFailed) {
+            // oxlint-disable-next-line max-depth -- terminal release remains inside registration rollback.
+            if (emissionRegisteredHandle) {
               this.authoritySubsystemFailed = true;
               // oxlint-disable-next-line max-depth -- release is nested to preserve exact binding cleanup.
+              // oxlint-disable-next-line max-depth -- exact release is nested in close failure handling.
               try {
                 // oxlint-disable-next-line max-depth -- release guard is part of the exact-once fence.
                 if (!this.authorityBindingReleased) {
@@ -2261,6 +2281,71 @@ export class Session {
       }
     } finally {
       let endError: unknown;
+      if (registeredRequestId) await this.flushOutboundEmissionTasks(registeredRequestId);
+      if (registeredRequestId && this.outboundAuthorityEmissionAuthorizer) {
+        const correlation = this.pendingAuthorityRequests.get(registeredRequestId);
+        if (correlation && this.enterpriseContext) {
+          const wasOpen = Boolean(
+            await this.authorityReceiptState?.resolveOpen({
+              handle: correlation.activeRequestHandle,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+            }),
+          );
+          const closed = await this.outboundAuthorityEmissionAuthorizer.close({
+            handle: correlation.activeRequestHandle,
+            principal: this.enterpriseContext.principal,
+            binding: {
+              sessionId: this.sessionId,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+              organizationId: this.enterpriseContext.principal.organizationId,
+              principalId: this.enterpriseContext.principal.principalId,
+              principalType: this.enterpriseContext.principal.principalType,
+              credentialId: this.enterpriseContext.principal.credentialId,
+              grantVersion: this.enterpriseContext.principal.grantVersion,
+              nodeId: this.enterpriseContext.node.nodeId,
+              clientId: this.clientId,
+            },
+            reason: "end",
+          });
+          // oxlint-disable-next-line max-depth -- terminal close cleanup is nested in request finally.
+          if (!closed) {
+            // oxlint-disable-next-line max-depth -- gate is part of terminal close cleanup.
+            if (wasOpen) this.authoritySubsystemFailed = true;
+            // oxlint-disable-next-line max-depth -- exact state close precedes binding release.
+            try {
+              await this.authorityReceiptState?.close({
+                handle: correlation.activeRequestHandle,
+                sessionBindingKey: correlation.sessionBindingKey,
+                sessionBindingGeneration: correlation.sessionBindingGeneration,
+                reason: "end",
+              });
+            } catch {
+              // Keep the terminal gate; cleanup retries the exact binding.
+            }
+            // oxlint-disable-next-line max-depth -- release is part of terminal close handling.
+            try {
+              // oxlint-disable-next-line max-depth -- exact binding guards the release.
+              if (
+                wasOpen &&
+                !this.authorityBindingReleased &&
+                this.authorityReceiptState &&
+                this.enterpriseContext
+              ) {
+                this.authorityReceiptState.releaseSession({
+                  sessionId: this.sessionId,
+                  sessionBindingKey: correlation.sessionBindingKey,
+                  sessionBindingGeneration: correlation.sessionBindingGeneration,
+                });
+                this.authorityBindingReleased = true;
+              }
+            } catch {
+              // cleanup() retries the exact binding release and preserves the terminal gate.
+            }
+          }
+        }
+      }
       if (
         registeredRequestId &&
         this.authorityReceiptState &&
@@ -2329,8 +2414,8 @@ export class Session {
     return this.terminalController.hasDirectorySubscription(input);
   }
 
-  public publish(message: SessionOutboundMessage): void {
-    this.emit(message);
+  public publish(message: SessionOutboundMessage, context?: OutboundAuthorizationContext): void {
+    this.emit(message, context);
   }
 
   private async dispatchInboundMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
@@ -8134,10 +8219,131 @@ export class Session {
     );
   }
 
-  private emit(msg: SessionOutboundMessage): void {
-    if (!this.authorization.allowsOutbound(msg)) {
+  private emit(msg: SessionOutboundMessage, context?: OutboundAuthorizationContext): void {
+    if (!this.enterpriseContext) {
+      this.deliver(msg);
       return;
     }
+    this.enqueueAuthorizedEmit(msg, context);
+  }
+
+  private emitForSource(
+    msg: SessionOutboundMessage,
+    source?: object,
+    context?: OutboundAuthorizationContext,
+  ): void {
+    if (!this.enterpriseContext) {
+      this.deliverForSource(msg, source);
+      return;
+    }
+    this.enqueueAuthorizedEmit(msg, context, source);
+  }
+
+  private enqueueAuthorizedEmit(
+    msg: SessionOutboundMessage,
+    context?: OutboundAuthorizationContext,
+    source?: object,
+  ): void {
+    // Authority context is minted only from the active inbound handle below;
+    // callers may supply resource/identity/transport context, never a receipt.
+    if (context?.kind === "authority") return;
+    let event: SessionOutboundMessage;
+    let authorizationContext: OutboundAuthorizationContext | undefined;
+    try {
+      event = freezeOutbound(SessionOutboundMessageSchema.parse(structuredClone(msg)));
+      authorizationContext = context ? freezeOutbound(structuredClone(context)) : undefined;
+    } catch {
+      return;
+    }
+    const requestId = this.outboundRequestId(event);
+    const previous = requestId
+      ? (this.outboundEmissionTailsByRequest.get(requestId) ?? Promise.resolve())
+      : Promise.resolve();
+    const task = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (!this.enterpriseContext || this.isCleanedUp || this.authoritySubsystemFailed)
+          return undefined;
+        let resolvedContext: OutboundAuthorizationContext | undefined = authorizationContext;
+        if (!resolvedContext) {
+          const emissionRequestId = this.outboundRequestId(event);
+          const correlation = emissionRequestId
+            ? this.pendingAuthorityRequests.get(emissionRequestId)
+            : undefined;
+          if (!correlation || !this.outboundAuthorityEmissionAuthorizer) return undefined;
+          const binding = this.enterpriseContext;
+          resolvedContext =
+            (await this.outboundAuthorityEmissionAuthorizer.authorizeEmission({
+              handle: correlation.activeRequestHandle,
+              principal: binding.principal,
+              binding: {
+                sessionId: this.sessionId,
+                sessionBindingKey: correlation.sessionBindingKey,
+                sessionBindingGeneration: correlation.sessionBindingGeneration,
+                organizationId: binding.principal.organizationId,
+                principalId: binding.principal.principalId,
+                principalType: binding.principal.principalType,
+                credentialId: binding.principal.credentialId,
+                grantVersion: binding.principal.grantVersion,
+                nodeId: binding.node.nodeId,
+                clientId: this.clientId,
+              },
+              event,
+            })) ?? undefined;
+          if (!resolvedContext) return undefined;
+        }
+        const allowed = await this.resourceAuthorization?.canEmit(
+          this.enterpriseContext.principal,
+          event,
+          resolvedContext,
+        );
+        if (allowed && !this.isCleanedUp) this.deliverForSource(event, source);
+        return undefined;
+      })
+      .catch((error) =>
+        this.sessionLogger.error({ err: error }, "Failed to authorize outbound message"),
+      );
+    if (requestId) {
+      const tail = task.finally(() => {
+        if (this.outboundEmissionTailsByRequest.get(requestId) === tail)
+          this.outboundEmissionTailsByRequest.delete(requestId);
+      });
+      this.outboundEmissionTailsByRequest.set(requestId, tail);
+    }
+    if (!requestId) {
+      this.outboundEmissionTasksWithoutRequest.add(task);
+      void task.finally(() => this.outboundEmissionTasksWithoutRequest.delete(task));
+      return;
+    }
+    let tasks = this.outboundEmissionTasksByRequest.get(requestId);
+    if (!tasks) {
+      tasks = new Set();
+      this.outboundEmissionTasksByRequest.set(requestId, tasks);
+    }
+    tasks.add(task);
+    void task.finally(() => {
+      const current = this.outboundEmissionTasksByRequest.get(requestId);
+      current?.delete(task);
+      if (current?.size === 0) this.outboundEmissionTasksByRequest.delete(requestId);
+    });
+  }
+
+  private async flushOutboundEmissionTasks(requestId: string): Promise<void> {
+    while (true) {
+      const tasks = this.outboundEmissionTasksByRequest.get(requestId);
+      if (!tasks || tasks.size === 0) return;
+      await Promise.allSettled(tasks);
+    }
+  }
+
+  private outboundRequestId(msg: SessionOutboundMessage): string | null {
+    if (!("payload" in msg) || !msg.payload || typeof msg.payload !== "object") return null;
+    const requestId = (msg.payload as { requestId?: unknown }).requestId;
+    return typeof requestId === "string" && requestId.length > 0 ? requestId : null;
+  }
+
+  private deliver(msg: SessionOutboundMessage): void {
+    if (!this.authorization.allowsOutbound(msg)) return;
     if (
       msg.type === "project.update" ||
       msg.type === "providers_snapshot_update" ||
@@ -8221,20 +8427,75 @@ export class Session {
     this.emitBinary(frame);
   }
 
-  private emitForSource(msg: SessionOutboundMessage, source?: object): void {
+  private deliverForSource(msg: SessionOutboundMessage, source?: object): void {
+    if (!this.authorization.allowsOutbound(msg)) return;
     if (source && this.onMessageToSource) {
       this.onMessageToSource(source, msg);
       return;
     }
-    this.emit(msg);
+    this.deliver(msg);
   }
 
   /**
    * Clean up session resources
    */
+  // oxlint-disable-next-line complexity -- cleanup drains authorization and all owned resources.
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
+    // Seal the outbound ingress synchronously, then drain both existing and
+    // racing tasks. Tasks queued after the seal observe isCleanedUp and cannot
+    // deliver, but are still joined before authority binding release.
+    while (
+      this.outboundEmissionTasksByRequest.size > 0 ||
+      this.outboundEmissionTasksWithoutRequest.size > 0
+    ) {
+      await Promise.allSettled([
+        ...[...this.outboundEmissionTasksByRequest.keys()].map((requestId) =>
+          this.flushOutboundEmissionTasks(requestId),
+        ),
+        ...this.outboundEmissionTasksWithoutRequest,
+      ]);
+    }
+    if (this.outboundAuthorityEmissionAuthorizer && this.enterpriseContext) {
+      for (const correlation of this.pendingAuthorityRequests.values()) {
+        const wasOpen = Boolean(
+          await this.authorityReceiptState?.resolveOpen({
+            handle: correlation.activeRequestHandle,
+            sessionBindingKey: correlation.sessionBindingKey,
+            sessionBindingGeneration: correlation.sessionBindingGeneration,
+          }),
+        );
+        const closed = await this.outboundAuthorityEmissionAuthorizer.close({
+          handle: correlation.activeRequestHandle,
+          principal: this.enterpriseContext.principal,
+          binding: {
+            sessionId: this.sessionId,
+            sessionBindingKey: correlation.sessionBindingKey,
+            sessionBindingGeneration: correlation.sessionBindingGeneration,
+            organizationId: this.enterpriseContext.principal.organizationId,
+            principalId: this.enterpriseContext.principal.principalId,
+            principalType: this.enterpriseContext.principal.principalType,
+            credentialId: this.enterpriseContext.principal.credentialId,
+            grantVersion: this.enterpriseContext.principal.grantVersion,
+            nodeId: this.enterpriseContext.node.nodeId,
+            clientId: this.clientId,
+          },
+          reason: "release",
+        });
+        if (!closed && wasOpen) {
+          this.authoritySubsystemFailed = true;
+          await this.authorityReceiptState?.close({
+            handle: correlation.activeRequestHandle,
+            sessionBindingKey: correlation.sessionBindingKey,
+            sessionBindingGeneration: correlation.sessionBindingGeneration,
+            reason: "release",
+          });
+        }
+      }
+    }
+    this.pendingAuthorityRequests.clear();
+    this.reservedAuthorityRequestIds.clear();
     let authorityReleaseError: unknown;
     if (this.enterpriseContext) {
       if (
