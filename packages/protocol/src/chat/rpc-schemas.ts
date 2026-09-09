@@ -7,6 +7,8 @@ export const ChatCreateRequestSchema = z.object({
   type: z.literal("chat/create"),
   requestId: z.string(),
   name: z.string(),
+  // Enterprise mode resolves this against the authenticated Principal and canonical registry.
+  workspaceId: z.string().min(1).optional(),
   purpose: z.string().optional(),
 });
 

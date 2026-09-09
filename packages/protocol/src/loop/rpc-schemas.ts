@@ -91,6 +91,8 @@ export const LoopRunRequestSchema = z.object({
   requestId: z.string(),
   prompt: z.string().trim().min(1),
   cwd: z.string(),
+  // Enterprise mode resolves this against the authenticated Principal and canonical registry.
+  workspaceId: z.string().min(1).optional(),
   provider: AgentProviderSchema.optional(),
   model: z.string().trim().min(1).optional(),
   modeId: z.string().trim().min(1).optional(),
