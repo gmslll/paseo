@@ -59,6 +59,7 @@ export class EnterprisePrincipalAuthenticator implements PrincipalAuthenticator 
     // connections must never gain Owner by presenting the daemon password.
     if (
       this.daemonPassword &&
+      canonicalContext.transport === "direct" &&
       (canonicalContext.peer === "loopback" || canonicalContext.peer === "local_ipc") &&
       (await compare(token, this.daemonPassword))
     ) {
@@ -87,6 +88,29 @@ export class EnterprisePrincipalAuthenticator implements PrincipalAuthenticator 
       });
     }
     return null;
+  }
+
+  async isCurrentPrincipalContext(principal: PrincipalContext): Promise<boolean> {
+    try {
+      const parsed = PrincipalContextSchema.parse(principal);
+      if (parsed.principalType === "break_glass_owner") {
+        const expected = `break-glass:${this.node.nodeId}:${this.node.paseoServerId}:${this.breakGlassGeneration}`;
+        const expectedGrants = ENTERPRISE_ACTIONS.map((action) => ({
+          action,
+          selector: { kind: "organization" as const, organizationId: this.organizationId },
+        }));
+        return (
+          parsed.principalId === "owner" &&
+          parsed.organizationId === this.organizationId &&
+          parsed.credentialId === expected &&
+          parsed.grantVersion === this.breakGlassGeneration &&
+          JSON.stringify(parsed.grants) === JSON.stringify(expectedGrants)
+        );
+      }
+      return await this.registry.isCurrentPrincipalContext(parsed);
+    } catch {
+      return false;
+    }
   }
 }
 
