@@ -271,6 +271,7 @@ export interface GrantEditorFormModel<TGeneration> {
     readonly sessionGeneration: TGeneration;
   }): Promise<GrantEditorResult>;
   setSessionGeneration(sessionGeneration: TGeneration): void;
+  refreshScope(sessionGeneration: TGeneration): void;
   close(): void;
 }
 
@@ -547,6 +548,16 @@ export function createGrantEditorFormModel<TGeneration>(options: {
     submit,
     setSessionGeneration: (nextGeneration) => {
       if (status === "closed" || isSameGeneration(currentGeneration, nextGeneration)) return;
+      cancelList();
+      cancelUpdate();
+      currentGeneration = nextGeneration;
+      server = { status: "not_requested" };
+      draft = Object.freeze([]);
+      mutation = { status: "idle" };
+      publish();
+    },
+    refreshScope: (nextGeneration) => {
+      if (status === "closed") return;
       cancelList();
       cancelUpdate();
       currentGeneration = nextGeneration;
