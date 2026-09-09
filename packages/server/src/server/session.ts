@@ -157,6 +157,7 @@ import {
   type WorkspaceMutation,
   type WorkspaceRegistry,
 } from "./workspace-registry.js";
+import { createEnterpriseSessionBindingKey } from "@getpaseo/protocol/messages";
 import {
   isEnterpriseAgentContextCurrentForSession,
   normalizeEnterpriseSessionContext,
@@ -164,6 +165,7 @@ import {
   type EnterpriseAgentSessionContextRegistry,
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
+import type { AuthoritySessionBindingLifecycle } from "./session/enterprise-authority-receipt-state.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
@@ -456,6 +458,7 @@ export interface SessionOptions {
   clientId: string;
   enterpriseContext?: EnterpriseSessionContext;
   enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
+  authorityReceiptState?: AuthoritySessionBindingLifecycle;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -666,6 +669,9 @@ function workspaceLabelErrorCode(error: unknown): string {
 export class Session {
   private readonly enterpriseContext?: EnterpriseSessionContext;
   private readonly enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
+  private readonly authorityReceiptState?: AuthoritySessionBindingLifecycle;
+  private readonly enterpriseSessionBindingKey?: string;
+  private authorityBindingReleased = false;
   private readonly clientId: string;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
@@ -774,6 +780,7 @@ export class Session {
       clientId,
       enterpriseContext,
       enterpriseAgentContextRegistry,
+      authorityReceiptState,
       permissions,
       appVersion,
       clientCapabilities,
@@ -828,15 +835,21 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    const enterpriseConfigured = Boolean(
+      enterpriseContext || enterpriseAgentContextRegistry || authorityReceiptState,
+    );
     if (
-      (enterpriseContext && !enterpriseAgentContextRegistry) ||
-      (!enterpriseContext && enterpriseAgentContextRegistry)
+      enterpriseConfigured &&
+      (!enterpriseContext || !enterpriseAgentContextRegistry || !authorityReceiptState)
     )
-      throw new Error("Enterprise context and registry must be configured together");
+      throw new Error(
+        "Enterprise context, registry, and authority receipt state must be configured together",
+      );
     this.enterpriseContext = enterpriseContext
       ? normalizeEnterpriseSessionContext(enterpriseContext)
       : undefined;
     this.enterpriseAgentContextRegistry = enterpriseAgentContextRegistry;
+    this.authorityReceiptState = authorityReceiptState;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
     this.appVersion = appVersion ?? null;
@@ -1152,12 +1165,96 @@ export class Session {
     this.subscribeToRegistryMutations();
 
     this.sessionLogger.trace({}, "agent.session.lifecycle.created");
+
+    if (this.enterpriseContext && this.authorityReceiptState) {
+      const { principal, node } = this.enterpriseContext;
+      const bindingKey = createEnterpriseSessionBindingKey({
+        organizationId: principal.organizationId,
+        principalId: principal.principalId,
+        credentialId: principal.credentialId,
+        grantVersion: principal.grantVersion,
+        clientId,
+      });
+      this.enterpriseSessionBindingKey = bindingKey;
+      try {
+        this.authorityReceiptState.registerSessionBinding({
+          sessionId: this.sessionId,
+          sessionBindingKey: bindingKey,
+          sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+          organizationId: principal.organizationId,
+          principalId: principal.principalId,
+          principalType: principal.principalType,
+          credentialId: principal.credentialId,
+          grantVersion: principal.grantVersion,
+          nodeId: node.nodeId,
+          clientId,
+        });
+      } catch (error) {
+        throw this.rollbackConstruction(error);
+      }
+    }
   }
 
   updateAppVersion(appVersion: string | null): void {
     if (appVersion && appVersion !== this.appVersion) {
       this.appVersion = appVersion;
     }
+  }
+
+  private rollbackConstruction(primary: unknown): Error {
+    const cleanupErrors: unknown[] = [primary];
+    const attempt = (cleanup: () => void): void => {
+      try {
+        cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+    this.isCleanedUp = true;
+    const authorityState = this.authorityReceiptState;
+    const authorityContext = this.enterpriseContext;
+    const authorityKey = this.enterpriseSessionBindingKey;
+    if (authorityContext && authorityState && authorityKey)
+      attempt(() => {
+        authorityState.releaseSession({
+          sessionId: this.sessionId,
+          sessionBindingKey: authorityKey,
+          sessionBindingGeneration: authorityContext.sessionBindingGeneration,
+        });
+        this.authorityBindingReleased = true;
+      });
+    attempt(() => this.unsubscribeAgentEvents?.());
+    this.unsubscribeAgentEvents = null;
+    attempt(() => this.unsubscribeProjectMutations?.());
+    this.unsubscribeProjectMutations = null;
+    attempt(() => this.unsubscribePluginChanges?.());
+    this.unsubscribePluginChanges = null;
+    attempt(() => this.unsubscribeWorkspaceMutations?.());
+    this.unsubscribeWorkspaceMutations = null;
+    attempt(() => this.workspaceLabelSubscription?.unsubscribe());
+    this.workspaceLabelSubscription = null;
+    attempt(() => this.agentUpdates.dispose());
+    attempt(() => this.unsubscribeTerminalWorkspaceContributionEvents?.());
+    this.unsubscribeTerminalWorkspaceContributionEvents = null;
+    attempt(() => this.providerCatalogSession.dispose());
+    this.hubExecutionController?.cleanup().catch((error) => {
+      this.sessionLogger.error({ err: error }, "Construction rollback hub cleanup failed");
+    });
+    this.voiceSession.cleanup().catch((error) => {
+      this.sessionLogger.error({ err: error }, "Construction rollback voice cleanup failed");
+    });
+    attempt(() => this.terminalController.dispose());
+    attempt(() => this.checkoutSession.cleanup());
+    attempt(() => this.workspaceGitObserver.dispose());
+    attempt(() => this.workspaceFilesSession.dispose());
+    attempt(() =>
+      this.enterpriseAgentContextRegistry?.releaseSession(
+        this.enterpriseContext?.sessionBindingGeneration ?? "",
+      ),
+    );
+    return new AggregateError(cleanupErrors, "Session construction rollback failed", {
+      cause: primary,
+    });
   }
 
   updateClientCapabilities(capabilities: Record<string, unknown> | null, source?: object): void {
@@ -7920,10 +8017,32 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
-    if (this.enterpriseContext)
-      this.enterpriseAgentContextRegistry?.releaseSession(
-        this.enterpriseContext.sessionBindingGeneration,
-      );
+    let authorityReleaseError: unknown;
+    if (this.enterpriseContext) {
+      if (
+        !this.authorityBindingReleased &&
+        this.authorityReceiptState &&
+        this.enterpriseSessionBindingKey
+      ) {
+        try {
+          this.authorityReceiptState.releaseSession({
+            sessionId: this.sessionId,
+            sessionBindingKey: this.enterpriseSessionBindingKey,
+            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+          });
+          this.authorityBindingReleased = true;
+        } catch (error) {
+          authorityReleaseError = error;
+        }
+      }
+      try {
+        this.enterpriseAgentContextRegistry?.releaseSession(
+          this.enterpriseContext.sessionBindingGeneration,
+        );
+      } catch (error) {
+        authorityReleaseError ??= error;
+      }
+    }
 
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();
@@ -7953,10 +8072,14 @@ export class Session {
 
     this.workspaceGitObserver.dispose();
     this.workspaceFilesSession.dispose();
+    if (authorityReleaseError) throw authorityReleaseError;
   }
 
   public getEnterpriseSessionContext(): EnterpriseSessionContext | undefined {
     return this.enterpriseContext;
+  }
+  public getEnterpriseSessionBindingKey(): string | undefined {
+    return this.enterpriseSessionBindingKey;
   }
   public bindAgentPrincipalContext(agentId: string): EnterpriseAgentContextHandle | null {
     if (

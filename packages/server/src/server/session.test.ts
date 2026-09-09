@@ -20,11 +20,13 @@ import {
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
 import { Session } from "./session.js";
+import { VoiceSession } from "./session/voice/voice-session.js";
 import {
   createEnterpriseAgentSessionContextRegistry,
   type EnterpriseAgentSessionContextRegistry,
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
+import { MemoryAuthorityReceiptState } from "./session/enterprise-authority-receipt-state.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
@@ -336,6 +338,8 @@ interface SessionForTestOptions {
   workspaceLabelService?: WorkspaceLabelService;
   enterpriseContext?: EnterpriseSessionContext;
   enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
+  authorityReceiptState?: SessionOptions["authorityReceiptState"];
+  autoAuthorityReceiptState?: boolean;
 }
 
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
@@ -442,6 +446,13 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     permissions: options.permissions ?? OWNER_PERMISSIONS,
     enterpriseContext: options.enterpriseContext,
     enterpriseAgentContextRegistry: options.enterpriseAgentContextRegistry,
+    authorityReceiptState:
+      options.authorityReceiptState ??
+      (options.autoAuthorityReceiptState !== false &&
+      options.enterpriseContext &&
+      options.enterpriseAgentContextRegistry
+        ? new MemoryAuthorityReceiptState()
+        : undefined),
   };
   return new Session(sessionOptions);
 }
@@ -479,6 +490,7 @@ function enterpriseContext(
 test("legacy Session has no enterprise context or agent resolution", () => {
   const session = createSessionForTest();
   expect(session.getEnterpriseSessionContext()).toBeUndefined();
+  expect(session.getEnterpriseSessionBindingKey()).toBeUndefined();
   expect(session.bindAgentPrincipalContext("agent-a")).toBeNull();
   expect(session.resolveAgentPrincipalContext("agent-a")).toBeNull();
 });
@@ -491,8 +503,206 @@ test.each([
   ],
 ])("Session rejects %s enterprise half-configuration", (_name, options) => {
   expect(() => createSessionForTest(options)).toThrow(
-    "Enterprise context and registry must be configured together",
+    "Enterprise context, registry, and authority receipt state",
   );
+});
+
+test("Session rejects every partial enterprise three-piece configuration", () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const context = enterpriseContext();
+  const partials = [
+    { enterpriseContext: context },
+    { enterpriseAgentContextRegistry: registry },
+    { authorityReceiptState },
+    { enterpriseContext: context, enterpriseAgentContextRegistry: registry },
+    { enterpriseContext: context, authorityReceiptState },
+    { enterpriseAgentContextRegistry: registry, authorityReceiptState },
+  ] as const;
+  for (const partial of partials)
+    expect(() => createSessionForTest({ ...partial, autoAuthorityReceiptState: false })).toThrow();
+});
+
+test("Session registers exact authority binding and releases it exactly once", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const registerSessionBinding = vi.spyOn(authorityReceiptState, "registerSessionBinding");
+  const releaseSession = vi.spyOn(authorityReceiptState, "releaseSession");
+  const context = enterpriseContext("generation-authority");
+  const session = createSessionForTest({
+    clientId: "client-authority",
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState,
+  });
+  const key = session.getEnterpriseSessionBindingKey();
+  expect(key).toBeTruthy();
+  const resolved = await authorityReceiptState.resolveCurrentSessionBinding({
+    sessionBindingKey: key!,
+    sessionBindingGeneration: context.sessionBindingGeneration,
+  });
+  expect(resolved).toEqual(
+    expect.objectContaining({
+      sessionBindingKey: key,
+      sessionBindingGeneration: context.sessionBindingGeneration,
+      organizationId: context.principal.organizationId,
+      principalId: context.principal.principalId,
+      principalType: context.principal.principalType,
+      credentialId: context.principal.credentialId,
+      grantVersion: context.principal.grantVersion,
+      nodeId: context.node.nodeId,
+      clientId: "client-authority",
+    }),
+  );
+  expect(registerSessionBinding).toHaveBeenCalledTimes(1);
+  expect(registerSessionBinding.mock.calls[0]?.[0]).toEqual(resolved);
+  await session.cleanup();
+  await session.cleanup();
+  expect(releaseSession).toHaveBeenCalledTimes(1);
+  expect(
+    await authorityReceiptState.resolveCurrentSessionBinding({
+      sessionBindingKey: key!,
+      sessionBindingGeneration: context.sessionBindingGeneration,
+    }),
+  ).toBeNull();
+});
+
+test("Session replacement cleanup does not release a newer binding", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const sessionA = createSessionForTest({
+    clientId: "client-authority",
+    enterpriseContext: enterpriseContext("generation-a"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState,
+  });
+  const sessionB = createSessionForTest({
+    clientId: "client-authority",
+    enterpriseContext: enterpriseContext("generation-b"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState,
+  });
+  const key = sessionB.getEnterpriseSessionBindingKey()!;
+  await sessionA.cleanup();
+  expect(
+    await authorityReceiptState.resolveCurrentSessionBinding({
+      sessionBindingKey: key,
+      sessionBindingGeneration: "generation-b",
+    }),
+  ).not.toBeNull();
+  await sessionB.cleanup();
+  expect(
+    await authorityReceiptState.resolveCurrentSessionBinding({
+      sessionBindingKey: key,
+      sessionBindingGeneration: "generation-b",
+    }),
+  ).toBeNull();
+});
+
+test("normal cleanup releases authority before a failing registry release", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const releaseRegistry = vi.fn(() => {
+    throw new Error("registry release failed");
+  });
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const releaseAuthority = vi.spyOn(authorityReceiptState, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-error"),
+    enterpriseAgentContextRegistry: { ...registry, releaseSession: releaseRegistry },
+    authorityReceiptState,
+  });
+  await expect(session.cleanup()).rejects.toThrow("registry release failed");
+  expect(releaseAuthority).toHaveBeenCalledTimes(1);
+  expect(releaseRegistry).toHaveBeenCalledTimes(1);
+});
+
+test("Session construction fails closed when authority binding registration fails", () => {
+  const releaseSession = vi.fn();
+  const unsubscribeAgent = vi.fn();
+  const subscribeAgent = vi.fn(() => unsubscribeAgent);
+  const unsubscribeHub = vi.fn();
+  const authorityReceiptState = {
+    registerSessionBinding: vi.fn(() => {
+      throw new Error("registration failed");
+    }),
+    releaseSession,
+  } as unknown as SessionOptions["authorityReceiptState"];
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState,
+      agentManager: { subscribe: subscribeAgent },
+      hubExecutionAgents: {
+        create: vi.fn(),
+        control: vi.fn(),
+        subscribe: vi.fn(() => unsubscribeHub),
+        invalidateAuthority: vi.fn(),
+      },
+    }),
+  ).toThrow();
+  expect(releaseSession).toHaveBeenCalledTimes(1);
+  expect(subscribeAgent).toHaveBeenCalled();
+  expect(unsubscribeAgent).toHaveBeenCalledTimes(1);
+  expect(unsubscribeHub).toHaveBeenCalledTimes(1);
+});
+
+test("construction rollback preserves registration and release errors", () => {
+  const authorityReceiptState = {
+    registerSessionBinding: vi.fn(() => {
+      throw new Error("registration failed");
+    }),
+    releaseSession: vi.fn(() => {
+      throw new Error("release failed");
+    }),
+  } as unknown as SessionOptions["authorityReceiptState"];
+  try {
+    createSessionForTest({
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState,
+    });
+    throw new Error("expected construction failure");
+  } catch (error) {
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((entry) => (entry as Error).message)).toEqual([
+      "registration failed",
+      "release failed",
+    ]);
+  }
+  expect(authorityReceiptState.releaseSession).toHaveBeenCalledTimes(1);
+});
+
+test("construction rollback continues after a non-authority cleanup failure", () => {
+  const releaseSession = vi.fn();
+  const authorityReceiptState = {
+    registerSessionBinding: vi.fn(() => {
+      throw new Error("registration failed");
+    }),
+    releaseSession,
+  } as unknown as SessionOptions["authorityReceiptState"];
+  const unsubscribeAgent = vi.fn(() => {
+    throw new Error("unsubscribe failed");
+  });
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const releaseRegistry = vi.fn(() => {
+    throw new Error("registry release failed");
+  });
+  const registryWithThrowingRelease = { ...registry, releaseSession: releaseRegistry };
+  const voiceCleanup = vi.spyOn(VoiceSession.prototype, "cleanup").mockResolvedValue(undefined);
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: registryWithThrowingRelease,
+      authorityReceiptState,
+      agentManager: { subscribe: vi.fn(() => unsubscribeAgent) },
+    }),
+  ).toThrow();
+  expect(unsubscribeAgent).toHaveBeenCalledTimes(1);
+  expect(releaseSession).toHaveBeenCalledTimes(1);
+  expect(releaseRegistry).toHaveBeenCalledTimes(1);
+  expect(voiceCleanup).toHaveBeenCalledTimes(1);
+  voiceCleanup.mockRestore();
 });
 
 test("Session normalizes and recursively freezes caller enterprise context", () => {

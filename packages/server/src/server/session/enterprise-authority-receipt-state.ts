@@ -53,6 +53,16 @@ export const AUTHORITY_RECEIPT_ID_MIN_LENGTH = 16;
 export const AUTHORITY_RECEIPT_ID_MAX_LENGTH = 256;
 export type AuthorityReceiptRegisterInput = z.input<typeof RegisterInputSchema>;
 
+/** Minimal Session-owned binding lifecycle seam; receipt consumption remains W2-owned. */
+export interface AuthoritySessionBindingLifecycle {
+  registerSessionBinding(input: AuthoritySessionBindingRecord): AuthoritySessionBindingRecord;
+  releaseSession(input: {
+    sessionId: string;
+    sessionBindingKey: string;
+    sessionBindingGeneration: string;
+  }): void;
+}
+
 export interface AuthorityReceiptStateOptions {
   readonly maxReceipts?: number;
   readonly clock?: AuthorityReceiptClock;
@@ -77,7 +87,9 @@ function parseInput<T extends z.ZodTypeAny>(schema: T, input: unknown): z.output
   }
 }
 
-export class MemoryAuthorityReceiptState implements AuthorityReceiptStatePort {
+export class MemoryAuthorityReceiptState
+  implements AuthorityReceiptStatePort, AuthoritySessionBindingLifecycle
+{
   private readonly receipts = new Map<string, AuthorizedRequestReceipt>();
   private readonly bindings = new Map<string, Map<string, AuthoritySessionBindingRecord>>();
   private readonly maxReceipts: number;
