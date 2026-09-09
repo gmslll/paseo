@@ -90,24 +90,31 @@ describe("desktop packaging", () => {
     );
   });
 
-  it("builds, traces, and unpacks the Darwin audit native binding", () => {
+  it("builds, traces, and unpacks the Darwin enterprise native bindings", () => {
     const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
     const serverPackage = readFileSync(join(packageRoot, "..", "server", "package.json"), "utf8");
     const runtimeTrace = readFileSync(
       join(packageRoot, "..", "..", "scripts", "trace-daemon.mjs"),
       "utf8",
     );
-    const bindingPath =
-      "packages/server/dist/server/server/enterprise/audit/native/darwin-audit-fs.node";
-
-    expect(serverPackage).toContain(
-      "node src/server/enterprise/audit/native/build-darwin-audit-fs.mjs",
-    );
     expect(runtimeTrace).toContain('process.platform === "darwin"');
-    expect(runtimeTrace).toContain(`"${bindingPath}"`);
-    expect(config).toContain(
-      "node_modules/@getpaseo/server/dist/server/server/enterprise/audit/native/*.node",
-    );
+
+    for (const binding of [
+      {
+        builder: "node src/server/enterprise/audit/native/build-darwin-audit-fs.mjs",
+        path: "packages/server/dist/server/server/enterprise/audit/native/darwin-audit-fs.node",
+        unpack: "node_modules/@getpaseo/server/dist/server/server/enterprise/audit/native/*.node",
+      },
+      {
+        builder: "node src/server/enterprise/runtime/native/build-darwin-workspace-fs.mjs",
+        path: "packages/server/dist/server/server/enterprise/runtime/native/darwin-workspace-fs.node",
+        unpack: "node_modules/@getpaseo/server/dist/server/server/enterprise/runtime/native/*.node",
+      },
+    ]) {
+      expect(serverPackage).toContain(binding.builder);
+      expect(runtimeTrace).toContain(`"${binding.path}"`);
+      expect(config).toContain(binding.unpack);
+    }
   });
 
   it("excludes package debug/source files from the packaged app", () => {

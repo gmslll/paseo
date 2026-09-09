@@ -74,7 +74,10 @@ const additionalInputs = [
   "node_modules/sherpa-onnx-node/**",
   `node_modules/${sherpaPlatformPackageName()}/**`,
   ...(process.platform === "darwin"
-    ? ["packages/server/dist/server/server/enterprise/audit/native/darwin-audit-fs.node"]
+    ? [
+        "packages/server/dist/server/server/enterprise/audit/native/darwin-audit-fs.node",
+        "packages/server/dist/server/server/enterprise/runtime/native/darwin-workspace-fs.node",
+      ]
     : []),
   ...(traceDesktop
     ? [
