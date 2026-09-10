@@ -6,8 +6,8 @@ does not mean the end-to-end case passes. `MISSING_CALL_SITE` means the producti
 yet proven to invoke the tested policy. `RED` is a known release blocker or missing mandatory real
 run. Do not replace these labels with `PASS` without attaching raw release-run evidence.
 
-Current blocking-state count, with every case counted once: `EVIDENCE` 17 (cases 1, 2, 4, 5, 6, 7, 8, 9, 10, 11,
-12, 14, 15, 16, 17, 18, and 19), `MISSING_CALL_SITE` 2, and `RED` 1 (case 20), leaving 3 cases not fully closed. Case
+Current blocking-state count, with every case counted once: `EVIDENCE` 18 (cases 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+12, 14, 15, 16, 17, 18, and 19), `MISSING_CALL_SITE` 1, and `RED` 1 (case 20), leaving 2 cases not fully closed. Case
 10 is now closed by the production run below. Static or unit-level evidence for the remaining
 missing cases is not counted as a second case.
 The `8dee12c94` cold-home provisioning/authentication run does not change
@@ -49,7 +49,11 @@ remain separate release gates.
   call-site evidence for cases 1, 2, 4, and 5: directory/list and metadata reads, workspace write/archive
   denials, timeline tail/before/after and gap recovery, Agent search, provider recents, child-Agent
   list/timeline, and tombstone delivery are exercised with foreign/guessed resources redacted or denied
-  without unauthorized source effects. Case 3 remains a missing ownership-transfer CAS call site.
+  without unauthorized source effects.
+- Case 3 is closed by the integrated transfer chain: W2 handler/CAS/audit and stores (`7c13b1906`),
+  W3 local seal and multi-Session tombstone fanout (`74603994c`, `f027ac25f`), client app-memory/
+  SQLite/timeline/provider eviction (`1543d4ce1`), and W7 production transfer/restart old-A denial /
+  new-B authorization plus multi-Session tombstone delivery (`c92031b7c`, `99b527a43`, `885b00873`).
 - W4 production Browser handle bind/cleanup (`26a175f99`), W3 Session waiting routing (`73ebdde08`),
   and the real Darwin production WS run at `5686ecc8e` close case 10: concurrent A/D writers on one
   Profile produce A as holder and D in its original Session's exclusive FIFO waiting position 1,
@@ -60,7 +64,7 @@ remain separate release gates.
 | ---: | ----------------------------------------------------------------------------------------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 |    1 | Employee A cannot list, read, update, or archive employee B's Workspace or Agent.                                 | `EVIDENCE` (closed) | Real Darwin `createPaseoDaemon` two-Principal WebSocket flow at `f1a101ae5` proves A sees only its Workspace/Agent directory rows; foreign fetch, update, archive, workspace title/pin/archive, and content requests are denied with persisted state unchanged.                                                                                                                                    |
 |    2 | Guessed foreign `workspaceId`, `agentId`, and `browserId` receive one non-enumerating denial.                     | `EVIDENCE` (closed) | The same production flow compares foreign and guessed Agent/Workspace denials, exercises foreign Profile/resource requests, and verifies redacted responses without foreign identifiers, secret markers, or unauthorized source effects.                                                                                                                                                           |
-|    3 | After A transfers a subscribed resource to B, A receives no later event.                                          | `MISSING_CALL_SITE` | Session authority-receipt and Agent-context registry tests exist; no ownership-transfer subscription E2E proves outbound revocation.                                                                                                                                                                                                                                                               |
+|    3 | After A transfers a subscribed resource to B, A receives no later event.                                          | `EVIDENCE` (closed) | W2 handler/CAS/audit and stores (`7c13b1906`), W3 local seal and multi-Session tombstone fanout (`74603994c`, `f027ac25f`), client app-memory/SQLite/timeline/provider eviction (`1543d4ce1`), and W7 production transfer/restart old-A denial/new-B allow plus multi-Session tombstone delivery (`c92031b7c`, `99b527a43`, `885b00873`) prove atomic revocation and no late events.               |
 |    4 | Timeline tail/before/after/gap recovery never exposes B's messages to A.                                          | `EVIDENCE` (closed) | The production flow at `f1a101ae5` denies A's foreign Agent timeline tail/before/after-gap, prompt, and subscription requests and observes no later foreign event after a denied subscription.                                                                                                                                                                                                     |
 |    5 | Search, provider recents, child Agents, and Tombstones reveal nothing about B.                                    | `EVIDENCE` (closed) | The same production flow returns no foreign Agent search or provider-recents results, denies repository search and child-Agent list/timeline requests, preserves the provider source call count, and emits no foreign tombstone after archive.                                                                                                                                                     |
 |    6 | Download tokens are Principal/Workspace-bound, expire, and are single-use.                                        | `EVIDENCE`          | W7's real Darwin `createPaseoDaemon` + public `/api/files/download` fetch proves Principal/Workspace binding, one-use, replay/closed rejection, wrong-PAT denial, and zero-read failures; policy tests cover expiry and concurrent consume. W3's host-supplied client seam carries Workspace/path context without a bearer field, but does not by itself prove every consumer or packaged runtime. |
