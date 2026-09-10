@@ -223,6 +223,11 @@ import {
   bindProductionAgentOwners,
   type ProductionAgentOwnerBinder,
 } from "./enterprise/access/production-agent-owner-binder.js";
+import { createProductionBrowserLeaseBundle } from "./enterprise/browser/production-bundle.js";
+import {
+  createEnterpriseBrowserLeaseSessionRuntime,
+  createProductionBrowserLeaseDispatcherRegistration,
+} from "./enterprise/browser/factory.js";
 import {
   createProductionAuditDispatcherRegistration,
   createProductionIdentityDispatcherRegistration,
@@ -840,7 +845,7 @@ export async function createPaseoDaemon(
       logger.error({ err: error }, "Failed to maintain orchestration skills at startup");
     });
     const browserToolsPolicy = new DaemonConfigBrowserToolsPolicy(daemonConfigStore);
-    const browserToolsBroker = new BrowserToolsBroker({});
+    let browserToolsBroker: BrowserToolsBroker;
     const pluginRuntime = new PluginService(logger, daemonConfigStore, daemonVersion, {
       managedSources: new ManagedPluginSources(capturedPaseoHome),
       settingsDirectory: path.join(capturedPaseoHome, "plugin-settings"),
@@ -1336,13 +1341,44 @@ export async function createPaseoDaemon(
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
       });
-      if (!identityRegistration || !resourceBundle || !auditRegistration) {
+      const browserBundle = createProductionBrowserLeaseBundle({
+        paseoHome: capturedPaseoHome,
+        nodeId: enterpriseRuntime.node.nodeId,
+        downloadBaseRoot: path.join(capturedPaseoHome, "enterprise", "browser", "profile-data"),
+        auditSink: enterpriseRuntime.audit,
+        clock: {
+          now: () => Date.now(),
+          setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+          clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+        },
+        createLeaseId: () => `lea_${randomUUID()}`,
+        createRequestId: () => `req_${randomUUID()}`,
+        maxLeaseTtlMs: 60_000,
+        onError: (error) => logger.error({ err: error }, "Enterprise browser lease failure"),
+      });
+      constructionCleanupStack.push(() => browserBundle.close());
+      await browserBundle.profiles.initialize();
+      await browserBundle.bindings.initialize();
+      await browserBundle.leases.initialize();
+      const browserRegistration = createProductionBrowserLeaseDispatcherRegistration({
+        provider: authorizationRuntimeProvider,
+        registry: enterpriseRuntime.agentContextRegistry,
+        bundle: browserBundle,
+        runtime: createEnterpriseBrowserLeaseSessionRuntime({
+          profiles: browserBundle.profiles,
+          bindings: browserBundle.bindings,
+          leases: browserBundle.leases,
+          leaseTtlMs: 60_000,
+        }),
+      });
+      if (!identityRegistration || !resourceBundle || !auditRegistration || !browserRegistration) {
         throw new Error("enterprise dispatcher production bundle unavailable");
       }
       productionEnterpriseDispatcherRegistration =
         createEnterpriseSessionDispatcherRegistration([
           identityRegistration,
           resourceBundle.dispatcherFactory,
+          browserRegistration,
           auditRegistration,
         ]) ?? undefined;
       if (!productionEnterpriseDispatcherRegistration) {
@@ -1351,8 +1387,16 @@ export async function createPaseoDaemon(
       productionEnterpriseFeatureFlags = Object.freeze({
         enterpriseIdentityV1: true,
         enterpriseResourceAuthorizationV1: true,
+        enterpriseBrowserProfilesV1: true,
         enterpriseAuditV1: true,
       });
+      browserToolsBroker = new BrowserToolsBroker({
+        enterprise: browserBundle.browserToolsRuntime,
+        onHostTeardownError: (error, hostClientId) =>
+          logger.error({ err: error, hostClientId }, "Enterprise browser host teardown failed"),
+      });
+    } else {
+      browserToolsBroker = new BrowserToolsBroker({});
     }
     const teardownArchivedWorkspaceRuntime = (workspaceId: string): void => {
       scriptRuntimeStore.removeForWorkspace(workspaceId);
