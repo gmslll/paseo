@@ -7,6 +7,7 @@ import type {
   FetchAgentsEntry,
   FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
+import type { EnterpriseFileRequestTransport } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import type { ConnectionOffer } from "@getpaseo/protocol/connection-offer";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
@@ -17,6 +18,7 @@ import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
 import { queryClient } from "@/data/query-client";
 import {
+  createEnterpriseFileRequestFactory,
   HostRuntimeController,
   HostRuntimeStore,
   readInitialDaemonConnectionHint,
@@ -691,6 +693,48 @@ describe("HostRuntimeController", () => {
 
     expect(received).not.toBeNull();
     expect(received!.enterpriseFileRequest).toBe(enterpriseFileRequest);
+  });
+
+  it("binds lifecycle-owned auth to an HTTP file request without putting it in the URL", async () => {
+    const host = makeHost({ serverId: "server-enterprise" });
+    const fetchMock = vi.fn(async () => new Response("file", { status: 200 }));
+    let capturedTransport: EnterpriseFileRequestTransport | null = null;
+    const createEnterpriseFileRequest = vi.fn(
+      ({ transport }: { transport: EnterpriseFileRequestTransport }) => {
+        capturedTransport = transport;
+        return vi.fn();
+      },
+    );
+    const factory = createEnterpriseFileRequestFactory({
+      lifecycle: { createEnterpriseFileRequest },
+      fetch: fetchMock,
+    });
+    const request = factory({
+      host,
+      connection: host.connections[0]!,
+      clientId: "cid_enterprise",
+      runtimeGeneration: 1,
+    });
+
+    expect(request).toBeTypeOf("function");
+    expect(capturedTransport).not.toBeNull();
+    await capturedTransport!.request({
+      serverId: host.serverId,
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      relativePath: "src/main.ts",
+      scopeGeneration: "generation-a",
+      authorization: "Bearer opaque",
+      signal: new AbortController().signal,
+    });
+    const [url, options] = fetchMock.mock.calls[0] as unknown as [
+      RequestInfo | URL,
+      RequestInit | undefined,
+    ];
+    expect(String(url)).toBe(
+      "http://lan:6767/api/files/download?workspaceId=wks_aaaaaaaaaaaaaaaa&relativePath=src%2Fmain.ts",
+    );
+    expect(options?.headers).toEqual({ Authorization: "Bearer opaque" });
+    expect(String(url)).not.toContain("opaque");
   });
 
   it("keeps browser client lifecycle tied to the active host runtime client", async () => {

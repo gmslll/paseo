@@ -8,6 +8,10 @@ import {
   type ConnectionState,
   type FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
+import type {
+  EnterpriseFileRequestTransport,
+  EnterpriseIdentityLifecycle,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import {
   connectionFromListen,
   createRemoteSshHostConnection,
@@ -189,6 +193,44 @@ export interface HostRuntimeControllerDeps {
     host: HostProfile;
     connection: HostConnection;
   }) => () => void;
+}
+
+/**
+ * Binds the lifecycle-owned credential vault to a host transport without
+ * exposing a credential handle or bearer to app callers.
+ */
+export function createEnterpriseFileRequestFactory(input: {
+  lifecycle: Pick<EnterpriseIdentityLifecycle, "createEnterpriseFileRequest">;
+  fetch?: typeof fetch;
+}): NonNullable<HostRuntimeControllerDeps["createEnterpriseFileRequest"]> {
+  const request = input.fetch ?? globalThis.fetch;
+  return ({ host, connection }) => {
+    if (connection.type !== "directTcp") return undefined;
+    const websocketUrl = buildDaemonWebSocketUrl(connection.endpoint, {
+      useTls: connection.useTls ?? false,
+    });
+    const baseUrl = new URL(websocketUrl);
+    baseUrl.protocol = baseUrl.protocol === "wss:" ? "https:" : "http:";
+    baseUrl.username = "";
+    baseUrl.password = "";
+    baseUrl.pathname = baseUrl.pathname.replace(/\/ws\/?$/, "/");
+    const transport: EnterpriseFileRequestTransport = {
+      request: ({ serverId, workspaceId, relativePath, authorization, signal }) => {
+        if (serverId !== host.serverId) return Promise.reject(new Error("Server scope mismatch"));
+        const url = new URL("/api/files/download", baseUrl);
+        url.searchParams.set("workspaceId", workspaceId);
+        url.searchParams.set("relativePath", relativePath);
+        return request(url, {
+          headers: { Authorization: authorization },
+          signal,
+        });
+      },
+    };
+    return input.lifecycle.createEnterpriseFileRequest({
+      serverId: host.serverId,
+      transport,
+    });
+  };
 }
 
 export interface HostRuntimeStorage {
