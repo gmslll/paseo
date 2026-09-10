@@ -45,7 +45,7 @@ export class JsonFileBrowserProfileLeaseGenerationStorage implements BrowserProf
 
 export interface ProductionBrowserLeaseBundleOptions extends Omit<
   BrowserProfileLeaseManagerOptions,
-  "generationStorage" | "clock"
+  "generationStorage" | "clock" | "isCurrentHandle" | "resolveAuthorization"
 > {
   paseoHome: string;
   nodeId: string;
