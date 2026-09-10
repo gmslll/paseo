@@ -8,14 +8,14 @@ import type { NodeContext, PrincipalContext } from "@getpaseo/protocol/messages"
 import { describe, expect, test } from "vitest";
 import { createProductionAuditRuntime } from "../audit/production-audit-runtime.js";
 import { createProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
-import { provisionProductionGrant } from "./production-grant-provisioner.js";
+import { provisionInitialGrant } from "./production-grant-provisioner.js";
 
 const execFileAsync = promisify(execFile);
 const nodeId = "nod_0123456789abcdef" as const;
 const organizationId = "org_0123456789abcdef" as const;
-const principal: PrincipalContext = {
-  principalType: "human",
-  principalId: "usr_0123456789abcdef",
+const actor: PrincipalContext = {
+  principalType: "break_glass_owner",
+  principalId: "owner",
   organizationId,
   credentialId: "cred_provision",
   grantVersion: "pending",
@@ -26,15 +26,22 @@ const node: NodeContext = { nodeId, paseoServerId: "srv_provision", mode: "stand
 describe("production grant provisioner", () => {
   test("rejects structural providers and exact mismatches without touching a store", async () => {
     await expect(
-      provisionProductionGrant({
+      provisionInitialGrant({
         provider: { grantStore: {}, owners: {} },
-        principal,
+        actor,
+        principalId: "usr_0123456789abcdef",
         organizationId,
         grants: [],
       }),
     ).resolves.toBeNull();
     await expect(
-      provisionProductionGrant({ provider: {}, principal, organizationId, grants: [] }),
+      provisionInitialGrant({
+        provider: {},
+        actor,
+        principalId: "usr_0123456789abcdef",
+        organizationId,
+        grants: [],
+      }),
     ).resolves.toBeNull();
   });
 
@@ -59,28 +66,55 @@ describe("production grant provisioner", () => {
           grantFilePath: path.join(root, "grants.json"),
         });
         expect(provider).not.toBeNull();
-        const first = await provisionProductionGrant({
+        const first = await provisionInitialGrant({
           provider: provider!,
-          principal,
+          actor,
+          principalId: "usr_0123456789abcdef",
           organizationId,
           grants: [],
         });
-        expect(first).toMatchObject({ principalId: principal.principalId, organizationId });
+        expect(first).toMatchObject({ principalId: "usr_0123456789abcdef", organizationId });
         expect(first?.grantVersion).toMatch(/^grv_/);
         await expect(
-          provisionProductionGrant({ provider: provider!, principal, organizationId, grants: [] }),
+          provisionInitialGrant({
+            provider: provider!,
+            actor,
+            principalId: "usr_0123456789abcdef",
+            organizationId,
+            grants: [],
+          }),
         ).resolves.toEqual(first);
         await expect(
-          provisionProductionGrant({
+          provisionInitialGrant({
             provider: provider!,
-            principal: { ...principal, organizationId: "org_abcdef0123456789" },
+            actor: {
+              ...actor,
+              principalType: "human",
+              principalId: "usr_0123456789abcdef",
+            },
+            principalId: "usr_abcdef0123456789",
+            organizationId,
+            grants: [],
+          }),
+        ).resolves.toBeNull();
+        await expect(
+          provisionInitialGrant({
+            provider: provider!,
+            actor: { ...actor, organizationId: "org_abcdef0123456789" },
+            principalId: "usr_0123456789abcdef",
             organizationId,
             grants: [],
           }),
         ).resolves.toBeNull();
         await audit.close();
         await expect(
-          provisionProductionGrant({ provider: provider!, principal, organizationId, grants: [] }),
+          provisionInitialGrant({
+            provider: provider!,
+            actor,
+            principalId: "usr_0123456789abcdef",
+            organizationId,
+            grants: [],
+          }),
         ).resolves.toBeNull();
       } finally {
         await rm(root, { recursive: true, force: true });
