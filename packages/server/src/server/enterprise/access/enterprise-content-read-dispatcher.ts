@@ -157,7 +157,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 { durability: "required" },
               );
               if (!current(sessionContext)) return false;
-              return deepFreeze(
+              const response = deepFreeze(
                 EnterpriseWorkspaceContentReadResponseSchema.parse({
                   type: "enterprise.workspace.content.read.response",
                   payload: {
@@ -168,6 +168,15 @@ export function createEnterpriseContentReadDispatcherRegistration(
                   },
                 }),
               );
+              const capability: Pending = Object.freeze({
+                context: sessionContext,
+                message,
+                response,
+                resource: canonical,
+              });
+              issued.set(response, capability);
+              pending.add(capability);
+              return response;
             } finally {
               reservations.delete(parsed.data.requestId);
             }
