@@ -315,6 +315,11 @@ function cloneFrozenEvent(event: AuditEvent): AuditEvent {
   return Object.freeze({ ...event, resource, metadata });
 }
 
+function sameAuditEvent(left: AuditEvent | null, right: AuditEvent | null): boolean {
+  if (left === null || right === null) return left === right;
+  return stable(left) === stable(right);
+}
+
 function cloneFrozenHashInput(event: AuditEvent): Readonly<AuditHashInput> {
   const { eventHash: _eventHash, ...input } = cloneFrozenEvent(event);
   return Object.freeze(input);
@@ -1123,6 +1128,39 @@ export class LocalAuditSink implements LocalAuditSinkContract {
     });
   }
 
+  snapshotEvents(): Promise<readonly AuditEvent[]> {
+    if (this.closed) return Promise.reject(new Error("audit sink closed"));
+    return this.enqueue(async () => {
+      const persisted = snapshotStoredEvents(await this.ports.readAll());
+      const persistedState = await this.verifyHistory(persisted);
+      if (!sameAuditEvent(persistedState.tail, this.durableTail)) {
+        throw new Error("audit durable tail changed outside the sink");
+      }
+
+      const events = [...persisted];
+      let previous = persistedState.tail;
+      const eventIds = new Set(persistedState.eventIds);
+      for (const queued of this.queue) {
+        if (
+          queued.previousHash !== (previous?.eventHash ?? undefined) ||
+          queued.nodeEventSeq !== (previous?.nodeEventSeq ?? 0) + 1 ||
+          eventIds.has(queued.eventId) ||
+          (previous !== null && Date.parse(queued.occurredAt) < Date.parse(previous.occurredAt)) ||
+          (await this.computeHash(queued)) !== queued.eventHash
+        ) {
+          throw new Error("audit queued chain continuity failure");
+        }
+        events.push(queued);
+        eventIds.add(queued.eventId);
+        previous = queued;
+      }
+      if (!sameAuditEvent(previous, this.chainTail)) {
+        throw new Error("audit chain tail changed outside the sink");
+      }
+      return Object.freeze(events.map(cloneFrozenEvent));
+    });
+  }
+
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
@@ -1141,6 +1179,16 @@ export class LocalAuditSink implements LocalAuditSinkContract {
   private async restore(): Promise<void> {
     // Snapshot and validate the complete returned history before the first async hash boundary.
     const events = snapshotStoredEvents(await this.ports.readAll());
+    const restored = await this.verifyHistory(events);
+    this.chainTail = restored.tail;
+    this.durableTail = restored.tail;
+    for (const eventId of restored.eventIds) this.eventIds.add(eventId);
+  }
+
+  private async verifyHistory(events: readonly AuditEvent[]): Promise<{
+    readonly tail: AuditEvent | null;
+    readonly eventIds: ReadonlySet<string>;
+  }> {
     let previous: AuditEvent | null = null;
     const restoredIds = new Set<string>();
     for (const event of events) {
@@ -1160,9 +1208,7 @@ export class LocalAuditSink implements LocalAuditSinkContract {
       previous = event;
       restoredIds.add(event.eventId);
     }
-    this.chainTail = previous;
-    this.durableTail = previous;
-    for (const eventId of restoredIds) this.eventIds.add(eventId);
+    return Object.freeze({ tail: previous, eventIds: restoredIds });
   }
 
   private async persist(event: AuditEvent): Promise<void> {

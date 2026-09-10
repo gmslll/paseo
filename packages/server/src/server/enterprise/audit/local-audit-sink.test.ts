@@ -602,6 +602,33 @@ describe("LocalAuditSink", () => {
     expect(new Set(storage.events.map((event) => event.eventId)).size).toBe(3);
   });
 
+  it("snapshots accepted buffered and durable events without duplicating or mutating the queue", async () => {
+    const storage = new MemoryStorage();
+    storage.fail = true;
+    const sink = new LocalAuditSink(dependencies(storage));
+    const buffered = await sink.append(input, { durability: "buffered" });
+    storage.fail = false;
+
+    const queuedSnapshot = await sink.snapshotEvents();
+    expect(queuedSnapshot).toEqual([buffered]);
+    expect(storage.events).toEqual([]);
+    expect(storage.attempts).toEqual([1]);
+    expect(Object.isFrozen(queuedSnapshot)).toBe(true);
+    expect(Object.isFrozen(queuedSnapshot[0])).toBe(true);
+
+    await sink.flush();
+    expect(await sink.snapshotEvents()).toEqual([buffered]);
+    expect(storage.events).toEqual([buffered]);
+    expect(storage.attempts).toEqual([1, 1]);
+
+    await sink.close();
+    await expect(sink.snapshotEvents()).rejects.toThrow("audit sink closed");
+
+    const resumed = new LocalAuditSink(dependencies(storage, 2));
+    expect(await resumed.snapshotEvents()).toEqual([buffered]);
+    await resumed.close();
+  });
+
   it("releases rejected event IDs after required failure and buffer overflow", async () => {
     const requiredStorage = new MemoryStorage();
     requiredStorage.fail = true;

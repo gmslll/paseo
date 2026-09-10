@@ -66,6 +66,7 @@ export interface ProductionAuditCapability extends LocalAuditSinkContract {
   readonly releaseReady: boolean;
   readonly unsupportedReason?: string;
   ready(): Promise<void>;
+  snapshotEvents(): Promise<readonly AuditEvent[]>;
   flush(): Promise<void>;
   close(): Promise<void>;
 }
@@ -106,6 +107,7 @@ type RuntimeState =
 interface RuntimeRecord {
   state: RuntimeState;
   readonly append: LocalAuditSink["append"];
+  readonly snapshotEvents: LocalAuditSink["snapshotEvents"];
   readonly flush: LocalAuditSink["flush"];
   readonly close: LocalAuditSink["close"];
   closePromise: Promise<void> | null;
@@ -221,6 +223,7 @@ class IssuedProductionAuditCapability implements ProductionAuditCapability {
     runtimeRecords.set(this, {
       state: { status: "initializing" },
       append: sink.append.bind(sink),
+      snapshotEvents: sink.snapshotEvents.bind(sink),
       flush: sink.flush.bind(sink),
       close: sink.close.bind(sink),
       closePromise: null,
@@ -247,6 +250,14 @@ class IssuedProductionAuditCapability implements ProductionAuditCapability {
       return Promise.reject(this.inactiveError(record.state));
     }
     return record.append(input, options);
+  }
+
+  snapshotEvents(): Promise<readonly AuditEvent[]> {
+    const record = recordFor(this);
+    if (!currentCapabilities.has(this) || record.state.status !== "ready") {
+      return Promise.reject(this.inactiveError(record.state));
+    }
+    return record.snapshotEvents();
   }
 
   flush(): Promise<void> {
