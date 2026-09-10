@@ -1,6 +1,6 @@
 # ADR-0023: Production enterprise runtime factory ownership
 
-Status: **DECISION_REQUIRED**
+Status: **ACCEPTED (contract; implementation pending)**
 
 ## Context
 
@@ -15,7 +15,7 @@ The dispatcher registry and feature flags are now assembled by integration, but
 they cannot create or infer these authority objects. A test fixture or a
 structural cast would break the same-source and current-guard contracts.
 
-## Decision required
+## Accepted contract
 
 Integration/root must own one production factory module and pass its bound
 factory to `createPaseoDaemon`. The factory must construct and retain, in this
@@ -74,6 +74,96 @@ factory before the listener or any Session is published. W1 and W2 may add the
 narrow typed constructors needed by this ruling inside their existing owned
 directories; no protocol or wire field is added.
 
+## Minimal identity document and invalidation event
+
+The W1 durable Principal source uses one strict, versioned document. This is an
+internal file contract, not a wire shape; unknown keys, mismatched record keys,
+empty required strings, invalid identifiers, and persisted `break_glass_owner`
+records are rejected.
+
+```ts
+const EnterpriseIdentityPrincipalRecordSchema = z
+  .strictObject({
+    principalId: PrincipalIdSchema,
+    organizationId: OrganizationIdSchema,
+    principalType: z.enum(["human", "service"]),
+    displayName: z.string().min(1).optional(),
+    metadata: z.record(z.string(), z.string()).optional(),
+  });
+
+const EnterpriseIdentityDocumentSchema = z
+  .strictObject({
+    version: z.literal(1),
+    principals: z.record(PrincipalIdSchema, EnterpriseIdentityPrincipalRecordSchema),
+  })
+  .superRefine((document, ctx) => {
+    for (const [key, principal] of Object.entries(document.principals)) {
+      if (key !== principal.principalId) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["principals", key],
+          message: "principal key mismatch",
+        });
+      }
+    }
+  });
+```
+
+The W1 registry's existing committed mutation event remains an internal
+`CredentialInvalidation` input. The integration bridge enriches it with the
+current W2 Grant version and fans it out once per affected live Session to the
+W3 teardown registry:
+
+```ts
+type CredentialInvalidationKind =
+  | "credential.revoke"
+  | "credential.rotate"
+  | "principal.logout_all";
+
+const CredentialIdSchema = z.string().regex(/^cred_[0-9a-f]{24}$/);
+
+const CredentialInvalidationEventSchema = z.strictObject({
+  kind: z.enum(["credential.revoke", "credential.rotate", "principal.logout_all"]),
+  credentialIds: z
+    .array(CredentialIdSchema)
+    .min(1)
+    .superRefine((ids, ctx) => {
+      if (new Set(ids).size !== ids.length)
+        ctx.addIssue({ code: "custom", message: "duplicate credential id" });
+    }),
+  principalId: PrincipalIdSchema,
+  organizationId: OrganizationIdSchema,
+  grantVersion: z.string().min(1),
+  sessionBindingGeneration: z.string().min(1),
+});
+
+interface CredentialInvalidationEvent {
+  readonly kind: CredentialInvalidationKind;
+  readonly credentialIds: readonly [string, ...string[]];
+  readonly principalId: PrincipalId;
+  readonly organizationId: OrganizationId;
+  readonly grantVersion: string;
+  /** Exactly one currently bound Session generation; never a client field. */
+  readonly sessionBindingGeneration: string;
+}
+
+interface CredentialInvalidationPublisher {
+  publishCredentialInvalidation(event: CredentialInvalidationEvent): Promise<void>;
+}
+```
+
+The runtime schema for this event is strict and requires non-empty
+`credentialIds`, `grantVersion`, and `sessionBindingGeneration`; it rejects
+unknown fields and duplicate or invalid identifiers. The bridge first commits
+the W1 mutation, invalidates the matching W1 admission credential or Principal
+authority, resolves the current Grant version from the same W2 `GrantStore`,
+then publishes one event for each current Session generation. A multi-Session
+`logout_all` therefore produces multiple events with distinct generations. If
+there is no live Session, no W3 event is needed, but admission invalidation is
+still mandatory. Any issuer or teardown-publisher failure rejects the operation
+after commit via the existing committed-invalidation error; it must never
+degrade to a no-op.
+
 ## Required evidence
 
 - A real daemon worker with enterprise configuration reaches bootstrap using
@@ -86,8 +176,14 @@ directories; no protocol or wire field is added.
 - Credential revoke, rotate, and logout-all evidence proves committed
   invalidation reaches admission authority and W3 Session teardown; a missing or
   failed invalidation publisher fails closed rather than degrading to a no-op.
+- Strict identity-document tests cover versioning, Principal key equality,
+  unknown-field rejection, and restart durability. Event tests cover two
+  concurrent Sessions, distinct generation fan-out, current Grant-version
+  binding, and issuer/teardown failure handling.
 - A Darwin cross-flow proves one audit → admission handle → W2 runtime → W5
   runtime → Session chain, including reconnect generation and release.
 
-Until this ADR is accepted and implemented, enterprise production startup and
-the remaining dispatcher families stay unavailable by default.
+This contract is accepted, but enterprise production startup and the remaining
+dispatcher families stay unavailable by default until the typed sources, bridge,
+root factory, daemon-worker injection, and required real-daemon evidence are
+implemented.
