@@ -241,6 +241,25 @@ export class OutboundAuthorityEmissionAuthorizer {
     }
   }
 
+  /** @internal Runtime teardown needs the exact delegate failure after local revocation. */
+  async closeForTeardown(input: CloseActiveAuthorizedRequestInput): Promise<void> {
+    const handle = input.handle;
+    const principal = canonicalPrincipal(input.principal);
+    const binding = canonicalBinding(input.binding);
+    const state = this.requestState(handle);
+    if (
+      !state ||
+      !samePrincipal(state.principal, principal) ||
+      !sameBinding(state.binding, binding)
+    ) {
+      throw new Error("active authorized request does not match runtime teardown");
+    }
+    if (state.lifecycle === "closed" || state.lifecycle === "terminal") return;
+    state.lifecycle = "closed";
+    state.claimed.close();
+    await this.closeState({ ...this.reference(state), reason: input.reason });
+  }
+
   private async authorizeEmissionSerial(
     state: ActiveRequestState,
     principal: PrincipalContext,

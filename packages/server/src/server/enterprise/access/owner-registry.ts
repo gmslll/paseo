@@ -26,6 +26,7 @@ export interface QuarantinedResource {
 
 type OwnedWorkspace = AuthorizedWorkspace;
 type OwnedAgent = AuthorizedAgent;
+const ownerRegistries = new WeakSet<object>();
 
 /**
  * Canonical in-process owner index. Rows without a complete enterprise owner
@@ -35,6 +36,10 @@ export class OwnerRegistry {
   private readonly workspaces = new Map<string, OwnedWorkspace>();
   private readonly agents = new Map<string, OwnedAgent>();
   private readonly quarantine = new Map<string, QuarantinedResource>();
+
+  constructor() {
+    ownerRegistries.add(this);
+  }
 
   registerWorkspace(record: EnterpriseWorkspaceAuthorizationRecord): void {
     const result = classifyOwner(record);
@@ -143,6 +148,26 @@ export class OwnerRegistry {
   quarantined(): QuarantinedResource[] {
     return [...this.quarantine.values()];
   }
+}
+
+export function isOwnerRegistry(value: unknown): value is OwnerRegistry {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    ownerRegistries.has(value)
+  );
+}
+
+export function getAuthoritativeWorkspace(
+  registry: OwnerRegistry,
+  workspaceId: string,
+): OwnedWorkspace | null {
+  if (!isOwnerRegistry(registry)) return null;
+  return OwnerRegistry.prototype.getWorkspace.call(registry, workspaceId);
+}
+
+export function getAuthoritativeAgent(registry: OwnerRegistry, agentId: string): OwnedAgent | null {
+  if (!isOwnerRegistry(registry)) return null;
+  return OwnerRegistry.prototype.getAgent.call(registry, agentId);
 }
 
 function resourceKey(kind: QuarantinedResource["kind"], id: string): string {

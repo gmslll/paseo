@@ -16,7 +16,7 @@ import {
   OutboundAuthorizationContextSchema,
   type ResourceAuthorization as ResourceAuthorizationContract,
 } from "@getpaseo/protocol/messages";
-import { OwnerRegistry } from "./owner-registry.js";
+import type { OwnerRegistry } from "./owner-registry.js";
 import type { GrantStore } from "./grant-store.js";
 import { isMatchingTransportControl, outboundActionsFor } from "./event-action-map.js";
 import type { OutboundAuthorityVerifier } from "./authority-receipt-verifier.js";
@@ -33,8 +33,13 @@ export interface WorkspacePathRegistry {
   resolve(workspace: AuthorizedWorkspace, requestedPath: string): Promise<string | null>;
 }
 
+export interface OwnerAuthorizationRegistry {
+  getWorkspace(workspaceId: string): ReturnType<OwnerRegistry["getWorkspace"]>;
+  getAgent(agentId: string): ReturnType<OwnerRegistry["getAgent"]>;
+}
+
 export interface ResourceAuthorizationDependencies {
-  owners: OwnerRegistry;
+  owners: OwnerAuthorizationRegistry;
   browserProfiles?: BrowserProfileRegistry;
   appSlots?: AppSlotRegistry;
   workspacePaths?: WorkspacePathRegistry;
@@ -78,7 +83,7 @@ const WORKSPACE_ACTIONS = [
 ] as const satisfies readonly EnterpriseAction[];
 
 export class ResourceAuthorizationService implements ResourceAuthorizationContract {
-  private readonly owners: OwnerRegistry;
+  private readonly owners: OwnerAuthorizationRegistry;
   private readonly browserProfiles?: BrowserProfileRegistry;
   private readonly appSlots?: AppSlotRegistry;
   private readonly workspacePaths?: WorkspacePathRegistry;

@@ -9,8 +9,11 @@ import {
   DAEMON_PERMISSIONS,
   OWNER_PERMISSIONS,
   SessionAuthorization,
+  closeActiveDaemonPermission,
   consumeCurrentInboundDaemonAuthorizationDecision,
   consumeInboundDaemonAuthorizationDecision,
+  isActiveDaemonPermissionCurrent,
+  issueActiveDaemonPermission,
   permissionsForLegacyHubScopes,
   parseDaemonPermissions,
 } from "./index.js";
@@ -285,5 +288,32 @@ describe("SessionAuthorization", () => {
     expect(
       consumeInboundDaemonAuthorizationDecision(authorization, message, currentDecision),
     ).toBeNull();
+  });
+
+  test("invalidates an opaque daemon permission handle on every permission replacement", () => {
+    const authorization = new SessionAuthorization(["workspace.read"]);
+    const handle = issueActiveDaemonPermission(authorization, "workspace.read");
+
+    expect(handle).not.toBeNull();
+    expect(Object.keys(handle!)).toEqual([]);
+    expect(Object.isFrozen(handle)).toBe(true);
+    expect(isActiveDaemonPermissionCurrent(authorization, handle!, "workspace.read")).toBe(true);
+    expect(isActiveDaemonPermissionCurrent(authorization, handle!, "workspace.write")).toBe(false);
+    expect(
+      isActiveDaemonPermissionCurrent(
+        new SessionAuthorization(["workspace.read"]),
+        handle!,
+        "workspace.read",
+      ),
+    ).toBe(false);
+
+    authorization.replacePermissions(["workspace.read"]);
+    expect(isActiveDaemonPermissionCurrent(authorization, handle!, "workspace.read")).toBe(false);
+
+    const current = issueActiveDaemonPermission(authorization, "workspace.read")!;
+    expect(closeActiveDaemonPermission(authorization, current)).toBe(true);
+    expect(closeActiveDaemonPermission(authorization, current)).toBe(false);
+    expect(isActiveDaemonPermissionCurrent(authorization, current, "workspace.read")).toBe(false);
+    expect(issueActiveDaemonPermission(authorization, "workspace.write")).toBeNull();
   });
 });

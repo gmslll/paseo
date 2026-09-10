@@ -347,6 +347,12 @@ export class RandomGrantVersionSource implements GrantVersionSource {
   }
 }
 
+interface AuthoritativeGrantStoreRecord {
+  readonly audit: AuditSink;
+}
+
+const authoritativeGrantStores = new WeakMap<object, AuthoritativeGrantStoreRecord>();
+
 export class GrantStore {
   private mutationQueue: Promise<void> = Promise.resolve();
   private readonly listeners = new Set<(change: GrantInvalidation) => void | Promise<void>>();
@@ -355,8 +361,10 @@ export class GrantStore {
   constructor(
     private readonly storage: GrantStorage,
     private readonly versionSource: GrantVersionSource = new RandomGrantVersionSource(),
-    private readonly audit: AuditSink,
-  ) {}
+    audit: AuditSink,
+  ) {
+    authoritativeGrantStores.set(this, Object.freeze({ audit }));
+  }
 
   async get(principalId: string): Promise<GrantRecord | null> {
     const operation = this.mutationQueue.then(async () => {
@@ -448,7 +456,7 @@ export class GrantStore {
       outcome: "allowed",
       metadata: { grantVersion: current.grantVersion, phase: "intent" },
     });
-    await this.audit.append(intent, { durability: "required" });
+    await authoritativeGrantStoreAudit(this).append(intent, { durability: "required" });
 
     try {
       await this.storage.put(GrantRecordSchema.parse(current));
@@ -487,7 +495,7 @@ export class GrantStore {
     error: unknown,
   ): Promise<unknown | null> {
     try {
-      await this.audit.append(
+      await authoritativeGrantStoreAudit(this).append(
         AuditEventInputSchema.parse({
           organizationId: current.organizationId,
           actorPrincipalId: actor.principalId,
@@ -509,6 +517,49 @@ export class GrantStore {
     }
     return null;
   }
+}
+
+export function isAuthoritativeGrantStore(value: unknown): value is GrantStore {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    authoritativeGrantStores.has(value)
+  );
+}
+
+export function isAuthoritativeGrantStoreForAudit(store: GrantStore, audit: AuditSink): boolean {
+  if (!isAuthoritativeGrantStore(store)) return false;
+  return authoritativeGrantStores.get(store)?.audit === audit;
+}
+
+export function readAuthoritativeGrantRecord(
+  store: GrantStore,
+  principalId: string,
+): Promise<GrantRecord | null> {
+  if (!isAuthoritativeGrantStore(store)) return Promise.reject(new Error("invalid GrantStore"));
+  return GrantStore.prototype.get.call(store, principalId);
+}
+
+export function currentAuthoritativeGrantVersion(
+  store: GrantStore,
+  organizationId: string,
+  principalId: string,
+): string | null {
+  if (!isAuthoritativeGrantStore(store)) return null;
+  return GrantStore.prototype.currentVersion.call(store, organizationId, principalId);
+}
+
+export function subscribeAuthoritativeGrantInvalidation(
+  store: GrantStore,
+  listener: (change: GrantInvalidation) => void | Promise<void>,
+): () => void {
+  if (!isAuthoritativeGrantStore(store)) throw new Error("invalid GrantStore");
+  return GrantStore.prototype.subscribe.call(store, listener);
+}
+
+function authoritativeGrantStoreAudit(store: GrantStore): AuditSink {
+  const record = authoritativeGrantStores.get(store);
+  if (!record) throw new Error("invalid GrantStore");
+  return record.audit;
 }
 
 function nextGrantVersion(source: GrantVersionSource, previousVersion: string | null): string {

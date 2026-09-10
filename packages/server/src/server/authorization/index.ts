@@ -26,6 +26,7 @@ export const OWNER_PERMISSIONS: readonly DaemonPermission[] = DAEMON_PERMISSIONS
 declare const inboundDaemonAuthorizationDecisionBrand: unique symbol;
 declare const consumedInboundDaemonAuthorizationDecisionBrand: unique symbol;
 declare const activeInboundDaemonAuthorizationBrand: unique symbol;
+declare const activeDaemonPermissionBrand: unique symbol;
 
 export interface InboundDaemonAuthorizationDecision {
   readonly [inboundDaemonAuthorizationDecisionBrand]: true;
@@ -39,6 +40,10 @@ export interface ConsumedInboundDaemonAuthorizationDecision {
 
 export interface ActiveInboundDaemonAuthorization {
   readonly [activeInboundDaemonAuthorizationBrand]: true;
+}
+
+export interface ActiveDaemonPermission {
+  readonly [activeDaemonPermissionBrand]: true;
 }
 
 interface SessionAuthorizationState {
@@ -66,6 +71,14 @@ const consumedInboundDaemonAuthorizationDecisionStates = new WeakMap<
 const activeInboundDaemonAuthorizationStates = new WeakMap<
   object,
   InboundDaemonAuthorizationDecisionState
+>();
+const activeDaemonPermissionStates = new WeakMap<
+  object,
+  {
+    readonly issuer: SessionAuthorization;
+    readonly permission: DaemonPermission;
+    readonly generation: number;
+  }
 >();
 
 export class SessionAuthorization {
@@ -130,6 +143,13 @@ export class SessionAuthorization {
   allowsPermission(permission: DaemonPermission): boolean {
     return sessionAuthorizationState(this).permissions.has(permission);
   }
+}
+
+export function isSessionAuthorization(value: unknown): value is SessionAuthorization {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    sessionAuthorizationStates.has(value)
+  );
 }
 
 export function consumeInboundDaemonAuthorizationDecision(
@@ -250,6 +270,54 @@ export function closeActiveInboundDaemonAuthorization(
   if ((typeof active !== "object" && typeof active !== "function") || active === null) return;
   const issued = activeInboundDaemonAuthorizationStates.get(active);
   if (issued?.issuer === authorization) activeInboundDaemonAuthorizationStates.delete(active);
+}
+
+export function issueActiveDaemonPermission(
+  authorization: SessionAuthorization,
+  permission: DaemonPermission,
+): ActiveDaemonPermission | null {
+  const current = sessionAuthorizationStates.get(authorization);
+  if (!current?.permissions.has(permission)) return null;
+  const handle = Object.freeze(Object.create(null)) as ActiveDaemonPermission;
+  activeDaemonPermissionStates.set(handle as object, {
+    issuer: authorization,
+    permission,
+    generation: current.generation,
+  });
+  return handle;
+}
+
+export function isActiveDaemonPermissionCurrent(
+  authorization: SessionAuthorization,
+  handle: ActiveDaemonPermission,
+  permission: DaemonPermission,
+): boolean {
+  if ((typeof handle !== "object" && typeof handle !== "function") || handle === null) {
+    return false;
+  }
+  const issued = activeDaemonPermissionStates.get(handle as object);
+  const current = sessionAuthorizationStates.get(authorization);
+  return Boolean(
+    issued &&
+    current &&
+    issued.issuer === authorization &&
+    issued.permission === permission &&
+    issued.generation === current.generation &&
+    current.permissions.has(permission),
+  );
+}
+
+export function closeActiveDaemonPermission(
+  authorization: SessionAuthorization,
+  handle: ActiveDaemonPermission,
+): boolean {
+  if ((typeof handle !== "object" && typeof handle !== "function") || handle === null) {
+    return false;
+  }
+  const issued = activeDaemonPermissionStates.get(handle as object);
+  if (issued?.issuer !== authorization) return false;
+  activeDaemonPermissionStates.delete(handle as object);
+  return true;
 }
 
 function sessionAuthorizationState(authorization: SessionAuthorization): SessionAuthorizationState {
