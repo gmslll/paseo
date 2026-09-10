@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import { EnterpriseWorkspaceContentReadResponseSchema } from "@getpaseo/protocol/messages";
+import { createProductionAppSlotRegistry } from "../runtime/production-app-slot-registry.js";
 import { createEnterpriseContentReadDispatcherRegistration } from "./enterprise-content-read-dispatcher.js";
 import {
   closeProductionRuntimeFixture,
@@ -349,6 +353,30 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
 
   test("reads an authorized app slot", async () => {
     const appSlotId = "aps_0123456789abcdef";
+    const tempHome = await mkdtemp(path.join(os.tmpdir(), "paseo-w2-app-slot-"));
+    await mkdir(path.join(tempHome, "enterprise"), { recursive: true, mode: 0o700 });
+    const appSlot = {
+      appSlotId,
+      organizationId: "org_0123456789abcdef",
+      nodeId: fixtureNode.nodeId,
+      appBundleId: "com.example.app",
+      accountBindingKey: "account",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      concurrency: 1,
+      status: "ready" as const,
+    };
+    await writeFile(
+      path.join(tempHome, "enterprise", "app-slots.json"),
+      JSON.stringify({ version: 1, records: [appSlot] }),
+      { mode: 0o600 },
+    );
+    const registry = createProductionAppSlotRegistry({
+      paseoHome: tempHome,
+      organizationId: appSlot.organizationId,
+      node: fixtureNode,
+    });
+    if (!registry) throw new Error("registry");
+    await registry.initialize();
     const fixture = await createProductionRuntimeFixture("content-app-slot", {
       grants: [
         {
@@ -356,21 +384,7 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
           selector: { kind: "organization", organizationId: "org_0123456789abcdef" },
         },
       ],
-      appSlots: {
-        get: async (id) =>
-          id === appSlotId
-            ? {
-                appSlotId,
-                organizationId: "org_0123456789abcdef",
-                nodeId: fixtureNode.nodeId,
-                appBundleId: "com.example.app",
-                accountBindingKey: "account",
-                ownerPrincipalId: "usr_0123456789abcdef",
-                concurrency: 1,
-                status: "ready",
-              }
-            : null,
-      },
+      appSlots: registry,
     });
     try {
       const unused = async (..._args: never[]): Promise<never> => {
@@ -439,6 +453,8 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       await fixture.runtime.release();
     } finally {
       await closeProductionRuntimeFixture();
+      await registry.close();
+      await rm(tempHome, { recursive: true, force: true });
     }
   });
 });
