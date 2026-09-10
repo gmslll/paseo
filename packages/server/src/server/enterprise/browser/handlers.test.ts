@@ -21,6 +21,11 @@ import {
   type EnterpriseBrowserProfileBindingPort,
   type EnterpriseBrowserProfileReadPort,
 } from "./handlers.js";
+import {
+  ENTERPRISE_BROWSER_LEASE_OPERATIONS,
+  createEnterpriseBrowserLeaseDispatcherRegistration,
+  createEnterpriseBrowserLeaseSessionRuntime,
+} from "./factory.js";
 import type { BrowserProfileLeaseAuthorization } from "./lease-manager.js";
 
 const ORGANIZATION_ID = "org_1111111111111111";
@@ -1017,5 +1022,71 @@ describe("EnterpriseBrowserLeaseHandler", () => {
 
     expect(leases.acquired).toEqual([]);
     expect(leases.released).toEqual([]);
+  });
+
+  test("opens a per-session dispatcher lease and closes its held leases", async () => {
+    const profiles = new MemoryProfiles([profile()]);
+    const bindings = new MemoryBindings([binding()]);
+    const leases = new MemoryLeases();
+    const authority = new MemoryAuthority();
+    const registration = createEnterpriseBrowserLeaseDispatcherRegistration({
+      runtime: createEnterpriseBrowserLeaseSessionRuntime({
+        profiles,
+        bindings,
+        leases,
+        leaseTtlMs: 60_000,
+      }),
+      authority,
+    });
+
+    expect(registration?.manifest.operations).toEqual(ENTERPRISE_BROWSER_LEASE_OPERATIONS);
+    expect(() =>
+      registration?.open({
+        sessionId: "",
+        clientId: "client-1",
+        context: sessionContext(),
+      }),
+    ).toThrow(/sessionId/);
+    const sessionLease = registration?.open({
+      sessionId: "session-1",
+      clientId: "client-1",
+      context: sessionContext(),
+    });
+    expect(sessionLease).toBeDefined();
+    if (!sessionLease) throw new Error("factory did not open a session lease");
+    await sessionLease.dispatcher.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-factory-acquire",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+    await sessionLease.close();
+
+    expect(leases.released).toEqual([{ handle: authority.handle, lease: lease() }]);
+    await expect(
+      sessionLease.dispatcher.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.browser.list_profiles.request",
+          requestId: "request-after-close",
+          workspaceId: WORKSPACE_ID,
+        },
+      }),
+    ).resolves.toBe(false);
+  });
+
+  test("does not register when typed runtime or authority dependencies are absent", () => {
+    expect(createEnterpriseBrowserLeaseDispatcherRegistration(null)).toBeNull();
+    expect(
+      createEnterpriseBrowserLeaseDispatcherRegistration({
+        runtime: undefined as never,
+        authority: undefined as never,
+      }),
+    ).toBeNull();
   });
 });
