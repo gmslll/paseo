@@ -20,6 +20,54 @@ export interface CredentialVault {
   read(serverId: string, handle: CredentialHandle): string | null;
   delete(serverId: string, handle: CredentialHandle): void;
 }
+declare const processCredentialVaultBrand: unique symbol;
+export type ProcessCredentialVault = CredentialVault & {
+  readonly [processCredentialVaultBrand]: "ProcessCredentialVault";
+};
+
+/**
+ * Production vault: secrets live only in this closure and are never exposed by
+ * object enumeration or serialization. Restarting the process signs the host out.
+ */
+export function createProcessCredentialVault(): ProcessCredentialVault {
+  const values = new Map<CredentialHandle, { readonly serverId: string; readonly token: string }>();
+  const vault = Object.create(null) as CredentialVault;
+  Object.defineProperties(vault, {
+    put: {
+      enumerable: false,
+      value(serverId: string, token: string) {
+        if (!serverId || !token) throw new Error("Invalid credential");
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (typeof globalThis.crypto?.randomUUID !== "function")
+            throw new Error("Secure credential handle unavailable");
+          const handle = globalThis.crypto.randomUUID() as CredentialHandle;
+          if (values.has(handle)) continue;
+          values.set(handle, Object.freeze({ serverId, token }));
+          return handle;
+        }
+        throw new Error("Credential handle collision");
+      },
+    },
+    read: {
+      enumerable: false,
+      value(serverId: string, handle: CredentialHandle) {
+        const value = values.get(handle);
+        return value && value.serverId === serverId ? value.token : null;
+      },
+    },
+    delete: {
+      enumerable: false,
+      value(serverId: string, handle: CredentialHandle) {
+        if (values.get(handle)?.serverId === serverId) values.delete(handle);
+      },
+    },
+  });
+  Object.freeze(vault);
+  processCredentialVaults.add(vault);
+  return vault as ProcessCredentialVault;
+}
+const processCredentialVaults = new WeakSet<object>();
+
 export class MemoryCredentialVault implements CredentialVault {
   private readonly values = new Map<CredentialHandle, { serverId: string; token: string }>();
   put(serverId: string, token: string): CredentialHandle {

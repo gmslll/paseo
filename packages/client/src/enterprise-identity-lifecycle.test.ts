@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { type PrincipalScopeKey } from "./daemon-client.js";
 import {
+  createProcessCredentialVault,
   MemoryCredentialVault,
   MemoryEnterpriseIdentityLifecycle,
 } from "./enterprise-identity-lifecycle.js";
@@ -57,6 +58,16 @@ const result = (teardownAttempt: () => Promise<void> = async () => {}) => ({
 });
 
 describe("enterprise identity lifecycle", () => {
+  it("keeps process credential vault secrets non-enumerable and isolated", () => {
+    const vault = createProcessCredentialVault();
+    const handle = vault.put("server-a", "pat");
+    expect(Object.keys(vault)).toEqual([]);
+    expect(JSON.stringify(vault)).toBe("{}");
+    expect(vault.read("server-a", handle)).toBe("pat");
+    vault.delete("server-a", handle);
+    expect(vault.read("server-a", handle)).toBeNull();
+  });
+
   it("gates legacy and unavailable enterprise bootstrap and exposes a frozen projection", async () => {
     const p = ports();
     const lifecycle = new MemoryEnterpriseIdentityLifecycle(

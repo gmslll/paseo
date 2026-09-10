@@ -11,7 +11,9 @@ import {
 import type {
   EnterpriseFileRequestTransport,
   EnterpriseIdentityLifecycle,
+  ProcessCredentialVault,
 } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import { createProcessCredentialVault } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import {
   connectionFromListen,
   createRemoteSshHostConnection,
@@ -177,6 +179,10 @@ export interface HostRuntimeControllerDeps {
     clientId: string;
     runtimeGeneration: number;
   }) => EnterpriseFileRequest | undefined;
+  createEnterpriseIdentityLifecycle?: (input: {
+    serverId: string;
+    vault: ProcessCredentialVault;
+  }) => EnterpriseIdentityLifecycle;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -668,6 +674,8 @@ export class HostRuntimeController {
   private switchRequestVersion = 0;
   private probeRequestVersion = 0;
   private probeCycleInFlight: Promise<void> | null = null;
+  private readonly enterpriseCredentialVault: ProcessCredentialVault | null;
+  private readonly enterpriseIdentityLifecycle: EnterpriseIdentityLifecycle | null;
 
   constructor(input: {
     host: HostProfile;
@@ -676,6 +684,16 @@ export class HostRuntimeController {
   }) {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
+    this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
+      ? createProcessCredentialVault()
+      : null;
+    this.enterpriseIdentityLifecycle =
+      this.deps.createEnterpriseIdentityLifecycle && this.enterpriseCredentialVault
+        ? this.deps.createEnterpriseIdentityLifecycle({
+            serverId: this.host.serverId,
+            vault: this.enterpriseCredentialVault,
+          })
+        : null;
     this.onReconcileServerId = input.onReconcileServerId ?? null;
     this.connectionMachineState = {
       tag: "booting",
@@ -698,6 +716,28 @@ export class HostRuntimeController {
 
   getClient(): DaemonClient | null {
     return this.snapshot.client;
+  }
+
+  getEnterpriseIdentitySnapshot(): ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]> | null {
+    return this.enterpriseIdentityLifecycle?.readSnapshot() ?? null;
+  }
+
+  subscribeEnterpriseIdentity(
+    listener: Parameters<EnterpriseIdentityLifecycle["subscribe"]>[0],
+  ): () => void {
+    return this.enterpriseIdentityLifecycle?.subscribe(listener) ?? (() => {});
+  }
+
+  getEnterpriseScopeGeneration(): string | null {
+    return this.enterpriseIdentityLifecycle?.readSnapshot().generation ?? null;
+  }
+
+  authenticateEnterpriseHost(
+    input: Parameters<EnterpriseIdentityLifecycle["authenticateEnterpriseHost"]>[0],
+  ): Promise<ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]>> {
+    if (!this.enterpriseIdentityLifecycle)
+      return Promise.reject(new Error("Enterprise identity unavailable"));
+    return this.enterpriseIdentityLifecycle.authenticateEnterpriseHost(input);
   }
 
   subscribe(listener: () => void): () => void {
@@ -1286,7 +1326,12 @@ export class HostRuntimeController {
         connection,
         clientId,
         runtimeGeneration: nextGeneration,
-        enterpriseFileRequest: this.deps.createEnterpriseFileRequest?.({
+        enterpriseFileRequest: (
+          this.deps.createEnterpriseFileRequest ??
+          (this.enterpriseIdentityLifecycle
+            ? createEnterpriseFileRequestFactory({ lifecycle: this.enterpriseIdentityLifecycle })
+            : undefined)
+        )?.({
           host: this.host,
           connection,
           clientId,

@@ -8,6 +8,10 @@ import type {
   FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
 import type { EnterpriseFileRequestTransport } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import {
+  MemoryEnterpriseIdentityLifecycle,
+  type ProcessCredentialVault,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import type { ConnectionOffer } from "@getpaseo/protocol/connection-offer";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
@@ -735,6 +739,55 @@ describe("HostRuntimeController", () => {
     );
     expect(options?.headers).toEqual({ Authorization: "Bearer opaque" });
     expect(String(url)).not.toContain("opaque");
+  });
+
+  it("creates and retains a lifecycle with a process-only vault", () => {
+    const host = makeHost({ serverId: "server-lifecycle" });
+    let receivedVault: ProcessCredentialVault | null = null;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createEnterpriseIdentityLifecycle: ({ vault }) => {
+          receivedVault = vault;
+          return new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            async () => ({
+              projection: {
+                principalType: "human",
+                principalId: "usr_aaaaaaaaaaaaaaaa",
+                organizationId: "org_aaaaaaaaaaaaaaaa",
+                nodeId: "nod_aaaaaaaaaaaaaaaa",
+                paseoServerId: host.serverId,
+                displayName: "Test",
+                grantVersion: "grant-v1",
+                navigation: [],
+                allowedOperations: [],
+              },
+              sessionBindingKey: "binding-a",
+              teardownAttempt: async () => {},
+            }),
+            {
+              stopNetworkAndSubscriptions: async () => {},
+              disposeRuntimeAndCachePartition: async () => {},
+              destroyDaemonClient: async () => {},
+              startNewClient: async () => {},
+              hydrateScope: async () => {},
+            },
+            { logoutAll: async () => {} },
+          );
+        },
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_lifecycle",
+      },
+    });
+
+    expect(receivedVault).not.toBeNull();
+    expect(JSON.stringify(receivedVault)).toBe("{}");
+    expect(controller.getEnterpriseIdentitySnapshot()?.state).toBe("booting");
+    expect(controller.getEnterpriseScopeGeneration()).toBeNull();
   });
 
   it("keeps browser client lifecycle tied to the active host runtime client", async () => {
