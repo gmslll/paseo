@@ -160,7 +160,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
             const parsedAgent = EnterpriseAgentContentReadRequestSchema.safeParse(message);
             const requestId = requestIdOf(parsed, parsedApp, parsedAgent);
             if (
-              (!parsed.success && !parsedApp.success) ||
+              (!parsed.success && !parsedApp.success && !parsedAgent.success) ||
               !current(sessionContext) ||
               reservations.has(requestId)
             )
