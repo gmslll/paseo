@@ -68,6 +68,11 @@ import {
   type ProductionAuthorizationRuntimeSessionInput,
 } from "./enterprise/access/production-authorization-runtime.js";
 import {
+  createProductionBrowserLeaseWaitingContext,
+  type ProductionBrowserLeaseWaitingContext,
+  type ProductionBrowserLeaseWaitingNotice,
+} from "./enterprise/browser/production-bundle.js";
+import {
   createEnterpriseLegacyResourceAuthorization,
   type EnterpriseLegacyResourceAuthorization,
 } from "./enterprise/access/legacy-resource-authorization.js";
@@ -564,6 +569,8 @@ export interface SessionOptions {
   enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   /** Integration/W1 supplies the current-session decision for identity-self requests. */
   enterpriseIdentitySelfAuthorization?: SessionAuthorization["authorizeInbound"];
+  /** Trusted server clock used to timestamp Browser Profile waiting status. */
+  now?: () => number;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -813,9 +820,9 @@ export class Session {
     }>
   >();
   private readonly reservedAuthorityRequestIds = new Set<string>();
-  private readonly outboundEmissionTasksByRequest = new Map<string, Set<Promise<void>>>();
-  private readonly outboundEmissionTailsByRequest = new Map<string, Promise<void>>();
-  private readonly outboundEmissionTasksWithoutRequest = new Set<Promise<void>>();
+  private readonly outboundEmissionTasksByRequest = new Map<string, Set<Promise<unknown>>>();
+  private readonly outboundEmissionTailsByRequest = new Map<string, Promise<unknown>>();
+  private readonly outboundEmissionTasksWithoutRequest = new Set<Promise<unknown>>();
   private authoritySubsystemFailed = false;
   private authorityBindingReleased = false;
   private readonly clientId: string;
@@ -922,9 +929,12 @@ export class Session {
   private enterpriseDispatcher: EnterpriseSessionDispatcher | null;
   private readonly enterpriseDispatcherFactory: EnterpriseSessionDispatcherFactory | null;
   private readonly enterpriseDispatcherLease: EnterpriseDispatcherLease | null;
+  private enterpriseDispatcherLeaseClosePromise: Promise<void> | null = null;
+  private enterpriseBrowserLeaseWaitingCallbackActive = false;
   private readonly enterpriseIdentitySelfAuthorization:
     | SessionAuthorization["authorizeInbound"]
     | null;
+  private readonly now: () => number;
 
   // oxlint-disable-next-line complexity -- Session constructor wires existing ports.
   constructor(options: SessionOptions) {
@@ -946,6 +956,7 @@ export class Session {
       enterpriseDispatcherFactory,
       enterpriseDispatcherRegistration,
       enterpriseIdentitySelfAuthorization,
+      now,
       permissions,
       appVersion,
       clientCapabilities,
@@ -1004,6 +1015,7 @@ export class Session {
     this.enterpriseDispatcherFactory = enterpriseDispatcherFactory ?? null;
     this.enterpriseDispatcherLease = null;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization ?? null;
+    this.now = now ?? Date.now;
     const enterpriseConfigured = Boolean(
       enterpriseContext ||
       enterpriseAgentContextRegistry ||
@@ -1102,42 +1114,6 @@ export class Session {
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = sessionId ?? uuidv4();
-    if (enterpriseDispatcherRegistration && this.enterpriseContext) {
-      const registrationLease = enterpriseDispatcherRegistration.open({
-        sessionId: this.sessionId,
-        clientId,
-        context: this.enterpriseContext,
-        authorizationRuntime: enterpriseAuthorizationRuntime,
-        filesRuntime: enterpriseWorkspaceFilesRuntime,
-      });
-      this.enterpriseDispatcherLease = registrationLease;
-      const registeredDispatcher = registrationLease.dispatcher;
-      const registeredOperations = new Set(enterpriseDispatcherRegistration.manifest.operations);
-      const existingDispatcher = enterpriseDispatcher;
-      this.enterpriseDispatcher = existingDispatcher
-        ? Object.freeze({
-            requestPolicyForType: (type: string) =>
-              registeredOperations.has(type)
-                ? (registeredDispatcher.requestPolicyForType?.(type) ?? null)
-                : (existingDispatcher.requestPolicyForType?.(type) ?? null),
-            handle: (input: {
-              readonly sessionContext: EnterpriseDispatchContext;
-              readonly message: SessionInboundMessage;
-            }) =>
-              registeredOperations.has(input.message.type)
-                ? registeredDispatcher.handle(input)
-                : existingDispatcher.handle(input),
-            consumeResponse: (input: {
-              readonly sessionContext: EnterpriseDispatchContext;
-              readonly message: SessionInboundMessage;
-              readonly response: SessionOutboundMessage;
-            }) =>
-              registeredOperations.has(input.message.type)
-                ? (registeredDispatcher.consumeResponse?.(input) ?? null)
-                : (existingDispatcher.consumeResponse?.(input) ?? null),
-          })
-        : registeredDispatcher;
-    }
     if (!this.enterpriseDispatcher && this.enterpriseDispatcherFactory && this.enterpriseContext) {
       this.enterpriseDispatcher = this.enterpriseDispatcherFactory.create({
         sessionId: this.sessionId,
@@ -1518,6 +1494,65 @@ export class Session {
     } catch (error) {
       throw this.rollbackConstruction(error);
     }
+    if (enterpriseDispatcherRegistration && this.enterpriseContext) {
+      const registeredOperations = new Set(enterpriseDispatcherRegistration.manifest.operations);
+      let requestLifecycle: ProductionBrowserLeaseWaitingContext;
+      requestLifecycle = createProductionBrowserLeaseWaitingContext({
+        sessionId: this.sessionId,
+        clientId,
+        sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+        onWaiting: (notice) => this.emitEnterpriseBrowserLeaseWaiting(notice, requestLifecycle),
+      });
+      let registrationLease: EnterpriseDispatcherLease | null = null;
+      try {
+        registrationLease = enterpriseDispatcherRegistration.open({
+          sessionId: this.sessionId,
+          clientId,
+          context: this.enterpriseContext,
+          authorizationRuntime: enterpriseAuthorizationRuntime,
+          filesRuntime: enterpriseWorkspaceFilesRuntime,
+          requestLifecycle,
+        });
+        this.enterpriseDispatcherLease = registrationLease;
+        const registeredDispatcher = registrationLease.dispatcher;
+        const existingDispatcher = this.enterpriseDispatcher;
+        this.enterpriseDispatcher = existingDispatcher
+          ? Object.freeze({
+              requestPolicyForType: (type: string) =>
+                registeredOperations.has(type)
+                  ? (registeredDispatcher.requestPolicyForType?.(type) ?? null)
+                  : (existingDispatcher.requestPolicyForType?.(type) ?? null),
+              handle: (input: {
+                readonly sessionContext: EnterpriseDispatchContext;
+                readonly message: SessionInboundMessage;
+              }) =>
+                registeredOperations.has(input.message.type)
+                  ? registeredDispatcher.handle(input)
+                  : existingDispatcher.handle(input),
+              consumeResponse: (input: {
+                readonly sessionContext: EnterpriseDispatchContext;
+                readonly message: SessionInboundMessage;
+                readonly response: SessionOutboundMessage;
+              }) =>
+                registeredOperations.has(input.message.type)
+                  ? (registeredDispatcher.consumeResponse?.(input) ?? null)
+                  : (existingDispatcher.consumeResponse?.(input) ?? null),
+            })
+          : registeredDispatcher;
+        this.enterpriseBrowserLeaseWaitingCallbackActive = true;
+      } catch (error) {
+        this.enterpriseBrowserLeaseWaitingCallbackActive = false;
+        if (registrationLease) {
+          void this.closeEnterpriseDispatcherLease().catch((closeError) => {
+            this.sessionLogger.error(
+              { err: closeError },
+              "Session construction rollback dispatcher close failed",
+            );
+          });
+        }
+        throw this.rollbackConstruction(error);
+      }
+    }
   }
 
   updateAppVersion(appVersion: string | null): void {
@@ -1535,6 +1570,7 @@ export class Session {
         cleanupErrors.push(error);
       }
     };
+    this.enterpriseBrowserLeaseWaitingCallbackActive = false;
     this.isCleanedUp = true;
     this.activeFileBinaryStreams.clear();
     const authorityState = this.authorityReceiptState;
@@ -1568,6 +1604,13 @@ export class Session {
     });
     this.voiceSession.cleanup().catch((error) => {
       this.sessionLogger.error({ err: error }, "Construction rollback voice cleanup failed");
+    });
+    const workspaceFilesSession = this.workspaceFilesSession as WorkspaceFilesSession | undefined;
+    workspaceFilesSession?.dispose().catch((error) => {
+      this.sessionLogger.error(
+        { err: error },
+        "Construction rollback workspace files cleanup failed",
+      );
     });
     attempt(() => this.terminalController.dispose());
     attempt(() => this.checkoutSession.cleanup());
@@ -8932,7 +8975,7 @@ export class Session {
       this.deliver(msg);
       return;
     }
-    this.enqueueAuthorizedEmit(msg, context);
+    void this.enqueueAuthorizedEmit(msg, context);
   }
 
   private emitForSource(
@@ -8944,24 +8987,71 @@ export class Session {
       this.deliverForSource(msg, source);
       return;
     }
-    this.enqueueAuthorizedEmit(msg, context, source);
+    void this.enqueueAuthorizedEmit(msg, context, source);
+  }
+
+  private async emitEnterpriseBrowserLeaseWaiting(
+    notice: ProductionBrowserLeaseWaitingNotice,
+    expectedContext: ProductionBrowserLeaseWaitingContext,
+  ): Promise<void> {
+    const enterpriseContext = this.enterpriseContext;
+    if (
+      !this.enterpriseBrowserLeaseWaitingCallbackActive ||
+      this.isCleanedUp ||
+      !enterpriseContext ||
+      notice.context !== expectedContext ||
+      expectedContext.sessionId !== this.sessionId ||
+      expectedContext.clientId !== this.clientId ||
+      expectedContext.sessionBindingGeneration !== enterpriseContext.sessionBindingGeneration
+    ) {
+      throw new Error("Browser lease waiting Session is no longer current.");
+    }
+    const queuedAt = new Date(this.now()).toISOString();
+    const resource = GlobalResourceRefSchema.parse({
+      resourceKind: "browser_profile",
+      organizationId: enterpriseContext.principal.organizationId,
+      nodeId: enterpriseContext.node.nodeId,
+      localResourceId: notice.resourceId,
+    });
+    if (resource.resourceKind !== "browser_profile")
+      throw new Error("Browser lease waiting resource is invalid.");
+    const resources = [Object.freeze(resource)];
+    Object.freeze(resources);
+    const delivered = await this.enqueueAuthorizedEmit(
+      {
+        type: "enterprise.resource.waiting",
+        payload: {
+          status: "resource_waiting",
+          workspaceId: notice.workspaceId,
+          agentId: notice.agentId,
+          nodeId: enterpriseContext.node.nodeId,
+          resourceKind: "browser_profile",
+          resourceId: notice.resourceId,
+          mode: notice.mode,
+          queuedAt,
+          position: notice.position,
+        },
+      },
+      Object.freeze({ kind: "resources", resources }),
+    );
+    if (!delivered) throw new Error("Browser lease waiting status was not delivered.");
   }
 
   private enqueueAuthorizedEmit(
     msg: SessionOutboundMessage,
     context?: OutboundAuthorizationContext,
     source?: object,
-  ): void {
+  ): Promise<boolean> {
     // Authority context is minted only from the active inbound handle below;
     // callers may supply resource/identity/transport context, never a receipt.
-    if (context?.kind === "authority") return;
+    if (context?.kind === "authority") return Promise.resolve(false);
     let event: SessionOutboundMessage;
     let authorizationContext: OutboundAuthorizationContext | undefined;
     try {
       event = freezeOutbound(SessionOutboundMessageSchema.parse(structuredClone(msg)));
       authorizationContext = context ? freezeOutbound(structuredClone(context)) : undefined;
     } catch {
-      return;
+      return Promise.resolve(false);
     }
     const requestId = this.outboundRequestId(event);
     const previous = requestId
@@ -8971,14 +9061,14 @@ export class Session {
       .catch(() => undefined)
       .then(async () => {
         if (!this.enterpriseContext || this.isCleanedUp || this.authoritySubsystemFailed)
-          return undefined;
+          return false;
         let resolvedContext: OutboundAuthorizationContext | undefined = authorizationContext;
         if (!resolvedContext) {
           const emissionRequestId = this.outboundRequestId(event);
           const correlation = emissionRequestId
             ? this.pendingAuthorityRequests.get(emissionRequestId)
             : undefined;
-          if (!correlation || !this.outboundAuthorityEmissionAuthorizer) return undefined;
+          if (!correlation || !this.outboundAuthorityEmissionAuthorizer) return false;
           const binding = this.enterpriseContext;
           resolvedContext =
             (await this.outboundAuthorityEmissionAuthorizer.authorizeEmission({
@@ -8998,7 +9088,7 @@ export class Session {
               },
               event,
             })) ?? undefined;
-          if (!resolvedContext) return undefined;
+          if (!resolvedContext) return false;
         }
         const allowedByResourceAuthorization = await this.resourceAuthorization?.canEmit(
           this.enterpriseContext.principal,
@@ -9009,12 +9099,13 @@ export class Session {
           allowedByResourceAuthorization ||
           (this.isEnterpriseLegacyResourceCurrent() &&
             isSafeEmptyLegacyDirectoryResponse(event, resolvedContext));
-        if (allowed && !this.isCleanedUp) this.deliverForSource(event, source);
-        return undefined;
+        if (allowed && !this.isCleanedUp) return this.deliverForSource(event, source);
+        return false;
       })
-      .catch((error) =>
-        this.sessionLogger.error({ err: error }, "Failed to authorize outbound message"),
-      );
+      .catch((error) => {
+        this.sessionLogger.error({ err: error }, "Failed to authorize outbound message");
+        return false;
+      });
     if (requestId) {
       const tail = task.finally(() => {
         if (this.outboundEmissionTailsByRequest.get(requestId) === tail)
@@ -9025,7 +9116,7 @@ export class Session {
     if (!requestId) {
       this.outboundEmissionTasksWithoutRequest.add(task);
       void task.finally(() => this.outboundEmissionTasksWithoutRequest.delete(task));
-      return;
+      return task;
     }
     let tasks = this.outboundEmissionTasksByRequest.get(requestId);
     if (!tasks) {
@@ -9038,6 +9129,7 @@ export class Session {
       current?.delete(task);
       if (current?.size === 0) this.outboundEmissionTasksByRequest.delete(requestId);
     });
+    return task;
   }
 
   private async flushOutboundEmissionTasks(requestId: string): Promise<void> {
@@ -9054,8 +9146,8 @@ export class Session {
     return typeof requestId === "string" && requestId.length > 0 ? requestId : null;
   }
 
-  private deliver(msg: SessionOutboundMessage): void {
-    if (!this.authorization.allowsOutbound(msg)) return;
+  private deliver(msg: SessionOutboundMessage): boolean {
+    if (!this.authorization.allowsOutbound(msg)) return false;
     if (
       msg.type === "project.update" ||
       msg.type === "providers_snapshot_update" ||
@@ -9067,9 +9159,9 @@ export class Session {
         for (const source of this.clientCapabilitiesBySource.keys()) {
           if (this.wantsEvent(msg.type, source)) this.onMessageToSource(source, msg);
         }
-        return;
+        return true;
       }
-      if (!this.wantsEvent(msg.type)) return;
+      if (!this.wantsEvent(msg.type)) return false;
     }
     // JSON.stringify(msg) is only computed when trace is enabled — it runs for
     // every outbound message otherwise, and trace is disabled by default.
@@ -9088,11 +9180,12 @@ export class Session {
         for (const [source] of this.clientCapabilitiesBySource) {
           this.onMessageToSource(source, this.workspaceSetupMessageForClient(msg, source));
         }
-        return;
+        return true;
       }
       msg = this.workspaceSetupMessageForClient(msg);
     }
     this.onMessage(msg);
+    return true;
   }
 
   // COMPAT(workspaceSetupBlocked): added in v0.8.0, remove after 2027-03-07 once client floor >= v0.8.0.
@@ -9295,13 +9388,13 @@ export class Session {
     this.onBinaryMessage(frame);
   }
 
-  private deliverForSource(msg: SessionOutboundMessage, source?: object): void {
-    if (!this.authorization.allowsOutbound(msg)) return;
+  private deliverForSource(msg: SessionOutboundMessage, source?: object): boolean {
+    if (!this.authorization.allowsOutbound(msg)) return false;
     if (source && this.onMessageToSource) {
       this.onMessageToSource(source, msg);
-      return;
+      return true;
     }
-    this.deliver(msg);
+    return this.deliver(msg);
   }
 
   /**
@@ -9310,6 +9403,7 @@ export class Session {
   // oxlint-disable-next-line complexity -- cleanup drains authorization and all owned resources.
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
+    this.enterpriseBrowserLeaseWaitingCallbackActive = false;
     this.isCleanedUp = true;
     const cleanupErrors: unknown[] = [];
     const admissionInvalidationUnsubscribe = this.admissionInvalidationUnsubscribe;
@@ -9517,7 +9611,7 @@ export class Session {
     }
     if (this.enterpriseDispatcherLease) {
       try {
-        await this.enterpriseDispatcherLease.close();
+        await this.closeEnterpriseDispatcherLease();
       } catch (error) {
         cleanupErrors.push(error);
       }
@@ -9527,6 +9621,20 @@ export class Session {
       throw new AggregateError(cleanupErrors, "Session cleanup failed", {
         cause: cleanupErrors[0],
       });
+  }
+
+  private closeEnterpriseDispatcherLease(): Promise<void> {
+    if (!this.enterpriseDispatcherLease) return Promise.resolve();
+    if (!this.enterpriseDispatcherLeaseClosePromise) {
+      try {
+        this.enterpriseDispatcherLeaseClosePromise = Promise.resolve(
+          this.enterpriseDispatcherLease.close(),
+        );
+      } catch (error) {
+        this.enterpriseDispatcherLeaseClosePromise = Promise.reject(error);
+      }
+    }
+    return this.enterpriseDispatcherLeaseClosePromise;
   }
 
   public getEnterpriseSessionContext(): EnterpriseSessionContext | undefined {

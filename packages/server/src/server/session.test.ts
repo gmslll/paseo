@@ -40,6 +40,7 @@ import { Session } from "./session.js";
 import { VoiceSession } from "./session/voice/voice-session.js";
 import {
   createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseAgentContextHandle,
   type EnterpriseAgentSessionContextRegistry,
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
@@ -53,6 +54,13 @@ import {
   createEnterpriseAuthorizationRuntime,
   isCurrentProductionAuthorizationRuntime,
 } from "./enterprise/access/production-authorization-runtime.js";
+import {
+  createProductionBrowserLeaseBundle,
+  isProductionBrowserLeaseWaitingContextForSession,
+  type ProductionBrowserLeaseBundle,
+  type ProductionBrowserLeaseWaitingContext,
+} from "./enterprise/browser/production-bundle.js";
+import type { BrowserProfileLeaseAuthorization } from "./enterprise/browser/lease-manager.js";
 import { createProductionAuditRuntime } from "./enterprise/audit/production-audit-runtime.js";
 import {
   bindEnterpriseAdmissionSession,
@@ -114,6 +122,7 @@ import type { CheckDetails, ForgeService } from "../services/forge-service.js";
 import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 
 interface SessionHandlerInternals {
+  authorization: SessionAuthorization;
   listFetchAgentsEntries(params: SessionInboundMessage): Promise<unknown>;
   readAgentDirectorySync(params: SessionInboundMessage): Promise<unknown>;
   listFetchWorkspacesEntries(params: SessionInboundMessage): Promise<unknown>;
@@ -151,6 +160,13 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
+  emitEnterpriseBrowserLeaseWaiting(
+    notice: {
+      requestId: string;
+      context: ProductionBrowserLeaseWaitingContext;
+    },
+    expectedContext: ProductionBrowserLeaseWaitingContext,
+  ): Promise<void>;
 }
 
 function asSessionInternals(session: Session): SessionHandlerInternals {
@@ -412,6 +428,7 @@ interface SessionForTestOptions {
   enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
   enterpriseDispatcherRegistration?: SessionOptions["enterpriseDispatcherRegistration"];
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
+  now?: SessionOptions["now"];
 }
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
@@ -551,6 +568,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     enterpriseDispatcher: options.enterpriseDispatcher,
     enterpriseDispatcherRegistration: options.enterpriseDispatcherRegistration,
     enterpriseIdentitySelfAuthorization: options.enterpriseIdentitySelfAuthorization,
+    now: options.now,
   };
   return new Session(sessionOptions);
 }
@@ -583,6 +601,134 @@ function enterpriseContext(
     },
     sessionBindingGeneration: generation,
   };
+}
+
+const WAITING_WORKSPACE_ID = "wks_aaaaaaaaaaaaaaaa";
+const WAITING_PROFILE_ID = "brp_bbbbbbbbbbbbbbbb";
+
+function browserWaitingAuthorization(
+  handle: EnterpriseAgentContextHandle,
+): BrowserProfileLeaseAuthorization {
+  const { principal, node } = handle.context;
+  return {
+    workspace: {
+      organizationId: principal.organizationId,
+      nodeId: node.nodeId,
+      ownerPrincipalId: principal.principalId,
+      createdByPrincipalId: principal.principalId,
+      workspaceId: WAITING_WORKSPACE_ID,
+    },
+    agent: {
+      organizationId: principal.organizationId,
+      nodeId: node.nodeId,
+      ownerPrincipalId: principal.principalId,
+      createdByPrincipalId: principal.principalId,
+      agentId: handle.agentId,
+      workspaceId: WAITING_WORKSPACE_ID,
+    },
+    profile: {
+      browserProfileId: WAITING_PROFILE_ID,
+      organizationId: principal.organizationId,
+      homeNodeId: node.nodeId,
+      businessIdentityId: "bid_bbbbbbbbbbbbbbbb",
+      ownerPrincipalId: principal.principalId,
+      platform: "generic",
+      businessAccountKey: "case-10-waiting",
+      label: "Case 10 waiting profile",
+      partitionKey: `persist:paseo-enterprise-${WAITING_PROFILE_ID}`,
+      downloadRoot: `/profiles/${WAITING_PROFILE_ID}/downloads`,
+      status: "ready",
+      createdAt: "2026-09-11T00:00:00.000Z",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+    },
+    bindingRevision: "binding-revision-case-10",
+  };
+}
+
+function createBrowserWaitingBundle(
+  paseoHome: string,
+  createRequestId: () => string,
+): ProductionBrowserLeaseBundle {
+  let leaseNumber = 0;
+  return createProductionBrowserLeaseBundle({
+    paseoHome,
+    nodeId: "nod_aaaaaaaaaaaaaaaa",
+    downloadBaseRoot: join(paseoHome, "downloads"),
+    auditSink: { append: vi.fn(async (event) => event as never) },
+    clock: {
+      now: () => 1_000,
+      setTimeout: vi.fn(() => Object.freeze({})),
+      clearTimeout: vi.fn(),
+    },
+    createLeaseId: () => `lea_00000000-0000-4000-8000-${String(++leaseNumber).padStart(12, "0")}`,
+    createRequestId,
+    maxLeaseTtlMs: 60_000,
+  });
+}
+
+function createBrowserWaitingRegistration(input: {
+  bundle: ProductionBrowserLeaseBundle;
+  registry: EnterpriseAgentSessionContextRegistry;
+  openedContexts?: ProductionBrowserLeaseWaitingContext[];
+}): EnterpriseSessionDispatcherFactoryRegistration {
+  return {
+    manifest: { operations: [] },
+    open(openInput) {
+      const waitingContext = openInput.requestLifecycle;
+      if (
+        !isProductionBrowserLeaseWaitingContextForSession(waitingContext, {
+          sessionId: openInput.sessionId,
+          clientId: openInput.clientId,
+          sessionBindingGeneration: openInput.context.sessionBindingGeneration,
+        })
+      ) {
+        throw new Error("Expected exact Browser lease waiting lifecycle.");
+      }
+      input.openedContexts?.push(waitingContext);
+      const unbind = input.bundle.bindSessionAuthority({
+        generation: openInput.context.sessionBindingGeneration,
+        isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
+        resolveAuthorization: (handle, profileId) => {
+          if (!input.registry.isCurrentHandle(handle) || profileId !== WAITING_PROFILE_ID)
+            throw new Error("Browser waiting authorization is unavailable.");
+          return browserWaitingAuthorization(handle);
+        },
+        waitingContext,
+      });
+      let closed = false;
+      return Object.freeze({
+        dispatcher: { handle: vi.fn(() => false) },
+        close: async () => {
+          if (closed) return;
+          closed = true;
+          unbind();
+          await input.bundle.invalidateSession(openInput.context.sessionBindingGeneration);
+        },
+      });
+    },
+  };
+}
+
+function bindBrowserWaitingAuthority(input: {
+  bundle: ProductionBrowserLeaseBundle;
+  registry: EnterpriseAgentSessionContextRegistry;
+  generation: string;
+  waitingContext?: ProductionBrowserLeaseWaitingContext;
+}): () => void {
+  return input.bundle.bindSessionAuthority({
+    generation: input.generation,
+    isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
+    resolveAuthorization: (handle, profileId) => {
+      if (!input.registry.isCurrentHandle(handle) || profileId !== WAITING_PROFILE_ID)
+        throw new Error("Browser waiting authorization is unavailable.");
+      return browserWaitingAuthorization(handle);
+    },
+    waitingContext: input.waitingContext,
+  });
+}
+
+async function flushBrowserWaitingDelivery(): Promise<void> {
+  for (let index = 0; index < 12; index++) await Promise.resolve();
 }
 
 function parseContentRequest(value: unknown, type: string): SessionInboundMessage {
@@ -845,6 +991,519 @@ test("passes the per-session workspace files runtime through dispatcher registra
   expect(open).toHaveBeenCalledWith(expect.objectContaining({ filesRuntime }));
   await session.cleanup();
   expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("passes an exact nominal waiting lifecycle through dispatcher registration", async () => {
+  const context = enterpriseContext("generation-browser-waiting-lifecycle");
+  const open = vi.fn(() => ({
+    dispatcher: { handle: vi.fn(() => false) },
+    close: vi.fn(),
+  }));
+  const session = createSessionForTest({
+    clientId: "client-browser-waiting-lifecycle",
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcherRegistration: {
+      manifest: { operations: [] },
+      open,
+    },
+  });
+
+  const openInput = open.mock.calls[0]?.[0];
+  if (!openInput) throw new Error("Expected dispatcher registration input.");
+  expect(
+    isProductionBrowserLeaseWaitingContextForSession(openInput.requestLifecycle, {
+      sessionId: openInput.sessionId,
+      clientId: "client-browser-waiting-lifecycle",
+      sessionBindingGeneration: context.sessionBindingGeneration,
+    }),
+  ).toBe(true);
+  await session.cleanup();
+});
+
+test("delivers same-Profile waiting once only to the exact waiter Session", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-waiting-"));
+  const createRequestId = vi.fn(() => "case10-internal-request-b");
+  const bundle = createBrowserWaitingBundle(paseoHome, createRequestId);
+  const contexts = [
+    enterpriseContext("generation-browser-holder"),
+    enterpriseContext("generation-browser-waiter"),
+    enterpriseContext("generation-browser-third"),
+  ];
+  const registries = contexts.map(() => createEnterpriseAgentSessionContextRegistry());
+  const messages: SessionOutboundMessage[][] = [[], [], []];
+  const canEmit = contexts.map(() => vi.fn<ResourceAuthorization["canEmit"]>(async () => true));
+  const openedContexts: ProductionBrowserLeaseWaitingContext[][] = [[], [], []];
+  const sessions = contexts.map((context, index) => {
+    const registry = registries[index]!;
+    return createSessionForTest({
+      clientId: `client-browser-${index}`,
+      messages: messages[index]!,
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: registry,
+      resourceAuthorization: { canEmit: canEmit[index]! } as never,
+      enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+        bundle,
+        registry,
+        openedContexts: openedContexts[index]!,
+      }),
+      now: () => 2_999,
+    });
+  });
+  const handles = sessions.map((session, index) => {
+    const handle = session.bindAgentPrincipalContext(`agent-browser-${index}`);
+    if (!handle) throw new Error("Expected enterprise Agent context handle.");
+    return handle;
+  });
+  const waiterCallback = vi.spyOn(
+    asSessionInternals(sessions[1]!),
+    "emitEnterpriseBrowserLeaseWaiting",
+  );
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: handles[0]!,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    const waitingLeasePromise = bundle.leases.acquire({
+      handle: handles[1]!,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await flushBrowserWaitingDelivery();
+
+    const expectedWaiting = {
+      type: "enterprise.resource.waiting",
+      payload: {
+        status: "resource_waiting",
+        workspaceId: WAITING_WORKSPACE_ID,
+        agentId: "agent-browser-1",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        resourceKind: "browser_profile",
+        resourceId: WAITING_PROFILE_ID,
+        mode: "write",
+        queuedAt: "1970-01-01T00:00:02.999Z",
+        position: 1,
+      },
+    } as const;
+    expect(createRequestId).toHaveBeenCalledTimes(1);
+    expect(createRequestId).toHaveReturnedWith("case10-internal-request-b");
+    expect(waiterCallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: "case10-internal-request-b",
+        context: openedContexts[1]![0],
+      }),
+      openedContexts[1]![0],
+    );
+    expect(messages).toEqual([[], [expectedWaiting], []]);
+    expect(Object.hasOwn(messages[1]?.[0]?.payload ?? {}, "requestId")).toBe(false);
+    expect(JSON.stringify(messages[1]?.[0])).not.toContain("case10-internal-request-b");
+    expect(Date.parse(expectedWaiting.payload.queuedAt) - 1_000).toBeLessThan(2_000);
+    expect(canEmit[0]!).not.toHaveBeenCalled();
+    expect(canEmit[2]!).not.toHaveBeenCalled();
+    expect(canEmit[1]!).toHaveBeenCalledWith(contexts[1]!.principal, expectedWaiting, {
+      kind: "resources",
+      resources: [
+        {
+          resourceKind: "browser_profile",
+          organizationId: contexts[1]!.principal.organizationId,
+          nodeId: contexts[1]!.node.nodeId,
+          localResourceId: WAITING_PROFILE_ID,
+        },
+      ],
+    });
+    const authorizationContext = canEmit[1]!.mock.calls[0]?.[2];
+    if (authorizationContext?.kind !== "resources")
+      throw new Error("Expected Browser Profile resource context.");
+    expect(Object.isFrozen(authorizationContext)).toBe(true);
+    expect(Object.isFrozen(authorizationContext?.resources)).toBe(true);
+    expect(Object.isFrozen(authorizationContext?.resources[0])).toBe(true);
+    expect(openedContexts.map((entries) => entries.length)).toEqual([1, 1, 1]);
+
+    await bundle.leases.releaseLease({ handle: handles[0]!, lease: holderLease });
+    const waitingLease = await waitingLeasePromise;
+    await bundle.leases.releaseLease({ handle: handles[1]!, lease: waitingLease });
+  } finally {
+    await Promise.allSettled(sessions.map((session) => session.cleanup()));
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("rejects Browser waiting when Session outbound authorization denies delivery", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-waiting-denied-"));
+  const bundle = createBrowserWaitingBundle(paseoHome, () => "case10-denied-request");
+  const holderContext = enterpriseContext("generation-browser-denied-holder");
+  const holderRegistry = createEnterpriseAgentSessionContextRegistry();
+  const holderHandle = holderRegistry.bind({
+    agentId: "agent-denied-holder",
+    context: holderContext,
+  });
+  const unbindHolder = bindBrowserWaitingAuthority({
+    bundle,
+    registry: holderRegistry,
+    generation: holderContext.sessionBindingGeneration,
+  });
+  const waiterContext = enterpriseContext("generation-browser-denied-waiter");
+  const waiterRegistry = createEnterpriseAgentSessionContextRegistry();
+  const messages: SessionOutboundMessage[] = [];
+  const canEmit = vi.fn<ResourceAuthorization["canEmit"]>(async () => true);
+  const session = createSessionForTest({
+    clientId: "client-browser-waiting-denied",
+    permissions: [],
+    messages,
+    enterpriseContext: waiterContext,
+    enterpriseAgentContextRegistry: waiterRegistry,
+    resourceAuthorization: { canEmit } as never,
+    enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+      bundle,
+      registry: waiterRegistry,
+    }),
+  });
+  const allowsOutbound = vi.spyOn(asSessionInternals(session).authorization, "allowsOutbound");
+  const waiterHandle = session.bindAgentPrincipalContext("agent-denied-waiter");
+  if (!waiterHandle) throw new Error("Expected waiter Agent context handle.");
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: holderHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await expect(
+      bundle.leases.acquire({
+        handle: waiterHandle,
+        resourceId: WAITING_PROFILE_ID,
+        mode: "write",
+        ttlMs: 60_000,
+      }),
+    ).rejects.toThrow(/status unavailable/i);
+
+    expect(canEmit).toHaveBeenCalledTimes(1);
+    expect(allowsOutbound).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([]);
+    await bundle.leases.releaseLease({ handle: holderHandle, lease: holderLease });
+  } finally {
+    await session.cleanup();
+    unbindHolder();
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("seals a racing Browser waiting callback before dispatcher close", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-close-race-"));
+  const bundle = createBrowserWaitingBundle(paseoHome, () => "case10-close-race-request");
+  const holderContext = enterpriseContext("generation-browser-close-race-holder");
+  const holderRegistry = createEnterpriseAgentSessionContextRegistry();
+  const holderHandle = holderRegistry.bind({
+    agentId: "agent-close-race-holder",
+    context: holderContext,
+  });
+  const unbindHolder = bindBrowserWaitingAuthority({
+    bundle,
+    registry: holderRegistry,
+    generation: holderContext.sessionBindingGeneration,
+  });
+  const waiterContext = enterpriseContext("generation-browser-close-race-waiter");
+  const waiterRegistry = createEnterpriseAgentSessionContextRegistry();
+  const messages: SessionOutboundMessage[] = [];
+  const canEmitStarted = deferred<void>();
+  const releaseCanEmit = deferred<void>();
+  const canEmit = vi.fn<ResourceAuthorization["canEmit"]>(async () => {
+    canEmitStarted.resolve();
+    await releaseCanEmit.promise;
+    return true;
+  });
+  const session = createSessionForTest({
+    clientId: "client-browser-close-race",
+    messages,
+    enterpriseContext: waiterContext,
+    enterpriseAgentContextRegistry: waiterRegistry,
+    resourceAuthorization: { canEmit } as never,
+    enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+      bundle,
+      registry: waiterRegistry,
+    }),
+    now: () => 3_000,
+  });
+  const waiterHandle = session.bindAgentPrincipalContext("agent-close-race-waiter");
+  if (!waiterHandle) throw new Error("Expected waiter Agent context handle.");
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: holderHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    const waitingLeasePromise = bundle.leases.acquire({
+      handle: waiterHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await canEmitStarted.promise;
+
+    const cleanup = session.cleanup();
+    releaseCanEmit.resolve();
+    await cleanup;
+    await expect(waitingLeasePromise).rejects.toThrow(/status unavailable/i);
+    expect(canEmit).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([]);
+
+    await bundle.leases.releaseLease({ handle: holderHandle, lease: holderLease });
+  } finally {
+    releaseCanEmit.resolve();
+    unbindHolder();
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("drops a late Browser waiting callback from the closed generation", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-late-waiting-"));
+  const bundle = createBrowserWaitingBundle(paseoHome, () => "case10-late-request");
+  const holderContext = enterpriseContext("generation-browser-late-holder");
+  const holderRegistry = createEnterpriseAgentSessionContextRegistry();
+  const holderHandle = holderRegistry.bind({
+    agentId: "agent-late-holder",
+    context: holderContext,
+  });
+  const unbindHolder = bindBrowserWaitingAuthority({
+    bundle,
+    registry: holderRegistry,
+    generation: holderContext.sessionBindingGeneration,
+  });
+  const closedContext = enterpriseContext("generation-browser-late-closed");
+  const closedRegistry = createEnterpriseAgentSessionContextRegistry();
+  const openedContexts: ProductionBrowserLeaseWaitingContext[] = [];
+  const messages: SessionOutboundMessage[] = [];
+  const canEmit = vi.fn<ResourceAuthorization["canEmit"]>(async () => true);
+  const session = createSessionForTest({
+    clientId: "client-browser-late-closed",
+    messages,
+    enterpriseContext: closedContext,
+    enterpriseAgentContextRegistry: closedRegistry,
+    resourceAuthorization: { canEmit } as never,
+    enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+      bundle,
+      registry: closedRegistry,
+      openedContexts,
+    }),
+  });
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: holderHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await session.cleanup();
+    const lateRegistry = createEnterpriseAgentSessionContextRegistry();
+    const lateHandle = lateRegistry.bind({
+      agentId: "agent-late-closed",
+      context: closedContext,
+    });
+    const unbindLate = bindBrowserWaitingAuthority({
+      bundle,
+      registry: lateRegistry,
+      generation: closedContext.sessionBindingGeneration,
+      waitingContext: openedContexts[0],
+    });
+    try {
+      await expect(
+        bundle.leases.acquire({
+          handle: lateHandle,
+          resourceId: WAITING_PROFILE_ID,
+          mode: "write",
+          ttlMs: 60_000,
+        }),
+      ).rejects.toThrow(/status unavailable/i);
+      expect(canEmit).not.toHaveBeenCalled();
+      expect(messages).toEqual([]);
+    } finally {
+      unbindLate();
+    }
+    await bundle.leases.releaseLease({ handle: holderHandle, lease: holderLease });
+  } finally {
+    unbindHolder();
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("does not open dispatcher registration before fallible Session construction completes", () => {
+  const open = vi.fn(() => ({
+    dispatcher: { handle: vi.fn(() => false) },
+    close: vi.fn(),
+  }));
+  const runtime = {
+    ...makeEnterpriseRuntime(async () => {}),
+    createUploadStore: () => {
+      throw new Error("workspace file runtime construction failed");
+    },
+  };
+
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-browser-late-open"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseWorkspaceFilesRuntime: runtime,
+      enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      name: "AggregateError",
+      cause: expect.objectContaining({ message: "workspace file runtime construction failed" }),
+    }),
+  );
+  expect(open).not.toHaveBeenCalled();
+});
+
+test("fails closed for a registration open exception and a non-nominal context", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const context = enterpriseContext("generation-browser-open-failure");
+  const cleanupWorkspaceFiles = vi.fn(async () => {});
+  const open = vi.fn(
+    (input: Parameters<EnterpriseSessionDispatcherFactoryRegistration["open"]>[0]) => {
+      expect(
+        isProductionBrowserLeaseWaitingContextForSession(input.requestLifecycle, {
+          sessionId: input.sessionId,
+          clientId: input.clientId,
+          sessionBindingGeneration: context.sessionBindingGeneration,
+        }),
+      ).toBe(true);
+      expect(
+        isProductionBrowserLeaseWaitingContextForSession(structuredClone(input.requestLifecycle), {
+          sessionId: input.sessionId,
+          clientId: input.clientId,
+          sessionBindingGeneration: context.sessionBindingGeneration,
+        }),
+      ).toBe(false);
+      expect(
+        isProductionBrowserLeaseWaitingContextForSession(input.requestLifecycle, {
+          sessionId: input.sessionId,
+          clientId: input.clientId,
+          sessionBindingGeneration: "generation-browser-wrong",
+        }),
+      ).toBe(false);
+      throw new Error("registration open failed");
+    },
+  );
+
+  expect(() =>
+    createSessionForTest({
+      clientId: "client-browser-open-failure",
+      messages,
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseWorkspaceFilesRuntime: makeEnterpriseRuntime(cleanupWorkspaceFiles),
+      enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      name: "AggregateError",
+      cause: expect.objectContaining({ message: "registration open failed" }),
+    }),
+  );
+  expect(open).toHaveBeenCalledTimes(1);
+  expect(messages).toEqual([]);
+  await flushBrowserWaitingDelivery();
+  expect(cleanupWorkspaceFiles).toHaveBeenCalledTimes(1);
+});
+
+test("closes an opened dispatcher lease once when final Session assembly fails", async () => {
+  const close = vi.fn(async () => {
+    throw new Error("post-open close failed");
+  });
+  const open = vi.fn(() => ({
+    get dispatcher(): never {
+      throw new Error("post-open dispatcher failed");
+    },
+    close,
+  }));
+
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-browser-post-open-failure"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      name: "AggregateError",
+      cause: expect.objectContaining({ message: "post-open dispatcher failed" }),
+    }),
+  );
+  await flushBrowserWaitingDelivery();
+  expect(open).toHaveBeenCalledTimes(1);
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("seals waiting and closes a failing dispatcher lease exactly once", async () => {
+  const close = vi.fn(() => {
+    throw new Error("registration close failed");
+  });
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-browser-close-failure"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcherRegistration: {
+      manifest: { operations: [] },
+      open: () => ({ dispatcher: { handle: vi.fn(() => false) }, close }),
+    },
+  });
+
+  await expect(session.cleanup()).rejects.toThrow("registration close failed");
+  await expect(session.cleanup()).rejects.toThrow("registration close failed");
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("keeps legacy and enterprise Sessions without registration unchanged", async () => {
+  const legacyMessages: SessionOutboundMessage[] = [];
+  const open = vi.fn(() => ({ dispatcher: { handle: vi.fn(() => false) }, close: vi.fn() }));
+  const legacy = createSessionForTest({
+    messages: legacyMessages,
+    enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+  });
+  legacy.publish({
+    type: "pong",
+    payload: { requestId: "legacy-no-registration", serverReceivedAt: 1, serverSentAt: 2 },
+  });
+  expect(open).not.toHaveBeenCalled();
+  expect(legacyMessages).toEqual([
+    {
+      type: "pong",
+      payload: { requestId: "legacy-no-registration", serverReceivedAt: 1, serverSentAt: 2 },
+    },
+  ]);
+
+  const enterpriseMessages: SessionOutboundMessage[] = [];
+  const enterprise = createSessionForTest({
+    messages: enterpriseMessages,
+    enterpriseContext: enterpriseContext("generation-browser-no-registration"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+  });
+  enterprise.publish(
+    {
+      type: "pong",
+      payload: { requestId: "enterprise-no-registration", serverReceivedAt: 3, serverSentAt: 4 },
+    },
+    { kind: "transport_control", control: "pong" },
+  );
+  await flushBrowserWaitingDelivery();
+  expect(enterpriseMessages).toEqual([
+    {
+      type: "pong",
+      payload: { requestId: "enterprise-no-registration", serverReceivedAt: 3, serverSentAt: 4 },
+    },
+  ]);
+  await Promise.all([legacy.cleanup(), enterprise.cleanup()]);
 });
 
 test("routes registered content requests through the per-session lease beside the global registry", async () => {
