@@ -25,6 +25,13 @@ export interface EnterpriseBrowserProfileContentReadSource {
   }): Promise<EnterpriseBrowserProfileContentPage>;
   close?(): Promise<void> | void;
 }
+type ReadProfile = (
+  input: Parameters<
+    NonNullable<
+      Parameters<typeof createEnterpriseBrowserProfileContentReadSource>[0]["readProfile"]
+    >
+  >[0],
+) => Promise<EnterpriseBrowserProfileContentPage>;
 export function isEnterpriseBrowserProfileContentReadSource(
   value: unknown,
 ): value is EnterpriseBrowserProfileContentReadSource {
@@ -41,6 +48,11 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
   }) => Promise<EnterpriseBrowserProfileContentPage>;
   readonly onClose?: () => void;
 }): EnterpriseBrowserProfileContentReadSource {
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== Object.prototype && prototype !== null)
+    throw new Error("Invalid source options.");
+  if (Reflect.ownKeys(input).some((key) => key !== "readProfile" && key !== "onClose"))
+    throw new Error("Invalid source options.");
   const readProfile = captureDataFunction(input, "readProfile");
   const onClose = captureDataOptionalFunction(input, "onClose");
   let closed = false;
@@ -72,16 +84,20 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
   return source;
 }
 
-// oxlint-disable-next-line no-explicit-any -- captured descriptor is narrowed by the caller contract
-function captureDataFunction(input: object, key: string): (...args: any[]) => any {
+function isReadProfile(value: unknown): value is ReadProfile {
+  return typeof value === "function";
+}
+function captureDataFunction(input: object, key: string): ReadProfile {
   const descriptor = Object.getOwnPropertyDescriptor(input, key);
-  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+  if (!descriptor?.enumerable || !("value" in descriptor) || typeof descriptor.value !== "function")
     throw new Error(`Invalid ${key}`);
+  if (!isReadProfile(descriptor.value)) throw new Error(`Invalid ${key}`);
   return descriptor.value;
 }
 function captureDataOptionalFunction(input: object, key: string): (() => void) | undefined {
   const descriptor = Object.getOwnPropertyDescriptor(input, key);
   if (!descriptor) return undefined;
+  if (!descriptor.enumerable) throw new Error(`Invalid ${key}`);
   if (
     !("value" in descriptor) ||
     (descriptor.value !== undefined && typeof descriptor.value !== "function")
