@@ -185,6 +185,25 @@ export class BrowserProfileRuntimeAuthorizationRegistry {
     this.trustedNodeId = parsePattern(trustedNodeId, ENTERPRISE_NODE_ID_PATTERN, "trusted node ID");
   }
 
+  public hydrateGeneration(hostWebContentsId: number, authorizations: readonly unknown[], lifecycleGeneration: string): readonly BrowserProfileRuntimeAuthorization[] {
+    assertHostWebContentsId(hostWebContentsId);
+    const parsed = authorizations.map((value) => {
+      const authorization = parseBrowserProfileRuntimeAuthorization(value);
+      if (authorization.lifecycleGeneration !== lifecycleGeneration || authorization.homeNodeId !== this.trustedNodeId) throw new Error("Invalid Browser Profile generation.");
+      return authorization;
+    });
+    const revoked = [...this.revokeHost(hostWebContentsId)];
+    this.lifecycleByHost.set(hostWebContentsId, lifecycleGeneration);
+    for (const authorization of parsed) this.authorizations.set(runtimeAuthorizationKey(hostWebContentsId, authorization), authorization);
+    return Object.freeze(revoked.map(cloneRuntimeAuthorization));
+  }
+
+  public revokeGeneration(hostWebContentsId: number, lifecycleGeneration: string): readonly BrowserProfileRuntimeAuthorization[] {
+    assertHostWebContentsId(hostWebContentsId);
+    if (this.lifecycleByHost.get(hostWebContentsId) !== lifecycleGeneration) return Object.freeze([]);
+    return Object.freeze(this.revokeHost(hostWebContentsId).map(cloneRuntimeAuthorization));
+  }
+
   public hydrate(
     hostWebContentsId: number,
     input: unknown,
