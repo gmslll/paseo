@@ -83,22 +83,29 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
             nextCursor: null,
           };
         }
-        const names = (await workspaceFs.listRoot(root)).filter((name) => !name.includes("/"));
+        const names = (await workspaceFs.listRoot(root))
+          .filter((name) => !name.includes("/"))
+          .sort();
         const start = cursor ? Number(cursor) : 0;
         const selected = names.slice(start, start + limit);
-        const items = await Promise.all(
-          selected.map(async (name) => {
+        const items = [];
+        for (const name of selected) {
+          try {
             const stat = await workspaceFs.stat(root, [name]);
-            return {
+            if (stat.kind !== "file") continue;
+            items.push({
               itemId: name,
               occurredAt: new Date(stat.mtimeMs).toISOString(),
-              kind: "artifact",
+              kind: "artifact" as const,
               reference: name,
               label: name,
               size: stat.size,
-            };
-          }),
-        );
+            });
+          } catch (error) {
+            if ((error as { code?: string }).code === "ENOENT") continue;
+            throw error;
+          }
+        }
         return {
           items,
           nextCursor:
