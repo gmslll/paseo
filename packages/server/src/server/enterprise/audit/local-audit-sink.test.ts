@@ -574,6 +574,109 @@ describe("LocalAuditSink", () => {
     expect(storage.events.map((event) => event.priority)).toEqual(["high", undefined]);
   });
 
+  it("round-trips strict ownership-transfer metadata through local JSONL storage", async () => {
+    const directory = await temporaryDirectory("paseo-audit-ownership-transfer-");
+    const file = path.join(directory, "audit-2026-01-01.jsonl");
+    try {
+      const storage = new JsonlAuditStorage(directory, new FaultFiles());
+      const sink = new LocalAuditSink(dependencies(storage));
+      const intent = await sink.append(
+        {
+          ...input,
+          action: "enterprise.resource.ownership.transfer",
+          priority: "high",
+          metadata: {
+            phase: "intent",
+            newOwnerPrincipalId: "usr_1111111111111111",
+            revision: "1",
+          },
+        },
+        { durability: "required" },
+      );
+      const failure = await sink.append(
+        {
+          ...input,
+          action: "enterprise.resource.ownership.transfer",
+          outcome: "failed",
+          reasonCode: "workspace_ownership_transfer_failed",
+          metadata: {
+            phase: "storage",
+            newOwnerPrincipalId: "usr_1111111111111111",
+            revision: "1",
+            intentEventId: intent.eventId,
+          },
+        },
+        { durability: "required" },
+      );
+      await sink.close();
+
+      const restored = new LocalAuditSink(
+        dependencies(new JsonlAuditStorage(directory, new FaultFiles()), 2),
+      );
+      expect(await restored.snapshotEvents()).toEqual([intent, failure]);
+      expect(intent).toMatchObject({
+        priority: "high",
+        metadata: {
+          phase: "intent",
+          newOwnerPrincipalId: "usr_1111111111111111",
+          revision: "1",
+        },
+      });
+      expect(failure).not.toHaveProperty("priority");
+      expect(failure.metadata).toEqual({
+        phase: "storage",
+        newOwnerPrincipalId: "usr_1111111111111111",
+        revision: "1",
+        intentEventId: intent.eventId,
+      });
+      expect(await readFile(file, "utf8")).toContain(`"intentEventId":"${intent.eventId}"`);
+      await restored.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("filters unknown and secret ownership-transfer metadata from local JSONL storage", async () => {
+    const directory = await temporaryDirectory("paseo-audit-ownership-redaction-");
+    const file = path.join(directory, "audit-2026-01-01.jsonl");
+    const secretCanary = "pso_u_credential.secret-token-canary";
+    try {
+      const storage = new JsonlAuditStorage(directory, new FaultFiles());
+      const sink = new LocalAuditSink(dependencies(storage));
+      const event = await sink.append(
+        {
+          ...input,
+          action: "enterprise.resource.ownership.transfer",
+          metadata: {
+            count: 1,
+            phase: "storage",
+            newOwnerPrincipalId: "usr_1111111111111111",
+            revision: "1",
+            intentEventId: secretCanary,
+            unknown: "must-not-persist",
+            secret: secretCanary,
+            token: secretCanary,
+          },
+        },
+        { durability: "required" },
+      );
+      await sink.close();
+
+      expect(event.metadata).toEqual({
+        count: 1,
+        phase: "storage",
+        newOwnerPrincipalId: "usr_1111111111111111",
+        revision: "1",
+      });
+      const persisted = await readFile(file, "utf8");
+      expect(persisted).not.toContain(secretCanary);
+      expect(persisted).not.toContain("must-not-persist");
+      expect(await storage.readAll()).toEqual([event]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("owns authority fields, redacts metadata, and resumes the verified chain", async () => {
     const storage = new MemoryStorage();
     const first = new LocalAuditSink(dependencies(storage));

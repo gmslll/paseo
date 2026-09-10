@@ -7,6 +7,7 @@ import {
   AuditEventInputSchema,
   AuditEventSchema,
   NodeContextSchema,
+  PrincipalIdSchema,
 } from "@getpaseo/protocol/messages";
 import type {
   AuditAppendOptions,
@@ -34,7 +35,7 @@ export const PORTABLE_AUDIT_STORAGE_UNSUPPORTED_REASON =
 const POISON_PAYLOAD = "paseo-audit-poisoned-v1\n";
 const AUDIT_FILE_PATTERN = /^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/;
 
-const ALLOWED_METADATA_KEYS = new Set([
+const ALLOWED_SCALAR_METADATA_KEYS = new Set([
   "count",
   "source",
   "mode",
@@ -42,6 +43,14 @@ const ALLOWED_METADATA_KEYS = new Set([
   "attempt",
   "durationMs",
   "status",
+]);
+const OWNERSHIP_TRANSFER_ACTION = "enterprise.resource.ownership.transfer";
+const OWNERSHIP_TRANSFER_PHASES = new Set(["intent", "storage"]);
+const OWNERSHIP_TRANSFER_METADATA_KEYS = new Set([
+  "phase",
+  "newOwnerPrincipalId",
+  "revision",
+  "intentEventId",
 ]);
 
 export interface AuditFileStat {
@@ -866,10 +875,8 @@ export class JsonlAuditStorage implements AuditStorage {
 function redact(input: AuditEventInput): AuditEventInput {
   const metadata = input.metadata
     ? Object.fromEntries(
-        Object.entries(input.metadata).filter(
-          ([key, value]) =>
-            ALLOWED_METADATA_KEYS.has(key) &&
-            (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))),
+        Object.entries(input.metadata).filter(([key, value]) =>
+          isCanonicalMetadataEntry(input.action, key, value),
         ),
       )
     : undefined;
@@ -893,16 +900,18 @@ function redact(input: AuditEventInput): AuditEventInput {
   });
 }
 
-function assertSafeOpenString(value: string, field: string): void {
-  if (
+function isSafeOpenString(value: string): boolean {
+  return !(
     value.length > 256 ||
     hasControlCharacter(value) ||
     /bearer|token|canary|secret|password/i.test(value) ||
     /[\\/]/.test(value) ||
     value.includes("..")
-  ) {
-    throw new Error(`unsafe audit ${field}`);
-  }
+  );
+}
+
+function assertSafeOpenString(value: string, field: string): void {
+  if (!isSafeOpenString(value)) throw new Error(`unsafe audit ${field}`);
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -935,15 +944,38 @@ function validateOpenStrings(input: AuditEventInput): void {
   }
 }
 
-function validateCanonicalMetadata(metadata: AuditEvent["metadata"]): void {
-  if (!metadata) return;
-  for (const [key, value] of Object.entries(metadata)) {
-    if (
-      !ALLOWED_METADATA_KEYS.has(key) ||
-      (typeof value !== "boolean" && !(typeof value === "number" && Number.isFinite(value)))
-    ) {
+function isOwnershipRevision(value: unknown): value is string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  try {
+    return BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+  } catch {
+    return false;
+  }
+}
+
+function isOwnershipTransferMetadataEntry(key: string, value: unknown): boolean {
+  if (!OWNERSHIP_TRANSFER_METADATA_KEYS.has(key) || typeof value !== "string") return false;
+  if (key === "phase") return OWNERSHIP_TRANSFER_PHASES.has(value);
+  if (key === "newOwnerPrincipalId") return PrincipalIdSchema.safeParse(value).success;
+  if (key === "revision") return isOwnershipRevision(value);
+  return AuditEventSchema.shape.eventId.safeParse(value).success && isSafeOpenString(value);
+}
+
+function isCanonicalMetadataEntry(action: string, key: string, value: unknown): boolean {
+  if (
+    ALLOWED_SCALAR_METADATA_KEYS.has(key) &&
+    (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value)))
+  ) {
+    return true;
+  }
+  return action === OWNERSHIP_TRANSFER_ACTION && isOwnershipTransferMetadataEntry(key, value);
+}
+
+function validateCanonicalMetadata(event: AuditEvent): void {
+  if (!event.metadata) return;
+  for (const [key, value] of Object.entries(event.metadata)) {
+    if (!isCanonicalMetadataEntry(event.action, key, value))
       throw new Error("unsafe audit metadata");
-    }
   }
 }
 
@@ -957,7 +989,7 @@ function validateFinalizedSafety(event: AuditEvent): void {
   ] as const) {
     if (value !== undefined) assertSafeOpenString(value, field);
   }
-  validateCanonicalMetadata(event.metadata);
+  validateCanonicalMetadata(event);
 }
 
 interface AuditAppendSnapshot {
