@@ -38,13 +38,21 @@ export class WorkspaceDirectoryReplica {
   private projects = new Map<string, ProjectDescriptor>();
   private workspaceIdsByProject = new Map<string, Set<string>>();
 
-  constructor(private readonly serverId: string) {}
+  constructor(
+    private readonly serverId: string,
+    private readonly isWorkspacePublicationBlocked: (workspaceId: string) => boolean = () => false,
+  ) {}
 
   applyDelta(delta: WorkspaceDirectoryDelta): DirectoryReplicaMutation[] {
     if (delta.kind === "script_status") return this.applyScriptStatus(delta.update);
     if ("projectId" in delta || "project" in delta) return this.applyProjectDelta(delta);
     if (delta.kind === "remove") return this.removeWorkspace(delta);
-    return this.upsertWorkspace(normalizeWorkspaceDescriptor(delta.workspace));
+    const workspace = normalizeWorkspaceDescriptor(delta.workspace);
+    if (this.isWorkspacePublicationBlocked(workspace.id)) {
+      this.deleteWorkspace(workspace.id);
+      return [{ kind: "workspace", type: "delete", id: workspace.id }];
+    }
+    return this.upsertWorkspace(workspace);
   }
 
   commitCached(input: {
@@ -52,7 +60,11 @@ export class WorkspaceDirectoryReplica {
     projects: Map<string, ProjectDescriptor>;
   }): void {
     this.replace({
-      workspaces: new Map([...input.workspaces, ...this.workspaces]),
+      workspaces: new Map(
+        [...input.workspaces, ...this.workspaces].filter(
+          ([workspaceId]) => !this.isWorkspacePublicationBlocked(workspaceId),
+        ),
+      ),
       projects: new Map([...input.projects, ...this.projects]),
     });
     useSessionStore.getState().setHasWorkspaceDirectorySnapshot(this.serverId, true);
@@ -62,6 +74,7 @@ export class WorkspaceDirectoryReplica {
     workspace: WorkspaceDescriptor,
     project: ProjectDescriptor | undefined,
   ): void {
+    if (this.isWorkspacePublicationBlocked(workspace.id)) return;
     if (shouldSuppressWorkspaceForLocalArchive({ serverId: this.serverId, workspace })) return;
     if (project) this.setProject(project);
     this.setWorkspace(workspace);
@@ -71,7 +84,14 @@ export class WorkspaceDirectoryReplica {
     snapshot: WorkspaceDirectorySnapshot,
     deltas: readonly WorkspaceDirectoryDelta[],
   ): DirectoryReplicaMutation[] {
-    this.replace(snapshot);
+    this.replace({
+      ...snapshot,
+      workspaces: new Map(
+        [...snapshot.workspaces].filter(
+          ([workspaceId]) => !this.isWorkspacePublicationBlocked(workspaceId),
+        ),
+      ),
+    });
     const mutations = deltas.flatMap((delta) => this.applyDelta(delta));
     useSessionStore.getState().setHasHydratedWorkspaces(this.serverId, true);
     return mutations;
@@ -82,7 +102,11 @@ export class WorkspaceDirectoryReplica {
   }
 
   acceptWorkspaces(workspaces: readonly WorkspaceDescriptor[]): DirectoryReplicaMutation[] {
-    return workspaces.flatMap((workspace) => this.upsertWorkspace(workspace));
+    return workspaces.flatMap((workspace) =>
+      this.isWorkspacePublicationBlocked(workspace.id)
+        ? [{ kind: "workspace" as const, type: "delete" as const, id: workspace.id }]
+        : this.upsertWorkspace(workspace),
+    );
   }
 
   acceptProject(project: ProjectDescriptor): DirectoryReplicaMutation[] {
@@ -92,6 +116,13 @@ export class WorkspaceDirectoryReplica {
 
   removeWorkspaceSnapshot(workspaceId: string): DirectoryReplicaMutation[] {
     this.deleteWorkspace(workspaceId);
+    return [{ kind: "workspace", type: "delete", id: workspaceId }];
+  }
+
+  evictTransferredWorkspace(workspaceId: string): DirectoryReplicaMutation[] {
+    this.deleteWorkspace(workspaceId);
+    clearWorkspaceArchivePending({ serverId: this.serverId, workspaceId });
+    useWorkspaceSetupStore.getState().removeWorkspace({ serverId: this.serverId, workspaceId });
     return [{ kind: "workspace", type: "delete", id: workspaceId }];
   }
 

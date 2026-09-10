@@ -444,6 +444,92 @@ describe("viewed timeline persistence", () => {
   });
 });
 
+describe("ownership transfer timeline fences", () => {
+  it("does not paint a cached timeline whose read resolves after eviction", async () => {
+    useSessionStore.getState().initializeSession(SERVER_ID, null);
+    let release!: (value: CachedTimeline) => void;
+    const read = new Promise<CachedTimeline>((resolve) => {
+      release = resolve;
+    });
+    const replica = createTimelineReplica({
+      serverId: SERVER_ID,
+      storage: {
+        readTimeline: () => read,
+        commitTimeline: () => undefined,
+      },
+      prepareAgent: async () => undefined,
+    });
+
+    const preparation = replica.prepare(AGENT_ID);
+    replica.evictAgents([AGENT_ID]);
+    release(cachedTimeline());
+    await preparation;
+
+    expect(replica.readCursor(AGENT_ID)).toBeUndefined();
+    expect(
+      selectAgentTimelineState(useSessionStore.getState().sessions[SERVER_ID], AGENT_ID),
+    ).toEqual({ status: "cold" });
+  });
+
+  it("discards queued and late publications for only the evicted agent", () => {
+    useSessionStore.getState().initializeSession(SERVER_ID, null);
+    applySynced(AGENT_ID, 8);
+    applySynced("agent-2", 3);
+    const commits: string[] = [];
+    const replica = createTimelineReplica({
+      serverId: SERVER_ID,
+      storage: {
+        readTimeline: async () => undefined,
+        commitTimeline: (_serverId, agentId) => commits.push(agentId),
+      },
+      prepareAgent: async () => undefined,
+    });
+    const owner = createViewedTimelineOwner({
+      serverId: SERVER_ID,
+      replica,
+      replaceDemandedAgentIds: () => undefined,
+      drainQueuedAgentMessage: () => undefined,
+      ports: {
+        initialDeliveryMode: "legacy",
+        setSubscription: async () => undefined,
+        readCursor: () => undefined,
+        fetchPage: async () => ({ hasNewer: false, endCursor: null }),
+        fetchLatestTail: async () => ({ hasNewer: false, endCursor: null }),
+        reportError: () => undefined,
+        schedule: () => () => undefined,
+      },
+    });
+    const streamEvent = (text: string, seq: number) => ({
+      event: {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text, messageId: text },
+      } as AgentStreamEventPayload,
+      seq,
+      epoch: "epoch-1",
+      timestamp: new Date("2026-08-26T10:00:01.000Z"),
+    });
+    owner.enqueueStreamEvent(AGENT_ID, streamEvent("queued-a", 9));
+    owner.enqueueStreamEvent("agent-2", streamEvent("queued-b", 4));
+
+    replica.evictAgents([AGENT_ID]);
+    owner.enqueueStreamEvent(AGENT_ID, streamEvent("late-a", 10));
+    owner.flushStreamAgent(AGENT_ID);
+    owner.flushStreamAgent("agent-2");
+
+    const session = useSessionStore.getState().sessions[SERVER_ID];
+    expect(session?.agentStreamTail.get(AGENT_ID)?.at(-1)).toMatchObject({ text: "network" });
+    expect(session?.agentTimelineCursor.get("agent-2")?.endSeq).toBe(4);
+    expect(commits).toEqual(["agent-2"]);
+
+    replica.resetEvictions();
+    owner.enqueueStreamEvent(AGENT_ID, streamEvent("new-generation", 9));
+    owner.flushStreamAgent(AGENT_ID);
+    expect(commits).toEqual(["agent-2", AGENT_ID]);
+    owner.dispose();
+  });
+});
+
 function createSqliteCache() {
   const database = new DatabaseSync(":memory:");
   let beforeRead = async () => {};

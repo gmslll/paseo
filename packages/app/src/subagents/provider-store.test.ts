@@ -1,11 +1,19 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { providerSubagentKey, useProviderSubagentStore } from "./provider-store";
+import {
+  blockProviderSubagentParent,
+  invalidateProviderSubagentParent,
+  invalidateProviderSubagentServer,
+  providerSubagentKey,
+  refreshProviderSubagents,
+  useProviderSubagentStore,
+} from "./provider-store";
 
 const SERVER_ID = "server-1";
 const PARENT_ID = "parent-1";
 const SUBAGENT_ID = "child-1";
 
 afterEach(() => {
+  invalidateProviderSubagentServer(SERVER_ID);
   useProviderSubagentStore.setState({
     descriptors: new Map(),
     timelines: new Map(),
@@ -131,6 +139,148 @@ describe("provider subagent client store", () => {
         .getState()
         .timelines.has(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
     ).toBe(false);
+  });
+
+  test("does not restore a parent from a list request invalidated while pending", async () => {
+    let release!: (value: {
+      requestId: string;
+      parentAgentId: string;
+      subagents: Array<{
+        id: string;
+        parentAgentId: string;
+        provider: "codex";
+        title: string;
+        description: null;
+        status: "running";
+        createdAt: string;
+        updatedAt: string;
+        toolCallId: string;
+      }>;
+      error: null;
+    }) => void;
+    const response = new Promise<Parameters<typeof release>[0]>((resolve) => {
+      release = resolve;
+    });
+    const listProviderSubagents = () => response;
+    const request = refreshProviderSubagents({ listProviderSubagents }, SERVER_ID, PARENT_ID);
+
+    invalidateProviderSubagentParent(SERVER_ID, PARENT_ID);
+    release({
+      requestId: "late-list",
+      parentAgentId: PARENT_ID,
+      subagents: [
+        {
+          id: SUBAGENT_ID,
+          parentAgentId: PARENT_ID,
+          provider: "codex",
+          title: "Late child",
+          description: null,
+          status: "running",
+          createdAt: "2026-07-12T10:00:00.000Z",
+          updatedAt: "2026-07-12T10:00:01.000Z",
+          toolCallId: "call-late",
+        },
+      ],
+      error: null,
+    });
+    await request;
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.has(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
+    ).toBe(false);
+  });
+
+  test("clears pending fences with the server lifecycle and permits a new request", async () => {
+    let releaseStale!: (value: {
+      requestId: string;
+      parentAgentId: string;
+      subagents: [];
+      error: null;
+    }) => void;
+    const staleResponse = new Promise<Parameters<typeof releaseStale>[0]>((resolve) => {
+      releaseStale = resolve;
+    });
+    let calls = 0;
+    const client = {
+      listProviderSubagents: () => {
+        calls += 1;
+        if (calls === 1) return staleResponse;
+        return Promise.resolve({
+          requestId: "fresh-list",
+          parentAgentId: PARENT_ID,
+          subagents: [
+            {
+              id: SUBAGENT_ID,
+              parentAgentId: PARENT_ID,
+              provider: "codex" as const,
+              title: "Fresh child",
+              description: null,
+              status: "running" as const,
+              createdAt: "2026-07-12T10:00:00.000Z",
+              updatedAt: "2026-07-12T10:00:01.000Z",
+              toolCallId: "call-fresh",
+            },
+          ],
+          error: null,
+        });
+      },
+    };
+    const staleRequest = refreshProviderSubagents(client, SERVER_ID, PARENT_ID);
+
+    invalidateProviderSubagentServer(SERVER_ID);
+    const freshRequest = refreshProviderSubagents(client, SERVER_ID, PARENT_ID);
+    expect(calls).toBe(2);
+    await freshRequest;
+    releaseStale({
+      requestId: "stale-list",
+      parentAgentId: PARENT_ID,
+      subagents: [],
+      error: null,
+    });
+    await staleRequest;
+
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID))?.title,
+    ).toBe("Fresh child");
+  });
+
+  test("drops late updates while blocked and resets the block with the server lifecycle", () => {
+    const running = {
+      id: SUBAGENT_ID,
+      parentAgentId: PARENT_ID,
+      provider: "codex" as const,
+      title: "Late child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-07-12T10:00:00.000Z",
+      updatedAt: "2026-07-12T10:00:01.000Z",
+      toolCallId: "call-late",
+    };
+    blockProviderSubagentParent(SERVER_ID, PARENT_ID);
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "upsert",
+      subagent: running,
+    });
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.has(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
+    ).toBe(false);
+
+    invalidateProviderSubagentServer(SERVER_ID);
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "upsert",
+      subagent: running,
+    });
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.has(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
+    ).toBe(true);
   });
 
   test("hides finished children locally without removing their timelines", () => {

@@ -1139,6 +1139,15 @@ export class ReplicaCache {
     this.schedulePersist();
   }
 
+  deleteTimelines(serverId: string, agentIds: readonly string[]): void {
+    if (!this.activeServerIds.has(serverId) || agentIds.length === 0) return;
+    this.advanceHostRevision(serverId);
+    for (const agentId of new Set(agentIds)) {
+      this.queueEntityDelete(serverId, "timeline", agentId);
+    }
+    this.schedulePersist();
+  }
+
   setHosts(serverIds: Iterable<string>): void {
     const next = new Set(serverIds);
     const removed = [...this.activeServerIds].filter((serverId) => !next.has(serverId));

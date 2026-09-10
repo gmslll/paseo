@@ -20,7 +20,7 @@ import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { HostConnection, HostProfile } from "@/types/host-connection";
 import { defaultHostAppearance } from "@/hosts/appearance";
-import { useSessionStore, type Agent } from "@/stores/session-store";
+import { normalizeWorkspaceDescriptor, useSessionStore, type Agent } from "@/stores/session-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
 import { queryClient } from "@/data/query-client";
@@ -100,8 +100,9 @@ class FakeDaemonClient {
   public sentAgentMessages: Array<Parameters<DaemonClient["sendAgentMessage"]>> = [];
   public sendAgentMessageFailures: Error[] = [];
   public sendAgentMessageResponses: Promise<void>[] = [];
-  private agentUpdateListeners = new Set<
-    (message: Extract<SessionOutboundMessage, { type: "agent_update" }>) => void
+  private outboundListeners = new Map<
+    SessionOutboundMessage["type"],
+    Set<(message: SessionOutboundMessage) => void>
   >();
   private fetchWaiters = new Set<() => void>();
   private agentListenerWaiters = new Set<() => void>();
@@ -113,20 +114,23 @@ class FakeDaemonClient {
     };
   } | null = null;
 
-  on(
-    type: "agent_update",
-    listener: (message: Extract<SessionOutboundMessage, { type: "agent_update" }>) => void,
+  on<TType extends SessionOutboundMessage["type"]>(
+    type: TType,
+    listener: (message: Extract<SessionOutboundMessage, { type: TType }>) => void,
   ): () => void {
-    if (type === "agent_update") this.agentUpdateListeners.add(listener);
+    const listeners = this.outboundListeners.get(type) ?? new Set();
+    const registered = listener as unknown as (message: SessionOutboundMessage) => void;
+    listeners.add(registered);
+    this.outboundListeners.set(type, listeners);
     for (const waiter of this.agentListenerWaiters) waiter();
-    return () => this.agentUpdateListeners.delete(listener);
+    return () => listeners.delete(registered);
   }
 
   async waitForAgentUpdates(): Promise<void> {
-    if (this.agentUpdateListeners.size > 0) return;
+    if ((this.outboundListeners.get("agent_update")?.size ?? 0) > 0) return;
     await new Promise<void>((resolve) => {
       const waiter = () => {
-        if (this.agentUpdateListeners.size === 0) return;
+        if ((this.outboundListeners.get("agent_update")?.size ?? 0) === 0) return;
         this.agentListenerWaiters.delete(waiter);
         resolve();
       };
@@ -135,9 +139,21 @@ class FakeDaemonClient {
   }
 
   agentUpdate(payload: Extract<SessionOutboundMessage, { type: "agent_update" }>["payload"]): void {
-    for (const listener of this.agentUpdateListeners) {
-      listener({ type: "agent_update", payload });
-    }
+    this.emit({ type: "agent_update", payload });
+  }
+
+  emit<TType extends SessionOutboundMessage["type"]>(
+    message: Extract<SessionOutboundMessage, { type: TType }>,
+  ): void {
+    for (const listener of this.outboundListeners.get(message.type) ?? []) listener(message);
+  }
+
+  snapshotHandlers<TType extends SessionOutboundMessage["type"]>(
+    type: TType,
+  ): Array<(message: Extract<SessionOutboundMessage, { type: TType }>) => void> {
+    return [...(this.outboundListeners.get(type) ?? [])] as Array<
+      (message: Extract<SessionOutboundMessage, { type: TType }>) => void
+    >;
   }
 
   async connect(): Promise<void> {
@@ -3049,6 +3065,158 @@ describe("HostRuntimeStore", () => {
       subscribe: { subscriptionId: "app:srv_no_session" },
       page: { limit: 200 },
     });
+
+    store.syncHosts([]);
+    expect(useSessionStore.getState().sessions[host.serverId]).toBeUndefined();
+  });
+
+  it("routes ownership tombstones through the current enterprise identity generation", async () => {
+    const host = makeHost({
+      serverId: "srv_transfer_identity",
+      connections: [
+        {
+          id: "direct:lan:6767",
+          type: "directTcp",
+          endpoint: "lan:6767",
+        },
+      ],
+    });
+    const client = new FakeDaemonClient();
+    client.setConnectionState({ status: "connected" });
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => {
+          throw new Error("initial client is supplied");
+        },
+        connectToDaemon: async () => {
+          throw new Error("single-connection host reuses its active client");
+        },
+        getClientId: async () => "cid_transfer_identity",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+    store.syncHosts([host], {
+      initialConnectionByServerId: new Map([
+        [
+          host.serverId,
+          {
+            connectionId: host.connections[0]!.id,
+            existingClient: client as unknown as DaemonClient,
+          },
+        ],
+      ]),
+    });
+    await waitForHostOnline(store, host.serverId);
+    const identityA = await lifecycle.authenticateEnterpriseHost({
+      serverId: host.serverId,
+      token: "pat-a",
+    });
+    expect(identityA.state).toBe("signed_in");
+    const generationA = identityA.generation;
+    expect(generationA).toEqual(expect.any(String));
+
+    const workspaceId = "wks_aaaaaaaaaaaaaaaa";
+    const workspace = normalizeWorkspaceDescriptor({
+      id: workspaceId,
+      projectId: "project-transfer",
+      projectDisplayName: "Transfer project",
+      projectRootPath: "/repo/transfer",
+      workspaceDirectory: "/repo/transfer",
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: "transfer",
+      status: "done",
+      statusEnteredAt: null,
+      activityAt: null,
+      archivingAt: null,
+      diffStat: null,
+      scripts: [],
+    });
+    const agent = {
+      ...replicaAgent(
+        makeFetchAgentsEntry({
+          id: "agent-transfer",
+          cwd: workspace.workspaceDirectory,
+          updatedAt: "2026-09-11T00:00:00.000Z",
+        }).agent,
+        host.serverId,
+      ),
+      workspaceId,
+    };
+    const tombstone = {
+      type: "enterprise.workspace.ownership.transfer.tombstone" as const,
+      payload: {
+        eventId: "evt_transfer_a",
+        resource: {
+          organizationId: "org_aaaaaaaaaaaaaaaa",
+          nodeId: "nod_aaaaaaaaaaaaaaaa",
+          resourceKind: "workspace" as const,
+          localResourceId: workspaceId,
+        },
+        oldPrincipalId: "usr_aaaaaaaaaaaaaaaa",
+        newRevision: "opaque-revision-a",
+        transferReceiptId: "receipt-transfer-a",
+      },
+    };
+    store.acceptWorkspaceSnapshots(host.serverId, [workspace]);
+    store.acceptAgentSnapshot(host.serverId, agent);
+    const generationAHandler = client.snapshotHandlers(
+      "enterprise.workspace.ownership.transfer.tombstone",
+    )[0];
+    expect(generationAHandler).toBeDefined();
+
+    client.emit(tombstone);
+    expect(store.isAgentPublicationBlocked(host.serverId, agent.id)).toBe(true);
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      false,
+    );
+
+    await lifecycle.logoutCurrent(host.serverId);
+    expect(store.isAgentPublicationBlocked(host.serverId, agent.id)).toBe(false);
+    store.acceptWorkspaceSnapshots(host.serverId, [workspace]);
+    store.acceptAgentSnapshot(host.serverId, agent);
+    generationAHandler?.(tombstone);
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      true,
+    );
+
+    const identityB = await lifecycle.authenticateEnterpriseHost({
+      serverId: host.serverId,
+      token: "pat-b",
+    });
+    expect(identityB.state).toBe("signed_in");
+    expect(identityB.generation).not.toBe(generationA);
+    generationAHandler?.({
+      ...tombstone,
+      payload: { ...tombstone.payload, eventId: "evt_transfer_stale_a" },
+    });
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      true,
+    );
+
+    client.emit({
+      ...tombstone,
+      payload: {
+        ...tombstone.payload,
+        eventId: "evt_transfer_b",
+        transferReceiptId: "receipt-transfer-b",
+        newRevision: "opaque-revision-b",
+      },
+    });
+    expect(store.isAgentPublicationBlocked(host.serverId, agent.id)).toBe(true);
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      false,
+    );
 
     store.syncHosts([]);
     expect(useSessionStore.getState().sessions[host.serverId]).toBeUndefined();

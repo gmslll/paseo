@@ -97,7 +97,11 @@ import { dispatchComposerAgentMessage, sendQueuedComposerMessageNow } from "@/co
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { resolveComposerAttachmentSubmitFormat } from "@/composer/attachments/submit";
 import { encodeImages } from "@/utils/encode-images";
-import { DirectorySync, type RefreshAgentDirectoryResult } from "@/runtime/directory-sync";
+import {
+  DirectorySync,
+  type DirectoryEnterpriseIdentity,
+  type RefreshAgentDirectoryResult,
+} from "@/runtime/directory-sync";
 import { ReplicaCache } from "@/runtime/replica-cache";
 import type { ReplicaRowStore } from "@/runtime/replica-cache/row-store";
 import { createReplicaRowStore } from "@/runtime/replica-cache/row-store-factory";
@@ -869,6 +873,7 @@ export class HostRuntimeController {
     host: HostProfile;
     deps?: HostRuntimeControllerDeps;
     onReconcileServerId?: (oldId: string, newId: string) => void;
+    onEnterpriseIdentityChange?: (serverId: string) => void;
   }) {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
@@ -962,6 +967,7 @@ export class HostRuntimeController {
             lifecycleGeneration: snapshot.generation,
           });
         }
+        input.onEnterpriseIdentityChange?.(this.host.serverId);
         void this.mountBrowserPageIdentityHandlerIfReady().catch(() => undefined);
       });
     }
@@ -2082,6 +2088,30 @@ function rekeyMap<V>(map: Map<string, V>, oldKey: string, newKey: string): void 
   map.set(newKey, value);
 }
 
+function directoryEnterpriseIdentityFromSnapshot(
+  serverId: string,
+  snapshot: EnterpriseIdentitySnapshot | null,
+): DirectoryEnterpriseIdentity | null {
+  const scope = snapshot?.scope;
+  const lifecycleGeneration = snapshot?.generation;
+  if (
+    snapshot?.state !== "signed_in" ||
+    snapshot.target !== "enterprise_host" ||
+    !scope ||
+    !lifecycleGeneration ||
+    scope.paseoServerId !== serverId
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    organizationId: scope.organizationId,
+    nodeId: scope.nodeId,
+    paseoServerId: scope.paseoServerId,
+    principalId: scope.principalId,
+    lifecycleGeneration,
+  });
+}
+
 interface AgentDirectoryRefreshInput {
   serverId: string;
   filter?: FetchAgentsOptions["filter"];
@@ -2373,6 +2403,10 @@ export class HostRuntimeStore {
         markAgentLoading: () => controller.markAgentDirectorySyncLoading(),
         markAgentReady: () => controller.markAgentDirectorySyncReady(),
         markAgentError: (error) => controller.markAgentDirectorySyncError(error),
+        evictAgentTimelines: (agentIds) =>
+          this.timelineReplicaByServer.get(newServerId)?.evictAgents(agentIds),
+        resetAgentTimelineEvictions: () =>
+          this.timelineReplicaByServer.get(newServerId)?.resetEvictions(),
       },
       this.replicaCache,
     );
@@ -2387,6 +2421,7 @@ export class HostRuntimeStore {
     );
     controller.adoptReconciledServerId(newServerId);
     const snapshot = controller.getSnapshot();
+    const identitySnapshot = controller.getEnterpriseIdentitySnapshot();
     this.clearHostReplica(oldServerId);
     this.syncSessionReplica(newServerId, snapshot);
     directory.connectionChanged({
@@ -2396,6 +2431,8 @@ export class HostRuntimeStore {
         clientGeneration: snapshot.clientGeneration,
         connectionEpoch: snapshot.connectionEpoch,
       },
+      enterpriseTarget: identitySnapshot?.target,
+      enterpriseIdentity: directoryEnterpriseIdentityFromSnapshot(newServerId, identitySnapshot),
     });
 
     const listeners = this.serverListeners.get(oldServerId);
@@ -2781,6 +2818,10 @@ export class HostRuntimeStore {
         host,
         deps: this.deps,
         onReconcileServerId: (oldId, newId) => this.reconcileServerId(oldId, newId),
+        onEnterpriseIdentityChange: (serverId) => {
+          this.syncDirectoryConnection(serverId);
+          this.emit(serverId);
+        },
       });
       this.controllers.set(host.serverId, controller);
       useSessionStore.getState().initializeSession(host.serverId, null);
@@ -2791,6 +2832,10 @@ export class HostRuntimeStore {
           markAgentLoading: () => controller.markAgentDirectorySyncLoading(),
           markAgentReady: () => controller.markAgentDirectorySyncReady(),
           markAgentError: (error) => controller.markAgentDirectorySyncError(error),
+          evictAgentTimelines: (agentIds) =>
+            this.timelineReplicaByServer.get(host.serverId)?.evictAgents(agentIds),
+          resetAgentTimelineEvictions: () =>
+            this.timelineReplicaByServer.get(host.serverId)?.resetEvictions(),
         },
         this.replicaCache,
       );
@@ -2850,6 +2895,7 @@ export class HostRuntimeStore {
       return;
     }
     const snapshot = controller.getSnapshot();
+    const identitySnapshot = controller.getEnterpriseIdentitySnapshot();
     const directory = this.directorySyncByServer.get(serverId);
     directory?.connectionChanged({
       client: snapshot.client,
@@ -2858,6 +2904,8 @@ export class HostRuntimeStore {
         clientGeneration: snapshot.clientGeneration,
         connectionEpoch: snapshot.connectionEpoch,
       },
+      enterpriseTarget: identitySnapshot?.target,
+      enterpriseIdentity: directoryEnterpriseIdentityFromSnapshot(serverId, identitySnapshot),
     });
     const previousStatus = this.lastConnectionStatusByServer.get(serverId);
     const statusChanged = previousStatus !== snapshot.connectionStatus;
@@ -2939,6 +2987,10 @@ export class HostRuntimeStore {
     transition: TurnLivenessTransition | readonly TurnLivenessTransition[],
   ): void {
     this.directorySyncByServer.get(serverId)?.applyAgentTurnLiveness(agentId, transition);
+  }
+
+  isAgentPublicationBlocked(serverId: string, agentId: string): boolean {
+    return this.directorySyncByServer.get(serverId)?.isAgentPublicationBlocked(agentId) ?? false;
   }
 
   beginAgentCancellation(serverId: string, agentId: string): number {
