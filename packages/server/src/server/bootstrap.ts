@@ -228,6 +228,7 @@ import {
   type ProductionAgentOwnerBinder,
 } from "./enterprise/access/production-agent-owner-binder.js";
 import { createProductionBrowserLeaseBundle } from "./enterprise/browser/production-bundle.js";
+import { createProductionEnterpriseBrowserProfileContentReadSource } from "./enterprise/browser/content-source.js";
 import {
   createEnterpriseBrowserLeaseSessionRuntime,
   createProductionBrowserLeaseDispatcherRegistration,
@@ -546,6 +547,7 @@ export interface PaseoDaemonDependencies {
     workspaceRoots: FileBackedWorkspaceRegistry;
   }) => EnterpriseWorkspaceFilesProductionProvider | null;
   createProductionBrowserLeaseBundle?: typeof createProductionBrowserLeaseBundle;
+  createProductionBrowserProfileContentReadSource?: typeof createProductionEnterpriseBrowserProfileContentReadSource;
   createEnterpriseAdmissionRuntime?: (input: {
     config: EnterpriseMultiUserConfig;
     audit: ProductionAuditCapability;
@@ -799,6 +801,9 @@ export async function createPaseoDaemon(
   const capturedIssue = dependencies.issueProductionAuditCapability;
   const capturedBrowserLeaseBundleFactory =
     dependencies.createProductionBrowserLeaseBundle ?? createProductionBrowserLeaseBundle;
+  const capturedBrowserProfileContentReadSourceFactory =
+    dependencies.createProductionBrowserProfileContentReadSource ??
+    createProductionEnterpriseBrowserProfileContentReadSource;
   const serverId = getOrCreateServerId(capturedPaseoHome, { logger });
   if (capturedEnterpriseMultiUser?.enabled === true) {
     enterpriseRuntime = await resolveEnterpriseRuntime(
@@ -1364,11 +1369,6 @@ export async function createPaseoDaemon(
         agentRecords,
         nodeId: enterpriseRuntime.node.nodeId,
       });
-      const contentRegistration = createEnterpriseContentReadDispatcherRegistration({
-        provider: authorizationRuntimeProvider,
-        audit: enterpriseRuntime.audit,
-        agents: agentManager,
-      });
       const auditRegistration = createProductionAuditDispatcherRegistration({
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
@@ -1411,6 +1411,21 @@ export async function createPaseoDaemon(
       await browserBundle.profiles.initialize();
       await browserBundle.bindings.initialize();
       await browserBundle.leases.initialize();
+      const browserProfileContentProbe = capturedBrowserProfileContentReadSourceFactory({});
+      const createBrowserProfileSource = browserProfileContentProbe
+        ? () => {
+            const source = capturedBrowserProfileContentReadSourceFactory({});
+            if (!source) throw new Error("enterprise browser profile content source unavailable");
+            return source;
+          }
+        : undefined;
+      await browserProfileContentProbe?.close?.();
+      const contentRegistration = createEnterpriseContentReadDispatcherRegistration({
+        provider: authorizationRuntimeProvider,
+        audit: enterpriseRuntime.audit,
+        agents: agentManager,
+        createBrowserProfileSource,
+      });
       const browserRegistration = createProductionBrowserLeaseDispatcherRegistration({
         provider: authorizationRuntimeProvider,
         registry: enterpriseRuntime.agentContextRegistry,

@@ -22,6 +22,7 @@ import {
   createProductionBrowserLeaseBundle,
   type ProductionBrowserLeaseBundle,
 } from "./enterprise/browser/production-bundle.js";
+import { createProductionEnterpriseBrowserProfileContentReadSource } from "./enterprise/browser/content-source.js";
 import { createProductionEnterpriseWorkspaceFilesProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import { getOrCreateServerId } from "./server-id.js";
 
@@ -94,6 +95,7 @@ describe.runIf(process.platform === "darwin")("enterprise browser shutdown", () 
     let audit: ProductionAuditCapability | undefined;
     const order: string[] = [];
     let browserClose: ReturnType<typeof vi.fn> | undefined;
+    let browserContentSourceCreates = 0;
     try {
       const paseoServerId = getOrCreateServerId(config.paseoHome, {
         logger: pino({ level: "silent" }),
@@ -151,12 +153,19 @@ describe.runIf(process.platform === "darwin")("enterprise browser shutdown", () 
           browserClose = close;
           return { ...bundle, close } satisfies ProductionBrowserLeaseBundle;
         },
+        createProductionBrowserProfileContentReadSource: () => {
+          browserContentSourceCreates += 1;
+          return createProductionEnterpriseBrowserProfileContentReadSource({
+            addonPath: workspaceAddonPath,
+          });
+        },
       });
       await daemon.start();
       await expect(daemon.stop()).resolves.toBeUndefined();
       await expect(daemon.stop()).resolves.toBeUndefined();
       expect(order).toEqual(["browser", "runtime"]);
       expect(browserClose).toHaveBeenCalledOnce();
+      expect(browserContentSourceCreates).toBe(1);
       expect(productionAuditCapabilityIssuer.current(audit!)).toBe(false);
     } finally {
       await audit?.close().catch(() => undefined);
