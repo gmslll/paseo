@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -9,7 +9,8 @@ const organization = "org_aaaaaaaaaaaaaaaa";
 
 describe("production enterprise initial provisioning orchestration", () => {
   test("provisions once and does not print a second token on rerun", async () => {
-    const home = await mkdtemp(path.join(os.tmpdir(), "paseo-enterprise-init-"));
+    const homeInput = await mkdtemp(path.join(os.tmpdir(), "paseo-enterprise-init-"));
+    const home = await realpath(homeInput);
     await mkdir(path.join(home, "enterprise"));
     let provisioned = false;
     const issue = vi.fn(async () => {

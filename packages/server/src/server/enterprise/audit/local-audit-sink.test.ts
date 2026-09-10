@@ -210,7 +210,8 @@ class FaultFiles implements AuditFileSystem {
   readonly noFollowFlag: number;
   readonly releaseReady = false;
   readonly unsupportedReason = PORTABLE_AUDIT_STORAGE_UNSUPPORTED_REASON;
-  private readonly node = new NodeAuditFileSystem();
+  private readonly node: NodeAuditFileSystem;
+  private readonly delegateNoFollowFlag: number;
   private readonly counts = new Map<string, number>();
   private nextHandleId = 0;
 
@@ -218,7 +219,10 @@ class FaultFiles implements AuditFileSystem {
     private readonly faults: readonly FileFault[] = [],
     noFollowFlag?: number,
   ) {
-    this.noFollowFlag = noFollowFlag ?? this.node.noFollowFlag;
+    const syntheticNoFollowFlag = 0x40000000;
+    this.noFollowFlag = noFollowFlag ?? (fileConstants.O_NOFOLLOW || syntheticNoFollowFlag);
+    this.delegateNoFollowFlag = fileConstants.O_NOFOLLOW || syntheticNoFollowFlag;
+    this.node = new NodeAuditFileSystem(this.delegateNoFollowFlag);
   }
 
   async ensureDirectory(directory: string, mode: number): Promise<void> {
@@ -232,7 +236,7 @@ class FaultFiles implements AuditFileSystem {
     const fault = this.record("directory.open", "open:directory");
     this.opens.push({ kind: "directory", name: path.basename(directory), flags });
     this.throwBefore(fault, "directory.open");
-    const handle = await this.node.openDirectory(directory, flags);
+    const handle = await this.node.openDirectory(directory, flags & ~this.noFollowFlag);
     this.throwAfter(fault, "directory.open");
     const label = `directory${++this.nextHandleId}`;
     return this.wrapDirectory(handle, label);
@@ -311,7 +315,7 @@ class FaultFiles implements AuditFileSystem {
         const fault = this.record(`${kind}.open`, `open:${kind}`);
         this.opens.push({ kind: "file", name, flags, mode });
         this.throwBefore(fault, `${kind}.open`);
-        const fileHandle = await handle.openFile(name, flags, mode);
+        const fileHandle = await handle.openFile(name, flags & ~this.noFollowFlag, mode);
         this.throwAfter(fault, `${kind}.open`);
         const fileLabel = `${kind}${++this.nextHandleId}`;
         return this.wrapFile(fileHandle, kind, fileLabel);

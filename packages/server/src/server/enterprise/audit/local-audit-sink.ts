@@ -133,11 +133,12 @@ class NodeAuditDirectoryHandle implements AuditDirectoryHandle {
 }
 
 export class NodeAuditFileSystem implements AuditFileSystem {
-  readonly noFollowFlag = fileConstants.O_NOFOLLOW;
+  readonly noFollowFlag: number;
   readonly releaseReady = PORTABLE_AUDIT_STORAGE_RELEASE_READY;
   readonly unsupportedReason = PORTABLE_AUDIT_STORAGE_UNSUPPORTED_REASON;
 
-  constructor() {
+  constructor(noFollowFlag = fileConstants.O_NOFOLLOW) {
+    this.noFollowFlag = noFollowFlag;
     assertNoFollowFlag(this.noFollowFlag);
   }
 
