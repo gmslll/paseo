@@ -1490,4 +1490,28 @@ describe("IdentityRegistry", () => {
         e.cause === primary,
     );
   });
+  test("issueInitialCredential is idempotent within the registry transaction", async () => {
+    const filePath = path.join(os.tmpdir(), "paseo-initial-credential-test.json");
+    const { registry } = createTestRegistry({ filePath });
+    await registry.load();
+    const [first, second] = await Promise.all([
+      registry.issueInitialCredential({
+        actor,
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+      }),
+      registry.issueInitialCredential({
+        actor,
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+      }),
+    ]);
+    expect([first.status, second.status].sort()).toEqual(["already_provisioned", "issued"]);
+    expect(
+      Object.keys(
+        (registry as unknown as { document: { credentials: Record<string, unknown> } }).document
+          .credentials,
+      ),
+    ).toHaveLength(1);
+  });
 });
