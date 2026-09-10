@@ -8,6 +8,7 @@ import type { EnterpriseContentAgentProductionSource } from "../runtime/enterpri
 import {
   createEnterpriseWorkspaceContentReadSource,
   createEnterpriseAppSlotContentReadSource,
+  createEnterpriseAgentContentReadSource,
 } from "../runtime/enterprise-content-read.js";
 import { isCurrentProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
@@ -23,6 +24,9 @@ import {
   EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseAppSlotContentReadResponseSchema,
   EnterpriseAppSlotContentSelectorSchema,
+  EnterpriseAgentContentReadRequestSchema,
+  EnterpriseAgentContentReadResponseSchema,
+  EnterpriseAgentContentSelectorSchema,
   type GlobalResourceRef,
 } from "@getpaseo/protocol/messages";
 import { productionAuditCapabilityIssuer } from "../audit/production-audit-runtime.js";
@@ -64,9 +68,11 @@ function equal(a: unknown, b: unknown): boolean {
 function requestIdOf(
   workspace: ReturnType<typeof EnterpriseWorkspaceContentReadRequestSchema.safeParse>,
   app: ReturnType<typeof EnterpriseAppSlotContentReadRequestSchema.safeParse>,
+  agent: ReturnType<typeof EnterpriseAgentContentReadRequestSchema.safeParse>,
 ): string {
   if (workspace.success) return workspace.data.requestId;
   if (app.success) return app.data.requestId;
+  if (agent.success) return agent.data.requestId;
   return "";
 }
 
@@ -86,6 +92,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
       operations: [
         "enterprise.workspace.content.read.request",
         "enterprise.app_slot.content.read.request",
+        "enterprise.agent.content.read.request",
       ],
     },
     open(openInput) {
@@ -99,6 +106,8 @@ export function createEnterpriseContentReadDispatcherRegistration(
         agents,
       });
       const appSlotSource = createEnterpriseAppSlotContentReadSource();
+      const agentSource = createEnterpriseAgentContentReadSource(agents);
+      if (!agentSource) throw new Error("agent source unavailable");
       if (!source) throw new Error("workspace source unavailable");
       let closed = false;
       let closePromise: Promise<void> | null = null;
@@ -140,14 +149,16 @@ export function createEnterpriseContentReadDispatcherRegistration(
         dispatcher: {
           requestPolicyForType: (type: string) =>
             type === "enterprise.workspace.content.read.request" ||
-            type === "enterprise.app_slot.content.read.request"
+            type === "enterprise.app_slot.content.read.request" ||
+            type === "enterprise.agent.content.read.request"
               ? ("resources" as const)
               : null,
           // oxlint-disable-next-line complexity
           handle: async ({ sessionContext, message }): Promise<SessionOutboundMessage | false> => {
             const parsed = EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
             const parsedApp = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
-            const requestId = requestIdOf(parsed, parsedApp);
+            const parsedAgent = EnterpriseAgentContentReadRequestSchema.safeParse(message);
+            const requestId = requestIdOf(parsed, parsedApp, parsedAgent);
             if (
               (!parsed.success && !parsedApp.success) ||
               !current(sessionContext) ||
@@ -198,6 +209,54 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 const response = deepFreeze(
                   EnterpriseAppSlotContentReadResponseSchema.parse({
                     type: "enterprise.app_slot.content.read.response",
+                    payload: { requestId, resource: canonical, selector, page },
+                  }),
+                );
+                return issuePending(sessionContext, message, response, canonical);
+              }
+              if (!parsed.success && parsedAgent.success) {
+                const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
+                if (!authority) return false;
+                const principal = sessionContext.enterpriseContext.principal;
+                const agent = await authority.resourceAuthorization.assertAgent(
+                  principal,
+                  "workspace.content.read",
+                  parsedAgent.data.resource.localResourceId,
+                );
+                if (!current(sessionContext)) return false;
+                const canonical = GlobalResourceRefSchema.parse({
+                  organizationId: agent.organizationId,
+                  nodeId: agent.nodeId,
+                  resourceKind: "agent",
+                  localResourceId: agent.agentId,
+                });
+                if (!equal(parsedAgent.data.resource, canonical)) return false;
+                const selector = EnterpriseAgentContentSelectorSchema.parse(
+                  parsedAgent.data.selector,
+                );
+                const page = await agentSource.read({
+                  resource: agent,
+                  selector,
+                  page: parsedAgent.data.page,
+                });
+                if (!current(sessionContext)) return false;
+                await currentAudit.append(
+                  {
+                    organizationId: principal.organizationId,
+                    actorPrincipalId: principal.principalId,
+                    actorCredentialId: principal.credentialId,
+                    sessionId: sessionContext.sessionId,
+                    action: "workspace.content.read",
+                    resource: { kind: "agent", id: agent.agentId },
+                    workspaceId: agent.workspaceId,
+                    outcome: "allowed",
+                  },
+                  { durability: "required" },
+                );
+                if (!current(sessionContext)) return false;
+                const response = deepFreeze(
+                  EnterpriseAgentContentReadResponseSchema.parse({
+                    type: "enterprise.agent.content.read.response",
                     payload: { requestId, resource: canonical, selector, page },
                   }),
                 );
@@ -274,22 +333,30 @@ export function createEnterpriseContentReadDispatcherRegistration(
               const workspaceRequest =
                 EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
               const appRequest = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
-              if (!workspaceRequest.success && !appRequest.success) return null;
+              const agentRequest = EnterpriseAgentContentReadRequestSchema.safeParse(message);
+              if (!workspaceRequest.success && !appRequest.success && !agentRequest.success)
+                return null;
               const request = workspaceRequest.success
                 ? workspaceRequest.data
                 : appRequest.success
                   ? appRequest.data
-                  : null;
+                  : agentRequest.success
+                    ? agentRequest.data
+                    : null;
               if (!request) return null;
               const workspaceResponse =
                 EnterpriseWorkspaceContentReadResponseSchema.safeParse(response);
               const appResponse = EnterpriseAppSlotContentReadResponseSchema.safeParse(response);
-              if (!workspaceResponse.success && !appResponse.success) return null;
+              const agentResponse = EnterpriseAgentContentReadResponseSchema.safeParse(response);
+              if (!workspaceResponse.success && !appResponse.success && !agentResponse.success)
+                return null;
               const parsedResponse = workspaceResponse.success
                 ? workspaceResponse.data
                 : appResponse.success
                   ? appResponse.data
-                  : null;
+                  : agentResponse.success
+                    ? agentResponse.data
+                    : null;
               if (!parsedResponse) return null;
               if (capability.context !== sessionContext) return null;
               if (capability.message !== message) return null;
