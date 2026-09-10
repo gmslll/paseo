@@ -96,6 +96,7 @@ describe.runIf(process.platform === "darwin")("enterprise browser shutdown", () 
     const order: string[] = [];
     let browserClose: ReturnType<typeof vi.fn> | undefined;
     let browserContentSourceCreates = 0;
+    let browserBundle: ProductionBrowserLeaseBundle | undefined;
     try {
       const paseoServerId = getOrCreateServerId(config.paseoHome, {
         logger: pino({ level: "silent" }),
@@ -145,6 +146,7 @@ describe.runIf(process.platform === "darwin")("enterprise browser shutdown", () 
           }),
         createProductionBrowserLeaseBundle: (input) => {
           const bundle = createProductionBrowserLeaseBundle(input);
+          browserBundle = bundle;
           const close = vi.fn(async () => {
             expect(productionAuditCapabilityIssuer.current(audit!)).toBe(true);
             order.push("browser");
@@ -153,10 +155,12 @@ describe.runIf(process.platform === "darwin")("enterprise browser shutdown", () 
           browserClose = close;
           return { ...bundle, close } satisfies ProductionBrowserLeaseBundle;
         },
-        createProductionBrowserProfileContentReadSource: () => {
+        createProductionBrowserProfileContentReadSource: (input) => {
           browserContentSourceCreates += 1;
+          expect(input.pageIdentity).toBe(browserBundle?.pageIdentityVerifier);
           return createProductionEnterpriseBrowserProfileContentReadSource({
             addonPath: workspaceAddonPath,
+            pageIdentity: input.pageIdentity,
           });
         },
       });

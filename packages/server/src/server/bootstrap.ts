@@ -1417,10 +1417,14 @@ export async function createPaseoDaemon(
       await browserBundle.profiles.initialize();
       await browserBundle.bindings.initialize();
       await browserBundle.leases.initialize();
-      const browserProfileContentProbe = capturedBrowserProfileContentReadSourceFactory({});
+      const browserProfileContentProbe = capturedBrowserProfileContentReadSourceFactory({
+        pageIdentity: browserBundle.pageIdentityVerifier,
+      });
       const createBrowserProfileSource = browserProfileContentProbe
         ? () => {
-            const source = capturedBrowserProfileContentReadSourceFactory({});
+            const source = capturedBrowserProfileContentReadSourceFactory({
+              pageIdentity: browserBundle.pageIdentityVerifier,
+            });
             if (!source) throw new Error("enterprise browser profile content source unavailable");
             return source;
           }
