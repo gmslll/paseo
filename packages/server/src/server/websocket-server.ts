@@ -2199,6 +2199,7 @@ export class VoiceAssistantWebSocketServer {
             await this.cleanupConnection(existing, "Enterprise session replaced");
           } catch (error) {
             runtime.admission.releaseSession(handle);
+            await enterpriseAuthorizationRuntime.release().catch(() => undefined);
             this.handshakeConnections.delete(ws);
             safeCloseSocket(
               ws,
