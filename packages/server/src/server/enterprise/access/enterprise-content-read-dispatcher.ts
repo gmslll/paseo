@@ -1,6 +1,7 @@
 import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 import type { ProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 import { resolveCurrentProductionRuntimeAuthority } from "./production-runtime-authority.js";
+import { isCurrentProductionAuthorizationRuntimeForAuthoritySources } from "./production-authorization-runtime.js";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
 import type { EnterpriseContentAgentProductionSource } from "../runtime/enterprise-content-read.js";
 import { createEnterpriseWorkspaceContentReadSource } from "../runtime/enterprise-content-read.js";
@@ -70,17 +71,58 @@ export function createEnterpriseContentReadDispatcherRegistration(
         throw new Error("content runtime unavailable");
       if (!resolveCurrentProductionRuntimeAuthority(openInput.authorizationRuntime, provider))
         throw new Error("content runtime is not current");
+      const runtime = openInput.authorizationRuntime;
       const source = createEnterpriseWorkspaceContentReadSource({
         filesRuntime: openInput.filesRuntime,
         agents,
       });
       if (!source) throw new Error("workspace source unavailable");
       let closed = false;
+      const reservations = new Set<string>();
+      const current = (ctx: {
+        sessionId: string;
+        clientId: string;
+        credentialId: string;
+        sessionBindingGeneration: string;
+        enterpriseContext: unknown;
+      }) =>
+        !closed &&
+        productionAuditCapabilityIssuer.current(currentAudit) &&
+        isCurrentProductionAuthorizationRuntimeProvider(provider) &&
+        ctx.sessionId === openInput.sessionId &&
+        ctx.clientId === openInput.clientId &&
+        ctx.credentialId === openInput.context.principal.credentialId &&
+        ctx.sessionBindingGeneration === openInput.context.sessionBindingGeneration &&
+        ctx.enterpriseContext === openInput.context &&
+        isCurrentProductionAuthorizationRuntimeForAuthoritySources(
+          runtime,
+          provider.grantStore,
+          provider.owners,
+        );
       return {
-        dispatcher: { handle: () => false },
+        dispatcher: {
+          requestPolicyForType: (type: string) =>
+            type === "enterprise.workspace.content.read.request" ? ("resources" as const) : null,
+          handle: async ({ sessionContext, message }): Promise<false> => {
+            const parsed = EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
+            if (
+              !parsed.success ||
+              !current(sessionContext) ||
+              reservations.has(parsed.data.requestId)
+            )
+              return false;
+            reservations.add(parsed.data.requestId);
+            try {
+              return false;
+            } finally {
+              reservations.delete(parsed.data.requestId);
+            }
+          },
+        },
         close: async () => {
           if (closed) return;
           closed = true;
+          reservations.clear();
           await source.close();
         },
       };
