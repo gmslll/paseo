@@ -178,7 +178,7 @@ function expectCommitError(
   expect(error.commitState).toBe(commitState);
 }
 
-describe("FileBackedGrantStorage secure persistence", () => {
+describe.skipIf(process.platform === "win32")("FileBackedGrantStorage secure persistence", () => {
   let directory: string;
   let filePath: string;
 
