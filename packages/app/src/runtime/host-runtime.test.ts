@@ -7,7 +7,10 @@ import type {
   FetchAgentsEntry,
   FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
-import type { EnterpriseFileRequestTransport } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import type {
+  EnterpriseFileRequestTransport,
+  EnterpriseIdentityLifecyclePorts,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import {
   MemoryEnterpriseIdentityLifecycle,
   type ProcessCredentialVault,
@@ -37,6 +40,48 @@ import {
   createWorkspaceLayoutWithExplorerSidebar,
   useWorkspaceLayoutStore,
 } from "@/stores/workspace-layout-store";
+import { mountBrowserPageIdentityDaemonClientHandler } from "@/desktop/browser/page-identity-transport";
+
+const mountedPageIdentityHandlers: Array<{
+  ready: ReturnType<typeof vi.fn>;
+  seal: ReturnType<typeof vi.fn>;
+  drain: ReturnType<typeof vi.fn>;
+  dispose: ReturnType<typeof vi.fn>;
+}> = [];
+const pageIdentityEvents: string[] = [];
+const pageIdentityLifecycleEvents: string[] = [];
+let pageIdentityReadyGate: Promise<void> | null = null;
+
+vi.mock("@/desktop/browser/page-identity-transport", async () => {
+  const actual = await vi.importActual<typeof import("@/desktop/browser/page-identity-transport")>(
+    "@/desktop/browser/page-identity-transport",
+  );
+  return {
+    ...actual,
+    mountBrowserPageIdentityDaemonClientHandler: vi.fn(() => {
+      const handler = {
+        ready: vi.fn(async () => {
+          if (pageIdentityReadyGate) await pageIdentityReadyGate;
+          pageIdentityEvents.push("ready");
+        }),
+        seal: vi.fn(() => {
+          pageIdentityEvents.push("seal");
+          pageIdentityLifecycleEvents.push("seal");
+        }),
+        drain: vi.fn(async () => {
+          pageIdentityEvents.push("drain");
+          pageIdentityLifecycleEvents.push("drain");
+        }),
+        dispose: vi.fn(async () => {
+          pageIdentityEvents.push("dispose");
+          pageIdentityLifecycleEvents.push("dispose");
+        }),
+      };
+      mountedPageIdentityHandlers.push(handler);
+      return handler;
+    }),
+  };
+});
 
 class FakeDaemonClient {
   private state: ConnectionState = { status: "idle" };
@@ -61,6 +106,12 @@ class FakeDaemonClient {
   private fetchWaiters = new Set<() => void>();
   private agentListenerWaiters = new Set<() => void>();
   private sentMessageWaiters = new Set<() => void>();
+  public serverInfo: {
+    features?: {
+      enterpriseBrowserPageIdentityObservationV1?: boolean;
+      enterpriseBrowserPageIdentityInvalidationV1?: boolean;
+    };
+  } | null = null;
 
   on(
     type: "agent_update",
@@ -132,8 +183,8 @@ class FakeDaemonClient {
     return this.state;
   }
 
-  getLastServerInfoMessage(): null {
-    return null;
+  getLastServerInfoMessage(): FakeDaemonClient["serverInfo"] {
+    return this.serverInfo;
   }
 
   subscribeConnectionStatus(listener: (status: ConnectionState) => void): () => void {
@@ -229,6 +280,11 @@ class FakeDaemonClient {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.mocked(mountBrowserPageIdentityDaemonClientHandler).mockClear();
+  mountedPageIdentityHandlers.length = 0;
+  pageIdentityEvents.length = 0;
+  pageIdentityLifecycleEvents.length = 0;
+  pageIdentityReadyGate = null;
   delete (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__;
   delete (globalThis as { window?: unknown }).window;
 });
@@ -379,6 +435,34 @@ function makeHost(input?: Partial<HostProfile>): HostProfile {
     preferredConnectionId: input?.preferredConnectionId ?? direct.id,
     createdAt: input?.createdAt ?? new Date(0).toISOString(),
     updatedAt: input?.updatedAt ?? new Date(0).toISOString(),
+  };
+}
+
+function makeLifecyclePorts(host: HostProfile): EnterpriseIdentityLifecyclePorts {
+  return {
+    authenticate: async () => ({
+      projection: {
+        principalType: "human",
+        principalId: "usr_aaaaaaaaaaaaaaaa",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        paseoServerId: host.serverId,
+        displayName: "Test",
+        grantVersion: "grant-v1",
+        navigation: [],
+        allowedOperations: [],
+      },
+      sessionBindingKey: "binding-a",
+      teardownAttempt: async () => {},
+    }),
+    teardown: {
+      stopNetworkAndSubscriptions: async () => {},
+      disposeRuntimeAndCachePartition: async () => {},
+      destroyDaemonClient: async () => {},
+      startNewClient: async () => {},
+      hydrateScope: async () => {},
+    },
+    remoteLogout: { logoutAll: async () => {} },
   };
 }
 
@@ -563,6 +647,311 @@ class BrowserClientLifecycle {
 }
 
 describe("HostRuntimeController", () => {
+  it("mounts page identity only after connected enterprise client and both capabilities", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    const revokeGate = createDeferred<void>();
+    const browserProfileRuntimeBridge: BrowserProfileRuntimeBridge = {
+      hydrateBrowserProfileAuthorizations: vi.fn(async () => {}),
+      revokeBrowserProfileGeneration: vi.fn(async () => {
+        pageIdentityLifecycleEvents.push("revoke-start");
+        await revokeGate.promise;
+        pageIdentityLifecycleEvents.push("revoke-end");
+      }),
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity",
+        browserProfileRuntimeBridge,
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => {
+          const ports = makeLifecyclePorts(host);
+          ports.teardown.stopNetworkAndSubscriptions = async () => {
+            pageIdentityLifecycleEvents.push("network-stop");
+          };
+          return ports;
+        },
+      },
+    });
+
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+
+    expect(vi.mocked(mountBrowserPageIdentityDaemonClientHandler)).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers).toHaveLength(1);
+    expect(mountedPageIdentityHandlers[0]?.ready).toHaveBeenCalledTimes(1);
+
+    pageIdentityLifecycleEvents.length = 0;
+    const logout = lifecycle.logoutCurrent(host.serverId);
+    await vi.waitFor(() => expect(pageIdentityLifecycleEvents).toContain("revoke-start"));
+    expect(pageIdentityLifecycleEvents).not.toContain("seal");
+    revokeGate.resolve();
+    await logout;
+    expect(pageIdentityLifecycleEvents).toEqual([
+      "revoke-start",
+      "revoke-end",
+      "seal",
+      "drain",
+      "dispose",
+      "network-stop",
+    ]);
+    expect(mountedPageIdentityHandlers[0]?.seal).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers[0]?.drain).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers[0]?.dispose).toHaveBeenCalledTimes(1);
+    await controller.stop();
+  });
+
+  it.each([
+    { label: "observation only", observation: true, invalidation: false },
+    { label: "invalidation only", observation: false, invalidation: true },
+    { label: "legacy", observation: false, invalidation: false },
+  ])(
+    "does not mount page identity when $label capability is absent",
+    async ({ observation, invalidation }) => {
+      const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+      const client = new FakeDaemonClient();
+      client.serverInfo = {
+        features: {
+          enterpriseBrowserPageIdentityObservationV1: observation,
+          enterpriseBrowserPageIdentityInvalidationV1: invalidation,
+        },
+      };
+      let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+      const controller = new HostRuntimeController({
+        host,
+        deps: {
+          createClient: () => client as unknown as DaemonClient,
+          connectToDaemon: async () => {
+            throw new Error("probe unavailable");
+          },
+          getClientId: async () => "cid_page_identity_absent",
+          createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+            lifecycle = new MemoryEnterpriseIdentityLifecycle(
+              vault,
+              ports.authenticate,
+              ports.teardown,
+              ports.remoteLogout,
+            );
+            return lifecycle;
+          },
+          createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+        },
+      });
+
+      await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+      await controller.activateConnection({ connectionId: "direct:lan:6767" });
+      expect(vi.mocked(mountBrowserPageIdentityDaemonClientHandler)).not.toHaveBeenCalled();
+      await controller.stop();
+    },
+  );
+
+  it("seals and drains the old page identity handler before switching clients", async () => {
+    const firstConnection: HostConnection = {
+      id: "direct:first",
+      type: "directTcp",
+      endpoint: "first:6767",
+    };
+    const secondConnection: HostConnection = {
+      id: "direct:second",
+      type: "directTcp",
+      endpoint: "second:6767",
+    };
+    const host = makeHost({
+      connections: [firstConnection, secondConnection],
+      preferredConnectionId: firstConnection.id,
+    });
+    const clients = [new FakeDaemonClient(), new FakeDaemonClient()];
+    for (const client of clients) {
+      client.serverInfo = {
+        features: {
+          enterpriseBrowserPageIdentityObservationV1: true,
+          enterpriseBrowserPageIdentityInvalidationV1: true,
+        },
+      };
+    }
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    let clientIndex = 0;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => clients[clientIndex++] as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_switch",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    await controller.activateConnection({ connectionId: firstConnection.id });
+    await controller.activateConnection({ connectionId: secondConnection.id });
+    const firstDisposeIndex = pageIdentityEvents.indexOf("dispose");
+    const secondReadyIndex = pageIdentityEvents.lastIndexOf("ready");
+
+    expect(mountedPageIdentityHandlers).toHaveLength(2);
+    expect(firstDisposeIndex).toBeGreaterThanOrEqual(0);
+    expect(secondReadyIndex).toBeGreaterThan(firstDisposeIndex);
+    await controller.stop();
+  });
+
+  it("discards a mount that becomes stale while ready is pending", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const readyGate = createDeferred<void>();
+    pageIdentityReadyGate = readyGate.promise;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_stale",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    const activation = controller.activateConnection({ connectionId: "direct:lan:6767" });
+    await vi.waitFor(() => expect(mountedPageIdentityHandlers).toHaveLength(1));
+    const logout = lifecycle.logoutCurrent(host.serverId);
+    readyGate.resolve();
+    await logout;
+    await activation;
+    expect(mountedPageIdentityHandlers[0]?.seal).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers[0]?.dispose).toHaveBeenCalledTimes(1);
+    await controller.stop();
+  });
+
+  it("coalesces connect and signed-in callbacks into one post-handshake mount", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    const connected = createDeferred<void>();
+    client.connect = async () => {
+      client.connectCalls += 1;
+      await connected.promise;
+      client.setConnectionState({ status: "connected" });
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_concurrent",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    const activation = controller.activateConnection({ connectionId: "direct:lan:6767" });
+    await vi.waitFor(() => expect(controller.getSnapshot().client).toBe(client));
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    expect(mountBrowserPageIdentityDaemonClientHandler).not.toHaveBeenCalled();
+    connected.resolve();
+    await activation;
+    expect(mountBrowserPageIdentityDaemonClientHandler).toHaveBeenCalledTimes(1);
+    await controller.stop();
+  });
+
+  it("does not mount page identity for an unsigned enterprise lifecycle", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_unsigned",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(mountBrowserPageIdentityDaemonClientHandler).not.toHaveBeenCalled();
+    await controller.stop();
+  });
+
   it("replaces the active relay client when re-pairing changes the daemon public key", async () => {
     const oldRelay: HostConnection = {
       id: "relay:wss:relay.paseo.sh:443",

@@ -88,6 +88,10 @@ import {
   mountServerDataPushRouter,
 } from "@/data/push-router";
 import { mountBrowserAutomationDaemonClientHandler } from "@/desktop/browser/automation/handler";
+import {
+  mountBrowserPageIdentityDaemonClientHandler,
+  type BrowserPageIdentityDaemonClientHandler,
+} from "@/desktop/browser/page-identity-transport";
 import { schedulesQueryBaseKey } from "@/schedules/aggregated-schedules";
 import { dispatchComposerAgentMessage, sendQueuedComposerMessageNow } from "@/composer/actions";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
@@ -846,6 +850,12 @@ export class HostRuntimeController {
     promise: Promise<void>;
   } | null = null;
   private browserProfileBridgeSealed = false;
+  private browserPageIdentityHandler: BrowserPageIdentityDaemonClientHandler | null = null;
+  private browserPageIdentityClient: DaemonClient | null = null;
+  private browserPageIdentityGeneration: string | null = null;
+  private browserPageIdentityMountPromise: Promise<void> | null = null;
+  private browserPageIdentityBarrier: Promise<void> = Promise.resolve();
+  private browserPageIdentityEpoch = 0;
   private readonly browserProfileBindingRevisions = new Map<
     string,
     { fingerprint: string; revision: string }
@@ -890,6 +900,7 @@ export class HostRuntimeController {
               ...identityPorts.teardown,
               stopNetworkAndSubscriptions: async () => {
                 const errors: unknown[] = [];
+                this.browserPageIdentityEpoch += 1;
                 const generation = this.browserProfileLifecycleGeneration;
                 if (generation && this.enterpriseResidueResetAdapter) {
                   const active = this.enterpriseResidueResetAdapter.getActiveScope();
@@ -913,6 +924,11 @@ export class HostRuntimeController {
                   } catch (error) {
                     errors.push(error);
                   }
+                }
+                try {
+                  await this.disposeBrowserPageIdentityHandler();
+                } catch (error) {
+                  errors.push(error);
                 }
                 try {
                   await identityPorts.teardown.stopNetworkAndSubscriptions();
@@ -946,6 +962,7 @@ export class HostRuntimeController {
             lifecycleGeneration: snapshot.generation,
           });
         }
+        void this.mountBrowserPageIdentityHandlerIfReady().catch(() => undefined);
       });
     }
     this.onReconcileServerId = input.onReconcileServerId ?? null;
@@ -1203,6 +1220,7 @@ export class HostRuntimeController {
     this.switchRequestVersion += 1;
     this.probeRequestVersion += 1;
     this.started = false;
+    this.browserPageIdentityEpoch += 1;
     if (this.probeIntervalHandle) {
       clearInterval(this.probeIntervalHandle);
       this.probeIntervalHandle = null;
@@ -1223,6 +1241,7 @@ export class HostRuntimeController {
         browserRevokeError = error;
       }
     }
+    await this.disposeBrowserPageIdentityHandler();
     if (this.activeClient) {
       const prev = this.activeClient;
       this.activeClient = null;
@@ -1705,6 +1724,8 @@ export class HostRuntimeController {
       this.unsubscribeClientHandlers();
       this.unsubscribeClientHandlers = null;
     }
+    this.browserPageIdentityEpoch += 1;
+    await this.disposeBrowserPageIdentityHandler();
     if (this.activeClient) {
       const previousClient = this.activeClient;
       this.activeClient = null;
@@ -1825,6 +1846,7 @@ export class HostRuntimeController {
       if (!existingClient) {
         await client.connect();
       }
+      await this.mountBrowserPageIdentityHandlerIfReady({ client, requestVersion });
     } catch (error) {
       if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) {
         return;
@@ -1838,6 +1860,152 @@ export class HostRuntimeController {
         ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
       });
     }
+  }
+
+  private enqueueBrowserPageIdentityOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.browserPageIdentityBarrier.then(operation, operation);
+    this.browserPageIdentityBarrier = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private mountBrowserPageIdentityHandlerIfReady(input?: {
+    client?: DaemonClient;
+    requestVersion?: number;
+  }): Promise<void> {
+    return this.enqueueBrowserPageIdentityOperation(() =>
+      this.mountBrowserPageIdentityHandlerIfReadyNow(input),
+    );
+  }
+
+  private isCurrentBrowserPageIdentityMount(input: {
+    client: DaemonClient;
+    generation: string;
+    clientGeneration: number;
+    epoch: number;
+    requestVersion?: number;
+  }): boolean {
+    const lifecycleSnapshot = this.enterpriseIdentityLifecycle?.readSnapshot();
+    const features = input.client.getLastServerInfoMessage()?.features;
+    return (
+      this.activeClient === input.client &&
+      this.snapshot.client === input.client &&
+      input.client.getConnectionState().status === "connected" &&
+      this.snapshot.clientGeneration === input.clientGeneration &&
+      this.browserPageIdentityEpoch === input.epoch &&
+      lifecycleSnapshot?.state === "signed_in" &&
+      lifecycleSnapshot.generation === input.generation &&
+      features?.enterpriseBrowserPageIdentityObservationV1 === true &&
+      features.enterpriseBrowserPageIdentityInvalidationV1 === true &&
+      (input.requestVersion === undefined || this.isCurrentSwitchRequest(input.requestVersion))
+    );
+  }
+
+  // oxlint-disable-next-line complexity -- lifecycle and client tuple fences are intentionally explicit.
+  private async mountBrowserPageIdentityHandlerIfReadyNow(input?: {
+    client?: DaemonClient;
+    requestVersion?: number;
+  }): Promise<void> {
+    const client = input?.client ?? this.activeClient;
+    if (!client || this.activeClient !== client) return;
+    if (input?.requestVersion !== undefined && !this.isCurrentSwitchRequest(input.requestVersion)) {
+      return;
+    }
+    const lifecycleSnapshot = this.enterpriseIdentityLifecycle?.readSnapshot();
+    const generation = lifecycleSnapshot?.generation;
+    const clientGeneration = this.snapshot.clientGeneration;
+    const lifecycleEpoch = this.browserPageIdentityEpoch;
+    const features = client.getLastServerInfoMessage()?.features;
+    if (
+      lifecycleSnapshot?.state !== "signed_in" ||
+      !generation ||
+      client.getConnectionState().status !== "connected" ||
+      features?.enterpriseBrowserPageIdentityObservationV1 !== true ||
+      features.enterpriseBrowserPageIdentityInvalidationV1 !== true
+    ) {
+      return;
+    }
+    if (
+      this.browserPageIdentityHandler &&
+      this.browserPageIdentityMountPromise &&
+      this.browserPageIdentityClient === client &&
+      this.browserPageIdentityGeneration === generation
+    ) {
+      return this.browserPageIdentityMountPromise;
+    }
+    await this.disposeBrowserPageIdentityHandlerNow();
+    if (
+      !this.isCurrentBrowserPageIdentityMount({
+        client,
+        generation,
+        clientGeneration,
+        epoch: lifecycleEpoch,
+        requestVersion: input?.requestVersion,
+      })
+    ) {
+      return;
+    }
+    const handler = mountBrowserPageIdentityDaemonClientHandler({
+      client,
+    });
+    this.browserPageIdentityHandler = handler;
+    this.browserPageIdentityClient = client;
+    this.browserPageIdentityGeneration = generation;
+    const mountPromise = (async () => {
+      await handler.ready();
+      if (
+        !this.isCurrentBrowserPageIdentityMount({
+          client,
+          generation,
+          clientGeneration,
+          epoch: lifecycleEpoch,
+          requestVersion: input?.requestVersion,
+        })
+      ) {
+        if (this.browserPageIdentityHandler === handler) {
+          handler.seal();
+          await handler.dispose().catch(() => undefined);
+          this.browserPageIdentityHandler = null;
+          this.browserPageIdentityClient = null;
+          this.browserPageIdentityGeneration = null;
+          this.browserPageIdentityMountPromise = null;
+        }
+      }
+    })();
+    this.browserPageIdentityMountPromise = mountPromise;
+    try {
+      await mountPromise;
+    } catch (error) {
+      if (this.browserPageIdentityHandler === handler) {
+        handler.seal();
+        await handler.dispose().catch(() => undefined);
+        this.browserPageIdentityHandler = null;
+        this.browserPageIdentityClient = null;
+        this.browserPageIdentityGeneration = null;
+        this.browserPageIdentityMountPromise = null;
+      }
+      throw error;
+    }
+  }
+
+  private disposeBrowserPageIdentityHandler(): Promise<void> {
+    return this.enqueueBrowserPageIdentityOperation(() =>
+      this.disposeBrowserPageIdentityHandlerNow(),
+    );
+  }
+
+  private async disposeBrowserPageIdentityHandlerNow(): Promise<void> {
+    const handler = this.browserPageIdentityHandler;
+    this.browserPageIdentityHandler = null;
+    this.browserPageIdentityClient = null;
+    this.browserPageIdentityGeneration = null;
+    this.browserPageIdentityMountPromise = null;
+    if (!handler) return;
+    handler.seal();
+    await handler.drain().catch(() => undefined);
+    await handler.dispose().catch(() => undefined);
   }
 
   adoptReconciledServerId(newServerId: string): void {
