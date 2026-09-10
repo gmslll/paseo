@@ -31,6 +31,10 @@ import {
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
 import { MemoryAuthorityReceiptState } from "./session/enterprise-authority-receipt-state.js";
+import {
+  createAdmissionInvalidationSink,
+  type AdmissionInvalidationSink,
+} from "./session/enterprise-admission-invalidation.js";
 import { StrictOutboundAuthorityVerifier } from "./enterprise/access/authority-receipt-verifier.js";
 import {
   createEnterpriseAuthorizationRuntime,
@@ -372,6 +376,7 @@ interface SessionForTestOptions {
   autoPrincipalGrantVersionGuard?: boolean;
   resourceAuthorization?: SessionOptions["resourceAuthorization"];
   enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
+  admissionInvalidationSink?: AdmissionInvalidationSink;
   sessionId?: SessionOptions["sessionId"];
   sessionAuthorization?: SessionOptions["sessionAuthorization"];
   admissionAuthorizationIssuer?: SessionOptions["admissionAuthorizationIssuer"];
@@ -509,6 +514,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       options.resourceAuthorization ??
       (options.enterpriseContext ? ({ canEmit: vi.fn(async () => true) } as never) : undefined),
     enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime,
+    admissionInvalidationSink: options.admissionInvalidationSink,
     sessionId: options.sessionId,
     sessionAuthorization: options.sessionAuthorization,
     admissionAuthorizationIssuer: options.admissionAuthorizationIssuer,
@@ -764,6 +770,42 @@ test("Session registers exact authority binding and releases it exactly once", a
       sessionBindingGeneration: context.sessionBindingGeneration,
     }),
   ).toBeNull();
+});
+
+test("Session registers admission invalidation and unsubscribes exactly once", async () => {
+  const sink = createAdmissionInvalidationSink();
+  const originalRegister = sink.register.bind(sink);
+  const register = vi.spyOn(sink, "register");
+  const unsubscribe = vi.fn();
+  register.mockImplementation((input) => {
+    const release = originalRegister(input);
+    return () => {
+      unsubscribe();
+      release();
+    };
+  });
+  const context = enterpriseContext("generation-admission-sink");
+  const session = createSessionForTest({
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    admissionInvalidationSink: sink,
+    clientId: "client-admission-sink",
+  });
+  const bindingKey = session.getEnterpriseSessionBindingKey();
+  expect(register).toHaveBeenCalledWith(
+    expect.objectContaining({
+      sessionBindingKey: bindingKey,
+      generation: context.sessionBindingGeneration,
+      credentialId: context.principal.credentialId,
+      principalId: context.principal.principalId,
+      organizationId: context.principal.organizationId,
+      grantVersion: context.principal.grantVersion,
+    }),
+  );
+  await session.cleanup();
+  await session.cleanup();
+  expect(unsubscribe).toHaveBeenCalledTimes(1);
 });
 
 test("Session replacement cleanup does not release a newer binding", async () => {

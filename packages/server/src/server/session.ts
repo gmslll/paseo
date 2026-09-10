@@ -65,6 +65,7 @@ import type {
   EnterpriseAdmissionAuthorizationHandle,
   EnterpriseAdmissionAuthorizationIssuer,
 } from "./enterprise/identity/admission-authorization.js";
+import type { AdmissionInvalidationSink } from "./session/enterprise-admission-invalidation.js";
 import { CursorError } from "./pagination/cursor.js";
 import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
 import { describeAgentHistoryMatches, rankAgentHistoryCandidates } from "./agent-history-search.js";
@@ -516,6 +517,7 @@ export interface SessionOptions {
   principalGrantVersionGuard?: PrincipalGrantVersionGuard;
   resourceAuthorization?: ResourceAuthorization;
   enterpriseWorkspaceFilesRuntime?: EnterpriseWorkspaceFilesRuntime;
+  admissionInvalidationSink?: AdmissionInvalidationSink;
   sessionId?: string;
   sessionAuthorization?: SessionAuthorization;
   admissionAuthorizationIssuer?: EnterpriseAdmissionAuthorizationIssuer;
@@ -762,6 +764,7 @@ export class Session {
     Map<string, FileBinaryStreamEntry>
   >();
   private readonly enterpriseSessionBindingKey?: string;
+  private admissionInvalidationUnsubscribe: (() => void) | null = null;
   private readonly inboundAuthorityRequestAuthorizer?: InboundAuthorityRequestAuthorizer;
   private readonly pendingAuthorityRequests = new Map<
     string,
@@ -897,6 +900,7 @@ export class Session {
       principalGrantVersionGuard,
       resourceAuthorization,
       enterpriseWorkspaceFilesRuntime,
+      admissionInvalidationSink,
       sessionId,
       sessionAuthorization,
       admissionAuthorizationIssuer,
@@ -968,7 +972,8 @@ export class Session {
       enterpriseContext ||
       enterpriseAgentContextRegistry ||
       authorityReceiptState ||
-      resourceAuthorization,
+      resourceAuthorization ||
+      admissionInvalidationSink,
     );
     if (
       enterpriseConfigured &&
@@ -1393,6 +1398,17 @@ export class Session {
           nodeId: node.nodeId,
           clientId,
         });
+        if (admissionInvalidationSink) {
+          this.admissionInvalidationUnsubscribe = admissionInvalidationSink.register({
+            sessionBindingKey: bindingKey,
+            generation: this.enterpriseContext.sessionBindingGeneration,
+            credentialId: principal.credentialId,
+            principalId: principal.principalId,
+            organizationId: principal.organizationId,
+            grantVersion: principal.grantVersion,
+            invalidate: (exact) => this.invalidateFromAdmission(exact),
+          });
+        }
       } catch (error) {
         throw this.rollbackConstruction(error);
       }
@@ -8862,6 +8878,15 @@ export class Session {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
     const cleanupErrors: unknown[] = [];
+    const admissionInvalidationUnsubscribe = this.admissionInvalidationUnsubscribe;
+    this.admissionInvalidationUnsubscribe = null;
+    if (admissionInvalidationUnsubscribe) {
+      try {
+        admissionInvalidationUnsubscribe();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     this.activeFileBinaryStreams.clear();
     // Seal the outbound ingress synchronously, then drain both existing and
     // racing tasks. Tasks queued after the seal observe isCleanedUp and cannot
