@@ -1,5 +1,11 @@
 import { z } from "zod";
-import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import {
+  NodeContextSchema,
+  PrincipalContextSchema,
+  type NodeContext,
+  type PrincipalContext,
+  type SessionOutboundMessage,
+} from "@getpaseo/protocol/messages";
 import { isSessionAuthorization, type SessionAuthorization } from "../../authorization/index.js";
 import type {
   EnterpriseAdmissionAuthorizationHandle,
@@ -67,6 +73,20 @@ export interface ProductionAuthorizationRuntimeOptions {
   readonly workspacePaths?: WorkspacePathRegistry;
 }
 
+export interface ProductionAuthorizationRuntimeSessionInput {
+  readonly admissionAuthorizationIssuer: EnterpriseAdmissionAuthorizationIssuer;
+  readonly admissionAuthorizationHandle: EnterpriseAdmissionAuthorizationHandle;
+  readonly sessionAuthorization: SessionAuthorization;
+  readonly sessionId: string;
+  readonly clientId: string;
+  readonly sessionBindingKey: string;
+  readonly enterpriseContext: {
+    readonly principal: PrincipalContext;
+    readonly node: NodeContext;
+    readonly sessionBindingGeneration: string;
+  };
+}
+
 export interface BoundOutboundAuthorityEmissionAuthorizer {
   register(handle: ActiveAuthorizedRequestHandle): Promise<boolean>;
   authorizeEmission(
@@ -107,6 +127,11 @@ const REQUIRED_RUNTIME_OPTION_KEYS = new Set([
 
 interface RuntimeRecord {
   active: boolean;
+  readonly admissionAuthorizationIssuer: EnterpriseAdmissionAuthorizationIssuer;
+  readonly admissionAuthorizationHandle: EnterpriseAdmissionAuthorizationHandle;
+  readonly sessionAuthorization: SessionAuthorization;
+  readonly authority: ResolvedProductionAuthorizationAuthority;
+  readonly binding: AuthoritySessionBindingRecord;
   readonly guard: RuntimeGrantVersionGuard;
   readonly fileBinary: FileBinaryOutboundAuthorizer;
   readonly outbound: BoundOutboundAuthorityEmissionAuthorizerImpl;
@@ -493,6 +518,11 @@ export async function createEnterpriseAuthorizationRuntime(
     });
     runtimeRecord = {
       active: true,
+      admissionAuthorizationIssuer: options.admissionAuthorizationIssuer,
+      admissionAuthorizationHandle: options.admissionAuthorizationHandle,
+      sessionAuthorization: options.sessionAuthorization,
+      authority,
+      binding,
       guard,
       fileBinary,
       outbound,
@@ -514,12 +544,90 @@ export function isCurrentProductionAuthorizationRuntime(
   try {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
     const record = runtimeRecords.get(value as object);
-    return Boolean(
-      record?.active && record.guard.isCurrent((value as ProductionAuthorizationRuntime).principal),
+    return Boolean(record?.active && record.guard.isCurrent(record.authority.principal));
+  } catch {
+    return false;
+  }
+}
+
+export function isCurrentProductionAuthorizationRuntimeForSession(
+  value: unknown,
+  input: unknown,
+): value is ProductionAuthorizationRuntime {
+  try {
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+    const record = runtimeRecords.get(value as object);
+    const session = captureRuntimeSessionInput(input);
+    if (!record?.active || !session) return false;
+    return (
+      record.admissionAuthorizationIssuer === session.admissionAuthorizationIssuer &&
+      record.admissionAuthorizationHandle === session.admissionAuthorizationHandle &&
+      record.sessionAuthorization === session.sessionAuthorization &&
+      record.binding.sessionId === session.sessionId &&
+      record.binding.clientId === session.clientId &&
+      record.binding.sessionBindingKey === session.sessionBindingKey &&
+      record.binding.sessionBindingGeneration ===
+        session.enterpriseContext.sessionBindingGeneration &&
+      sameCanonicalValue(record.authority.principal, session.enterpriseContext.principal) &&
+      sameCanonicalValue(record.authority.node, session.enterpriseContext.node) &&
+      record.guard.isCurrent(record.authority.principal)
     );
   } catch {
     return false;
   }
+}
+
+const RUNTIME_SESSION_KEYS = new Set([
+  "admissionAuthorizationIssuer",
+  "admissionAuthorizationHandle",
+  "sessionAuthorization",
+  "sessionId",
+  "clientId",
+  "sessionBindingKey",
+  "enterpriseContext",
+]);
+const ENTERPRISE_SESSION_CONTEXT_KEYS = new Set(["principal", "node", "sessionBindingGeneration"]);
+
+function captureRuntimeSessionInput(
+  input: unknown,
+): Readonly<ProductionAuthorizationRuntimeSessionInput> | null {
+  const top = captureExactRecord(input, RUNTIME_SESSION_KEYS);
+  if (!top) return null;
+  const context = captureExactRecord(top.enterpriseContext, ENTERPRISE_SESSION_CONTEXT_KEYS);
+  if (!context) return null;
+  const principalSnapshot = snapshotOwnData(context.principal);
+  const nodeSnapshot = snapshotOwnData(context.node);
+  const principal = PrincipalContextSchema.parse(principalSnapshot);
+  const node = NodeContextSchema.parse(nodeSnapshot);
+  if (
+    !sameCanonicalValue(principalSnapshot, principal) ||
+    !sameCanonicalValue(nodeSnapshot, node)
+  ) {
+    return null;
+  }
+  if (
+    typeof top.sessionId !== "string" ||
+    typeof top.clientId !== "string" ||
+    typeof top.sessionBindingKey !== "string" ||
+    typeof context.sessionBindingGeneration !== "string"
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    admissionAuthorizationIssuer:
+      top.admissionAuthorizationIssuer as EnterpriseAdmissionAuthorizationIssuer,
+    admissionAuthorizationHandle:
+      top.admissionAuthorizationHandle as EnterpriseAdmissionAuthorizationHandle,
+    sessionAuthorization: top.sessionAuthorization as SessionAuthorization,
+    sessionId: top.sessionId,
+    clientId: top.clientId,
+    sessionBindingKey: top.sessionBindingKey,
+    enterpriseContext: Object.freeze({
+      principal: deepFreeze(principal),
+      node: deepFreeze(node),
+      sessionBindingGeneration: context.sessionBindingGeneration,
+    }),
+  });
 }
 
 function captureRuntimeOptions(
@@ -712,6 +820,93 @@ function dataProperty(input: object, key: string): unknown {
     throw new Error("runtime options must use enumerable data properties");
   }
   return descriptor.value;
+}
+
+function captureExactRecord(
+  input: unknown,
+  expectedKeys: ReadonlySet<string>,
+): Readonly<Record<string, unknown>> | null {
+  try {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const keys = Reflect.ownKeys(input);
+    if (
+      keys.length !== expectedKeys.size ||
+      keys.some((key) => typeof key !== "string" || !expectedKeys.has(key))
+    ) {
+      return null;
+    }
+    const captured = Object.create(null) as Record<string, unknown>;
+    for (const key of keys) {
+      if (typeof key !== "string") return null;
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) return null;
+      captured[key] = descriptor.value;
+    }
+    return Object.freeze(captured);
+  } catch {
+    return null;
+  }
+}
+
+// oxlint-disable-next-line complexity -- descriptor-safe recursive snapshot is intentionally explicit
+function snapshotOwnData(input: unknown, seen = new WeakSet<object>()): unknown {
+  if (input === null || typeof input !== "object") return input;
+  if (seen.has(input)) throw new Error("cyclic session input");
+  seen.add(input);
+  const isArray = Array.isArray(input);
+  const prototype = Object.getPrototypeOf(input);
+  if (
+    (isArray && prototype !== Array.prototype) ||
+    (!isArray && prototype !== Object.prototype && prototype !== null)
+  ) {
+    throw new Error("invalid session input prototype");
+  }
+  const keys = Reflect.ownKeys(input);
+  const output: unknown[] | Record<string, unknown> = isArray ? [] : Object.create(null);
+  let arrayLength = -1;
+  if (isArray) {
+    const length = Object.getOwnPropertyDescriptor(input, "length");
+    if (!length || !("value" in length) || !Number.isSafeInteger(length.value)) {
+      throw new Error("invalid session array length");
+    }
+    arrayLength = length.value;
+    (output as unknown[]).length = arrayLength;
+  }
+  for (const key of keys) {
+    if (isArray && key === "length") continue;
+    if (typeof key !== "string" || (isArray && !/^(0|[1-9]\d*)$/.test(key))) {
+      throw new Error("invalid session input key");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new Error("session input must use enumerable data properties");
+    }
+    if (isArray && Number(key) >= arrayLength) throw new Error("sparse session array");
+    (output as Record<string, unknown>)[key] = snapshotOwnData(descriptor.value, seen);
+  }
+  if (isArray && keys.length - 1 !== arrayLength) throw new Error("sparse session array");
+  seen.delete(input);
+  return Object.freeze(output);
+}
+
+function sameCanonicalValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") {
+    return false;
+  }
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
+  if (leftKeys.length !== rightKeys.length || leftKeys.some((key) => !rightKeys.includes(key))) {
+    return false;
+  }
+  return leftKeys.every((key) =>
+    sameCanonicalValue(
+      Object.getOwnPropertyDescriptor(left, key)?.value,
+      Object.getOwnPropertyDescriptor(right, key)?.value,
+    ),
+  );
 }
 
 function deepFreeze<T>(value: T): T {

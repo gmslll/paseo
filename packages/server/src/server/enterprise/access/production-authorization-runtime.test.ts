@@ -25,6 +25,7 @@ import {
 import { OwnerRegistry } from "./owner-registry.js";
 import {
   createEnterpriseAuthorizationRuntime,
+  isCurrentProductionAuthorizationRuntimeForSession,
   isCurrentProductionAuthorizationRuntime,
   ProductionAuthorizationRuntimeTeardownError,
   type ProductionAuthorizationRuntime,
@@ -228,6 +229,88 @@ describe("production enterprise authorization runtime", () => {
 
       await runtime.release();
       expect(isCurrentProductionAuthorizationRuntime(runtime)).toBe(false);
+      await fixture.audit.close();
+    },
+  );
+
+  test.runIf(process.platform === "darwin")(
+    "accepts only the exact current runtime and authoritative session source",
+    async () => {
+      const fixture = await createFixture("session-current");
+      const runtime = await createEnterpriseAuthorizationRuntime(fixture.options);
+      if (!runtime) throw new Error("expected production authorization runtime");
+      const input = runtimeSessionInput(runtime, fixture);
+
+      expect(isCurrentProductionAuthorizationRuntimeForSession(runtime, input)).toBe(true);
+      expect(isCurrentProductionAuthorizationRuntimeForSession({ ...runtime }, input)).toBe(false);
+      expect(
+        isCurrentProductionAuthorizationRuntimeForSession(runtime, {
+          ...input,
+          admissionAuthorizationIssuer: createEnterpriseAdmissionAuthorizationIssuer(
+            Object.freeze({}),
+          ),
+        }),
+      ).toBe(false);
+      expect(
+        isCurrentProductionAuthorizationRuntimeForSession(runtime, {
+          ...input,
+          admissionAuthorizationHandle: Object.freeze({}),
+        }),
+      ).toBe(false);
+      expect(
+        isCurrentProductionAuthorizationRuntimeForSession(runtime, {
+          ...input,
+          sessionAuthorization: new SessionAuthorization(["workspace.read"]),
+        }),
+      ).toBe(false);
+
+      for (const mismatch of [
+        { sessionId: "session-other" },
+        { clientId: "client-other" },
+        { sessionBindingKey: "binding-other" },
+        {
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            sessionBindingGeneration: "generation-other",
+          },
+        },
+        {
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            node: { ...input.enterpriseContext.node, nodeId: "nod_fedcba9876543210" },
+          },
+        },
+        {
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            principal: { ...input.enterpriseContext.principal, grantVersion: "grv_other" },
+          },
+        },
+        {
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            principal: { ...input.enterpriseContext.principal, grants: [] },
+          },
+        },
+      ]) {
+        expect(
+          isCurrentProductionAuthorizationRuntimeForSession(runtime, { ...input, ...mismatch }),
+        ).toBe(false);
+      }
+
+      let getterCalls = 0;
+      const malformed = Object.defineProperty({ ...input }, "enterpriseContext", {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return input.enterpriseContext;
+        },
+      });
+      expect(isCurrentProductionAuthorizationRuntimeForSession(runtime, malformed)).toBe(false);
+      expect(getterCalls).toBe(0);
+
+      await runtime.release();
+      expect(isCurrentProductionAuthorizationRuntimeForSession(runtime, input)).toBe(false);
       await fixture.audit.close();
     },
   );
@@ -672,6 +755,25 @@ function daemonStatusResponse(requestId: string) {
       listen: "127.0.0.1:0",
       relay: null,
       providers: [],
+    },
+  };
+}
+
+function runtimeSessionInput(
+  runtime: ProductionAuthorizationRuntime,
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+) {
+  return {
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    sessionAuthorization: fixture.sessionAuthorization,
+    sessionId: runtime.binding.sessionId,
+    clientId: runtime.binding.clientId,
+    sessionBindingKey: runtime.binding.sessionBindingKey,
+    enterpriseContext: {
+      principal: runtime.principal,
+      node: runtime.node,
+      sessionBindingGeneration: runtime.binding.sessionBindingGeneration,
     },
   };
 }
