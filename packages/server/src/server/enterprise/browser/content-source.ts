@@ -102,7 +102,7 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
               size: stat.size,
             });
           } catch (error) {
-            if ((error as { code?: string }).code === "ENOENT") continue;
+            if (["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? "")) continue;
             throw error;
           }
         }

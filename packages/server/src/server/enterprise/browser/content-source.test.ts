@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -142,4 +142,35 @@ describe("browser profile content source", () => {
       }
     },
   );
+
+  test.runIf(process.platform === "darwin")("filters native artifacts", async () => {
+    const buildDirectory = await mkdtemp(path.join(tmpdir(), "paseo-browser-content-native-"));
+    const addonPath = path.join(buildDirectory, "darwin-workspace-fs.node");
+    await executeFile(process.execPath, [
+      fileURLToPath(new URL("../runtime/native/build-darwin-workspace-fs.mjs", import.meta.url)),
+      "--output",
+      addonPath,
+    ]);
+    const downloadRoot = await realpath(
+      await mkdtemp(path.join(tmpdir(), "paseo-browser-content-root-")),
+    );
+    try {
+      await writeFile(path.join(downloadRoot, "b.txt"), "b");
+      await writeFile(path.join(downloadRoot, "a.txt"), "a");
+      await mkdir(path.join(downloadRoot, "dir"));
+      await symlink("a.txt", path.join(downloadRoot, "link"));
+      const source = createProductionEnterpriseBrowserProfileContentReadSource({ addonPath });
+      if (!source) throw new Error("native source unavailable");
+      const page = await source.read({
+        profile: { ...profile, downloadRoot },
+        selector: { kind: "browser_profile", view: "artifacts" },
+        limit: 10,
+      });
+      expect(page.items.map((item) => item.reference)).toEqual(["a.txt", "b.txt"]);
+      await source.close?.();
+    } finally {
+      await rm(downloadRoot, { recursive: true, force: true });
+      await rm(buildDirectory, { recursive: true, force: true });
+    }
+  });
 });
