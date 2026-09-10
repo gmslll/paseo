@@ -1085,7 +1085,7 @@ export async function createPaseoDaemon(
         if (!res.headersSent) {
           res.status(enterpriseRuntime ? 403 : 500).json({ error: "File download failed" });
         } else if (!res.writableEnded) {
-          res.end();
+          res.destroy(error instanceof Error ? error : new Error(String(error)));
         }
       });
     });
