@@ -209,6 +209,7 @@ import type {
   EnterpriseFeatureAdvertisement,
 } from "./enterprise/dispatcher-registry.js";
 import { createEnterpriseDispatcherRegistry } from "./enterprise/dispatcher-registry.js";
+import { createEnterpriseAuditDispatcher } from "./enterprise/audit/handlers.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -2019,12 +2020,25 @@ export async function createPaseoDaemon(
               logDaemonPasswordAuthentication(logger, config.auth?.password);
 
               requireStartAudit();
+              const suppliedDispatcherRegistrations =
+                dependencies.enterpriseDispatcherRegistrations ?? [];
+              const dispatcherRegistrations = [...suppliedDispatcherRegistrations];
+              if (
+                enterpriseAudit &&
+                !dispatcherRegistrations.some((registration) => registration.family === "audit")
+              ) {
+                dispatcherRegistrations.push({
+                  family: "audit",
+                  requestTypes: ["enterprise.audit.list_events.request"],
+                  dispatcher: createEnterpriseAuditDispatcher({
+                    audit: productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit),
+                  }),
+                });
+              }
               const enterpriseDispatcherRegistry =
                 dependencies.enterpriseDispatcherRegistry ??
-                (dependencies.enterpriseDispatcherRegistrations
-                  ? createEnterpriseDispatcherRegistry(
-                      dependencies.enterpriseDispatcherRegistrations,
-                    )
+                (dispatcherRegistrations.length > 0
+                  ? createEnterpriseDispatcherRegistry(dispatcherRegistrations)
                   : undefined);
               wsServer = new VoiceAssistantWebSocketServer(
                 httpServer,
