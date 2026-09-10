@@ -23,6 +23,12 @@ export {
   decideBrowserWindowOpenRequest,
   PendingBrowserWindowOpenRequests,
 };
+export {
+  createBrowserPageIdentityTransportPublisherPorts,
+  installBrowserPageIdentityTransportRoutes,
+  type BrowserPageIdentityTransportController,
+  type BrowserPageIdentityTransportRoute,
+} from "./page-identity-transport.js";
 
 const browserRegistry = new PaseoBrowserWebviewRegistry();
 let pageIdentityPublisher: BrowserPageIdentityPublisher | null = null;
