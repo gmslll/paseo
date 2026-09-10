@@ -439,6 +439,8 @@ async function attachEncryptedSocket(
     };
     const challenge = randomBytes(32).toString("base64url");
     let authenticated = !authenticateEnterprise;
+    let authenticating = false;
+    let authSettled = authenticated;
     let authResolve: (() => void) | undefined;
     let authReject: ((error: Error) => void) | undefined;
     const authPromise = authenticated
@@ -447,12 +449,18 @@ async function attachEncryptedSocket(
           authResolve = resolve;
           authReject = reject;
         });
+    const rejectAuth = (error: unknown): void => {
+      if (authSettled) return;
+      authSettled = true;
+      authReject?.(error instanceof Error ? error : new Error(String(error)));
+    };
     const channel = await createDaemonChannel(
       relayTransport,
       daemonKeyPair,
       {
         onmessage: (data) => {
           if (!authenticated) {
+            if (authenticating) return;
             try {
               const parsed = JSON.parse(
                 typeof data === "string" ? data : new TextDecoder().decode(data),
@@ -464,28 +472,18 @@ async function attachEncryptedSocket(
               ) {
                 throw new Error("invalid encrypted auth preface");
               }
+              authenticating = true;
               void authenticateEnterprise!({ token: parsed.token, challenge })
-                .then(
-                  (ok) => {
-                    if (!ok) throw new Error("enterprise authentication failed");
-                    authenticated = true;
-                    void channel.send(JSON.stringify({ type: "auth_ok", challenge }));
-                    authResolve?.();
-                    return undefined;
-                  },
-                  (error: unknown) => {
-                    const failure = error instanceof Error ? error : new Error(String(error));
-                    authReject?.(failure);
-                    try {
-                      socket.close(1008, "enterprise authentication failed");
-                    } catch {
-                      // ignore
-                    }
-                  },
-                )
+                .then(async (ok) => {
+                  if (!ok) throw new Error("enterprise authentication failed");
+                  await channel.send(JSON.stringify({ type: "auth_ok", challenge }));
+                  authenticated = true;
+                  authSettled = true;
+                  authResolve?.();
+                  return undefined;
+                })
                 .catch((error: unknown) => {
-                  const failure = error instanceof Error ? error : new Error(String(error));
-                  authReject?.(failure);
+                  rejectAuth(error);
                   try {
                     socket.close(1008, "enterprise authentication failed");
                   } catch {
@@ -493,6 +491,7 @@ async function attachEncryptedSocket(
                   }
                 });
             } catch {
+              rejectAuth(new Error("invalid encrypted auth preface"));
               try {
                 socket.close(1008, "enterprise authentication failed");
               } catch {
@@ -503,8 +502,12 @@ async function attachEncryptedSocket(
           }
           emitMessage(data);
         },
-        onclose: (code, reason) => emitter.emit("close", code, reason),
+        onclose: (code, reason) => {
+          rejectAuth(new Error(`relay socket closed during authentication: ${code} ${reason}`));
+          emitter.emit("close", code, reason);
+        },
         onerror: (error) => {
+          rejectAuth(error);
           logger.warn({ err: error }, "relay_e2ee_error");
           emitter.emit("error", error);
         },
