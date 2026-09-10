@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import { createEnterpriseContentReadDispatcherRegistration } from "./enterprise-content-read-dispatcher.js";
 import {
   closeProductionRuntimeFixture,
@@ -14,7 +15,28 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
         getAgent: async () => null,
         getTimelineRows: async () => [],
       };
-      const filesRuntime = { list: async () => [], cleanup: async () => {} };
+      let cleanupCount = 0;
+      const unused = async (..._args: never[]): Promise<never> => {
+        throw new Error("unused");
+      };
+      const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
+        stat: unused,
+        list: async () => [],
+        openRead: unused,
+        write: unused,
+        create: unused,
+        rename: unused,
+        copy: unused,
+        delete: unused,
+        watch: unused,
+        issueDownloadToken: unused,
+        createUploadStore: () => {
+          throw new Error("unused");
+        },
+        cleanup: async () => {
+          cleanupCount += 1;
+        },
+      };
       const registration = createEnterpriseContentReadDispatcherRegistration({
         provider: fixture.provider,
         audit: fixture.audit,
@@ -51,6 +73,7 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       ).toBe(false);
       await lease.close();
       await lease.close();
+      expect(cleanupCount).toBe(1);
       await fixture.runtime.release();
     } finally {
       await closeProductionRuntimeFixture();
