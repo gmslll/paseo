@@ -48,4 +48,51 @@ describe("browser profile content source", () => {
       nextCursor: null,
     });
   });
+
+  test("returns a two-file artifact page with cursor", async () => {
+    const source = createEnterpriseBrowserProfileContentReadSource({
+      readProfile: async ({ cursor }) =>
+        cursor
+          ? {
+              items: [
+                {
+                  itemId: "b",
+                  occurredAt: profile.updatedAt,
+                  kind: "artifact",
+                  reference: "b",
+                  label: "b",
+                  size: 2,
+                },
+              ],
+              nextCursor: null,
+            }
+          : {
+              items: [
+                {
+                  itemId: "a",
+                  occurredAt: profile.updatedAt,
+                  kind: "artifact",
+                  reference: "a",
+                  label: "a",
+                  size: 1,
+                },
+              ],
+              nextCursor: "next",
+            },
+    });
+    const first = await source.read({
+      profile,
+      selector: { kind: "browser_profile", view: "artifacts" },
+      limit: 1,
+    });
+    expect(first.nextCursor).toBe("next");
+    await expect(
+      source.read({
+        profile,
+        selector: { kind: "browser_profile", view: "artifacts" },
+        cursor: first.nextCursor ?? undefined,
+        limit: 1,
+      }),
+    ).resolves.toMatchObject({ items: [{ reference: "b" }] });
+  });
 });
