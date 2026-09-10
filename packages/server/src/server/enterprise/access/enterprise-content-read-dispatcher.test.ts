@@ -114,6 +114,28 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
             event.actorPrincipalId === fixture.context.enterpriseContext.principal.principalId,
         ),
       ).toBe(true);
+      const message2 = { ...message, requestId: "r-burn", resource: { ...message.resource } };
+      const response2 = await lease.dispatcher.handle({
+        sessionContext: fixture.context,
+        message: message2,
+      });
+      expect(response2).not.toBe(false);
+      if (response2 === false) throw new Error("response2");
+      const clonedMessage2 = { ...message2, resource: { ...message2.resource } };
+      expect(
+        lease.dispatcher.consumeResponse?.({
+          sessionContext: fixture.context,
+          message: clonedMessage2,
+          response: response2,
+        }),
+      ).toBeNull();
+      expect(
+        lease.dispatcher.consumeResponse?.({
+          sessionContext: fixture.context,
+          message: message2,
+          response: response2,
+        }),
+      ).toBeNull();
       await lease.close();
       await lease.close();
       expect(cleanupCount).toBe(1);
