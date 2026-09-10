@@ -23,7 +23,7 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
       expect(
         await authorization?.assertWorkspace("workspace.metadata.read", "wks_missing"),
       ).toBeNull();
-      expect(await authorization?.filterAgents([])).toEqual([]);
+      expect(await authorization?.filterAgents("workspace.content.read", [])).toEqual([]);
     } finally {
       await closeProductionRuntimeFixture();
     }
@@ -82,7 +82,7 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
       ).not.toBeNull();
       expect(
         (
-          await authorization.filterAgents([
+          await authorization.filterAgents("workspace.content.read", [
             {
               id: "agt_0123456789abcdef",
               organizationId: fixture.context.enterpriseContext.principal.organizationId,
@@ -96,7 +96,7 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
       ).toBe(1);
       expect(
         (
-          await authorization.filterAgents([
+          await authorization.filterAgents("workspace.content.read", [
             {
               id: "agt_0123456789abcdef",
               organizationId: "org_ffffffffffffffff",
@@ -130,6 +130,40 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
     expect(createEnterpriseLegacyResourceAuthorization(symbolExtra)).toBeNull();
   });
 
+  test("uses the requested agent action", async () => {
+    const fixture = await createProductionRuntimeFixture("legacy-agent-action", {
+      grants: [
+        {
+          action: "workspace.metadata.read",
+          selector: { kind: "workspace", workspaceIds: ["wks_0123456789abcdef"] },
+        },
+      ],
+    });
+    try {
+      const row = {
+        id: "agt_0123456789abcdef",
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        nodeId: fixture.context.enterpriseContext.node.nodeId,
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        workspaceId: "wks_0123456789abcdef",
+      };
+      fixture.provider.owners.registerAgent(row);
+      const authorization = createEnterpriseLegacyResourceAuthorization({
+        authorizationRuntime: fixture.runtime,
+      });
+      if (!authorization) throw new Error("authorization");
+      await expect(
+        authorization.filterAgents("workspace.metadata.read", [row]),
+      ).resolves.toHaveLength(1);
+      await expect(
+        authorization.filterAgents("workspace.content.read", [row]),
+      ).resolves.toHaveLength(0);
+    } finally {
+      await closeProductionRuntimeFixture();
+    }
+  });
+
   test("fails closed when release races async assertions", async () => {
     const fixture = await createProductionRuntimeFixture("legacy-race");
     try {
@@ -153,7 +187,7 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
         "workspace.content.read",
         "wks_0123456789abcdef",
       );
-      const pendingAgents = authorization.filterAgents([agent]);
+      const pendingAgents = authorization.filterAgents("workspace.content.read", [agent]);
       await fixture.runtime.release();
       await expect(pendingWorkspace).resolves.toBeNull();
       await expect(pendingAgents).resolves.toEqual([]);

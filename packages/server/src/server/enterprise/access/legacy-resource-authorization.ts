@@ -16,6 +16,7 @@ export interface EnterpriseLegacyResourceAuthorization {
     rows: readonly T[],
   ): readonly T[];
   filterAgents<T extends EnterpriseAgentAuthorizationRecord>(
+    action: "workspace.metadata.read" | "workspace.content.read",
     rows: readonly T[],
   ): Promise<readonly T[]>;
   assertWorkspace(action: EnterpriseAction, id: string): Promise<AuthorizedWorkspace | null>;
@@ -55,6 +56,7 @@ export function createEnterpriseLegacyResourceAuthorization(
             return isCurrentProductionAuthorizationRuntime(runtime) ? result : [];
           },
           filterAgents: async <T extends EnterpriseAgentAuthorizationRecord>(
+            action: "workspace.metadata.read" | "workspace.content.read",
             rows: readonly T[],
           ) => {
             if (!isCurrentProductionAuthorizationRuntime(runtime)) return [] as readonly T[];
@@ -62,7 +64,7 @@ export function createEnterpriseLegacyResourceAuthorization(
             for (const row of rows) {
               if (!isCurrentProductionAuthorizationRuntime(runtime)) return [];
               const canonical = await runtime.resourceAuthorization
-                .assertAgent(runtime.principal, "workspace.metadata.read", row.id)
+                .assertAgent(runtime.principal, action, row.id)
                 .catch(() => null);
               if (canonical) {
                 try {
