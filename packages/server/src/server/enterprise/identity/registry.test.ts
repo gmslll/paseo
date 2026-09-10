@@ -1537,4 +1537,20 @@ describe("IdentityRegistry", () => {
       }),
     ).rejects.toThrow();
   });
+  test("initial credential propagates storage failure", async () => {
+    const fs = new FaultFs();
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-initial-failure-"));
+    const filePath = path.join(root, "credentials.json");
+    const { registry } = createTestRegistry({ filePath, fs });
+    await registry.load();
+    const failure = new Error("initial storage failure");
+    fs.fail("write", failure, { matches: (call) => (call.path ?? "").endsWith(".tmp") });
+    await expect(
+      registry.issueInitialCredential({
+        actor,
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+      }),
+    ).rejects.toThrow();
+  });
 });
