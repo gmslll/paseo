@@ -84,6 +84,7 @@ function readIdentityDocument(
 
 export interface ProductionPrincipalProvisioning {
   ensurePrincipal(input: PrincipalMetadataRecord): Promise<PrincipalMetadataRecord>;
+  ensurePrincipalIntent(input: Omit<PrincipalMetadataRecord, "createdAt" | "updatedAt">): Promise<PrincipalMetadataRecord>;
 }
 
 export function createProductionPrincipalProvisioning(input: {
@@ -109,7 +110,13 @@ export function createProductionPrincipalProvisioning(input: {
       }
       const existing = document.principals[validated.principalId];
       if (existing) {
-        if (JSON.stringify(existing) !== JSON.stringify(validated))
+        const stable = (value: PrincipalMetadataRecord) => {
+          const copy = { ...value } as Record<string, unknown>;
+          delete copy.createdAt;
+          delete copy.updatedAt;
+          return copy;
+        };
+        if (JSON.stringify(stable(existing)) !== JSON.stringify(stable(validated)))
           throw new Error("principal conflict");
         return Object.freeze({ ...existing });
       }
@@ -157,6 +164,12 @@ export function createProductionPrincipalProvisioning(input: {
       }
       productionAuditCapabilityIssuer.requireCurrent(input.audit);
       return Object.freeze({ ...validated });
+    },
+    async ensurePrincipalIntent(intent) {
+      productionAuditCapabilityIssuer.requireCurrent(input.audit);
+      const now = new Date().toISOString();
+      const created = PrincipalMetadataSchema.parse({ ...intent, createdAt: now, updatedAt: now });
+      return this.ensurePrincipal(created as PrincipalMetadataRecord);
     },
   };
 }
