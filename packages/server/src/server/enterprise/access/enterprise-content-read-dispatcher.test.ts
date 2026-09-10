@@ -7,6 +7,12 @@ import {
   JsonFileBrowserProfileStorage,
 } from "../browser/profile-registry.js";
 import { createEnterpriseBrowserProfileContentReadSource } from "../browser/content-source.js";
+import {
+  BrowserPageIdentityRegistry,
+  createAuthenticatedBrowserHostSession,
+  createBrowserPageIdentityVerifier,
+} from "../../browser-tools/page-identity-registry.js";
+import { EnterpriseBrowserPageIdentityObservationRequestSchema } from "@getpaseo/protocol/messages";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import { EnterpriseWorkspaceContentReadResponseSchema } from "@getpaseo/protocol/messages";
 import { createProductionAppSlotRegistry } from "../runtime/production-app-slot-registry.js";
@@ -621,21 +627,61 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
         label: "Profile",
         status: "ready",
       });
+      let reads = 0;
       const source = createEnterpriseBrowserProfileContentReadSource({
-        readProfile: async () => ({
-          items: [
-            {
-              itemId: "state",
-              occurredAt: "2026-01-01T00:00:00.000Z",
-              kind: "state",
-              label: "Profile",
-              status: "ready",
-            },
-          ],
-          nextCursor: null,
-        }),
+        readProfile: async () => {
+          reads += 1;
+          return {
+            items: [
+              {
+                itemId: "state",
+                occurredAt: "2026-01-01T00:00:00.000Z",
+                kind: "state",
+                label: "Profile",
+                status: "ready",
+              },
+            ],
+            nextCursor: null,
+          };
+        },
         onClose: () => {},
       });
+      const identityRegistry = new BrowserPageIdentityRegistry({
+        profiles: {
+          get: async () => ({
+            ...created,
+            expectedIdentity: {
+              hostnames: ["SHOP.EXAMPLE."],
+              accountLabelHash: "sha256:account-a",
+            },
+          }),
+        },
+      });
+      const identityHost = createAuthenticatedBrowserHostSession({
+        clientId: fixture.context.clientId,
+        homeNodeId: fixture.context.enterpriseContext.node.nodeId,
+        sessionBindingGeneration: fixture.context.sessionBindingGeneration,
+      });
+      const browserId = "11111111-1111-4111-8111-111111111111";
+      identityRegistry.registerBrowser({
+        host: identityHost,
+        browserId,
+        browserProfileId: created.browserProfileId,
+        bindingRevision: "binding-1",
+      });
+      await identityRegistry.observe(
+        identityHost,
+        EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+          type: "enterprise.browser.page_identity.observe.request",
+          requestId: "observe-browser",
+          browser: { browserId, browserProfileId: created.browserProfileId },
+          hostname: "shop.example",
+          accountLabelHash: "sha256:account-a",
+          observationRevision: "observation-1",
+          bindingRevision: "binding-1",
+          lifecycleGeneration: fixture.context.sessionBindingGeneration,
+        }),
+      );
       const registration = createEnterpriseContentReadDispatcherRegistration({
         provider: fixture.provider,
         audit: fixture.audit,
@@ -645,6 +691,7 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
           getTimelineRows: async () => [],
         },
         createBrowserProfileSource: () => source,
+        pageIdentityVerifier: createBrowserPageIdentityVerifier(identityRegistry),
       });
       if (!registration) throw new Error("registration");
       const unused = async (..._args: never[]): Promise<never> => {
@@ -697,6 +744,25 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       expect(
         lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
       ).toBeNull();
+      const readsBeforeMismatch = reads;
+      const auditBeforeMismatch = (await fixture.audit.snapshotEvents()).filter(
+        (event) => event.action === "browser.use" && event.outcome === "allowed",
+      ).length;
+      const mismatch = await lease.dispatcher.handle({
+        sessionContext: fixture.context,
+        message: {
+          ...message,
+          requestId: "r-browser-mismatch",
+          resource: { ...message.resource, organizationId: "org_ffffffffffffffff" },
+        },
+      });
+      expect(mismatch).toBe(false);
+      expect(reads).toBe(readsBeforeMismatch);
+      expect(
+        (await fixture.audit.snapshotEvents()).filter(
+          (event) => event.action === "browser.use" && event.outcome === "allowed",
+        ).length,
+      ).toBe(auditBeforeMismatch);
       expect(
         (await fixture.audit.snapshotEvents()).some(
           (event) => event.action === "browser.use" && event.outcome === "allowed",

@@ -6,6 +6,7 @@ import { isCurrentProductionAuthorizationRuntimeForAuthoritySources } from "./pr
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
 import type { EnterpriseContentAgentProductionSource } from "../runtime/enterprise-content-read.js";
 import type { EnterpriseBrowserProfileContentReadSource } from "../browser/content-source.js";
+import type { BrowserPageIdentityVerifier } from "../../browser-tools/page-identity-registry.js";
 import {
   EnterpriseBrowserProfileContentReadRequestSchema,
   EnterpriseBrowserProfileContentReadResponseSchema,
@@ -42,6 +43,7 @@ export interface EnterpriseContentReadFactoryInput {
   readonly audit: ProductionAuditCapability;
   readonly agents: EnterpriseContentAgentProductionSource;
   readonly createBrowserProfileSource?: () => EnterpriseBrowserProfileContentReadSource;
+  readonly pageIdentityVerifier?: BrowserPageIdentityVerifier;
 }
 interface Pending {
   readonly context: EnterpriseDispatchContext;
@@ -88,7 +90,7 @@ function requestIdOf(
 export function createEnterpriseContentReadDispatcherRegistration(
   input: EnterpriseContentReadFactoryInput,
 ): EnterpriseSessionDispatcherFactoryRegistration | null {
-  const { provider, audit, agents, createBrowserProfileSource } = input;
+  const { provider, audit, agents, createBrowserProfileSource, pageIdentityVerifier } = input;
   let currentAudit: ProductionAuditCapability;
   try {
     currentAudit = productionAuditCapabilityIssuer.requireCurrent(audit);
@@ -102,7 +104,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
         "enterprise.workspace.content.read.request",
         "enterprise.app_slot.content.read.request",
         "enterprise.agent.content.read.request",
-        ...(createBrowserProfileSource
+        ...(createBrowserProfileSource && pageIdentityVerifier
           ? ["enterprise.browser_profile.content.read.request" as const]
           : []),
       ],
@@ -292,6 +294,11 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
                 if (!authority) return false;
                 const principal = sessionContext.enterpriseContext.principal;
+                if (!pageIdentityVerifier) return false;
+                await pageIdentityVerifier.verifyProfile(
+                  parsedBrowser.data.resource.localResourceId,
+                );
+                if (!current(sessionContext)) return false;
                 const profile = await authority.resourceAuthorization.assertBrowserProfile(
                   principal,
                   "browser.use",
