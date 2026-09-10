@@ -1347,6 +1347,31 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         requestId: "deny-access",
         code: "access_denied",
       });
+      const terminalsPromise = next(
+        a.socket,
+        (v) =>
+          (v?.type === "rpc_error" && v.payload?.requestId === "deny-terminal") ||
+          (v?.type === "session" &&
+            v.message?.type === "rpc_error" &&
+            v.message?.payload?.requestId === "deny-terminal"),
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "list_terminals_request",
+            requestId: "deny-terminal",
+            cwd: paseoHome,
+          },
+        }),
+      );
+      const terminals = await terminalsPromise;
+      const terminalPayload = terminals.payload ?? terminals.message?.payload;
+      expect(terminalPayload).toMatchObject({
+        requestId: "deny-terminal",
+        code: "access_denied",
+      });
+      expect(JSON.stringify(terminals)).not.toContain(paseoHome);
     } finally {
       for (const socket of sockets) socket.close();
       await daemon.stop().catch(() => undefined);
