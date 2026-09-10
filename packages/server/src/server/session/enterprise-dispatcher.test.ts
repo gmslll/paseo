@@ -5,6 +5,7 @@ import {
   dispatchEnterpriseRequest,
   ENTERPRISE_IDENTITY_SELF_POLICY,
   registerEnterpriseIdentitySelfPolicy,
+  resolveEnterpriseReceiptPolicy,
   type EnterpriseSessionDispatcher,
 } from "./enterprise-dispatcher.js";
 
@@ -34,6 +35,23 @@ describe("enterprise session dispatcher seam", () => {
     const dispatcher: EnterpriseSessionDispatcher = { handle: vi.fn(() => false) };
     const registered = registerEnterpriseIdentitySelfPolicy(dispatcher);
     expect(registered).not.toBe(dispatcher);
+  });
+
+  test("resolves identity requests to a receipt policy without bypassing inbound authorization", () => {
+    expect(resolveEnterpriseReceiptPolicy("enterprise.identity.get_current.request")).toEqual({
+      event: "enterprise.identity.get_current.response",
+      requestType: "enterprise.identity.get_current.request",
+      daemonPermission: null,
+      enterpriseActions: ["identity.manage"],
+      emission: "terminal",
+    });
+    expect(resolveEnterpriseReceiptPolicy("enterprise.identity.logout_all.request")).toEqual(
+      expect.objectContaining({
+        event: "enterprise.identity.logout_all.response",
+        requestType: "enterprise.identity.logout_all.request",
+      }),
+    );
+    expect(resolveEnterpriseReceiptPolicy("enterprise.unknown.request")).toBeNull();
   });
   test("passes the server-bound context to the registered dispatcher", async () => {
     const handle = vi.fn(() => message);
