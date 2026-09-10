@@ -18,6 +18,16 @@ import type {
   WorkspaceDescriptorPayload,
 } from "@getpaseo/protocol/messages";
 import {
+  EnterpriseAgentContentReadRequestSchema,
+  EnterpriseAgentContentReadResponseSchema,
+  EnterpriseAppSlotContentReadRequestSchema,
+  EnterpriseAppSlotContentReadResponseSchema,
+  EnterpriseBrowserProfileContentReadRequestSchema,
+  EnterpriseBrowserProfileContentReadResponseSchema,
+  EnterpriseWorkspaceContentReadRequestSchema,
+  EnterpriseWorkspaceContentReadResponseSchema,
+} from "@getpaseo/protocol/messages";
+import {
   decodeFileTransferFrame,
   encodeFileTransferFrame,
   FileTransferOpcode,
@@ -68,6 +78,10 @@ import { createPersistedProjectRecord } from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
+import {
+  resolveEnterpriseContentReadPolicy,
+  type EnterpriseContentReadRequestType,
+} from "./session/enterprise-dispatcher.js";
 import {
   asSessionInternals as asSessionInternalsHelper,
   asAgentManager,
@@ -555,6 +569,307 @@ function enterpriseContext(
     sessionBindingGeneration: generation,
   };
 }
+
+function parseContentRequest(value: unknown, type: string): SessionInboundMessage {
+  switch (type) {
+    case "enterprise.workspace.content.read.request":
+      return EnterpriseWorkspaceContentReadRequestSchema.parse(value);
+    case "enterprise.agent.content.read.request":
+      return EnterpriseAgentContentReadRequestSchema.parse(value);
+    case "enterprise.browser_profile.content.read.request":
+      return EnterpriseBrowserProfileContentReadRequestSchema.parse(value);
+    case "enterprise.app_slot.content.read.request":
+      return EnterpriseAppSlotContentReadRequestSchema.parse(value);
+    default:
+      throw new Error(`unknown content request type: ${type}`);
+  }
+}
+
+function parseContentResponse(value: unknown, type: string): SessionOutboundMessage {
+  switch (type) {
+    case "enterprise.workspace.content.read.response":
+      return EnterpriseWorkspaceContentReadResponseSchema.parse(value);
+    case "enterprise.agent.content.read.response":
+      return EnterpriseAgentContentReadResponseSchema.parse(value);
+    case "enterprise.browser_profile.content.read.response":
+      return EnterpriseBrowserProfileContentReadResponseSchema.parse(value);
+    case "enterprise.app_slot.content.read.response":
+      return EnterpriseAppSlotContentReadResponseSchema.parse(value);
+    default:
+      throw new Error(`unknown content response type: ${type}`);
+  }
+}
+
+test.each([
+  [
+    "workspace",
+    "enterprise.workspace.content.read.request",
+    "enterprise.workspace.content.read.response",
+    { resourceKind: "workspace", localResourceId: "wks_aaaaaaaaaaaaaaaa" },
+    { kind: "workspace", view: "timeline" },
+  ],
+  [
+    "agent",
+    "enterprise.agent.content.read.request",
+    "enterprise.agent.content.read.response",
+    { resourceKind: "agent", localResourceId: "agent-a" },
+    { kind: "agent", view: "transcript" },
+  ],
+  [
+    "browser profile",
+    "enterprise.browser_profile.content.read.request",
+    "enterprise.browser_profile.content.read.response",
+    {
+      resourceKind: "browser_profile",
+      localResourceId: "brp_aaaaaaaaaaaaaaaa",
+    },
+    { kind: "browser_profile", view: "state" },
+  ],
+  [
+    "app slot",
+    "enterprise.app_slot.content.read.request",
+    "enterprise.app_slot.content.read.response",
+    { resourceKind: "app_slot", localResourceId: "aps_aaaaaaaaaaaaaaaa" },
+    { kind: "app_slot", view: "state" },
+  ],
+])(
+  "delivers %s content through the resources authorization context",
+  async (_name, requestType, responseType, resource, selector) => {
+    const messages: SessionOutboundMessage[] = [];
+    const requestId = `content-${String(_name)}`;
+    const request = parseContentRequest(
+      {
+        type: requestType as EnterpriseContentReadRequestType,
+        requestId,
+        resource: {
+          organizationId: "org_aaaaaaaaaaaaaaaa",
+          nodeId: "nod_aaaaaaaaaaaaaaaa",
+          ...resource,
+        },
+        selector,
+        page: { limit: 20 },
+      },
+      requestType,
+    );
+    const response = parseContentResponse(
+      {
+        type: responseType,
+        payload: {
+          requestId,
+          resource: request.resource,
+          selector,
+          page: { items: [], nextCursor: null },
+        },
+      },
+      responseType,
+    );
+    const handle = vi.fn(async () => response);
+    const consumeResponse = vi.fn(() => ({
+      response,
+      authorizationContext: {
+        kind: "resources" as const,
+        resources: [request.resource],
+      },
+      receiptClassification: "resources" as const,
+    }));
+    const dispatcher = {
+      requestPolicyForType: (type: string) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle,
+      consumeResponse,
+    };
+    const resourceAuthorization: ResourceAuthorization = {
+      filterWorkspaces: (_ctx, rows) => [...rows],
+      assertWorkspace: vi.fn(),
+      assertAgent: vi.fn(),
+      assertBrowserProfile: vi.fn(),
+      assertAppSlot: vi.fn(),
+      resolveWorkspacePath: vi.fn(),
+      canEmit: vi.fn(async () => true),
+    };
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      resourceAuthorization,
+      enterpriseDispatcher: dispatcher,
+    });
+
+    await session.handleMessage(request);
+
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(consumeResponse).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual(response);
+    expect(resourceAuthorization.canEmit).toHaveBeenCalledWith(
+      expect.anything(),
+      response,
+      expect.objectContaining({ kind: "resources", resources: [request.resource] }),
+    );
+  },
+);
+
+test("fails closed for an unregistered content handler", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = {
+    type: "enterprise.workspace.content.read.request",
+    requestId: "content-missing-handler",
+    resource: {
+      resourceKind: "workspace",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      localResourceId: "wks_aaaaaaaaaaaaaaaa",
+    },
+    selector: { kind: "workspace", view: "timeline" },
+    page: { limit: 20 },
+  } as SessionInboundMessage;
+  const handle = vi.fn(() => false);
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle,
+    },
+  });
+
+  await session.handleMessage(request);
+
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(messages).toContainEqual({
+    type: "rpc_error",
+    payload: {
+      requestId: request.requestId,
+      requestType: request.type,
+      error: "Enterprise operation unavailable",
+      code: "unavailable",
+    },
+  });
+});
+
+test("reserves a content request id until the outbound tail settles", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = parseContentRequest(
+    {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "content-duplicate",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { limit: 20 },
+    },
+    "enterprise.workspace.content.read.request",
+  );
+  const response = parseContentResponse(
+    {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: request.requestId,
+        resource: request.resource,
+        selector: request.selector,
+        page: { items: [], nextCursor: null },
+      },
+    },
+    "enterprise.workspace.content.read.response",
+  );
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const handle = vi.fn(async () => {
+    await blocked;
+    return response;
+  });
+  const consumeResponse = vi.fn(() => ({
+    response,
+    authorizationContext: { kind: "resources" as const, resources: [request.resource] },
+    receiptClassification: "resources" as const,
+  }));
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle,
+      consumeResponse,
+    },
+  });
+
+  const first = session.handleMessage(request);
+  await Promise.resolve();
+  const second = session.handleMessage(request);
+  await Promise.resolve();
+  expect(handle).toHaveBeenCalledTimes(1);
+  release();
+  await Promise.all([first, second]);
+  expect(messages).toHaveLength(1);
+});
+
+test("does not deliver content when ResourceAuthorization denies emission", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = parseContentRequest(
+    {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "content-denied-emission",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { limit: 20 },
+    },
+    "enterprise.workspace.content.read.request",
+  );
+  const response = parseContentResponse(
+    {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: request.requestId,
+        resource: request.resource,
+        selector: request.selector,
+        page: { items: [], nextCursor: null },
+      },
+    },
+    "enterprise.workspace.content.read.response",
+  );
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces: (_ctx, rows) => [...rows],
+    assertWorkspace: vi.fn(),
+    assertAgent: vi.fn(),
+    assertBrowserProfile: vi.fn(),
+    assertAppSlot: vi.fn(),
+    resolveWorkspacePath: vi.fn(),
+    canEmit: vi.fn(async () => false),
+  };
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    resourceAuthorization,
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle: vi.fn(async () => response),
+      consumeResponse: vi.fn(() => ({
+        response,
+        authorizationContext: { kind: "resources" as const, resources: [request.resource] },
+        receiptClassification: "resources" as const,
+      })),
+    },
+  });
+  await session.handleMessage(request);
+  expect(resourceAuthorization.canEmit).toHaveBeenCalledTimes(1);
+  expect(messages).toHaveLength(0);
+});
 
 class SessionTestGrantVersions implements GrantVersionSource {
   private value = 1;

@@ -36,6 +36,8 @@ import {
   ENTERPRISE_UNAVAILABLE_ERROR,
   dispatchEnterpriseRequest,
   isIdentitySelfRequest,
+  isEnterpriseResponsePair,
+  resolveEnterpriseContentReadPolicy,
   resolveEnterpriseReceiptPolicy,
   isEnterpriseRequest,
   isEnterpriseResourceRequest,
@@ -2291,6 +2293,9 @@ export class Session {
         },
         "agent.session.inbound",
       );
+      const contentPolicy = isEnterpriseRequest(msg)
+        ? resolveEnterpriseContentReadPolicy(msg.type)
+        : null;
       const daemonDecision =
         isEnterpriseRequest(msg) &&
         isIdentitySelfRequest(msg) &&
@@ -2323,19 +2328,16 @@ export class Session {
           ))
       ) {
         const requestId = sessionRequestId(msg);
-        if (!this.enterpriseDispatcher || !this.enterpriseContext) {
-          if (requestId) {
-            this.onMessage({
-              type: "rpc_error",
-              payload: {
-                requestId,
-                requestType: msg.type,
-                error: ENTERPRISE_UNAVAILABLE_ERROR,
-                code: "unavailable",
-              },
-            });
-          }
-          return;
+        if (requestId) {
+          this.onMessage({
+            type: "rpc_error",
+            payload: {
+              requestId,
+              requestType: msg.type,
+              error: ENTERPRISE_UNAVAILABLE_ERROR,
+              code: "unavailable",
+            },
+          });
         }
         return;
       }
@@ -2345,6 +2347,17 @@ export class Session {
         if (!requestId || this.reservedAuthorityRequestIds.has(requestId)) return;
         this.reservedAuthorityRequestIds.add(requestId);
         try {
+          const unavailable = (): void => {
+            this.onMessage({
+              type: "rpc_error",
+              payload: {
+                requestId,
+                requestType: msg.type,
+                error: ENTERPRISE_UNAVAILABLE_ERROR,
+                code: "unavailable",
+              },
+            });
+          };
           const response = await dispatchEnterpriseRequest(
             this.enterpriseDispatcher,
             {
@@ -2356,7 +2369,14 @@ export class Session {
             },
             msg,
           );
-          if (response === false) return;
+          if (response === false) {
+            unavailable();
+            return;
+          }
+          if (!isEnterpriseResponsePair(msg, response)) {
+            unavailable();
+            return;
+          }
           const contextual = this.enterpriseDispatcher.consumeResponse?.({
             sessionContext: {
               sessionId: this.sessionId,
@@ -2368,7 +2388,10 @@ export class Session {
             message: msg,
             response,
           });
-          if (!contextual || contextual.receiptClassification !== "resources") return;
+          if (!contextual || contextual.receiptClassification !== "resources") {
+            unavailable();
+            return;
+          }
           this.emit(contextual.response, contextual.authorizationContext);
         } finally {
           await this.flushOutboundEmissionTasks(requestId);
@@ -2377,11 +2400,14 @@ export class Session {
         return;
       }
       if (
+        !contentPolicy &&
         this.inboundAuthorityRequestAuthorizer &&
         this.authorityReceiptState &&
         this.enterpriseContext &&
         this.enterpriseSessionBindingKey
       ) {
+        const authorityDecision = daemonDecision;
+        if (!authorityDecision) return;
         const requestId = sessionRequestId(msg);
         const policy =
           authorityReceiptPolicyForRequestType(msg.type) ??
@@ -2398,7 +2424,10 @@ export class Session {
           reservedRequestId = requestId;
           let emissionRegisteredHandle: ActiveAuthorizedRequestHandle | null = null;
           try {
-            const evidence = this.inboundAuthorityRequestAuthorizer.authorize(msg, daemonDecision);
+            const evidence = this.inboundAuthorityRequestAuthorizer.authorize(
+              msg,
+              authorityDecision,
+            );
             const consumed = evidence
               ? this.inboundAuthorityRequestAuthorizer.consumeForRegistration(msg, evidence)
               : null;

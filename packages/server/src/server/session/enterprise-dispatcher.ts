@@ -18,6 +18,62 @@ export type EnterpriseReceiptClassification =
   | "resources"
   | "identity_self"
   | "transport_control";
+
+export type EnterpriseContentReadRequestType =
+  | "enterprise.workspace.content.read.request"
+  | "enterprise.agent.content.read.request"
+  | "enterprise.browser_profile.content.read.request"
+  | "enterprise.app_slot.content.read.request";
+export type EnterpriseContentReadResponseType =
+  | "enterprise.workspace.content.read.response"
+  | "enterprise.agent.content.read.response"
+  | "enterprise.browser_profile.content.read.response"
+  | "enterprise.app_slot.content.read.response";
+export interface EnterpriseContentReadPolicy {
+  readonly requestType: EnterpriseContentReadRequestType;
+  readonly responseType: EnterpriseContentReadResponseType;
+  readonly action: "workspace.content.read" | "browser.use" | "app.use";
+  readonly featureFlag:
+    | "enterpriseWorkspaceContentReadV1"
+    | "enterpriseAgentContentReadV1"
+    | "enterpriseBrowserProfileContentReadV1"
+    | "enterpriseAppSlotContentReadV1";
+}
+export const ENTERPRISE_CONTENT_READ_MANIFEST: readonly EnterpriseContentReadPolicy[] =
+  Object.freeze([
+    Object.freeze({
+      requestType: "enterprise.workspace.content.read.request",
+      responseType: "enterprise.workspace.content.read.response",
+      action: "workspace.content.read",
+      featureFlag: "enterpriseWorkspaceContentReadV1",
+    }),
+    Object.freeze({
+      requestType: "enterprise.agent.content.read.request",
+      responseType: "enterprise.agent.content.read.response",
+      action: "workspace.content.read",
+      featureFlag: "enterpriseAgentContentReadV1",
+    }),
+    Object.freeze({
+      requestType: "enterprise.browser_profile.content.read.request",
+      responseType: "enterprise.browser_profile.content.read.response",
+      action: "browser.use",
+      featureFlag: "enterpriseBrowserProfileContentReadV1",
+    }),
+    Object.freeze({
+      requestType: "enterprise.app_slot.content.read.request",
+      responseType: "enterprise.app_slot.content.read.response",
+      action: "app.use",
+      featureFlag: "enterpriseAppSlotContentReadV1",
+    }),
+  ]);
+
+export function resolveEnterpriseContentReadPolicy(
+  requestType: string,
+): EnterpriseContentReadPolicy | null {
+  return (
+    ENTERPRISE_CONTENT_READ_MANIFEST.find((policy) => policy.requestType === requestType) ?? null
+  );
+}
 export interface EnterpriseDispatchResponse {
   readonly response: SessionOutboundMessage;
   readonly authorizationContext?: OutboundAuthorizationContext;
@@ -74,8 +130,66 @@ export function isIdentitySelfRequest(message: SessionInboundMessage): boolean {
 export function isEnterpriseResourceRequest(message: SessionInboundMessage): boolean {
   return (
     message.type === "enterprise.organization.list_resources.request" ||
-    message.type === "enterprise.placement.resolve_workspace.request"
+    message.type === "enterprise.placement.resolve_workspace.request" ||
+    resolveEnterpriseContentReadPolicy(message.type) !== null
   );
+}
+
+export function isEnterpriseResponsePair(
+  request: SessionInboundMessage,
+  response: SessionOutboundMessage,
+): boolean {
+  const policy = resolveEnterpriseContentReadPolicy(request.type);
+  if (!policy) return true;
+  const responseType = typeof response.type === "string" ? response.type : "";
+  if (responseType !== policy.responseType) return false;
+  const requestValue = request as unknown as {
+    readonly requestId?: unknown;
+    readonly resource?: unknown;
+    readonly selector?: unknown;
+  };
+  const payload = (
+    response as unknown as {
+      readonly payload?: {
+        readonly requestId?: unknown;
+        readonly resource?: unknown;
+        readonly selector?: unknown;
+      };
+    }
+  ).payload;
+  const requestId = requestValue.requestId;
+  const requestResource = requestValue.resource;
+  const responseResource = payload?.resource;
+  const requestSelector = requestValue.selector;
+  const responseSelector = payload?.selector;
+  const sameResource = sameResourceRef(requestResource, responseResource);
+  const sameSelector = sameContentSelector(requestSelector, responseSelector);
+  return (
+    typeof requestId === "string" &&
+    payload !== undefined &&
+    payload.requestId === requestId &&
+    sameResource &&
+    sameSelector
+  );
+}
+
+function sameResourceRef(left: unknown, right: unknown): boolean {
+  if (!isRecord(left) || !isRecord(right)) return false;
+  return (
+    left.resourceKind === right.resourceKind &&
+    left.organizationId === right.organizationId &&
+    left.nodeId === right.nodeId &&
+    left.localResourceId === right.localResourceId
+  );
+}
+
+function sameContentSelector(left: unknown, right: unknown): boolean {
+  if (!isRecord(left) || !isRecord(right)) return false;
+  return left.kind === right.kind && left.view === right.view;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 export function isIdentitySelfResponse(message: SessionOutboundMessage): boolean {
   return (

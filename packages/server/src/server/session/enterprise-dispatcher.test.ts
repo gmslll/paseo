@@ -3,8 +3,11 @@ import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.
 import type { EnterpriseSessionContext } from "../enterprise/identity/session-context.js";
 import {
   dispatchEnterpriseRequest,
+  ENTERPRISE_CONTENT_READ_MANIFEST,
   ENTERPRISE_IDENTITY_SELF_POLICY,
+  isEnterpriseResponsePair,
   registerEnterpriseIdentitySelfPolicy,
+  resolveEnterpriseContentReadPolicy,
   resolveEnterpriseReceiptPolicy,
   type EnterpriseSessionDispatcher,
 } from "./enterprise-dispatcher.js";
@@ -105,5 +108,91 @@ describe("enterprise session dispatcher seam", () => {
     expect(result).toBe(contextual);
     expect(consume).toHaveBeenCalledTimes(1);
     expect(result?.receiptClassification).toBe("resources");
+  });
+
+  test("exposes four independently flaggable content-read policies", () => {
+    expect(ENTERPRISE_CONTENT_READ_MANIFEST).toEqual([
+      expect.objectContaining({
+        requestType: "enterprise.workspace.content.read.request",
+        responseType: "enterprise.workspace.content.read.response",
+        action: "workspace.content.read",
+        featureFlag: "enterpriseWorkspaceContentReadV1",
+      }),
+      expect.objectContaining({
+        requestType: "enterprise.agent.content.read.request",
+        responseType: "enterprise.agent.content.read.response",
+        action: "workspace.content.read",
+        featureFlag: "enterpriseAgentContentReadV1",
+      }),
+      expect.objectContaining({
+        requestType: "enterprise.browser_profile.content.read.request",
+        responseType: "enterprise.browser_profile.content.read.response",
+        action: "browser.use",
+        featureFlag: "enterpriseBrowserProfileContentReadV1",
+      }),
+      expect.objectContaining({
+        requestType: "enterprise.app_slot.content.read.request",
+        responseType: "enterprise.app_slot.content.read.response",
+        action: "app.use",
+        featureFlag: "enterpriseAppSlotContentReadV1",
+      }),
+    ]);
+    expect(resolveEnterpriseContentReadPolicy("enterprise.agent.content.read.request")).toEqual(
+      expect.objectContaining({ action: "workspace.content.read" }),
+    );
+    expect(resolveEnterpriseContentReadPolicy("enterprise.unknown.request")).toBeNull();
+  });
+
+  test("accepts only the exact content request/response pairing", () => {
+    const request = {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "request-content",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+    } as SessionInboundMessage;
+    const response = {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: "request-content",
+        resource: request.resource,
+        selector: request.selector,
+      },
+    } as SessionOutboundMessage;
+    expect(isEnterpriseResponsePair(request, response)).toBe(true);
+    expect(
+      isEnterpriseResponsePair(request, {
+        ...response,
+        type: "enterprise.agent.content.read.response",
+      } as SessionOutboundMessage),
+    ).toBe(false);
+    expect(
+      isEnterpriseResponsePair(request, {
+        ...response,
+        payload: { requestId: "other" },
+      } as SessionOutboundMessage),
+    ).toBe(false);
+    expect(
+      isEnterpriseResponsePair(request, {
+        ...response,
+        payload: {
+          ...response.payload,
+          resource: { ...request.resource, localResourceId: "wks_bbbbbbbbbbbbbbbb" },
+        },
+      } as SessionOutboundMessage),
+    ).toBe(false);
+    expect(
+      isEnterpriseResponsePair(request, {
+        ...response,
+        payload: {
+          ...response.payload,
+          selector: { kind: "workspace", view: "files" },
+        },
+      } as SessionOutboundMessage),
+    ).toBe(false);
   });
 });
