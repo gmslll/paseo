@@ -546,7 +546,15 @@ export class IdentityRegistry {
     expiresAt?: string;
   }): Promise<IssuedPersonalAccessToken> {
     const snapshotInput = { ...input, actor: PrincipalContextSchema.parse(input.actor) };
-    return this.serial(async () => {
+    return this.serial(() => this.issueTokenUnlocked(snapshotInput));
+  }
+  private async issueTokenUnlocked(input: {
+    actor: CredentialActor;
+    principalId: string;
+    organizationId: OrganizationId;
+    expiresAt?: string;
+  }): Promise<IssuedPersonalAccessToken> {
+    const snapshotInput = { ...input, actor: PrincipalContextSchema.parse(input.actor) };
       const actor = snapshotInput.actor;
       if (actor.organizationId !== snapshotInput.organizationId)
         throw new Error("Actor organization mismatch");
@@ -627,7 +635,6 @@ export class IdentityRegistry {
         credentialId,
         principal: authenticatedPrincipal,
       };
-    });
   }
 
   async issueInitialCredential(input: {
@@ -636,9 +643,9 @@ export class IdentityRegistry {
     organizationId: OrganizationId;
     expiresAt?: string;
   }): Promise<InitialCredentialResult> {
-    const existing = await this.serial(async () => {
+    return this.serial(async () => {
       const now = this.captureClock();
-      return Object.values(this.document.credentials)
+      const existing = Object.values(this.document.credentials)
         .filter(
           (credential) =>
             credential.principalId === input.principalId &&
@@ -647,11 +654,11 @@ export class IdentityRegistry {
             (!credential.expiresAt || !isExpired(credential.expiresAt, now)),
         )
         .map((credential) => credential.credentialId);
+      if (existing.length > 0)
+        return { status: "already_provisioned", credentialIds: Object.freeze(existing) };
+      const issued = await this.issueTokenUnlocked({ ...input, actor: PrincipalContextSchema.parse(input.actor) });
+      return { status: "issued", token: issued.token, credentialId: issued.credentialId };
     });
-    if (existing.length > 0)
-      return { status: "already_provisioned", credentialIds: Object.freeze(existing) };
-    const issued = await this.issueToken(input);
-    return { status: "issued", token: issued.token, credentialId: issued.credentialId };
   }
   async authenticate(token: string, node: NodeContext): Promise<PrincipalContext | null> {
     if (this.poisoned) return null;
