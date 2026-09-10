@@ -378,6 +378,7 @@ interface SessionForTestOptions {
   admissionAuthorizationHandle?: SessionOptions["admissionAuthorizationHandle"];
   enterpriseAuthorizationRuntime?: SessionOptions["enterpriseAuthorizationRuntime"];
   enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
+  enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 }
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
@@ -514,6 +515,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     admissionAuthorizationHandle: options.admissionAuthorizationHandle,
     enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime,
     enterpriseDispatcher: options.enterpriseDispatcher,
+    enterpriseIdentitySelfAuthorization: options.enterpriseIdentitySelfAuthorization,
   };
   return new Session(sessionOptions);
 }

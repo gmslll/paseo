@@ -35,6 +35,7 @@ import { SessionOutboundMessageSchema } from "@getpaseo/protocol/messages";
 import {
   ENTERPRISE_UNAVAILABLE_ERROR,
   dispatchEnterpriseRequest,
+  isIdentitySelfRequest,
   resolveEnterpriseReceiptPolicy,
   isEnterpriseRequest,
   type EnterpriseSessionDispatcher,
@@ -518,6 +519,8 @@ export interface SessionOptions {
   enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
   /** W3 routing seam; domain handlers are registered by integration/owning streams. */
   enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  /** Integration/W1 supplies the current-session decision for identity-self requests. */
+  enterpriseIdentitySelfAuthorization?: SessionAuthorization["authorizeInbound"];
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -872,6 +875,9 @@ export class Session {
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly enterpriseDispatcher: EnterpriseSessionDispatcher | null;
+  private readonly enterpriseIdentitySelfAuthorization:
+    | SessionAuthorization["authorizeInbound"]
+    | null;
 
   // oxlint-disable-next-line complexity -- Session constructor wires existing ports.
   constructor(options: SessionOptions) {
@@ -889,6 +895,7 @@ export class Session {
       admissionAuthorizationHandle,
       enterpriseAuthorizationRuntime,
       enterpriseDispatcher,
+      enterpriseIdentitySelfAuthorization,
       permissions,
       appVersion,
       clientCapabilities,
@@ -944,6 +951,7 @@ export class Session {
       getWebSocketRuntimeMetrics,
     } = options;
     this.enterpriseDispatcher = enterpriseDispatcher ?? null;
+    this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization ?? null;
     const enterpriseConfigured = Boolean(
       enterpriseContext ||
       enterpriseAgentContextRegistry ||
@@ -2237,7 +2245,12 @@ export class Session {
         },
         "agent.session.inbound",
       );
-      const daemonDecision = this.authorization.authorizeInbound(msg);
+      const daemonDecision =
+        isEnterpriseRequest(msg) &&
+        isIdentitySelfRequest(msg) &&
+        this.enterpriseIdentitySelfAuthorization
+          ? this.enterpriseIdentitySelfAuthorization(msg)
+          : this.authorization.authorizeInbound(msg);
       if (!daemonDecision) {
         const requestId = sessionRequestId(msg);
         if (requestId) {
