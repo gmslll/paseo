@@ -161,12 +161,17 @@ describe("browser profile content source", () => {
       await symlink("a.txt", path.join(downloadRoot, "link"));
       const source = createProductionEnterpriseBrowserProfileContentReadSource({ addonPath });
       if (!source) throw new Error("native source unavailable");
-      const page = await source.read({
+      const first = await source.read({
         profile: { ...profile, downloadRoot },
         selector: { kind: "browser_profile", view: "artifacts" },
-        limit: 10,
+        limit: 1,
       });
-      expect(page.items.map((item) => item.reference)).toEqual(["a.txt", "b.txt"]);
+      expect(first.items.map((item) => item.reference)).toEqual(["a.txt"]);
+      expect(first.nextCursor).not.toBeNull();
+      expect(first.nextCursor).not.toBe("1");
+      const second = await source.read({ profile: { ...profile, downloadRoot }, selector: { kind: "browser_profile", view: "artifacts" }, cursor: first.nextCursor ?? undefined, limit: 1 });
+      expect(second.items.map((item) => item.reference)).toEqual(["b.txt"]);
+      await expect(source.read({ profile: { ...profile, downloadRoot }, selector: { kind: "browser_profile", view: "artifacts" }, cursor: first.nextCursor ?? undefined, limit: 1 })).rejects.toThrow();
       await source.close?.();
     } finally {
       await rm(downloadRoot, { recursive: true, force: true });
