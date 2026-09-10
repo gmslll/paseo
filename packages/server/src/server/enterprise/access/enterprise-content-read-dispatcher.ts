@@ -7,7 +7,10 @@ import type { EnterpriseContentAgentProductionSource } from "../runtime/enterpri
 import { createEnterpriseWorkspaceContentReadSource } from "../runtime/enterprise-content-read.js";
 import { isCurrentProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
-import type { EnterpriseDispatchContext } from "../../session/enterprise-dispatcher.js";
+import type {
+  EnterpriseDispatchContext,
+  EnterpriseDispatchResponse,
+} from "../../session/enterprise-dispatcher.js";
 import {
   EnterpriseWorkspaceContentReadRequestSchema,
   GlobalResourceRefSchema,
@@ -180,6 +183,21 @@ export function createEnterpriseContentReadDispatcherRegistration(
             } finally {
               reservations.delete(parsed.data.requestId);
             }
+          },
+          consumeResponse: ({
+            sessionContext,
+            message,
+            response,
+          }): EnterpriseDispatchResponse | null => {
+            if (!isObject(response)) return null;
+            const capability = issued.get(response);
+            if (!capability) return null;
+            issued.delete(response);
+            pending.delete(capability);
+            void sessionContext;
+            void message;
+            void response;
+            return null;
           },
         },
         close: async () => {
