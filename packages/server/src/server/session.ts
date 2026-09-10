@@ -32,6 +32,12 @@ import {
   type WorkspaceDescriptorPayload,
 } from "./messages.js";
 import { SessionOutboundMessageSchema } from "@getpaseo/protocol/messages";
+import {
+  ENTERPRISE_UNAVAILABLE_ERROR,
+  dispatchEnterpriseRequest,
+  isEnterpriseRequest,
+  type EnterpriseSessionDispatcher,
+} from "./session/enterprise-dispatcher.js";
 import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
@@ -509,6 +515,8 @@ export interface SessionOptions {
   admissionAuthorizationIssuer?: EnterpriseAdmissionAuthorizationIssuer;
   admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
   enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  /** W3 routing seam; domain handlers are registered by integration/owning streams. */
+  enterpriseDispatcher?: EnterpriseSessionDispatcher;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -862,6 +870,7 @@ export class Session {
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private readonly enterpriseDispatcher: EnterpriseSessionDispatcher | null;
 
   // oxlint-disable-next-line complexity -- Session constructor wires existing ports.
   constructor(options: SessionOptions) {
@@ -878,6 +887,7 @@ export class Session {
       admissionAuthorizationIssuer,
       admissionAuthorizationHandle,
       enterpriseAuthorizationRuntime,
+      enterpriseDispatcher,
       permissions,
       appVersion,
       clientCapabilities,
@@ -932,6 +942,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    this.enterpriseDispatcher = enterpriseDispatcher ?? null;
     const enterpriseConfigured = Boolean(
       enterpriseContext ||
       enterpriseAgentContextRegistry ||
@@ -2236,6 +2247,44 @@ export class Session {
               requestType: msg.type,
               error: `Session is not authorized for ${msg.type}`,
               code: "access_denied",
+            },
+          });
+        }
+        return;
+      }
+      if (isEnterpriseRequest(msg) && (this.enterpriseDispatcher || !this.enterpriseContext)) {
+        const requestId = sessionRequestId(msg);
+        if (!this.enterpriseDispatcher || !this.enterpriseContext) {
+          if (requestId) {
+            this.onMessage({
+              type: "rpc_error",
+              payload: {
+                requestId,
+                requestType: msg.type,
+                error: ENTERPRISE_UNAVAILABLE_ERROR,
+                code: "unavailable",
+              },
+            });
+          }
+          return;
+        }
+        const handled = await dispatchEnterpriseRequest(
+          this.enterpriseDispatcher,
+          {
+            sessionId: this.sessionId,
+            clientId: this.clientId,
+            enterpriseContext: this.enterpriseContext,
+          },
+          msg,
+        );
+        if (!handled && requestId) {
+          this.onMessage({
+            type: "rpc_error",
+            payload: {
+              requestId,
+              requestType: msg.type,
+              error: ENTERPRISE_UNAVAILABLE_ERROR,
+              code: "unavailable",
             },
           });
         }

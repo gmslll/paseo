@@ -1119,6 +1119,32 @@ interface PingProbe {
 }
 
 export class DaemonClient {
+  /**
+   * Batch A enterprise RPC wrapper. Domain-specific methods are added by the
+   * owning workstream; this wrapper only snapshots payloads and correlates the
+   * dotted request/response pair.
+   */
+  public requestEnterprise(
+    type: string,
+    payload: Readonly<Record<string, unknown>> = {},
+    requestId?: string,
+  ): Promise<Readonly<Record<string, unknown>>> {
+    if (!type.startsWith("enterprise.") || !type.endsWith(".request")) {
+      return Promise.reject(new Error("Invalid enterprise request type"));
+    }
+    let snapshot: Record<string, unknown>;
+    try {
+      snapshot = structuredClone(payload);
+    } catch {
+      return Promise.reject(new Error("Invalid enterprise request payload"));
+    }
+    const responseType = `${type.slice(0, -".request".length)}.response` as CorrelatedResponseType;
+    return this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: type as SessionInboundMessage["type"], ...snapshot },
+      responseType,
+    }) as Promise<Readonly<Record<string, unknown>>>;
+  }
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({
     fetch: (cwd) => this.requestProvidersSnapshot({ cwd }),
     emit: (message) => this.deliverSessionMessage(message),

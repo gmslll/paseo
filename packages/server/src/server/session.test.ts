@@ -377,6 +377,7 @@ interface SessionForTestOptions {
   admissionAuthorizationIssuer?: SessionOptions["admissionAuthorizationIssuer"];
   admissionAuthorizationHandle?: SessionOptions["admissionAuthorizationHandle"];
   enterpriseAuthorizationRuntime?: SessionOptions["enterpriseAuthorizationRuntime"];
+  enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
 }
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
@@ -512,6 +513,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     admissionAuthorizationIssuer: options.admissionAuthorizationIssuer,
     admissionAuthorizationHandle: options.admissionAuthorizationHandle,
     enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime,
+    enterpriseDispatcher: options.enterpriseDispatcher,
   };
   return new Session(sessionOptions);
 }
@@ -7357,4 +7359,39 @@ test("provider snapshots preserve versionless visibility while capabilities upda
     "plugin-provider",
   ]);
   expect(references.compactSnapshot!.entries[0]!.modes![0]!.icon).toBe("ShieldCheck");
+});
+
+describe("enterprise dispatcher integration seam", () => {
+  test("legacy sessions leave enterprise requests unavailable", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({ messages });
+    await session.handleMessage({
+      type: "enterprise.identity.get_current.request",
+      requestId: "legacy-enterprise",
+    });
+    expect(messages.at(-1)).toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "legacy-enterprise", code: "unavailable" },
+    });
+  });
+
+  test("enterprise sessions route through one dispatcher and unknown operations are unavailable", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const handle = vi.fn(() => false);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseDispatcher: { handle },
+    });
+    await session.handleMessage({
+      type: "enterprise.identity.get_current.request",
+      requestId: "enterprise-unknown",
+    });
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(messages.at(-1)).toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "enterprise-unknown", code: "unavailable" },
+    });
+  });
 });
