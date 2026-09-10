@@ -32,6 +32,8 @@ import {
   EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseResourceOwnershipTransferRequestSchema,
   EnterpriseResourceOwnershipTransferResponseSchema,
+  EnterpriseBrowserPageIdentityObservationRequestSchema,
+  EnterpriseBrowserPageIdentityObservationResponseSchema,
   EnterpriseResourceOwnerWireSchema,
   EnterpriseResourceStatusProjectionSchema,
   EnterpriseSessionBindingSchema,
@@ -89,6 +91,7 @@ describe("enterprise feature compatibility", () => {
       enterpriseBrowserProfileContentReadV1: false,
       enterpriseAppSlotContentReadV1: false,
       enterpriseResourceOwnershipTransferV1: false,
+      enterpriseBrowserPageIdentityObservationV1: false,
     });
   });
 
@@ -139,6 +142,86 @@ describe("enterprise feature compatibility", () => {
       serverId: "enterprise-server",
       features: { providersSnapshot: true },
     });
+  });
+});
+
+describe("enterprise Browser page identity observation contract", () => {
+  const request = {
+    type: "enterprise.browser.page_identity.observe.request" as const,
+    requestId: "observation-1",
+    browser: {
+      browserId: "11111111-1111-4111-8111-111111111111",
+      browserProfileId: "brp_3333333333333333",
+    },
+    hostname: "account.example.com",
+    accountLabelHash: "a".repeat(64),
+    observationRevision: "obs-rev-1",
+    bindingRevision: "binding-rev-1",
+    lifecycleGeneration: "generation-1",
+  };
+
+  test("accepts normalized observation and exact correlated revision", () => {
+    expect(EnterpriseBrowserPageIdentityObservationRequestSchema.parse(request)).toEqual(request);
+    expect(
+      EnterpriseBrowserPageIdentityObservationResponseSchema.parse({
+        type: "enterprise.browser.page_identity.observe.response",
+        payload: { requestId: request.requestId, acceptedRevision: request.observationRevision },
+      }),
+    ).toEqual({
+      type: "enterprise.browser.page_identity.observe.response",
+      payload: { requestId: request.requestId, acceptedRevision: request.observationRevision },
+    });
+  });
+
+  test("accepts BrowserAutomation timestamp-hex browser ids", () => {
+    expect(
+      EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+        ...request,
+        browser: { ...request.browser, browserId: "1712345678901-abcdef012345" },
+      }),
+    ).toBeTruthy();
+  });
+
+  test("accepts hostname-only observation without an account label hash", () => {
+    const { accountLabelHash: _omitted, ...hostnameOnly } = request;
+    expect(EnterpriseBrowserPageIdentityObservationRequestSchema.parse(hostnameOnly)).toEqual(
+      hostnameOnly,
+    );
+  });
+
+  test("rejects identity secrets, extras, invalid hash, and invalid revision", () => {
+    for (const extra of [
+      { url: "https://account.example.com/private" },
+      { cookie: "secret" },
+      { accountLabel: "Alice" },
+      { path: "/tmp/profile" },
+      { pat: "token" },
+      { lease: "lease-1" },
+      { clientId: "client-1" },
+      { homeNodeId: "node-1" },
+    ]) {
+      expect(() =>
+        EnterpriseBrowserPageIdentityObservationRequestSchema.parse({ ...request, ...extra }),
+      ).toThrow();
+    }
+    expect(() =>
+      EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+        ...request,
+        accountLabelHash: "",
+      }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+        ...request,
+        observationRevision: "",
+      }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+        ...request,
+        hostname: "Account.Example.com",
+      }),
+    ).toThrow();
   });
 });
 

@@ -173,6 +173,8 @@ import type {
   EnterpriseAppSlotContentReadResponse,
   EnterpriseResourceOwnershipTransferRequest,
   EnterpriseResourceOwnershipTransferResponse,
+  EnterpriseBrowserPageIdentityObservationRequest,
+  EnterpriseBrowserPageIdentityObservationResponse,
 } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
@@ -1261,6 +1263,19 @@ export class DaemonClient {
       payload,
       requestId,
     ) as Promise<EnterpriseResourceOwnershipTransferResponse>;
+  }
+
+  public observeBrowserPageIdentity(
+    input: Omit<EnterpriseBrowserPageIdentityObservationRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserPageIdentityObservationResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.browser.page_identity.observe.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseBrowserPageIdentityObservationResponse>;
   }
 
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({

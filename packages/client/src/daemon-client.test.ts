@@ -8,6 +8,7 @@ import {
 } from "./daemon-client";
 import type {
   EnterpriseResourceOwnershipTransferResponse,
+  EnterpriseBrowserPageIdentityObservationResponse,
   EnterpriseWorkspaceContentReadResponse,
 } from "@getpaseo/protocol/messages";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
@@ -119,6 +120,47 @@ test("enterprise ownership transfer wrapper preserves strict dotted type and cor
       expectedOwnerPrincipalId: "usr_3333333333333333",
       expectedRevision: "rev-1",
       newPrincipalId: response.payload.ownerPrincipalId,
+    },
+    response.payload.requestId,
+  );
+});
+
+test("enterprise page observation wrapper preserves dotted type and correlation", async () => {
+  const client = Object.create(DaemonClient.prototype) as DaemonClient;
+  const response: EnterpriseBrowserPageIdentityObservationResponse = {
+    type: "enterprise.browser.page_identity.observe.response",
+    payload: { requestId: "observation-request-1", acceptedRevision: "obs-rev-1" },
+  };
+  const requestEnterprise = vi
+    .spyOn(client, "requestEnterprise")
+    .mockResolvedValue(response as unknown as Readonly<Record<string, unknown>>);
+
+  await expect(
+    client.observeBrowserPageIdentity({
+      requestId: response.payload.requestId,
+      browser: {
+        browserId: "11111111-1111-4111-8111-111111111111",
+        browserProfileId: "brp_3333333333333333",
+      },
+      hostname: "account.example.com",
+      accountLabelHash: "a".repeat(64),
+      observationRevision: response.payload.acceptedRevision,
+      bindingRevision: "binding-rev-1",
+      lifecycleGeneration: "generation-1",
+    }),
+  ).resolves.toEqual(response);
+  expect(requestEnterprise).toHaveBeenCalledWith(
+    "enterprise.browser.page_identity.observe.request",
+    {
+      browser: {
+        browserId: "11111111-1111-4111-8111-111111111111",
+        browserProfileId: "brp_3333333333333333",
+      },
+      hostname: "account.example.com",
+      accountLabelHash: "a".repeat(64),
+      observationRevision: response.payload.acceptedRevision,
+      bindingRevision: "binding-rev-1",
+      lifecycleGeneration: "generation-1",
     },
     response.payload.requestId,
   );

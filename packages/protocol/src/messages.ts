@@ -58,6 +58,7 @@ import {
 import {
   BrowserAutomationExecuteRequestSchema,
   BrowserAutomationExecuteResponseSchema,
+  BrowserAutomationBrowserIdSchema,
 } from "./browser-automation/rpc-schemas.js";
 import { BrowserAutomationHostCapabilityWireSchema } from "./browser-automation/capabilities.js";
 import {
@@ -119,6 +120,7 @@ export const ENTERPRISE_FEATURE_FLAGS = [
   "enterpriseBrowserProfileContentReadV1",
   "enterpriseAppSlotContentReadV1",
   "enterpriseResourceOwnershipTransferV1",
+  "enterpriseBrowserPageIdentityObservationV1",
 ] as const;
 
 export const EnterpriseFeatureFlagsWireSchema = z
@@ -133,6 +135,7 @@ export const EnterpriseFeatureFlagsWireSchema = z
     enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
     enterpriseAppSlotContentReadV1: z.boolean().optional(),
     enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
+    enterpriseBrowserPageIdentityObservationV1: z.boolean().optional(),
   })
   .passthrough();
 
@@ -153,6 +156,8 @@ export function normalizeEnterpriseFeatureFlags(
     enterpriseBrowserProfileContentReadV1: flags?.enterpriseBrowserProfileContentReadV1 === true,
     enterpriseAppSlotContentReadV1: flags?.enterpriseAppSlotContentReadV1 === true,
     enterpriseResourceOwnershipTransferV1: flags?.enterpriseResourceOwnershipTransferV1 === true,
+    enterpriseBrowserPageIdentityObservationV1:
+      flags?.enterpriseBrowserPageIdentityObservationV1 === true,
   };
 }
 
@@ -4213,6 +4218,36 @@ export const EnterpriseAppSlotContentReadResponseSchema = enterpriseContentReadR
   EnterpriseAppSlotContentItemSchema,
 );
 
+const BrowserPageIdentityObservationBrowserSchema = z.strictObject({
+  browserId: BrowserAutomationBrowserIdSchema,
+  browserProfileId: BrowserProfileIdSchema,
+});
+const NormalizedBrowserHostnameSchema = z
+  .string()
+  .min(1)
+  .max(253)
+  .regex(/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/);
+const BrowserAccountLabelHashSchema = z.string().min(1).max(256);
+
+export const EnterpriseBrowserPageIdentityObservationRequestSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.observe.request"),
+  requestId: z.string().min(1),
+  browser: BrowserPageIdentityObservationBrowserSchema,
+  hostname: NormalizedBrowserHostnameSchema,
+  accountLabelHash: BrowserAccountLabelHashSchema.optional(),
+  observationRevision: z.string().min(1),
+  bindingRevision: z.string().min(1),
+  lifecycleGeneration: z.string().min(1),
+});
+
+export const EnterpriseBrowserPageIdentityObservationResponseSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.observe.response"),
+  payload: z.strictObject({
+    requestId: z.string().min(1),
+    acceptedRevision: z.string().min(1),
+  }),
+});
+
 const EnterpriseOwnershipTransferResourceSchema = z.union([
   z.strictObject({
     ...GlobalResourceRefSharedShape,
@@ -4508,6 +4543,12 @@ export type EnterpriseAppSlotContentReadRequest = z.infer<
 export type EnterpriseAppSlotContentReadResponse = z.infer<
   typeof EnterpriseAppSlotContentReadResponseSchema
 >;
+export type EnterpriseBrowserPageIdentityObservationRequest = z.infer<
+  typeof EnterpriseBrowserPageIdentityObservationRequestSchema
+>;
+export type EnterpriseBrowserPageIdentityObservationResponse = z.infer<
+  typeof EnterpriseBrowserPageIdentityObservationResponseSchema
+>;
 export type EnterpriseResourceOwnershipTransferRequest = z.infer<
   typeof EnterpriseResourceOwnershipTransferRequestSchema
 >;
@@ -4611,6 +4652,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseBrowserProfileContentReadRequestSchema,
   EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseResourceOwnershipTransferRequestSchema,
+  EnterpriseBrowserPageIdentityObservationRequestSchema,
   EnterpriseAccessListGrantsRequestSchema,
   EnterpriseAccessUpdateGrantsRequestSchema,
   EnterpriseAuditListEventsRequestSchema,
@@ -5171,6 +5213,9 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(enterpriseResourceOwnershipTransferV1): added in v0.9.0, remove gate after 2027-03-09.
         // Keep absent until the strict transfer schema, production handler, receipt/current checks, audit, and denial evidence are ready.
         enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserPageIdentityObservationV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until observer transport, bootstrap, W2 verification, publisher, and mismatch evidence are ready.
+        enterpriseBrowserPageIdentityObservationV1: z.boolean().optional(),
       })
       .optional(),
   })
@@ -8055,6 +8100,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseBrowserProfileContentReadResponseSchema,
   EnterpriseAppSlotContentReadResponseSchema,
   EnterpriseResourceOwnershipTransferResponseSchema,
+  EnterpriseBrowserPageIdentityObservationResponseSchema,
   EnterpriseAccessListGrantsResponseSchema,
   EnterpriseAccessUpdateGrantsResponseSchema,
   EnterpriseAuditListEventsResponseSchema,
