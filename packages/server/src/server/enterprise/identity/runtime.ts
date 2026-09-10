@@ -11,6 +11,7 @@ import type { PrincipalGrantVersionGuard } from "../access/resource-authorizatio
 import type { PrincipalContext } from "@getpaseo/protocol/messages";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
 import type { ProductionAuthorizationRuntimeProvider } from "../access/production-authorization-runtime-provider.js";
+import type { PrincipalGrantSource } from "./registry.js";
 import type { AdmissionInvalidationSink } from "../../session/enterprise-admission-invalidation.js";
 import type {
   EnterpriseAdmissionAuthenticationEvidence,
@@ -57,6 +58,7 @@ export interface EnterpriseAdmissionRuntime {
   readonly resourceAuthorization: ResourceAuthorization;
   readonly authorizationRuntimeProvider?: ProductionAuthorizationRuntimeProvider;
   readonly admissionInvalidationSink?: AdmissionInvalidationSink;
+  readonly principalSource?: PrincipalGrantSource;
   nextSessionBindingGeneration(): string;
   close?(): Promise<void>;
 }

@@ -207,6 +207,7 @@ export function createProductionEnterpriseRuntimeFactory(
         resourceAuthorization,
         authorizationRuntimeProvider,
         admissionInvalidationSink,
+        principalSource,
         nextSessionBindingGeneration: createSessionBindingGeneration,
         close() {
           closePromise ??= appSlots.close();

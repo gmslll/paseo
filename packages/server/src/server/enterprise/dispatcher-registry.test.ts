@@ -4,6 +4,7 @@ import {
   contentFeaturesForEnterpriseManifest,
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
+  workspaceOwnershipTransferFeatureForManifest,
 } from "./dispatcher-registry.js";
 
 const context = {} as EnterpriseDispatchContext;
@@ -14,6 +15,15 @@ const response = {
 } as never;
 
 describe("enterprise dispatcher registry", () => {
+  it("advertises workspace ownership transfer only for the exact operation", () => {
+    expect(
+      workspaceOwnershipTransferFeatureForManifest({
+        operations: ["enterprise.resource.ownership.transfer.request"],
+      }),
+    ).toEqual({ enterpriseWorkspaceOwnershipTransferV1: true });
+    expect(workspaceOwnershipTransferFeatureForManifest({ operations: [] })).toEqual({});
+    expect(workspaceOwnershipTransferFeatureForManifest(undefined)).toEqual({});
+  });
   it("routes registered requests and leaves unknown requests unavailable", async () => {
     const handle = vi.fn().mockResolvedValue(response);
     const registry = createEnterpriseDispatcherRegistry([

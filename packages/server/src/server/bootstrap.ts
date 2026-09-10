@@ -220,6 +220,7 @@ import {
   contentFeaturesForEnterpriseManifest,
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
+  workspaceOwnershipTransferFeatureForManifest,
 } from "./enterprise/dispatcher-registry.js";
 import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
 import { createEnterpriseContentReadDispatcherRegistration } from "./enterprise/access/enterprise-content-read-dispatcher.js";
@@ -1368,6 +1369,8 @@ export async function createPaseoDaemon(
         workspaceRegistry,
         agentRecords,
         nodeId: enterpriseRuntime.node.nodeId,
+        audit: enterpriseRuntime.audit,
+        principalSource: enterpriseRuntime.principalSource,
       });
       const auditRegistration = createProductionAuditDispatcherRegistration({
         audit: enterpriseRuntime.audit,
@@ -1463,6 +1466,9 @@ export async function createPaseoDaemon(
         enterpriseBrowserProfilesV1: true,
         enterpriseAuditV1: true,
         ...contentFeaturesForEnterpriseManifest(
+          productionEnterpriseDispatcherRegistration.manifest,
+        ),
+        ...workspaceOwnershipTransferFeatureForManifest(
           productionEnterpriseDispatcherRegistration.manifest,
         ),
       });

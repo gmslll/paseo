@@ -31,7 +31,8 @@ export type EnterpriseFeatureAdvertisement = Readonly<
       | "enterpriseWorkspaceContentReadV1"
       | "enterpriseAgentContentReadV1"
       | "enterpriseBrowserProfileContentReadV1"
-      | "enterpriseAppSlotContentReadV1",
+      | "enterpriseAppSlotContentReadV1"
+      | "enterpriseWorkspaceOwnershipTransferV1",
       true
     >
   >
@@ -62,6 +63,14 @@ export function contentFeaturesForEnterpriseManifest(
       ? { enterpriseAppSlotContentReadV1: true as const }
       : {}),
   });
+}
+
+export function workspaceOwnershipTransferFeatureForManifest(
+  manifest: EnterpriseDispatcherManifest | undefined,
+): EnterpriseFeatureAdvertisement {
+  return manifest?.operations.includes("enterprise.resource.ownership.transfer.request")
+    ? Object.freeze({ enterpriseWorkspaceOwnershipTransferV1: true as const })
+    : Object.freeze({});
 }
 
 const familyFlags: Readonly<Record<EnterpriseFeatureFamily, keyof EnterpriseFeatureAdvertisement>> =
