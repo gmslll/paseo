@@ -163,6 +163,14 @@ import type {
   AgentSkillSelection,
   AgentSkillsStatus,
   AgentSkillsSaveResult,
+  EnterpriseWorkspaceContentReadRequest,
+  EnterpriseWorkspaceContentReadResponse,
+  EnterpriseAgentContentReadRequest,
+  EnterpriseAgentContentReadResponse,
+  EnterpriseBrowserProfileContentReadRequest,
+  EnterpriseBrowserProfileContentReadResponse,
+  EnterpriseAppSlotContentReadRequest,
+  EnterpriseAppSlotContentReadResponse,
 } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
@@ -1186,6 +1194,90 @@ export class DaemonClient {
       message: { type: type as SessionInboundMessage["type"], ...snapshot },
       responseType,
     }) as Promise<Readonly<Record<string, unknown>>>;
+  }
+
+  public readWorkspaceContent(
+    input: Omit<EnterpriseWorkspaceContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseWorkspaceContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.workspace.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseWorkspaceContentReadResponse>;
+  }
+
+  public enterpriseWorkspaceContentRead(
+    input: Omit<EnterpriseWorkspaceContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseWorkspaceContentReadResponse> {
+    return this.readWorkspaceContent(input);
+  }
+
+  public readAgentContent(
+    input: Omit<EnterpriseAgentContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseAgentContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.agent.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseAgentContentReadResponse>;
+  }
+
+  public enterpriseAgentContentRead(
+    input: Omit<EnterpriseAgentContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseAgentContentReadResponse> {
+    return this.readAgentContent(input);
+  }
+
+  public readBrowserProfileContent(
+    input: Omit<EnterpriseBrowserProfileContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserProfileContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.browser_profile.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseBrowserProfileContentReadResponse>;
+  }
+
+  public enterpriseBrowserProfileContentRead(
+    input: Omit<EnterpriseBrowserProfileContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserProfileContentReadResponse> {
+    return this.readBrowserProfileContent(input);
+  }
+
+  public readAppSlotContent(
+    input: Omit<EnterpriseAppSlotContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseAppSlotContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.app_slot.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseAppSlotContentReadResponse>;
+  }
+
+  public enterpriseAppSlotContentRead(
+    input: Omit<EnterpriseAppSlotContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseAppSlotContentReadResponse> {
+    return this.readAppSlotContent(input);
   }
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({
     fetch: (cwd) => this.requestProvidersSnapshot({ cwd }),

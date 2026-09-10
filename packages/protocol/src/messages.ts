@@ -114,6 +114,10 @@ export const ENTERPRISE_FEATURE_FLAGS = [
   "enterpriseBrowserProfilesV1",
   "enterpriseAuditV1",
   "enterpriseDistributedNodeV1",
+  "enterpriseWorkspaceContentReadV1",
+  "enterpriseAgentContentReadV1",
+  "enterpriseBrowserProfileContentReadV1",
+  "enterpriseAppSlotContentReadV1",
 ] as const;
 
 export const EnterpriseFeatureFlagsWireSchema = z
@@ -123,6 +127,10 @@ export const EnterpriseFeatureFlagsWireSchema = z
     enterpriseBrowserProfilesV1: z.boolean().optional(),
     enterpriseAuditV1: z.boolean().optional(),
     enterpriseDistributedNodeV1: z.boolean().optional(),
+    enterpriseWorkspaceContentReadV1: z.boolean().optional(),
+    enterpriseAgentContentReadV1: z.boolean().optional(),
+    enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
+    enterpriseAppSlotContentReadV1: z.boolean().optional(),
   })
   .passthrough();
 
@@ -138,6 +146,10 @@ export function normalizeEnterpriseFeatureFlags(
     enterpriseBrowserProfilesV1: flags?.enterpriseBrowserProfilesV1 === true,
     enterpriseAuditV1: flags?.enterpriseAuditV1 === true,
     enterpriseDistributedNodeV1: flags?.enterpriseDistributedNodeV1 === true,
+    enterpriseWorkspaceContentReadV1: flags?.enterpriseWorkspaceContentReadV1 === true,
+    enterpriseAgentContentReadV1: flags?.enterpriseAgentContentReadV1 === true,
+    enterpriseBrowserProfileContentReadV1: flags?.enterpriseBrowserProfileContentReadV1 === true,
+    enterpriseAppSlotContentReadV1: flags?.enterpriseAppSlotContentReadV1 === true,
   };
 }
 
@@ -549,6 +561,7 @@ export const EnterpriseResourceKindSchema = z.enum([
   "browser_profile",
   "app_slot",
 ]);
+export type EnterpriseResourceKind = z.infer<typeof EnterpriseResourceKindSchema>;
 
 const GlobalResourceRefSharedShape = {
   organizationId: OrganizationIdSchema,
@@ -4012,6 +4025,148 @@ export const EnterpriseIdentityListPrincipalsResponseSchema = z.object({
   }),
 });
 
+const EnterpriseContentReadPageSchema = z.strictObject({
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100),
+});
+const EnterpriseContentReadResponsePageSchema = <Item extends z.ZodTypeAny>(item: Item) =>
+  z.strictObject({ items: z.array(item), nextCursor: z.string().min(1).nullable() });
+
+export const EnterpriseWorkspaceContentSelectorSchema = z.strictObject({
+  kind: z.literal("workspace"),
+  view: z.enum(["timeline", "files"]),
+});
+export const EnterpriseAgentContentSelectorSchema = z.strictObject({
+  kind: z.literal("agent"),
+  view: z.enum(["transcript", "artifacts"]),
+});
+export const EnterpriseBrowserProfileContentSelectorSchema = z.strictObject({
+  kind: z.literal("browser_profile"),
+  view: z.enum(["state", "artifacts"]),
+});
+export const EnterpriseAppSlotContentSelectorSchema = z.strictObject({
+  kind: z.literal("app_slot"),
+  view: z.enum(["state", "artifacts"]),
+});
+
+const EnterpriseContentItemSharedShape = {
+  itemId: z.string().min(1),
+  occurredAt: z.string().min(1),
+  content: z.string(),
+};
+export const EnterpriseWorkspaceContentItemSchema = z.strictObject({
+  ...EnterpriseContentItemSharedShape,
+  kind: z.enum(["message", "file"]),
+});
+export const EnterpriseAgentContentItemSchema = z.strictObject({
+  ...EnterpriseContentItemSharedShape,
+  kind: z.enum(["message", "artifact"]),
+});
+export const EnterpriseBrowserProfileContentItemSchema = z.strictObject({
+  ...EnterpriseContentItemSharedShape,
+  kind: z.enum(["state", "artifact"]),
+});
+export const EnterpriseAppSlotContentItemSchema = z.strictObject({
+  ...EnterpriseContentItemSharedShape,
+  kind: z.enum(["state", "artifact"]),
+});
+
+function enterpriseContentReadRequestSchema<
+  const Type extends `enterprise.${string}.request`,
+  const Kind extends EnterpriseResourceKind,
+>(type: Type, resourceKind: Kind, selector: z.ZodTypeAny) {
+  return z
+    .strictObject({
+      type: z.literal(type),
+      requestId: z.string().min(1),
+      resource: GlobalResourceRefSchema,
+      selector,
+      page: EnterpriseContentReadPageSchema,
+    })
+    .superRefine((value, ctx) => {
+      if (value.resource.resourceKind !== resourceKind) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["resource", "resourceKind"],
+          message: "resource kind mismatch",
+        });
+      }
+    });
+}
+
+export const EnterpriseWorkspaceContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.workspace.content.read.request",
+  "workspace",
+  EnterpriseWorkspaceContentSelectorSchema,
+);
+export const EnterpriseAgentContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.agent.content.read.request",
+  "agent",
+  EnterpriseAgentContentSelectorSchema,
+);
+export const EnterpriseBrowserProfileContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.browser_profile.content.read.request",
+  "browser_profile",
+  EnterpriseBrowserProfileContentSelectorSchema,
+);
+export const EnterpriseAppSlotContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.app_slot.content.read.request",
+  "app_slot",
+  EnterpriseAppSlotContentSelectorSchema,
+);
+
+function enterpriseContentReadResponseSchema<
+  const Type extends `enterprise.${string}.response`,
+  Item extends z.ZodTypeAny,
+  Selector extends z.ZodTypeAny,
+>(type: Type, resourceKind: EnterpriseResourceKind, selector: Selector, item: Item) {
+  return z
+    .strictObject({
+      type: z.literal(type),
+      payload: z.strictObject({
+        requestId: z.string().min(1),
+        resource: GlobalResourceRefSchema,
+        selector,
+        page: EnterpriseContentReadResponsePageSchema(item),
+      }),
+    })
+    .superRefine((value, ctx) => {
+      if (value.payload.resource.resourceKind !== resourceKind) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["payload", "resource", "resourceKind"],
+          message: "resource kind mismatch",
+        });
+      }
+    });
+}
+
+export const EnterpriseWorkspaceContentReadResponseSchema = enterpriseContentReadResponseSchema(
+  "enterprise.workspace.content.read.response",
+  "workspace",
+  EnterpriseWorkspaceContentSelectorSchema,
+  EnterpriseWorkspaceContentItemSchema,
+);
+export const EnterpriseAgentContentReadResponseSchema = enterpriseContentReadResponseSchema(
+  "enterprise.agent.content.read.response",
+  "agent",
+  EnterpriseAgentContentSelectorSchema,
+  EnterpriseAgentContentItemSchema,
+);
+export const EnterpriseBrowserProfileContentReadResponseSchema =
+  enterpriseContentReadResponseSchema(
+    "enterprise.browser_profile.content.read.response",
+    "browser_profile",
+    EnterpriseBrowserProfileContentSelectorSchema,
+    EnterpriseBrowserProfileContentItemSchema,
+  );
+export const EnterpriseAppSlotContentReadResponseSchema = enterpriseContentReadResponseSchema(
+  "enterprise.app_slot.content.read.response",
+  "app_slot",
+  EnterpriseAppSlotContentSelectorSchema,
+  EnterpriseAppSlotContentItemSchema,
+);
+
 export const EnterpriseAccessListGrantsRequestSchema = z.object({
   type: z.literal("enterprise.access.list_grants.request"),
   requestId: z.string().min(1),
@@ -4234,6 +4389,46 @@ export type EnterpriseIdentityListPrincipalsRequest = z.infer<
 export type EnterpriseIdentityListPrincipalsResponse = z.infer<
   typeof EnterpriseIdentityListPrincipalsResponseSchema
 >;
+export type EnterpriseWorkspaceContentSelector = z.infer<
+  typeof EnterpriseWorkspaceContentSelectorSchema
+>;
+export type EnterpriseAgentContentSelector = z.infer<typeof EnterpriseAgentContentSelectorSchema>;
+export type EnterpriseBrowserProfileContentSelector = z.infer<
+  typeof EnterpriseBrowserProfileContentSelectorSchema
+>;
+export type EnterpriseAppSlotContentSelector = z.infer<
+  typeof EnterpriseAppSlotContentSelectorSchema
+>;
+export type EnterpriseWorkspaceContentItem = z.infer<typeof EnterpriseWorkspaceContentItemSchema>;
+export type EnterpriseAgentContentItem = z.infer<typeof EnterpriseAgentContentItemSchema>;
+export type EnterpriseBrowserProfileContentItem = z.infer<
+  typeof EnterpriseBrowserProfileContentItemSchema
+>;
+export type EnterpriseAppSlotContentItem = z.infer<typeof EnterpriseAppSlotContentItemSchema>;
+export type EnterpriseWorkspaceContentReadRequest = z.infer<
+  typeof EnterpriseWorkspaceContentReadRequestSchema
+>;
+export type EnterpriseWorkspaceContentReadResponse = z.infer<
+  typeof EnterpriseWorkspaceContentReadResponseSchema
+>;
+export type EnterpriseAgentContentReadRequest = z.infer<
+  typeof EnterpriseAgentContentReadRequestSchema
+>;
+export type EnterpriseAgentContentReadResponse = z.infer<
+  typeof EnterpriseAgentContentReadResponseSchema
+>;
+export type EnterpriseBrowserProfileContentReadRequest = z.infer<
+  typeof EnterpriseBrowserProfileContentReadRequestSchema
+>;
+export type EnterpriseBrowserProfileContentReadResponse = z.infer<
+  typeof EnterpriseBrowserProfileContentReadResponseSchema
+>;
+export type EnterpriseAppSlotContentReadRequest = z.infer<
+  typeof EnterpriseAppSlotContentReadRequestSchema
+>;
+export type EnterpriseAppSlotContentReadResponse = z.infer<
+  typeof EnterpriseAppSlotContentReadResponseSchema
+>;
 export type EnterpriseAccessListGrantsRequest = z.infer<
   typeof EnterpriseAccessListGrantsRequestSchema
 >;
@@ -4326,6 +4521,10 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseIdentityGetCurrentRequestSchema,
   EnterpriseIdentityLogoutAllRequestSchema,
   EnterpriseIdentityListPrincipalsRequestSchema,
+  EnterpriseWorkspaceContentReadRequestSchema,
+  EnterpriseAgentContentReadRequestSchema,
+  EnterpriseBrowserProfileContentReadRequestSchema,
+  EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseAccessListGrantsRequestSchema,
   EnterpriseAccessUpdateGrantsRequestSchema,
   EnterpriseAuditListEventsRequestSchema,
@@ -4871,6 +5070,18 @@ export const ServerInfoStatusPayloadSchema = z
         enterpriseAuditV1: z.boolean().optional(),
         // COMPAT(enterpriseDistributedNodeV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires distributed Node V1.
         enterpriseDistributedNodeV1: z.boolean().optional(),
+        // COMPAT(enterpriseWorkspaceContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
+        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseWorkspaceContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseAgentContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
+        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseAgentContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserProfileContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
+        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseAppSlotContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
+        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseAppSlotContentReadV1: z.boolean().optional(),
       })
       .optional(),
   })
@@ -7750,6 +7961,10 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseIdentityScopeRefreshedMessageSchema,
   EnterpriseIdentityCredentialRevokedMessageSchema,
   EnterpriseIdentityListPrincipalsResponseSchema,
+  EnterpriseWorkspaceContentReadResponseSchema,
+  EnterpriseAgentContentReadResponseSchema,
+  EnterpriseBrowserProfileContentReadResponseSchema,
+  EnterpriseAppSlotContentReadResponseSchema,
   EnterpriseAccessListGrantsResponseSchema,
   EnterpriseAccessUpdateGrantsResponseSchema,
   EnterpriseAuditListEventsResponseSchema,

@@ -25,6 +25,11 @@ import {
   EnterpriseOrganizationResourceProjectionSchema,
   EnterprisePrincipalSummaryProjectionSchema,
   EnterprisePrincipalRecordSchema,
+  EnterpriseWorkspaceContentReadRequestSchema,
+  EnterpriseWorkspaceContentReadResponseSchema,
+  EnterpriseAgentContentReadRequestSchema,
+  EnterpriseBrowserProfileContentReadRequestSchema,
+  EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseResourceOwnerWireSchema,
   EnterpriseResourceStatusProjectionSchema,
   EnterpriseSessionBindingSchema,
@@ -77,6 +82,10 @@ describe("enterprise feature compatibility", () => {
       enterpriseBrowserProfilesV1: false,
       enterpriseAuditV1: false,
       enterpriseDistributedNodeV1: false,
+      enterpriseWorkspaceContentReadV1: false,
+      enterpriseAgentContentReadV1: false,
+      enterpriseBrowserProfileContentReadV1: false,
+      enterpriseAppSlotContentReadV1: false,
     });
   });
 
@@ -127,6 +136,85 @@ describe("enterprise feature compatibility", () => {
       serverId: "enterprise-server",
       features: { providersSnapshot: true },
     });
+  });
+});
+
+describe("enterprise content-read contracts", () => {
+  const base = {
+    type: "enterprise.workspace.content.read.request" as const,
+    requestId: "content-1",
+    resource: {
+      organizationId: "org_1111111111111111",
+      nodeId: "nod_2222222222222222",
+      resourceKind: "workspace" as const,
+      localResourceId: "workspace-1",
+    },
+    selector: { kind: "workspace" as const, view: "timeline" as const },
+    page: { limit: 20 },
+  };
+
+  test("accepts each strict family request and response envelope", () => {
+    expect(EnterpriseWorkspaceContentReadRequestSchema.parse(base)).toEqual(base);
+    expect(
+      EnterpriseWorkspaceContentReadResponseSchema.parse({
+        type: "enterprise.workspace.content.read.response",
+        payload: {
+          requestId: "content-1",
+          resource: base.resource,
+          selector: base.selector,
+          page: {
+            items: [
+              { itemId: "item-1", occurredAt: "2026-01-01", content: "safe", kind: "message" },
+            ],
+            nextCursor: null,
+          },
+        },
+      }),
+    ).toBeTruthy();
+    expect(
+      EnterpriseAgentContentReadRequestSchema.parse({
+        ...base,
+        type: "enterprise.agent.content.read.request",
+        resource: { ...base.resource, resourceKind: "agent" },
+        selector: { kind: "agent", view: "transcript" },
+      }),
+    ).toBeTruthy();
+    expect(
+      EnterpriseBrowserProfileContentReadRequestSchema.parse({
+        ...base,
+        type: "enterprise.browser_profile.content.read.request",
+        resource: {
+          ...base.resource,
+          resourceKind: "browser_profile",
+          localResourceId: "brp_3333333333333333",
+        },
+        selector: { kind: "browser_profile", view: "state" },
+      }),
+    ).toBeTruthy();
+    expect(
+      EnterpriseAppSlotContentReadRequestSchema.parse({
+        ...base,
+        type: "enterprise.app_slot.content.read.request",
+        resource: {
+          ...base.resource,
+          resourceKind: "app_slot",
+          localResourceId: "aps_4444444444444444",
+        },
+        selector: { kind: "app_slot", view: "state" },
+      }),
+    ).toBeTruthy();
+  });
+
+  test("rejects unknown fields and resource/selector family mismatch", () => {
+    expect(() =>
+      EnterpriseWorkspaceContentReadRequestSchema.parse({ ...base, extra: true }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseWorkspaceContentReadRequestSchema.parse({
+        ...base,
+        resource: { ...base.resource, resourceKind: "agent" },
+      }),
+    ).toThrow();
   });
 });
 
