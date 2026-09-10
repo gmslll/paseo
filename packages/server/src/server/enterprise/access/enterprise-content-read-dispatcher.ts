@@ -106,8 +106,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
         agents,
       });
       const appSlotSource = createEnterpriseAppSlotContentReadSource();
-      const agentSource = createEnterpriseAgentContentReadSource(agents);
-      if (!agentSource) throw new Error("agent source unavailable");
+      const agentSource = createEnterpriseAgentContentReadSource({ agents });
       if (!source) throw new Error("workspace source unavailable");
       let closed = false;
       let closePromise: Promise<void> | null = null;
@@ -215,6 +214,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 return issuePending(sessionContext, message, response, canonical);
               }
               if (!parsed.success && parsedAgent.success) {
+                if (!agentSource) return false;
                 const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
                 if (!authority) return false;
                 const principal = sessionContext.enterpriseContext.principal;

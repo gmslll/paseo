@@ -65,6 +65,7 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       expect(registration?.manifest.operations).toEqual([
         "enterprise.workspace.content.read.request",
         "enterprise.app_slot.content.read.request",
+        "enterprise.agent.content.read.request",
       ]);
       const registrationReady = registration;
       if (!registrationReady) throw new Error("registration");
@@ -483,6 +484,99 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       await closeProductionRuntimeFixture();
       await registry.close();
       await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  test("reads an authorized agent and consumes once", async () => {
+    const fixture = await createProductionRuntimeFixture("content-agent");
+    try {
+      const agentId = "agt_0123456789abcdef";
+      fixture.provider.owners.registerAgent({
+        id: agentId,
+        workspaceId: "wks_0123456789abcdef",
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        nodeId: fixture.context.enterpriseContext.node.nodeId,
+        createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+      });
+      const agent = {
+        id: agentId,
+        workspaceId: "wks_0123456789abcdef",
+        enterpriseOwnership: {
+          workspaceId: "wks_0123456789abcdef",
+          organizationId: fixture.context.enterpriseContext.principal.organizationId,
+          nodeId: fixture.context.enterpriseContext.node.nodeId,
+          ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+          createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        },
+      };
+      const registration = createEnterpriseContentReadDispatcherRegistration({
+        provider: fixture.provider,
+        audit: fixture.audit,
+        agents: {
+          listAgents: () => [agent] as never,
+          getAgent: () => agent as never,
+          getTimelineRows: async () => [],
+        },
+      });
+      if (!registration) throw new Error("registration");
+      const unused = async (..._args: never[]): Promise<never> => {
+        throw new Error("unused");
+      };
+      const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
+        stat: unused,
+        list: async () => [],
+        openRead: unused,
+        write: unused,
+        create: unused,
+        rename: unused,
+        copy: unused,
+        delete: unused,
+        watch: unused,
+        issueDownloadToken: unused,
+        createUploadStore: () => {
+          throw new Error("unused");
+        },
+        cleanup: async () => {},
+      };
+      const lease = registration.open({
+        sessionId: fixture.context.sessionId,
+        clientId: fixture.context.clientId,
+        context: fixture.context.enterpriseContext,
+        authorizationRuntime: fixture.runtime,
+        filesRuntime,
+      });
+      const message = {
+        type: "enterprise.agent.content.read.request" as const,
+        requestId: "r-agent",
+        resource: {
+          organizationId: fixture.context.enterpriseContext.principal.organizationId,
+          nodeId: fixture.context.enterpriseContext.node.nodeId,
+          resourceKind: "agent" as const,
+          localResourceId: agentId,
+        },
+        selector: { kind: "agent" as const, view: "transcript" as const },
+        page: { limit: 1 },
+      };
+      const response = await lease.dispatcher.handle({ sessionContext: fixture.context, message });
+      expect(response).not.toBe(false);
+      if (response === false) throw new Error("response");
+      expect(Object.isFrozen(response)).toBe(true);
+      expect(
+        lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
+      ).not.toBeNull();
+      expect(
+        lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
+      ).toBeNull();
+      expect(
+        (await fixture.audit.snapshotEvents()).some(
+          (event) => event.action === "workspace.content.read" && event.outcome === "allowed",
+        ),
+      ).toBe(true);
+      await lease.close();
+      await fixture.runtime.release();
+    } finally {
+      await closeProductionRuntimeFixture();
     }
   });
 });
