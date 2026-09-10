@@ -130,6 +130,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
   private attempt = 0;
   private handle?: CredentialHandle;
   private handleServerId?: string;
+  private readonly activeFileRequestControllers = new Set<AbortController>();
 
   constructor(
     private readonly vault: CredentialVault,
@@ -178,6 +179,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
       const token = this.vault.read(serverId, handle);
       if (!token) throw new Error("Enterprise credential unavailable");
       const controller = new AbortController();
+      this.activeFileRequestControllers.add(controller);
       const onAbort = () => controller.abort();
       if (request.signal?.aborted) controller.abort();
       else request.signal?.addEventListener("abort", onAbort, { once: true });
@@ -202,6 +204,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
           throw new Error("Enterprise file request scope is no longer current");
         return response;
       } finally {
+        this.activeFileRequestControllers.delete(controller);
         request.signal?.removeEventListener("abort", onAbort);
       }
     };
@@ -520,6 +523,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
     return run;
   }
   private async localTeardown(force = false): Promise<void> {
+    for (const controller of this.activeFileRequestControllers) controller.abort();
     this.publish({ state: "unavailable", target: "enterprise_host" });
     const errors = await this.bestEffortTeardown();
     this.deleteHandle();
