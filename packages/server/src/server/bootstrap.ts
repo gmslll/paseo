@@ -200,6 +200,7 @@ import {
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
 import { createProductionAuthorizationRuntimeProvider } from "./enterprise/access/production-authorization-runtime-provider.js";
 import { createProductionEnterpriseWorkspaceFilesProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
+import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -494,6 +495,9 @@ export interface PaseoDaemon {
 }
 
 export interface PaseoDaemonDependencies {
+  createEnterpriseWorkspaceFilesProvider?: (input: {
+    workspaceRoots: FileBackedWorkspaceRegistry;
+  }) => EnterpriseWorkspaceFilesProductionProvider | null;
   createEnterpriseAdmissionRuntime?: (input: {
     config: EnterpriseMultiUserConfig;
     audit: ProductionAuditCapability;
@@ -1101,7 +1105,10 @@ export async function createPaseoDaemon(
       logger,
     );
     if (enterpriseRuntime && workspaceRegistry) {
-      enterpriseWorkspaceFilesProvider = createProductionEnterpriseWorkspaceFilesProvider({
+      enterpriseWorkspaceFilesProvider = (
+        dependencies.createEnterpriseWorkspaceFilesProvider ??
+        createProductionEnterpriseWorkspaceFilesProvider
+      )({
         workspaceRoots: workspaceRegistry,
       });
       if (!enterpriseWorkspaceFilesProvider || !enterpriseWorkspaceFilesProvider.releaseReady) {
