@@ -115,6 +115,96 @@ describe("enterprise identity lifecycle", () => {
     ).rejects.toThrow();
   });
 
+  it("keeps process-vault, file scope, and lifecycle generations isolated across A revoke and B login", async () => {
+    const p = ports();
+    const vault = createProcessCredentialVault();
+    let login = 0;
+    const transport = {
+      request: vi.fn(
+        async (input: { authorization: string }) =>
+          new Response(input.authorization, { status: 200 }),
+      ),
+    };
+    const lifecycle = createEnterpriseIdentityLifecycle({
+      vault,
+      ports: {
+        teardown: p.teardown,
+        remoteLogout: p.remoteLogout,
+        authenticate: async ({ serverId }) => {
+          login += 1;
+          const suffix = login === 1 ? "a" : "b";
+          return {
+            projection: {
+              ...projection,
+              paseoServerId: serverId,
+              displayName: `Principal ${suffix.toUpperCase()}`,
+              grantVersion: `grant-${suffix}`,
+            },
+            sessionBindingKey: `binding-${suffix}`,
+            teardownAttempt: async () => {},
+          };
+        },
+      },
+    });
+    await lifecycle.bootstrap({ target: "enterprise_host", enterpriseIdentityV1: true });
+    const a = await lifecycle.authenticateEnterpriseHost({ serverId: "server-a", token: "pat-a" });
+    const request = lifecycle.createEnterpriseFileRequest({ serverId: "server-a", transport });
+    await expect(
+      request({
+        serverId: "server-a",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "A.txt",
+        scopeGeneration: a.generation!,
+      }),
+    ).resolves.toMatchObject({ status: 200 });
+    expect(await transport.request.mock.results[0]!.value.then((response) => response.text())).toBe(
+      "Bearer pat-a",
+    );
+
+    await lifecycle.credentialRevoked({
+      serverId: "server-a",
+      generation: a.generation!,
+      sessionBindingKey: a.sessionBindingKey!,
+    });
+    expect(lifecycle.readSnapshot().state).toBe("unavailable");
+    await expect(
+      request({
+        serverId: "server-a",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "A-late.txt",
+        scopeGeneration: a.generation!,
+      }),
+    ).rejects.toThrow();
+
+    const b = await lifecycle.authenticateEnterpriseHost({ serverId: "server-a", token: "pat-b" });
+    expect(b.generation).not.toBe(a.generation);
+    expect(b.sessionBindingKey).toBe("binding-b");
+    await expect(
+      request({
+        serverId: "server-a",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "B.txt",
+        scopeGeneration: b.generation!,
+      }),
+    ).resolves.toMatchObject({ status: 200 });
+    expect(await transport.request.mock.results[1]!.value.then((response) => response.text())).toBe(
+      "Bearer pat-b",
+    );
+    expect(JSON.stringify(vault)).toBe("{}");
+
+    await lifecycle.logoutCurrent("server-a");
+    expect(lifecycle.readSnapshot().state).toBe("signed_out");
+    await expect(
+      request({
+        serverId: "server-a",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "B-late.txt",
+        scopeGeneration: b.generation!,
+      }),
+    ).rejects.toThrow();
+    expect(transport.request).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps process credential vault secrets non-enumerable and isolated", () => {
     const vault = createProcessCredentialVault();
     const handle = vault.put("server-a", "pat");
