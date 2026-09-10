@@ -25,7 +25,7 @@ export interface EnterpriseContentReadFactoryInput {
   readonly audit: ProductionAuditCapability;
   readonly agents: EnterpriseContentAgentProductionSource;
 }
-export interface Pending {
+interface Pending {
   readonly context: EnterpriseDispatchContext;
   message: SessionInboundMessage;
   response: SessionOutboundMessage;
@@ -65,11 +65,6 @@ export function createEnterpriseContentReadDispatcherRegistration(
   } catch {
     return null;
   }
-  void currentAudit;
-  void EnterpriseWorkspaceContentReadRequestSchema;
-  void EnterpriseWorkspaceContentReadResponseSchema;
-  void equal;
-  void deepFreeze;
   if (!isCurrentProductionAuthorizationRuntimeProvider(provider) || !audit || !agents) return null;
   return {
     manifest: { operations: ["enterprise.workspace.content.read.request"] },
@@ -130,7 +125,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 "workspace.content.read",
                 parsed.data.resource.localResourceId,
               );
-              if (!resolveCurrentProductionRuntimeAuthority(runtime, provider)) return false;
+              if (!current(sessionContext)) return false;
               const canonical = GlobalResourceRefSchema.parse({
                 organizationId: workspace.organizationId,
                 nodeId: workspace.nodeId,
@@ -180,6 +175,8 @@ export function createEnterpriseContentReadDispatcherRegistration(
               issued.set(response, capability);
               pending.add(capability);
               return response;
+            } catch {
+              return false;
             } finally {
               reservations.delete(parsed.data.requestId);
             }
