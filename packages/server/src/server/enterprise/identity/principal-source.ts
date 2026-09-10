@@ -46,6 +46,7 @@ const IdentityDocumentSchema = z
     }
   });
 type GrantProjectionWithoutType = Omit<PrincipalGrantProjection, "principalType">;
+type PrincipalMetadataRecord = EnterprisePrincipalRecord;
 
 export interface ProductionPrincipalGrantSource extends PrincipalGrantSource {
   ready(): Promise<void>;

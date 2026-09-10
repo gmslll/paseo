@@ -9,6 +9,7 @@ import type { IdentityRegistryFsPort } from "./fs-port.js";
 import {
   createFilePrincipalGrantSource,
   createProductionPrincipalGrantSource,
+  createProductionPrincipalProvisioning,
 } from "./principal-source.js";
 import type { PrincipalGrantSource } from "./registry.js";
 import { FileBackedGrantStorage } from "../access/grant-store.js";
@@ -282,6 +283,49 @@ describe("file principal grant source", () => {
       } finally {
         await audit?.close().catch(() => undefined);
         await foreignAudit?.close().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.runIf(process.platform === "darwin")(
+    "provisions an exact principal idempotently",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-principal-provision-"));
+      let audit: ProductionAuditCapability | undefined;
+      try {
+        audit = await createProductionAuditRuntime({
+          node: {
+            nodeId: "nod_aaaaaaaaaaaaaaaa",
+            paseoServerId: "srv_provision",
+            mode: "standalone",
+          },
+          auditRoot: path.join(root, "audit"),
+          nativeAddonPath: addonPath,
+        });
+        const provisioning = createProductionPrincipalProvisioning({
+          filePath: path.join(root, "principals.json"),
+          audit,
+        });
+        const record = {
+          principalId,
+          organizationId,
+          principalType: "human" as const,
+          status: "active" as const,
+          createdAt: "2026-01-01",
+          updatedAt: "2026-01-01",
+        };
+        await provisioning.ensurePrincipal(record);
+        const before = await import("node:fs/promises").then((fs) =>
+          fs.readFile(path.join(root, "principals.json"), "utf8"),
+        );
+        await expect(provisioning.ensurePrincipal(record)).resolves.toEqual(record);
+        const after = await import("node:fs/promises").then((fs) =>
+          fs.readFile(path.join(root, "principals.json"), "utf8"),
+        );
+        expect(after).toBe(before);
+      } finally {
+        await audit?.close().catch(() => undefined);
         await rm(root, { recursive: true, force: true });
       }
     },
