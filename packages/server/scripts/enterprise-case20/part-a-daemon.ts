@@ -1,7 +1,10 @@
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { hash } from "bcryptjs";
 import pino from "pino";
@@ -11,6 +14,7 @@ import { createPaseoDaemon, type PaseoDaemon } from "../../src/server/bootstrap.
 import { productionAuditCapabilityIssuer } from "../../src/server/enterprise/audit/production-audit-runtime.js";
 import { EnterpriseAdmission } from "../../src/server/enterprise/identity/admission.js";
 import { createProductionEnterpriseRuntimeFactory } from "../../src/server/enterprise/production-runtime-factory.js";
+import { createProductionEnterpriseWorkspaceFilesProvider } from "../../src/server/enterprise/runtime/production-workspace-files-runtime-provider.js";
 
 import { CASE20_PART_A_CLIENT_COUNT, type Case20Mode } from "./model.js";
 import type { Case20AuditVerification, Case20PartAClientFixture } from "./part-a-fixture.js";
@@ -19,6 +23,7 @@ import { assertFileContainsNoSecrets } from "./secret-scan.js";
 const ORGANIZATION_ID = "org_20ca5e0000000000";
 const NODE_ID = "nod_20ca5e0000000000";
 const SERVER_ID = "srv_20ca5e000001";
+const executeFile = promisify(execFile);
 
 interface StartedDaemon {
   readonly daemon: PaseoDaemon;
@@ -26,6 +31,7 @@ interface StartedDaemon {
   readonly paseoHome: string;
   readonly clients: readonly Case20PartAClientFixture[];
   readonly daemonPasswordPlaintext: string;
+  readonly auditAddonPath: string;
   readonly destination: ReturnType<typeof pino.destination>;
   readonly logger: pino.Logger;
 }
@@ -170,6 +176,7 @@ async function scanAndVerify(
   const verifier = await productionAuditCapabilityIssuer.issue({
     node: { nodeId: NODE_ID, paseoServerId: SERVER_ID, mode: "standalone" },
     auditRoot: path.join(started.paseoHome, "enterprise", "audit"),
+    nativeAddonPath: started.auditAddonPath,
   });
   await verifier.close();
   const homeFiles = await listRegularFiles(started.paseoHome);
@@ -203,12 +210,38 @@ async function startDaemon(
   state.paseoHome = paseoHome;
   const staticDir = path.join(root, "static");
   const workspacesRoot = path.join(root, "workspaces");
+  const addonDirectory = path.join(root, "native");
+  const auditAddonPath = path.join(addonDirectory, "darwin-audit-fs.node");
+  const workspaceAddonPath = path.join(addonDirectory, "darwin-workspace-fs.node");
   await Promise.all([
     mkdir(path.join(paseoHome, "enterprise"), { recursive: true, mode: 0o700 }),
     mkdir(path.join(paseoHome, "projects"), { recursive: true, mode: 0o700 }),
     mkdir(path.join(paseoHome, "agents"), { recursive: true, mode: 0o700 }),
     mkdir(staticDir, { recursive: true, mode: 0o700 }),
     mkdir(workspacesRoot, { recursive: true, mode: 0o700 }),
+    mkdir(addonDirectory, { recursive: true, mode: 0o700 }),
+  ]);
+  await Promise.all([
+    executeFile(process.execPath, [
+      fileURLToPath(
+        new URL(
+          "../../src/server/enterprise/audit/native/build-darwin-audit-fs.mjs",
+          import.meta.url,
+        ),
+      ),
+      "--output",
+      auditAddonPath,
+    ]),
+    executeFile(process.execPath, [
+      fileURLToPath(
+        new URL(
+          "../../src/server/enterprise/runtime/native/build-darwin-workspace-fs.mjs",
+          import.meta.url,
+        ),
+      ),
+      "--output",
+      workspaceAddonPath,
+    ]),
   ]);
   await seedAuthority(paseoHome, workspacesRoot);
   const daemonPasswordPlaintext = randomBytes(32).toString("base64url");
@@ -217,6 +250,7 @@ async function startDaemon(
   const audit = await productionAuditCapabilityIssuer.issue({
     node: { nodeId: NODE_ID, paseoServerId: SERVER_ID, mode: "standalone" },
     auditRoot: path.join(paseoHome, "enterprise", "audit"),
+    nativeAddonPath: auditAddonPath,
   });
   const runtime = await createProductionEnterpriseRuntimeFactory({ paseoHome, daemonPassword })({
     config: {
@@ -310,10 +344,17 @@ async function startDaemon(
     },
     logger,
     {
+      issueProductionAuditCapability: (input) =>
+        productionAuditCapabilityIssuer.issue({ ...input, nativeAddonPath: auditAddonPath }),
       createEnterpriseAdmissionRuntime: createProductionEnterpriseRuntimeFactory({
         paseoHome,
         daemonPassword,
       }),
+      createEnterpriseWorkspaceFilesProvider: ({ workspaceRoots }) =>
+        createProductionEnterpriseWorkspaceFilesProvider({
+          workspaceRoots,
+          nativeAddonPath: workspaceAddonPath,
+        }),
     },
   );
   state.daemon = daemon;
@@ -357,6 +398,7 @@ async function startDaemon(
       paseoHome,
       clients,
       daemonPasswordPlaintext,
+      auditAddonPath,
       destination,
       logger,
     };
