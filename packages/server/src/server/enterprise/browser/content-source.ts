@@ -110,8 +110,27 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
   readonly workspaceFs?: DarwinWorkspaceFileSystem;
   readonly addonPath?: string;
 }): EnterpriseBrowserProfileContentReadSource | null {
+  const proto = Object.getPrototypeOf(input);
+  if (proto !== Object.prototype && proto !== null)
+    throw new Error("Invalid production source options.");
+  if (Reflect.ownKeys(input).some((key) => key !== "workspaceFs" && key !== "addonPath"))
+    throw new Error("Invalid production source options.");
+  const workspaceDescriptor = Object.getOwnPropertyDescriptor(input, "workspaceFs");
+  const addonDescriptor = Object.getOwnPropertyDescriptor(input, "addonPath");
+  if (workspaceDescriptor && !("value" in workspaceDescriptor))
+    throw new Error("Invalid workspaceFs.");
+  if (addonDescriptor && !("value" in addonDescriptor)) throw new Error("Invalid addonPath.");
+  if (workspaceDescriptor?.value && addonDescriptor?.value)
+    throw new Error("Choose workspaceFs or addonPath.");
+  if (
+    addonDescriptor?.value !== undefined &&
+    (typeof addonDescriptor.value !== "string" || addonDescriptor.value.length === 0)
+  )
+    throw new Error("Invalid addonPath.");
   const workspaceFs =
     input.workspaceFs ?? new DarwinWorkspaceFileSystem({ addonPath: input.addonPath });
+  if (input.workspaceFs && !(input.workspaceFs instanceof DarwinWorkspaceFileSystem))
+    throw new Error("Invalid workspaceFs.");
   if (!workspaceFs.releaseReady) return null;
   const cursorRecords = new Map<
     string,
