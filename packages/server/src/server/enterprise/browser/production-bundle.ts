@@ -72,6 +72,17 @@ export interface ProductionBrowserLeaseBundle {
       profileId: string,
     ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
   }) => () => void;
+  readonly runtimeForSession: (generation: string) => ProductionBrowserLeaseRuntime;
+}
+
+export interface ProductionBrowserLeaseRuntime {
+  readonly isCurrentHandle: (handle: EnterpriseAgentContextHandle) => boolean;
+  readonly resolveAuthorization: (
+    handle: EnterpriseAgentContextHandle,
+    profileId: string,
+  ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
+  readonly leases: BrowserProfileLeaseManager;
+  readonly leaseTtlMs: number;
 }
 
 interface SessionAuthority {
@@ -125,6 +136,20 @@ export function createProductionBrowserLeaseBundle(
     clock: options.clock,
   });
   let closed = false;
+  const runtimeForSession = (generation: string): ProductionBrowserLeaseRuntime => ({
+    isCurrentHandle: (handle) => {
+      const authority = authorities.get(generation);
+      return authority?.isCurrentHandle(handle) === true;
+    },
+    resolveAuthorization: (handle, profileId) => {
+      const authority = authorities.get(generation);
+      if (!authority || !authority.isCurrentHandle(handle))
+        throw new Error("Browser session authority is stale.");
+      return authority.resolveAuthorization(handle, profileId);
+    },
+    leases,
+    leaseTtlMs: options.maxLeaseTtlMs,
+  });
   return {
     profiles,
     bindings,
@@ -140,6 +165,7 @@ export function createProductionBrowserLeaseBundle(
         if (authorities.get(input.generation) === input) authorities.delete(input.generation);
       };
     },
+    runtimeForSession,
     close: async () => {
       if (closed) return;
       closed = true;
