@@ -67,13 +67,19 @@ export function createEnterpriseIdentityDispatcher(
       }
       return false;
     },
-    consumeResponse: (({ response }) =>
-      isIdentitySelfResponse(response)
+    consumeResponse: (({ response }) => {
+      if (response.type === "enterprise.identity.list_principals.response")
+        return {
+          response,
+          receiptClassification: "authority",
+        } satisfies EnterpriseDispatchResponse;
+      return isIdentitySelfResponse(response)
         ? ({
             response,
             receiptClassification: "identity_self",
           } satisfies EnterpriseDispatchResponse)
-        : null) satisfies EnterpriseResponseContextConsumer["consumeResponse"],
+        : null;
+    }) satisfies EnterpriseResponseContextConsumer["consumeResponse"],
   };
 }
 
