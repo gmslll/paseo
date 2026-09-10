@@ -1491,7 +1491,10 @@ describe("IdentityRegistry", () => {
     );
   });
   test("issueInitialCredential is idempotent within the registry transaction", async () => {
-    const filePath = path.join(os.tmpdir(), "paseo-initial-credential-test.json");
+    const filePath = path.join(
+      await mkdtemp(path.join(os.tmpdir(), "paseo-initial-")),
+      "credentials.json",
+    );
     const { registry } = createTestRegistry({ filePath });
     await registry.load();
     const [first, second] = await Promise.all([
@@ -1513,5 +1516,25 @@ describe("IdentityRegistry", () => {
           .credentials,
       ),
     ).toHaveLength(1);
+  });
+  test("initial credential rejects foreign and unknown principals", async () => {
+    const { registry } = createTestRegistry({
+      filePath: path.join(os.tmpdir(), "paseo-initial-foreign.json"),
+    });
+    await registry.load();
+    await expect(
+      registry.issueInitialCredential({
+        actor,
+        principalId: principal.principalId,
+        organizationId: "org_bbbbbbbbbbbbbbbb",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      registry.issueInitialCredential({
+        actor,
+        principalId: "usr_bbbbbbbbbbbbbbbb",
+        organizationId: principal.organizationId,
+      }),
+    ).rejects.toThrow();
   });
 });
