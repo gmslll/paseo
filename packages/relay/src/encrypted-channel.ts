@@ -377,17 +377,7 @@ export class EncryptedChannel {
         const parsed: unknown = JSON.parse(text);
         if (isE2EEReadyMessage(parsed)) {
           this.options.binaryCiphertext = supportsBinaryCiphertext(parsed);
-          this.state = "open";
-          this.events.onopen?.();
-          for (const cb of this.onOpenCallbacks) cb();
-          try {
-            await this.flushPendingSends();
-          } catch (error) {
-            const err = error instanceof Error ? error : new Error(String(error));
-            this.events.onerror?.(err);
-            this.state = "closed";
-            this.transport.close(1011, err.message);
-          }
+          await this.transitionToOpen();
         }
       } catch {
         // ignore non-ready handshake traffic
@@ -470,6 +460,20 @@ export class EncryptedChannel {
       } catch {
         // ignore
       }
+    }
+  }
+
+  private async transitionToOpen(): Promise<void> {
+    this.state = "open";
+    this.events.onopen?.();
+    for (const cb of this.onOpenCallbacks) cb();
+    try {
+      await this.flushPendingSends();
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.events.onerror?.(err);
+      this.state = "closed";
+      this.transport.close(1011, err.message);
     }
   }
 
