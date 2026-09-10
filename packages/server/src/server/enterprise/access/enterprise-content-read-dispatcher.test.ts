@@ -5,6 +5,7 @@ import { createEnterpriseContentReadDispatcherRegistration } from "./enterprise-
 import {
   closeProductionRuntimeFixture,
   createProductionRuntimeFixture,
+  node as fixtureNode,
 } from "./production-runtime-test-fixture.js";
 
 describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", () => {
@@ -340,6 +341,101 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
           (event) => event.action === "workspace.content.read" && event.outcome === "allowed",
         ),
       ).toBe(false);
+      await fixture.runtime.release();
+    } finally {
+      await closeProductionRuntimeFixture();
+    }
+  });
+
+  test("reads an authorized app slot", async () => {
+    const appSlotId = "aps_0123456789abcdef";
+    const fixture = await createProductionRuntimeFixture("content-app-slot", {
+      grants: [
+        {
+          action: "app.use",
+          selector: { kind: "organization", organizationId: "org_0123456789abcdef" },
+        },
+      ],
+      appSlots: {
+        get: async (id) =>
+          id === appSlotId
+            ? {
+                appSlotId,
+                organizationId: "org_0123456789abcdef",
+                nodeId: fixtureNode.nodeId,
+                appBundleId: "com.example.app",
+                accountBindingKey: "account",
+                ownerPrincipalId: "usr_0123456789abcdef",
+                concurrency: 1,
+                status: "ready",
+              }
+            : null,
+      },
+    });
+    try {
+      const unused = async (..._args: never[]): Promise<never> => {
+        throw new Error("unused");
+      };
+      const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
+        stat: unused,
+        list: async () => [],
+        openRead: unused,
+        write: unused,
+        create: unused,
+        rename: unused,
+        copy: unused,
+        delete: unused,
+        watch: unused,
+        issueDownloadToken: unused,
+        createUploadStore: () => {
+          throw new Error("unused");
+        },
+        cleanup: async () => {},
+      };
+      const registration = createEnterpriseContentReadDispatcherRegistration({
+        provider: fixture.provider,
+        audit: fixture.audit,
+        agents: {
+          listAgents: async () => [],
+          getAgent: async () => null,
+          getTimelineRows: async () => [],
+        },
+      });
+      if (!registration) throw new Error("registration");
+      const lease = registration.open({
+        sessionId: fixture.context.sessionId,
+        clientId: fixture.context.clientId,
+        context: fixture.context.enterpriseContext,
+        authorizationRuntime: fixture.runtime,
+        filesRuntime,
+      });
+      const message = {
+        type: "enterprise.app_slot.content.read.request" as const,
+        requestId: "r-app",
+        resource: {
+          organizationId: fixture.context.enterpriseContext.principal.organizationId,
+          nodeId: fixture.context.enterpriseContext.node.nodeId,
+          resourceKind: "app_slot" as const,
+          localResourceId: appSlotId,
+        },
+        selector: { kind: "app_slot" as const, view: "state" as const },
+        page: { limit: 1 },
+      };
+      const response = await lease.dispatcher.handle({ sessionContext: fixture.context, message });
+      expect(response).not.toBe(false);
+      if (response === false) throw new Error("response");
+      expect(
+        lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
+      ).not.toBeNull();
+      expect(
+        lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
+      ).toBeNull();
+      expect(
+        (await fixture.audit.snapshotEvents()).some(
+          (event) => event.action === "app.use" && event.outcome === "allowed",
+        ),
+      ).toBe(true);
+      await lease.close();
       await fixture.runtime.release();
     } finally {
       await closeProductionRuntimeFixture();

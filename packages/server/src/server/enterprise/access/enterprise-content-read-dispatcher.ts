@@ -1,3 +1,4 @@
+// oxlint-disable no-nested-ternary
 import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 import type { ProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 import { resolveCurrentProductionRuntimeAuthority } from "./production-runtime-authority.js";
@@ -257,6 +258,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
               reservations.delete(requestId);
             }
           },
+          // oxlint-disable-next-line complexity
           consumeResponse: ({
             sessionContext,
             message,
@@ -272,14 +274,22 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
               const appRequest = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
               if (!workspaceRequest.success && !appRequest.success) return null;
-              const request = workspaceRequest.success ? workspaceRequest.data : appRequest.data;
+              const request = workspaceRequest.success
+                ? workspaceRequest.data
+                : appRequest.success
+                  ? appRequest.data
+                  : null;
+              if (!request) return null;
               const workspaceResponse =
                 EnterpriseWorkspaceContentReadResponseSchema.safeParse(response);
               const appResponse = EnterpriseAppSlotContentReadResponseSchema.safeParse(response);
               if (!workspaceResponse.success && !appResponse.success) return null;
               const parsedResponse = workspaceResponse.success
                 ? workspaceResponse.data
-                : appResponse.data;
+                : appResponse.success
+                  ? appResponse.data
+                  : null;
+              if (!parsedResponse) return null;
               if (capability.context !== sessionContext) return null;
               if (capability.message !== message) return null;
               if (capability.response !== response) return null;
