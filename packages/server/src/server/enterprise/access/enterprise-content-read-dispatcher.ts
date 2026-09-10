@@ -138,6 +138,21 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 page: parsed.data.page,
               });
               if (!current(sessionContext)) return false;
+              const principal = sessionContext.enterpriseContext.principal;
+              await currentAudit.append(
+                {
+                  organizationId: principal.organizationId,
+                  actorPrincipalId: principal.principalId,
+                  actorCredentialId: principal.credentialId,
+                  sessionId: sessionContext.sessionId,
+                  action: "workspace.content.read",
+                  resource: { kind: "workspace", id: workspace.workspaceId },
+                  workspaceId: workspace.workspaceId,
+                  outcome: "allowed",
+                },
+                { durability: "required" },
+              );
+              if (!current(sessionContext)) return false;
               void page;
               return false;
             } finally {
