@@ -2272,7 +2272,8 @@ export class Session {
           !this.enterpriseContext ||
           !(
             authorityReceiptPolicyForRequestType(msg.type) ??
-            resolveEnterpriseReceiptPolicy(msg.type)
+            resolveEnterpriseReceiptPolicy(msg.type) ??
+            this.enterpriseDispatcher.requestPolicyForType?.(msg.type)
           ))
       ) {
         const requestId = sessionRequestId(msg);

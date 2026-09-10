@@ -80,6 +80,24 @@ export function isIdentitySelfResponse(message: SessionOutboundMessage): boolean
 export function resolveEnterpriseReceiptPolicy(
   requestType: string,
 ): OutboundAuthorityReceiptPolicy | null {
+  if (requestType === "enterprise.organization.list_resources.request") {
+    return {
+      event: "enterprise.organization.list_resources.response",
+      requestType: "enterprise.organization.list_resources.request",
+      daemonPermission: null,
+      enterpriseActions: ["workspace.metadata.read"],
+      emission: "terminal",
+    };
+  }
+  if (requestType === "enterprise.placement.resolve_workspace.request") {
+    return {
+      event: "enterprise.placement.resolve_workspace.response",
+      requestType: "enterprise.placement.resolve_workspace.request",
+      daemonPermission: null,
+      enterpriseActions: ["workspace.metadata.read"],
+      emission: "terminal",
+    };
+  }
   if (requestType === "enterprise.identity.get_current.request") {
     return {
       event: "enterprise.identity.get_current.response",
@@ -103,6 +121,7 @@ export function resolveEnterpriseReceiptPolicy(
 
 /** W3 routing seam; domain policy and handlers remain owned by their workstreams. */
 export interface EnterpriseSessionDispatcher {
+  readonly requestPolicyForType?: (type: string) => EnterpriseReceiptClassification | null;
   handle(input: {
     readonly sessionContext: EnterpriseDispatchContext;
     readonly message: SessionInboundMessage;

@@ -52,6 +52,22 @@ describe("enterprise session dispatcher seam", () => {
       }),
     );
     expect(resolveEnterpriseReceiptPolicy("enterprise.unknown.request")).toBeNull();
+    expect(
+      resolveEnterpriseReceiptPolicy("enterprise.organization.list_resources.request"),
+    ).toEqual(
+      expect.objectContaining({
+        event: "enterprise.organization.list_resources.response",
+        enterpriseActions: ["workspace.metadata.read"],
+      }),
+    );
+    expect(
+      resolveEnterpriseReceiptPolicy("enterprise.placement.resolve_workspace.request"),
+    ).toEqual(
+      expect.objectContaining({
+        event: "enterprise.placement.resolve_workspace.response",
+        enterpriseActions: ["workspace.metadata.read"],
+      }),
+    );
   });
   test("passes the server-bound context to the registered dispatcher", async () => {
     const handle = vi.fn(() => message as unknown as SessionOutboundMessage);
