@@ -223,7 +223,7 @@ export function resolveEnterpriseReceiptPolicy(
       event: "enterprise.identity.get_current.response",
       requestType: "enterprise.identity.get_current.request",
       daemonPermission: null,
-      enterpriseActions: ["identity.manage"],
+      enterpriseActions: [],
       emission: "terminal",
     };
   }
@@ -232,7 +232,7 @@ export function resolveEnterpriseReceiptPolicy(
       event: "enterprise.identity.logout_all.response",
       requestType: "enterprise.identity.logout_all.request",
       daemonPermission: null,
-      enterpriseActions: ["identity.manage"],
+      enterpriseActions: [],
       emission: "terminal",
     };
   }

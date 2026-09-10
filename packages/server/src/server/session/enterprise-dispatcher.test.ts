@@ -45,13 +45,14 @@ describe("enterprise session dispatcher seam", () => {
       event: "enterprise.identity.get_current.response",
       requestType: "enterprise.identity.get_current.request",
       daemonPermission: null,
-      enterpriseActions: ["identity.manage"],
+      enterpriseActions: [],
       emission: "terminal",
     });
     expect(resolveEnterpriseReceiptPolicy("enterprise.identity.logout_all.request")).toEqual(
       expect.objectContaining({
         event: "enterprise.identity.logout_all.response",
         requestType: "enterprise.identity.logout_all.request",
+        enterpriseActions: [],
       }),
     );
     expect(resolveEnterpriseReceiptPolicy("enterprise.unknown.request")).toBeNull();
