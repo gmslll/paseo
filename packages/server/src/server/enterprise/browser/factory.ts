@@ -117,7 +117,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
   const base = createEnterpriseBrowserLeaseDispatcherRegistration({
     runtime: input.runtime,
     authority: createUnavailableAuthority(),
-    authorityForSessionRuntime: ({ authorizationRuntime, context }) => {
+    authorityForSessionRuntime: ({ authorizationRuntime, context: sessionContext }) => {
       const authority = resolveCurrentProductionRuntimeAuthority(
         authorizationRuntime,
         input.provider,
@@ -139,24 +139,31 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
             "workspace.metadata.read",
             agent.workspaceId,
           );
+          const binding = await input.bundle.bindings.resolveForAgent({ workspace, agent });
+          if (!binding) throw new Error("Binding unavailable.");
           const profile = await authority.resourceAuthorization.assertBrowserProfile(
             handle.context.principal,
             "browser.use",
-            (await input.bundle.bindings.resolveForAgent({ workspace, agent }))?.browserProfileId ??
-              "",
+            binding.browserProfileId,
           );
-          const binding = await input.bundle.bindings.resolveForAgent({ workspace, agent });
-          if (!binding || !input.registry.isCurrentHandle(handle))
-            throw new Error("Binding unavailable.");
+          if (
+            !input.registry.isCurrentHandle(handle) ||
+            binding.organizationId !== workspace.organizationId ||
+            binding.nodeId !== workspace.nodeId ||
+            binding.workspaceId !== workspace.workspaceId ||
+            binding.workspaceId !== agent.workspaceId ||
+            binding.browserProfileId !== profile.browserProfileId
+          )
+            throw new Error("Binding changed while resolving authorization.");
           return { workspace, agent, profile, bindingRevision: binding.boundAt };
         },
       };
       const unbind = input.bundle.bindSessionAuthority({
-        generation: context.sessionBindingGeneration,
+        generation: sessionContext.sessionBindingGeneration,
         isCurrentHandle: resolvedAuthority.isCurrentHandle,
         resolveAuthorization: resolvedAuthority.resolveLeaseAuthorization,
       });
-      unbindByGeneration.set(context.sessionBindingGeneration, { unbind });
+      unbindByGeneration.set(sessionContext.sessionBindingGeneration, { unbind });
       return resolvedAuthority;
     },
   });
