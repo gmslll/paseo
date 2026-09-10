@@ -1029,6 +1029,7 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     const serverId = "srv_0123456789ab";
     const principalA = "usr_aaaaaaaaaaaaaaaa";
     const principalB = "usr_bbbbbbbbbbbbbbbb";
+    const principalC = "usr_cccccccccccccccc";
     await mkdir(path.join(paseoHome, "enterprise"), { recursive: true, mode: 0o700 });
     await mkdir(staticDir, { recursive: true, mode: 0o700 });
     await mkdir(path.join(paseoHome, "projects"), { recursive: true, mode: 0o700 });
@@ -1126,6 +1127,14 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
+          [principalC]: {
+            principalId: principalC,
+            organizationId: principal.organizationId,
+            principalType: "human",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
         },
       }),
       { mode: 0o600 },
@@ -1170,6 +1179,17 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             },
           ],
           grantVersion: "grv_b",
+        },
+        [principalC]: {
+          principalId: principalC,
+          organizationId: principal.organizationId,
+          grants: [
+            {
+              action: "workspace.metadata.read",
+              selector: { kind: "workspace", workspaceIds: [workspaceId] },
+            },
+          ],
+          grantVersion: "grv_c",
         },
       }),
       { mode: 0o600 },
@@ -1229,6 +1249,11 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     const issuedB = await preparatoryRuntime.admission.registry.issueToken({
       actor: breakGlass,
       principalId: principalB,
+      organizationId: principal.organizationId,
+    });
+    const issuedC = await preparatoryRuntime.admission.registry.issueToken({
+      actor: breakGlass,
+      principalId: principalC,
       organizationId: principal.organizationId,
     });
     await expect(
@@ -1340,13 +1365,23 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           clientType: "browser",
           protocolVersion: 1,
         });
-        socket.send(hello);
+        let sendError: Error | undefined;
+        await new Promise<void>((done) => {
+          socket.send(hello, (error) => {
+            sendError = error ?? undefined;
+            done();
+          });
+        });
+        if (sendError) throw sendError;
         return { socket, info: await infoPromise };
       };
       const [a, b] = await Promise.all([
         connect("default-a", issuedA.token),
         connect("default-b", issuedB.token),
       ]);
+      phase = "c-connect";
+      const c = await connect("default-c", issuedC.token);
+      c.socket.close();
       const liveAgent = await daemon.agentManager.createAgent(
         { provider: "mock", cwd: workspaceRoot, model: "ten-second-stream" },
         "00000000-0000-4000-8000-000000000777",
