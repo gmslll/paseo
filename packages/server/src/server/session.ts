@@ -216,7 +216,10 @@ import {
   type EnterpriseSessionContext,
 } from "./session/enterprise-agent-session-context-registry.js";
 import type { AuthoritySessionBindingLifecycle } from "./session/enterprise-authority-receipt-state.js";
-import type { AuthorityReceiptStatePort } from "./enterprise/access/authority-receipt-verifier.js";
+import type {
+  AuthorityReceiptStatePort,
+  AuthoritySessionBindingRecord,
+} from "./enterprise/access/authority-receipt-verifier.js";
 import {
   InboundAuthorityRequestAuthorizer,
   type ActiveAuthorizedRequestHandle,
@@ -236,6 +239,15 @@ import {
   setProjectCustomIcon,
 } from "../utils/project-custom-icon.js";
 import { VoiceSession } from "./session/voice/voice-session.js";
+import {
+  claimAndFanoutWorkspaceOwnershipTransferTombstone,
+  consumeWorkspaceOwnershipTransferTargetDelivery,
+  registerWorkspaceOwnershipTransferSession,
+  unregisterWorkspaceOwnershipTransferSession,
+  type WorkspaceOwnershipTransferSessionHandle,
+  type WorkspaceOwnershipTransferTargetDelivery,
+  type WorkspaceOwnershipTransferTargetResult,
+} from "./session/enterprise-workspace-ownership-transfer-fanout.js";
 
 function freezeOutbound<T>(value: T): T {
   if (value && typeof value === "object") {
@@ -972,6 +984,9 @@ export class Session {
   private readonly enterpriseDispatcherFactory: EnterpriseSessionDispatcherFactory | null;
   private readonly enterpriseDispatcherLease: EnterpriseDispatcherLease | null;
   private enterpriseDispatcherLeaseClosePromise: Promise<void> | null = null;
+  private enterpriseWorkspaceOwnershipTransferDispatcher: unknown = null;
+  private enterpriseWorkspaceOwnershipTransferSessionHandle: WorkspaceOwnershipTransferSessionHandle | null =
+    null;
   private enterpriseBrowserLeaseWaitingCallbackActive = false;
   private readonly enterpriseIdentitySelfAuthorization:
     | SessionAuthorization["authorizeInbound"]
@@ -1165,6 +1180,7 @@ export class Session {
         filesRuntime: enterpriseWorkspaceFilesRuntime,
       });
     }
+    this.enterpriseWorkspaceOwnershipTransferDispatcher = this.enterpriseDispatcher;
     this.onMessage = onMessage;
     this.onMessageToSource = onMessageToSource ?? null;
     this.onBinaryMessage = onBinaryMessage ?? null;
@@ -1563,6 +1579,9 @@ export class Session {
         });
         this.enterpriseDispatcherLease = registrationLease;
         const registeredDispatcher = registrationLease.dispatcher;
+        if (registeredOperations.has("enterprise.resource.ownership.transfer.request")) {
+          this.enterpriseWorkspaceOwnershipTransferDispatcher = registeredDispatcher;
+        }
         const existingDispatcher = this.enterpriseDispatcher;
         this.enterpriseDispatcher = existingDispatcher
           ? Object.freeze({
@@ -1601,6 +1620,21 @@ export class Session {
         throw this.rollbackConstruction(error);
       }
     }
+    if (this.enterpriseContext && this.enterpriseAgentContextRegistry) {
+      const binding = this.workspaceOwnershipTransferSessionBinding();
+      if (!binding)
+        throw this.rollbackConstruction(new Error("Missing Workspace transfer Session binding"));
+      try {
+        this.enterpriseWorkspaceOwnershipTransferSessionHandle =
+          registerWorkspaceOwnershipTransferSession({
+            runtimeKey: this.enterpriseAgentContextRegistry,
+            binding,
+            deliver: (delivery) => this.deliverWorkspaceOwnershipTransferTombstone(delivery),
+          });
+      } catch (error) {
+        throw this.rollbackConstruction(error);
+      }
+    }
   }
 
   updateAppVersion(appVersion: string | null): void {
@@ -1620,6 +1654,10 @@ export class Session {
     };
     this.enterpriseBrowserLeaseWaitingCallbackActive = false;
     this.enterpriseAgentEventIngressSealed = true;
+    unregisterWorkspaceOwnershipTransferSession(
+      this.enterpriseWorkspaceOwnershipTransferSessionHandle,
+    );
+    this.enterpriseWorkspaceOwnershipTransferSessionHandle = null;
     this.isCleanedUp = true;
     this.activeFileBinaryStreams.clear();
     const authorityState = this.authorityReceiptState;
@@ -4167,6 +4205,54 @@ export class Session {
     return resource.localResourceId;
   }
 
+  private workspaceOwnershipTransferSessionBinding(): AuthoritySessionBindingRecord | null {
+    const context = this.enterpriseContext;
+    const sessionBindingKey = this.enterpriseSessionBindingKey;
+    if (!context || !sessionBindingKey) return null;
+    return Object.freeze({
+      sessionId: this.sessionId,
+      sessionBindingKey,
+      sessionBindingGeneration: context.sessionBindingGeneration,
+      organizationId: context.principal.organizationId,
+      principalId: context.principal.principalId,
+      principalType: context.principal.principalType,
+      credentialId: context.principal.credentialId,
+      grantVersion: context.principal.grantVersion,
+      nodeId: context.node.nodeId,
+      clientId: this.clientId,
+    });
+  }
+
+  private isWorkspaceOwnershipTransferSessionCurrent(): boolean {
+    if (this.isCleanedUp) return false;
+    const runtime = this.enterpriseAuthorizationRuntime;
+    const session = this.productionAuthorizationSession;
+    return Boolean(
+      runtime && session && isCurrentProductionAuthorizationRuntimeForSession(runtime, session),
+    );
+  }
+
+  private deliverWorkspaceOwnershipTransferTombstone(
+    delivery: WorkspaceOwnershipTransferTargetDelivery,
+  ): WorkspaceOwnershipTransferTargetResult {
+    const binding = this.workspaceOwnershipTransferSessionBinding();
+    if (!binding) return Object.freeze({ sealed: false, delivered: false });
+    const message = consumeWorkspaceOwnershipTransferTargetDelivery(delivery, binding);
+    if (!message || !this.isWorkspaceOwnershipTransferSessionCurrent())
+      return Object.freeze({ sealed: false, delivered: false });
+
+    this.invalidateTransferredWorkspaceScope(message.payload.resource.localResourceId);
+    try {
+      return Object.freeze({ sealed: true, delivered: this.deliver(message) });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error },
+        "Failed to deliver Workspace ownership transfer tombstone",
+      );
+      return Object.freeze({ sealed: true, delivered: false });
+    }
+  }
+
   private async emitEnterpriseDispatcherResponse(
     request: SessionInboundMessage,
     contextual: EnterpriseDispatchResponse,
@@ -4182,10 +4268,19 @@ export class Session {
       this.emit(contextual.response, contextual.authorizationContext);
       return;
     }
+    let issuerSealedByFanout = false;
     try {
       await this.enqueueAuthorizedEmit(contextual.response, contextual.authorizationContext);
     } finally {
-      this.invalidateTransferredWorkspaceScope(transferredWorkspaceId);
+      try {
+        issuerSealedByFanout = claimAndFanoutWorkspaceOwnershipTransferTombstone({
+          issuerHandle: this.enterpriseWorkspaceOwnershipTransferSessionHandle,
+          dispatcher: this.enterpriseWorkspaceOwnershipTransferDispatcher,
+          contextualResponse: contextual,
+        }).issuerSealed;
+      } finally {
+        if (!issuerSealedByFanout) this.invalidateTransferredWorkspaceScope(transferredWorkspaceId);
+      }
     }
   }
 
@@ -10322,6 +10417,10 @@ export class Session {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.enterpriseBrowserLeaseWaitingCallbackActive = false;
     this.enterpriseAgentEventIngressSealed = true;
+    unregisterWorkspaceOwnershipTransferSession(
+      this.enterpriseWorkspaceOwnershipTransferSessionHandle,
+    );
+    this.enterpriseWorkspaceOwnershipTransferSessionHandle = null;
     const agentUpdatesDrain = this.agentUpdates.sealAndDrain();
     this.isCleanedUp = true;
     for (const context of this.inheritedTransportRequests.values()) {

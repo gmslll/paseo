@@ -14,6 +14,7 @@ import {
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type {
+  OutboundAuthorizationContext,
   ResourceAuthorization,
   WorkspaceDescriptorPayload,
 } from "@getpaseo/protocol/messages";
@@ -108,6 +109,7 @@ import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
 import {
   type EnterpriseDispatchContext,
+  type EnterpriseDispatchResponse,
   type EnterpriseSessionDispatcher,
   resolveEnterpriseContentReadPolicy,
   type EnterpriseSessionDispatcherFactoryRegistration,
@@ -153,6 +155,16 @@ interface SessionHandlerInternals {
     lastEmittedByWorkspaceId: Map<string, unknown>;
   } | null;
   workspaceUpdateTails: Map<string, Promise<void>>;
+  enterpriseWorkspaceOwnershipTransferDispatcher: EnterpriseSessionDispatcher;
+  productionAuthorizationSession?: unknown;
+  enqueueAuthorizedEmit(
+    message: SessionOutboundMessage,
+    context?: OutboundAuthorizationContext,
+  ): Promise<boolean>;
+  emitEnterpriseDispatcherResponse(
+    request: SessionInboundMessage,
+    contextual: EnterpriseDispatchResponse,
+  ): Promise<void>;
   listFetchAgentsEntries(params: SessionInboundMessage): Promise<unknown>;
   readAgentDirectorySync(params: SessionInboundMessage): Promise<unknown>;
   listFetchWorkspacesEntries(params: SessionInboundMessage): Promise<unknown>;
@@ -10944,59 +10956,12 @@ async function createEnterpriseOwnershipTransferHarness(
     principalSource,
   });
   if (!resourceBundle) throw new Error("Expected production resource bundle");
-  const duplicateConsumeResults: unknown[] = [];
-  const dispatcherRegistration: EnterpriseSessionDispatcherFactoryRegistration = {
-    manifest: resourceBundle.dispatcherFactory.manifest,
-    open(input) {
-      const lease = resourceBundle.dispatcherFactory.open(input);
-      const delegate = lease.dispatcher;
-      return {
-        dispatcher: {
-          requestPolicyForType: (type) => delegate.requestPolicyForType?.(type) ?? null,
-          handle: (request) => delegate.handle(request),
-          consumeResponse: (response) => {
-            const consumed = delegate.consumeResponse?.(response) ?? null;
-            duplicateConsumeResults.push(delegate.consumeResponse?.(response) ?? null);
-            return consumed;
-          },
-        },
-        close: () => lease.close(),
-      };
-    },
-  };
+  const dispatcherRegistration = resourceBundle.dispatcherFactory;
 
   const mintSecret = Object.freeze({});
   const issuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret);
-  const principal = {
-    ...context.principal,
-    grants: grantRecord.grants,
-    grantVersion: grantRecord.grantVersion,
-  };
-  const evidence = issueEnterpriseAdmissionEvidence(issuer, mintSecret, principal, context.node, {
-    node: context.node,
-    transport: "direct",
-    peer: "loopback",
-  });
-  if (!evidence) throw new Error("Expected transfer admission evidence");
-  const clientId = `client-${name}`;
-  const handle = bindEnterpriseAdmissionSession(issuer, evidence, clientId);
-  if (!handle) throw new Error("Expected transfer admission handle");
-  const sessionId = `session-${name}`;
-  const sessionAuthorization = new SessionAuthorization(OWNER_PERMISSIONS);
   const authorityState = new MemoryAuthorityReceiptState();
-  const runtime = await createProductionAuthorizationRuntimeForSession(provider, {
-    admissionAuthorizationIssuer: issuer,
-    admissionAuthorizationHandle: handle,
-    sessionAuthorization,
-    sessionId,
-    authorityState,
-  });
-  if (!runtime) throw new Error("Expected transfer authorization runtime");
-  const enterpriseSessionContext: EnterpriseSessionContext = {
-    principal: runtime.principal,
-    node: runtime.node,
-    sessionBindingGeneration: runtime.binding.sessionBindingGeneration,
-  };
+  const sessionContextRegistry = createEnterpriseAgentSessionContextRegistry();
   const managedAgents = [
     makeEnterpriseEventManagedAgent(transferAgentAId, transferWorkspaceAId),
     makeEnterpriseEventManagedAgent(transferAgentBId, transferWorkspaceBId),
@@ -11020,55 +10985,116 @@ async function createEnterpriseOwnershipTransferHarness(
     }),
   ];
   const projectById = new Map(projects.map((project) => [project.projectId, project] as const));
-  const messages: SessionOutboundMessage[] = [];
-  const listeners: TestAgentEventListener[] = [];
-  const session = createSessionForTest({
-    messages,
-    onMessage: (message) => {
-      messages.push(message);
-      onMessage?.(message);
-    },
-    clientId,
-    enterpriseContext: enterpriseSessionContext,
-    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
-    authorityReceiptState: authorityState,
-    principalGrantVersionGuard: runtime.grantVersionGuard,
-    resourceAuthorization: runtime.resourceAuthorization,
-    sessionId,
-    sessionAuthorization,
-    admissionAuthorizationIssuer: issuer,
-    admissionAuthorizationHandle: handle,
-    enterpriseAuthorizationRuntime: runtime,
-    enterpriseDispatcherRegistration: dispatcherRegistration,
-    workspaceRegistry: {
-      get: (workspaceId: string) => workspaceRegistry.get(workspaceId),
-      list: () => workspaceRegistry.list(),
-    },
-    projectRegistry: {
-      get: vi.fn((projectId: string) => Promise.resolve(projectById.get(projectId))),
-      list: vi.fn(async () => projects),
-    },
-    agentManager: {
-      listAgents: vi.fn(() => managedAgents),
-      getAgent: vi.fn((agentId: string) => managedAgents.find((agent) => agent.id === agentId)),
-      subscribe: vi.fn((listener: TestAgentEventListener) => {
-        listeners.push(listener);
-        return () => {};
-      }),
-    },
-    agentStorage: {
-      get: vi.fn((agentId: string) =>
-        Promise.resolve(storedAgents.find((agent) => agent.id === agentId)),
-      ),
-      list: vi.fn(async () => storedAgents),
-    },
-  });
-  const listener = listeners[0];
+  // oxlint-disable-next-line complexity -- fixture wiring preserves the exact production binding lifecycle.
+  const createTransferSession = async (input: {
+    suffix: string;
+    principalId?: string;
+    permissions?: readonly DaemonPermission[];
+    registry?: EnterpriseAgentSessionContextRegistry;
+    onMessage?: (message: SessionOutboundMessage) => void;
+    includeProductionRuntime?: boolean;
+  }) => {
+    const principalId = input.principalId ?? context.principal.principalId;
+    const currentGrantRecord = await provider.grantStore.get(principalId);
+    if (!currentGrantRecord) throw new Error(`Expected grant record for ${principalId}`);
+    const principal = {
+      ...context.principal,
+      principalId,
+      grants: currentGrantRecord.grants,
+      credentialId: `credential-${input.suffix}`,
+      grantVersion: currentGrantRecord.grantVersion,
+    };
+    const evidence = issueEnterpriseAdmissionEvidence(issuer, mintSecret, principal, context.node, {
+      node: context.node,
+      transport: "direct",
+      peer: "loopback",
+    });
+    if (!evidence) throw new Error("Expected transfer admission evidence");
+    const clientId = `client-${input.suffix}`;
+    const handle = bindEnterpriseAdmissionSession(issuer, evidence, clientId);
+    if (!handle) throw new Error("Expected transfer admission handle");
+    const sessionId = `session-${input.suffix}`;
+    const sessionAuthorization = new SessionAuthorization(input.permissions ?? OWNER_PERMISSIONS);
+    const runtime =
+      input.includeProductionRuntime === false
+        ? null
+        : await createProductionAuthorizationRuntimeForSession(provider, {
+            admissionAuthorizationIssuer: issuer,
+            admissionAuthorizationHandle: handle,
+            sessionAuthorization,
+            sessionId,
+            authorityState,
+          });
+    if (input.includeProductionRuntime !== false && !runtime)
+      throw new Error("Expected transfer authorization runtime");
+    const enterpriseSessionContext: EnterpriseSessionContext = runtime
+      ? {
+          principal: runtime.principal,
+          node: runtime.node,
+          sessionBindingGeneration: runtime.binding.sessionBindingGeneration,
+        }
+      : enterpriseContext(`generation-${input.suffix}`, principal);
+    const messages: SessionOutboundMessage[] = [];
+    const listeners: TestAgentEventListener[] = [];
+    const session = createSessionForTest({
+      messages,
+      onMessage: (message) => {
+        messages.push(message);
+        input.onMessage?.(message);
+      },
+      clientId,
+      enterpriseContext: enterpriseSessionContext,
+      enterpriseAgentContextRegistry: input.registry ?? sessionContextRegistry,
+      authorityReceiptState: authorityState,
+      principalGrantVersionGuard: runtime?.grantVersionGuard ?? { isCurrent: () => true },
+      resourceAuthorization:
+        runtime?.resourceAuthorization ?? ({ canEmit: vi.fn(async () => true) } as never),
+      sessionId: runtime ? sessionId : undefined,
+      sessionAuthorization: runtime ? sessionAuthorization : undefined,
+      admissionAuthorizationIssuer: runtime ? issuer : undefined,
+      admissionAuthorizationHandle: runtime ? handle : undefined,
+      enterpriseAuthorizationRuntime: runtime ?? undefined,
+      enterpriseDispatcherRegistration: runtime ? dispatcherRegistration : undefined,
+      workspaceRegistry: {
+        get: (workspaceId: string) => workspaceRegistry.get(workspaceId),
+        list: () => workspaceRegistry.list(),
+      },
+      projectRegistry: {
+        get: vi.fn((projectId: string) => Promise.resolve(projectById.get(projectId))),
+        list: vi.fn(async () => projects),
+      },
+      agentManager: {
+        listAgents: vi.fn(() => managedAgents),
+        getAgent: vi.fn((agentId: string) => managedAgents.find((agent) => agent.id === agentId)),
+        subscribe: vi.fn((listener: TestAgentEventListener) => {
+          listeners.push(listener);
+          return () => {};
+        }),
+      },
+      agentStorage: {
+        get: vi.fn((agentId: string) =>
+          Promise.resolve(storedAgents.find((agent) => agent.id === agentId)),
+        ),
+        list: vi.fn(async () => storedAgents),
+      },
+    });
+    return {
+      enterpriseSessionContext,
+      listener: listeners[0],
+      messages,
+      runtime,
+      session,
+      sessionAuthorization,
+    };
+  };
+  const primary = await createTransferSession({ suffix: name, onMessage });
+  const { enterpriseSessionContext, listener, messages, runtime, session } = primary;
   if (!listener) throw new Error("Transfer Agent event listener was not installed");
+  if (!runtime) throw new Error("Expected primary transfer runtime");
   return {
     audit,
     authorityState,
-    duplicateConsumeResults,
+    createTransferSession,
     enterpriseSessionContext,
     listener,
     messages,
@@ -11564,6 +11590,318 @@ describe("enterprise agent event publication", () => {
 describe.runIf(process.platform === "darwin")(
   "enterprise ownership transfer Session invalidation",
   () => {
+    test("fans one exact tombstone to every current old-principal Session in the same runtime", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-fanout");
+      const sibling = await h.createTransferSession({
+        suffix: "session-transfer-fanout-sibling",
+        permissions: ["workspace.read"],
+      });
+      const newOwner = await h.createTransferSession({
+        suffix: "session-transfer-fanout-new-owner",
+        principalId: transferNewOwnerId,
+        permissions: [],
+      });
+      const isolated = await h.createTransferSession({
+        suffix: "session-transfer-fanout-isolated",
+        registry: createEnterpriseAgentSessionContextRegistry(),
+        permissions: ["workspace.read"],
+      });
+      const stale = await h.createTransferSession({
+        suffix: "session-transfer-fanout-stale",
+        permissions: ["workspace.read"],
+      });
+      const missingRuntime = await h.createTransferSession({
+        suffix: "session-transfer-fanout-missing-runtime",
+        includeProductionRuntime: false,
+      });
+      const missingSession = await h.createTransferSession({
+        suffix: "session-transfer-fanout-missing-session",
+        permissions: ["workspace.read"],
+      });
+      const closed = await h.createTransferSession({
+        suffix: "session-transfer-fanout-closed",
+        permissions: ["workspace.read"],
+      });
+      if (!stale.runtime || !sibling.runtime) throw new Error("Expected peer runtimes");
+      const sourceInternals = asSessionInternals(h.session);
+      const siblingInternals = asSessionInternals(sibling.session);
+      const missingRuntimeInternals = asSessionInternals(missingRuntime.session);
+      const sourceInvalidate = vi.spyOn(sourceInternals.agentUpdates, "invalidateWorkspace");
+      const siblingInvalidate = vi.spyOn(siblingInternals.agentUpdates, "invalidateWorkspace");
+      const missingRuntimeInvalidate = vi.spyOn(
+        missingRuntimeInternals.agentUpdates,
+        "invalidateWorkspace",
+      );
+      const missingSessionInternals = asSessionInternals(missingSession.session);
+      const missingSessionInvalidate = vi.spyOn(
+        missingSessionInternals.agentUpdates,
+        "invalidateWorkspace",
+      );
+      const missingProductionSession = missingSessionInternals.productionAuthorizationSession;
+      missingSessionInternals.productionAuthorizationSession = undefined;
+      const siblingCanEmit = vi.spyOn(sibling.runtime.resourceAuthorization, "canEmit");
+
+      try {
+        sibling.session.updateClientCapabilities({ [CLIENT_CAPS.selectiveAgentTimeline]: true });
+        await sibling.session.handleMessage({
+          type: "agent.timeline.set_subscription.request",
+          requestId: "timeline-before-fanout",
+          agentIds: [transferAgentAId, transferAgentBId],
+        });
+        await sibling.session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: "agents-before-fanout",
+          subscribe: { subscriptionId: "agents-fanout-subscription" },
+        });
+        await sibling.session.handleMessage({
+          type: "fetch_workspaces_request",
+          requestId: "workspaces-before-fanout",
+          subscribe: { subscriptionId: "workspaces-fanout-subscription" },
+        });
+        sibling.messages.length = 0;
+        siblingCanEmit.mockClear();
+        await stale.runtime.release();
+        await closed.session.cleanup();
+
+        const request = {
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-session-fanout",
+          resource: {
+            organizationId: h.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.enterpriseSessionContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: transferWorkspaceAId,
+          },
+          expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+          expectedRevision: "0",
+          newPrincipalId: transferNewOwnerId,
+        } as const satisfies SessionInboundMessage;
+        await h.session.handleMessage(request);
+
+        const response = h.messages.find(
+          (message) => message.type === "enterprise.resource.ownership.transfer.response",
+        );
+        if (!response || response.type !== "enterprise.resource.ownership.transfer.response")
+          throw new Error("Expected transfer response");
+        const sourceTombstones = h.messages.filter(
+          (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+        );
+        const siblingTombstones = sibling.messages.filter(
+          (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+        );
+        expect(sourceTombstones).toHaveLength(1);
+        expect(siblingTombstones).toEqual(sourceTombstones);
+        expect(sourceTombstones[0]).toEqual({
+          type: "enterprise.workspace.ownership.transfer.tombstone",
+          payload: {
+            eventId: expect.any(String),
+            resource: request.resource,
+            oldPrincipalId: request.expectedOwnerPrincipalId,
+            newRevision: response.payload.revision,
+            transferReceiptId: response.payload.receiptId,
+          },
+        });
+        expect("requestId" in sourceTombstones[0]!.payload).toBe(false);
+        expect(Object.isFrozen(sourceTombstones[0])).toBe(true);
+        expect(Object.isFrozen(sourceTombstones[0]!.payload)).toBe(true);
+        expect(Object.isFrozen(sourceTombstones[0]!.payload.resource)).toBe(true);
+        expect(newOwner.messages).toEqual([]);
+        expect(isolated.messages).toEqual([]);
+        expect(stale.messages).toEqual([]);
+        expect(missingRuntime.messages).toEqual([]);
+        expect(missingSession.messages).toEqual([]);
+        expect(closed.messages).toEqual([]);
+        expect(sourceInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(missingRuntimeInvalidate).not.toHaveBeenCalled();
+        expect(missingSessionInvalidate).not.toHaveBeenCalled();
+        expect(siblingCanEmit).not.toHaveBeenCalled();
+        expect(siblingInternals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
+        expect(siblingInternals.workspaceUpdatesSubscription?.excludedWorkspaceIds).toEqual(
+          new Set([transferWorkspaceAId]),
+        );
+
+        await sibling.listener?.(enterpriseTimelineEvent("late-a", transferAgentAId));
+        await sibling.listener?.(enterpriseTimelineEvent("still-current-b", transferAgentBId));
+        expect(
+          sibling.messages.some(
+            (message) =>
+              message.type === "agent_stream" &&
+              message.payload.agentId === transferAgentAId &&
+              message.payload.event.type === "timeline",
+          ),
+        ).toBe(false);
+        expect(sibling.messages).toContainEqual(
+          expect.objectContaining({
+            type: "agent_stream",
+            payload: expect.objectContaining({ agentId: transferAgentBId }),
+          }),
+        );
+
+        await h.session.handleMessage(request);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(
+          sibling.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(sourceInvalidate).toHaveBeenCalledTimes(1);
+        expect(siblingInvalidate).toHaveBeenCalledTimes(1);
+      } finally {
+        missingSessionInternals.productionAuthorizationSession = missingProductionSession;
+        await Promise.allSettled([
+          h.session.cleanup(),
+          sibling.session.cleanup(),
+          newOwner.session.cleanup(),
+          isolated.session.cleanup(),
+          stale.session.cleanup(),
+          missingRuntime.session.cleanup(),
+          missingSession.session.cleanup(),
+        ]);
+        await h.audit.close();
+      }
+    });
+
+    test("fans out after a committed transfer even when the response is denied", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-fanout-denied");
+      const sibling = await h.createTransferSession({
+        suffix: "session-transfer-fanout-denied-sibling",
+        permissions: [],
+      });
+      if (!sibling.runtime) throw new Error("Expected sibling runtime");
+      const sourceInvalidate = vi.spyOn(
+        asSessionInternals(h.session).agentUpdates,
+        "invalidateWorkspace",
+      );
+      const siblingInvalidate = vi.spyOn(
+        asSessionInternals(sibling.session).agentUpdates,
+        "invalidateWorkspace",
+      );
+      const siblingCanEmit = vi.spyOn(sibling.runtime.resourceAuthorization, "canEmit");
+      const sourceCanEmit = vi.spyOn(h.runtime.resourceAuthorization, "canEmit");
+      const originalCanEmit = h.runtime.resourceAuthorization.canEmit.bind(
+        h.runtime.resourceAuthorization,
+      );
+      sourceCanEmit.mockImplementation((principal, event, context) =>
+        event.type === "enterprise.resource.ownership.transfer.response"
+          ? Promise.resolve(false)
+          : originalCanEmit(principal, event, context),
+      );
+
+      try {
+        await h.session.handleMessage({
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-session-fanout-denied",
+          resource: {
+            organizationId: h.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.enterpriseSessionContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: transferWorkspaceAId,
+          },
+          expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+          expectedRevision: "0",
+          newPrincipalId: transferNewOwnerId,
+        });
+
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.resource.ownership.transfer.response",
+          ),
+        ).toEqual([]);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(
+          sibling.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(sourceInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingCanEmit).not.toHaveBeenCalled();
+        expect(sourceCanEmit).toHaveBeenCalledTimes(1);
+      } finally {
+        await Promise.allSettled([h.session.cleanup(), sibling.session.cleanup()]);
+        await h.audit.close();
+      }
+    });
+
+    test("fans out and seals in finally while preserving a response enqueue rejection", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-fanout-throw");
+      const sibling = await h.createTransferSession({
+        suffix: "session-transfer-fanout-throw-sibling",
+        permissions: ["workspace.read"],
+      });
+      const sourceInternals = asSessionInternals(h.session);
+      const sourceInvalidate = vi.spyOn(sourceInternals.agentUpdates, "invalidateWorkspace");
+      const siblingInvalidate = vi.spyOn(
+        asSessionInternals(sibling.session).agentUpdates,
+        "invalidateWorkspace",
+      );
+      const request = {
+        type: "enterprise.resource.ownership.transfer.request",
+        requestId: "transfer-session-fanout-throw",
+        resource: {
+          organizationId: h.enterpriseSessionContext.principal.organizationId,
+          nodeId: h.enterpriseSessionContext.node.nodeId,
+          resourceKind: "workspace",
+          localResourceId: transferWorkspaceAId,
+        },
+        expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+        expectedRevision: "0",
+        newPrincipalId: transferNewOwnerId,
+      } as const satisfies SessionInboundMessage;
+      const dispatchContext: EnterpriseDispatchContext = Object.freeze({
+        sessionId: h.session.getSessionId(),
+        clientId: h.runtime.binding.clientId,
+        credentialId: h.enterpriseSessionContext.principal.credentialId,
+        sessionBindingGeneration: h.enterpriseSessionContext.sessionBindingGeneration,
+        enterpriseContext: h.enterpriseSessionContext,
+      });
+      const dispatcher = sourceInternals.enterpriseWorkspaceOwnershipTransferDispatcher;
+
+      try {
+        const response = await dispatcher.handle({
+          sessionContext: dispatchContext,
+          message: request,
+        });
+        if (response === false) throw new Error("Expected direct transfer response");
+        const contextual = dispatcher.consumeResponse?.({
+          sessionContext: dispatchContext,
+          message: request,
+          response,
+        });
+        if (!contextual) throw new Error("Expected direct contextual transfer response");
+        const enqueueError = new Error("response enqueue failed");
+        vi.spyOn(sourceInternals, "enqueueAuthorizedEmit").mockRejectedValueOnce(enqueueError);
+
+        await expect(
+          sourceInternals.emitEnterpriseDispatcherResponse(request, contextual),
+        ).rejects.toBe(enqueueError);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(
+          sibling.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(sourceInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+      } finally {
+        await Promise.allSettled([h.session.cleanup(), sibling.session.cleanup()]);
+        await h.audit.close();
+      }
+    });
+
     test("publishes the real receipt response before sealing only the old owner's workspace state", async () => {
       const responseTriggeredPublications: Promise<void>[] = [];
       let transferListener: TestAgentEventListener | undefined;
@@ -11696,7 +12034,6 @@ describe.runIf(process.platform === "darwin")(
         ]);
         expect(h.messages[0]).toEqual(transferResponses[0]);
         expect(responseTriggeredPublications).toHaveLength(1);
-        expect(h.duplicateConsumeResults).toEqual([null]);
         expect(invalidateWorkspace).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
         expect(internals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
         expect(internals.workspaceUpdatesSubscription?.excludedWorkspaceIds).toEqual(
@@ -11810,7 +12147,6 @@ describe.runIf(process.platform === "darwin")(
           ),
         ).toHaveLength(responseCount);
         expect(invalidateWorkspace).toHaveBeenCalledTimes(1);
-        expect(h.duplicateConsumeResults).toEqual([null]);
         expect(internals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
         await h.listener(enterpriseTimelineEvent("after-replay-b", transferAgentBId));
         expect(h.messages).toContainEqual(
@@ -11902,7 +12238,6 @@ describe.runIf(process.platform === "darwin")(
             (message) => message.type === "enterprise.resource.ownership.transfer.response",
           ),
         ).toEqual([]);
-        expect(h.duplicateConsumeResults).toEqual([null]);
         expect(invalidateWorkspace).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
         expect(internals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
         expect(internals.workspaceUpdatesSubscription?.excludedWorkspaceIds).toEqual(
@@ -11933,7 +12268,6 @@ describe.runIf(process.platform === "darwin")(
         ).toBe(false);
         await h.session.handleMessage(transferRequest);
         expect(invalidateWorkspace).toHaveBeenCalledTimes(1);
-        expect(h.duplicateConsumeResults).toEqual([null]);
       } finally {
         releaseLatePublication.resolve();
         await h.session.cleanup();
