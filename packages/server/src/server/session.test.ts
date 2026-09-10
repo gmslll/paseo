@@ -79,6 +79,7 @@ import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
 import {
+  type EnterpriseDispatchContext,
   resolveEnterpriseContentReadPolicy,
   type EnterpriseSessionDispatcherFactoryRegistration,
   type EnterpriseContentReadRequestType,
@@ -666,15 +667,22 @@ test.each([
       },
       responseType,
     );
-    const handle = vi.fn(async () => response);
-    const consumeResponse = vi.fn(() => ({
-      response,
-      authorizationContext: {
-        kind: "resources" as const,
-        resources: [request.resource],
-      },
-      receiptClassification: "resources" as const,
-    }));
+    let dispatchContext: EnterpriseDispatchContext | undefined;
+    const handle = vi.fn(async (input: { sessionContext: EnterpriseDispatchContext }) => {
+      dispatchContext = input.sessionContext;
+      return response;
+    });
+    const consumeResponse = vi.fn((input: { sessionContext: EnterpriseDispatchContext }) => {
+      expect(input.sessionContext).toBe(dispatchContext);
+      return {
+        response,
+        authorizationContext: {
+          kind: "resources" as const,
+          resources: [request.resource],
+        },
+        receiptClassification: "resources" as const,
+      };
+    });
     const dispatcher = {
       requestPolicyForType: (type: string) =>
         resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,

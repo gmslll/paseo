@@ -2359,15 +2359,16 @@ export class Session {
               },
             });
           };
+          const dispatchContext = Object.freeze({
+            sessionId: this.sessionId,
+            clientId: this.clientId,
+            credentialId: this.enterpriseContext.principal.credentialId,
+            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+            enterpriseContext: this.enterpriseContext,
+          });
           const response = await dispatchEnterpriseRequest(
             this.enterpriseDispatcher,
-            {
-              sessionId: this.sessionId,
-              clientId: this.clientId,
-              credentialId: this.enterpriseContext.principal.credentialId,
-              sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
-              enterpriseContext: this.enterpriseContext,
-            },
+            dispatchContext,
             msg,
           );
           if (response === false) {
@@ -2379,13 +2380,7 @@ export class Session {
             return;
           }
           const contextual = this.enterpriseDispatcher.consumeResponse?.({
-            sessionContext: {
-              sessionId: this.sessionId,
-              clientId: this.clientId,
-              credentialId: this.enterpriseContext.principal.credentialId,
-              sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
-              enterpriseContext: this.enterpriseContext,
-            },
+            sessionContext: dispatchContext,
             message: msg,
             response,
           });
