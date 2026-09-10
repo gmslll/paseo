@@ -24,6 +24,10 @@ import {
   EnterpriseAppSlotContentReadResponseSchema,
   EnterpriseBrowserBindProfileRequestSchema,
   EnterpriseBrowserListProfilesRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationResponseSchema,
+  EnterpriseBrowserPageIdentityObservationRequestSchema,
+  EnterpriseBrowserPageIdentityObservationResponseSchema,
   EnterpriseBrowserProfileContentReadRequestSchema,
   EnterpriseBrowserProfileContentReadResponseSchema,
   EnterpriseResourceAcquireLeaseRequestSchema,
@@ -91,6 +95,7 @@ import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
 import {
   type EnterpriseDispatchContext,
+  type EnterpriseSessionDispatcher,
   resolveEnterpriseContentReadPolicy,
   type EnterpriseSessionDispatcherFactoryRegistration,
   type EnterpriseContentReadRequestType,
@@ -767,6 +772,87 @@ function parseContentResponse(value: unknown, type: string): SessionOutboundMess
   }
 }
 
+type BrowserPageIdentityRequest = Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "enterprise.browser.page_identity.observe.request"
+      | "enterprise.browser.page_identity.invalidate.request";
+  }
+>;
+
+function browserPageIdentityRequests(): BrowserPageIdentityRequest[] {
+  return [
+    EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "page-identity-observe",
+      browser: {
+        browserId: "11111111-1111-4111-8111-111111111111",
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+      },
+      hostname: "account.example.com",
+      accountLabelHash: "a".repeat(64),
+      observationRevision: "observation-revision-1",
+      bindingRevision: "binding-revision-1",
+      lifecycleGeneration: "lifecycle-generation-1",
+    }),
+    EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse({
+      type: "enterprise.browser.page_identity.invalidate.request",
+      requestId: "page-identity-invalidate",
+      browser: {
+        browserId: "1712345678901-abcdef012345",
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+      },
+      bindingRevision: "binding-revision-1",
+      lifecycleGeneration: "lifecycle-generation-1",
+      observationRevision: "observation-revision-1",
+    }),
+  ];
+}
+
+function browserPageIdentityResponse(request: BrowserPageIdentityRequest): SessionOutboundMessage {
+  const value = {
+    type: request.type.replace(/\.request$/, ".response"),
+    payload: {
+      requestId: request.requestId,
+      acceptedRevision: request.observationRevision,
+    },
+  };
+  return request.type === "enterprise.browser.page_identity.observe.request"
+    ? EnterpriseBrowserPageIdentityObservationResponseSchema.parse(value)
+    : EnterpriseBrowserPageIdentityInvalidationResponseSchema.parse(value);
+}
+
+function browserPageIdentityRegistration(
+  handle: EnterpriseSessionDispatcher["handle"],
+  options: {
+    consumeResponse?: ReturnType<typeof vi.fn>;
+    close?: ReturnType<typeof vi.fn>;
+    open?: ReturnType<typeof vi.fn>;
+  } = {},
+): EnterpriseSessionDispatcherFactoryRegistration {
+  const operations = browserPageIdentityRequests().map((request) => request.type);
+  const open = options.open ?? vi.fn();
+  const registration: EnterpriseSessionDispatcherFactoryRegistration = {
+    manifest: { operations },
+    open: (input) => {
+      open(input);
+      return {
+        dispatcher: {
+          requestPolicyForType: (type) =>
+            operations.includes(type as BrowserPageIdentityRequest["type"])
+              ? "transport_control"
+              : null,
+          handle,
+          ...(options.consumeResponse ? { consumeResponse: options.consumeResponse } : {}),
+        },
+        close: options.close ?? vi.fn(),
+      };
+    },
+  };
+  return registration;
+}
+
 test.each([
   [
     "workspace",
@@ -974,6 +1060,239 @@ test("routes dynamically registered browser resource policies through the resour
     })),
   );
   await session.cleanup();
+});
+
+test.each(browserPageIdentityRequests())(
+  "routes registered $type through the current Session inherited context",
+  async (request) => {
+    const messages: SessionOutboundMessage[] = [];
+    const response = browserPageIdentityResponse(request);
+    const context = enterpriseContext("generation-page-identity-current");
+    const consumeResponse = vi.fn(() => {
+      throw new Error("transport control must not consume a resource or authority receipt");
+    });
+    const canEmit = vi.fn(async () => {
+      throw new Error("transport control must not require resource authorization");
+    });
+    const open = vi.fn();
+    const handle = vi.fn(({ sessionContext, message }) => {
+      expect(Object.isFrozen(sessionContext)).toBe(true);
+      expect(sessionContext).toEqual({
+        sessionId: open.mock.calls[0]?.[0].sessionId,
+        clientId: "client-page-identity-current",
+        credentialId: context.principal.credentialId,
+        sessionBindingGeneration: context.sessionBindingGeneration,
+        enterpriseContext: session.getEnterpriseSessionContext(),
+      });
+      expect(message).toBe(request);
+      return response;
+    });
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-page-identity-current",
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      resourceAuthorization: { canEmit } as unknown as ResourceAuthorization,
+      enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle, {
+        consumeResponse,
+        open,
+      }),
+    });
+    const allowsOutbound = vi.spyOn(asSessionInternals(session).authorization, "allowsOutbound");
+
+    await session.handleMessage(request);
+
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(consumeResponse).not.toHaveBeenCalled();
+    expect(canEmit).not.toHaveBeenCalled();
+    expect(allowsOutbound).toHaveBeenCalledWith(response);
+    expect(messages).toEqual([response]);
+    await session.cleanup();
+  },
+);
+
+test.each([
+  ["false", () => false],
+  [
+    "response type mismatch",
+    (request: BrowserPageIdentityRequest) =>
+      request.type === "enterprise.browser.page_identity.observe.request"
+        ? EnterpriseBrowserPageIdentityInvalidationResponseSchema.parse({
+            type: "enterprise.browser.page_identity.invalidate.response",
+            payload: {
+              requestId: request.requestId,
+              acceptedRevision: request.observationRevision,
+            },
+          })
+        : EnterpriseBrowserPageIdentityObservationResponseSchema.parse({
+            type: "enterprise.browser.page_identity.observe.response",
+            payload: {
+              requestId: request.requestId,
+              acceptedRevision: request.observationRevision,
+            },
+          }),
+  ],
+  [
+    "request id mismatch",
+    (request: BrowserPageIdentityRequest) => ({
+      ...browserPageIdentityResponse(request),
+      payload: {
+        ...browserPageIdentityResponse(request).payload,
+        requestId: `${request.requestId}-wrong`,
+      },
+    }),
+  ],
+  [
+    "accepted revision mismatch",
+    (request: BrowserPageIdentityRequest) => ({
+      ...browserPageIdentityResponse(request),
+      payload: {
+        ...browserPageIdentityResponse(request).payload,
+        acceptedRevision: `${request.observationRevision}-wrong`,
+      },
+    }),
+  ],
+  [
+    "malformed response",
+    (request: BrowserPageIdentityRequest) => ({
+      type: request.type.replace(/\.request$/, ".response"),
+      payload: { requestId: request.requestId },
+    }),
+  ],
+  ["throw", () => Promise.reject(new Error("registered transport handler failed"))],
+] as const)(
+  "returns correlated unavailable when a registered transport handler yields %s",
+  async (_case, result) => {
+    const request = browserPageIdentityRequests()[0];
+    const messages: SessionOutboundMessage[] = [];
+    const handle = vi.fn(() => result(request) as never);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-page-identity-failure"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle),
+    });
+
+    await expect(session.handleMessage(request)).resolves.toBeUndefined();
+
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: request.requestId,
+          requestType: request.type,
+          error: "Enterprise operation unavailable",
+          code: "unavailable",
+        },
+      },
+    ]);
+    await session.cleanup();
+  },
+);
+
+test("reserves a registered transport request id until its inherited outbound tail settles", async () => {
+  const request = browserPageIdentityRequests()[0];
+  const response = browserPageIdentityResponse(request);
+  const messages: SessionOutboundMessage[] = [];
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const handle = vi.fn(async () => {
+    await blocked;
+    return response;
+  });
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-page-identity-duplicate"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle),
+  });
+
+  const first = session.handleMessage(request);
+  await Promise.resolve();
+  const duplicate = session.handleMessage(request);
+  await Promise.resolve();
+  expect(handle).toHaveBeenCalledTimes(1);
+  release();
+  await Promise.all([first, duplicate]);
+
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(messages).toEqual([response]);
+  await session.cleanup();
+});
+
+test("drops registered transport responses after revocation or Session cleanup", async () => {
+  for (const terminal of ["revoke", "cleanup"] as const) {
+    const request = browserPageIdentityRequests()[0];
+    const response = browserPageIdentityResponse(request);
+    const messages: SessionOutboundMessage[] = [];
+    let current = true;
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handle = vi.fn(async () => {
+      await blocked;
+      return response;
+    });
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext(`generation-page-identity-${terminal}`),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      principalGrantVersionGuard: { isCurrent: () => current },
+      enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle),
+    });
+
+    const pending = session.handleMessage(request);
+    await Promise.resolve();
+    if (terminal === "revoke") current = false;
+    else await session.cleanup();
+    release();
+    await pending;
+    await session.handleMessage(request);
+
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([]);
+    if (terminal === "revoke") await session.cleanup();
+  }
+});
+
+test("keeps page identity registration inactive for legacy and absent registrations", async () => {
+  const request = browserPageIdentityRequests()[0];
+  const legacyMessages: SessionOutboundMessage[] = [];
+  const open = vi.fn();
+  const handle = vi.fn(() => browserPageIdentityResponse(request));
+  const legacy = createSessionForTest({
+    messages: legacyMessages,
+    enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle, { open }),
+  });
+  await legacy.handleMessage(request);
+  expect(open).not.toHaveBeenCalled();
+  expect(handle).not.toHaveBeenCalled();
+  expect(legacyMessages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        requestType: request.type,
+        error: "Enterprise operation unavailable",
+        code: "unavailable",
+      },
+    },
+  ]);
+
+  const enterpriseMessages: SessionOutboundMessage[] = [];
+  const enterprise = createSessionForTest({
+    messages: enterpriseMessages,
+    enterpriseContext: enterpriseContext("generation-page-identity-unregistered"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+  });
+  await enterprise.handleMessage(request);
+  expect(enterpriseMessages).toEqual(legacyMessages);
+  await Promise.all([legacy.cleanup(), enterprise.cleanup()]);
 });
 
 test("passes the per-session workspace files runtime through dispatcher registration", async () => {

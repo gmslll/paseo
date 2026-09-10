@@ -223,7 +223,10 @@ import {
 import { OutboundAuthorityEmissionAuthorizer } from "./enterprise/access/outbound-authority-emission-authorizer.js";
 import type { OutboundAuthorityEmissionStatePort } from "./enterprise/access/outbound-authority-emission-authorizer.js";
 import type { PrincipalGrantVersionGuard } from "./enterprise/access/resource-authorization.js";
-import { authorityReceiptPolicyForRequestType } from "./enterprise/access/event-action-map.js";
+import {
+  OUTBOUND_INHERITED_CONTEXT_EVENTS,
+  authorityReceiptPolicyForRequestType,
+} from "./enterprise/access/event-action-map.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
@@ -334,7 +337,17 @@ import {
 } from "./worktree-session.js";
 import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
-import { SessionAuthorization, type DaemonPermission } from "./authorization/index.js";
+import {
+  SessionAuthorization,
+  activateCurrentInboundDaemonAuthorizationDecision,
+  closeActiveInboundDaemonAuthorization,
+  consumeInboundDaemonAuthorizationDecision,
+  isActiveInboundDaemonAuthorizationCurrent,
+  type ActiveInboundDaemonAuthorization,
+  type DaemonPermission,
+  type InboundDaemonAuthorizationDecision,
+} from "./authorization/index.js";
+import type { PermissionRequirement } from "./authorization/operation-permissions.js";
 
 function resolveWorkspaceSetupRuntime(
   runtime: WorkspaceSetupRuntime | undefined,
@@ -725,6 +738,19 @@ function sessionRequestId(message: SessionInboundMessage): string | null {
   return null;
 }
 
+interface EnterpriseTransportRequestContext {
+  readonly sessionId: string;
+  readonly clientId: string;
+  readonly sessionBindingGeneration: string;
+  readonly enterpriseContext: EnterpriseSessionContext;
+  readonly requestId: string;
+  readonly requestType: SessionInboundMessage["type"];
+  readonly responseType: string;
+  readonly correlatedRevision?: string;
+  readonly daemonPermission: PermissionRequirement;
+  readonly activeDaemonAuthorization: ActiveInboundDaemonAuthorization;
+}
+
 interface AgentTimelineProjectionSelection {
   timeline: AgentTimelineFetchResult;
   entries: TimelineProjectionEntry[];
@@ -821,6 +847,10 @@ export class Session {
     }>
   >();
   private readonly reservedAuthorityRequestIds = new Set<string>();
+  private readonly inheritedTransportRequests = new Map<
+    string,
+    EnterpriseTransportRequestContext
+  >();
   private readonly outboundEmissionTasksByRequest = new Map<string, Set<Promise<unknown>>>();
   private readonly outboundEmissionTailsByRequest = new Map<string, Promise<unknown>>();
   private readonly outboundEmissionTasksWithoutRequest = new Set<Promise<unknown>>();
@@ -2696,6 +2726,9 @@ export class Session {
         if (requestId) this.emitLegacyResourceDenied(requestId, msg.type);
         return;
       }
+      const registeredEnterpriseRequestPolicy = isEnterpriseRequest(msg)
+        ? (this.enterpriseDispatcher?.requestPolicyForType?.(msg.type) ?? null)
+        : null;
       if (
         isEnterpriseRequest(msg) &&
         (!this.enterpriseDispatcher ||
@@ -2703,7 +2736,7 @@ export class Session {
           !(
             authorityReceiptPolicyForRequestType(msg.type) ??
             resolveEnterpriseReceiptPolicy(msg.type) ??
-            this.enterpriseDispatcher.requestPolicyForType?.(msg.type)
+            registeredEnterpriseRequestPolicy
           ))
       ) {
         const requestId = sessionRequestId(msg);
@@ -2720,8 +2753,15 @@ export class Session {
         }
         return;
       }
-      const registeredEnterpriseResourcePolicy =
-        this.enterpriseDispatcher?.requestPolicyForType?.(msg.type) === "resources";
+      if (
+        registeredEnterpriseRequestPolicy === "transport_control" &&
+        this.enterpriseDispatcher &&
+        this.enterpriseContext
+      ) {
+        await this.handleRegisteredEnterpriseTransportRequest(msg, daemonDecision);
+        return;
+      }
+      const registeredEnterpriseResourcePolicy = registeredEnterpriseRequestPolicy === "resources";
       if (
         (isEnterpriseResourceRequest(msg) || registeredEnterpriseResourcePolicy) &&
         this.enterpriseDispatcher &&
@@ -9358,6 +9398,201 @@ export class Session {
     );
   }
 
+  private async handleRegisteredEnterpriseTransportRequest(
+    message: SessionInboundMessage,
+    daemonDecision: InboundDaemonAuthorizationDecision,
+  ): Promise<void> {
+    const dispatcher = this.enterpriseDispatcher;
+    if (!dispatcher) return;
+    const transportContext = this.reserveEnterpriseTransportRequest(message, daemonDecision);
+    if (!transportContext) return;
+    try {
+      let response: SessionOutboundMessage | false;
+      try {
+        response = await dispatchEnterpriseRequest(
+          dispatcher,
+          Object.freeze({
+            sessionId: this.sessionId,
+            clientId: this.clientId,
+            credentialId: transportContext.enterpriseContext.principal.credentialId,
+            sessionBindingGeneration: transportContext.sessionBindingGeneration,
+            enterpriseContext: transportContext.enterpriseContext,
+          }),
+          message,
+        );
+      } catch {
+        await this.emitEnterpriseTransportUnavailableIfCurrent(transportContext);
+        return;
+      }
+      if (!this.isEnterpriseTransportRequestCurrent(transportContext)) return;
+      const parsedResponse =
+        response === false ? null : this.parseEnterpriseTransportResponse(response);
+      if (
+        response === false ||
+        !parsedResponse ||
+        !this.isEnterpriseTransportResponsePair(transportContext, parsedResponse)
+      ) {
+        this.emitEnterpriseTransportUnavailable(transportContext);
+      } else {
+        this.emit(parsedResponse);
+      }
+      await this.flushOutboundEmissionTasks(transportContext.requestId);
+    } finally {
+      this.closeEnterpriseTransportRequest(transportContext);
+    }
+  }
+
+  private reserveEnterpriseTransportRequest(
+    message: SessionInboundMessage,
+    daemonDecision: InboundDaemonAuthorizationDecision,
+  ): EnterpriseTransportRequestContext | null {
+    const enterpriseContext = this.enterpriseContext;
+    const requestId = sessionRequestId(message);
+    const responseType = this.enterpriseResponseTypeForRequest(message.type);
+    if (
+      !enterpriseContext ||
+      !requestId ||
+      !responseType ||
+      this.isCleanedUp ||
+      this.reservedAuthorityRequestIds.has(requestId) ||
+      !this.inboundAuthorityRequestAuthorizer?.isPrincipalGrantCurrent()
+    )
+      return null;
+    this.reservedAuthorityRequestIds.add(requestId);
+    const consumedDaemonAuthorization = consumeInboundDaemonAuthorizationDecision(
+      this.authorization,
+      message,
+      daemonDecision,
+    );
+    const activeDaemonAuthorization = consumedDaemonAuthorization
+      ? activateCurrentInboundDaemonAuthorizationDecision(
+          this.authorization,
+          message,
+          message.type,
+          consumedDaemonAuthorization,
+        )
+      : null;
+    if (!consumedDaemonAuthorization || !activeDaemonAuthorization) {
+      this.reservedAuthorityRequestIds.delete(requestId);
+      return null;
+    }
+    const transportContext = Object.freeze({
+      sessionId: this.sessionId,
+      clientId: this.clientId,
+      sessionBindingGeneration: enterpriseContext.sessionBindingGeneration,
+      enterpriseContext,
+      requestId,
+      requestType: message.type,
+      responseType,
+      ...("observationRevision" in message && typeof message.observationRevision === "string"
+        ? { correlatedRevision: message.observationRevision }
+        : {}),
+      daemonPermission: consumedDaemonAuthorization.daemonPermission,
+      activeDaemonAuthorization,
+    });
+    this.inheritedTransportRequests.set(requestId, transportContext);
+    return transportContext;
+  }
+
+  private closeEnterpriseTransportRequest(context: EnterpriseTransportRequestContext): void {
+    if (this.inheritedTransportRequests.get(context.requestId) === context) {
+      this.inheritedTransportRequests.delete(context.requestId);
+    }
+    closeActiveInboundDaemonAuthorization(this.authorization, context.activeDaemonAuthorization);
+    this.reservedAuthorityRequestIds.delete(context.requestId);
+  }
+
+  private parseEnterpriseTransportResponse(
+    response: SessionOutboundMessage,
+  ): SessionOutboundMessage | null {
+    try {
+      const parsed = SessionOutboundMessageSchema.safeParse(structuredClone(response));
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async emitEnterpriseTransportUnavailableIfCurrent(
+    context: EnterpriseTransportRequestContext,
+  ): Promise<void> {
+    if (!this.isEnterpriseTransportRequestCurrent(context)) return;
+    this.emitEnterpriseTransportUnavailable(context);
+    await this.flushOutboundEmissionTasks(context.requestId);
+  }
+
+  private enterpriseResponseTypeForRequest(requestType: string): string | null {
+    const suffix = ".request";
+    if (!requestType.startsWith("enterprise.") || !requestType.endsWith(suffix)) return null;
+    return `${requestType.slice(0, -suffix.length)}.response`;
+  }
+
+  private isEnterpriseTransportRequestCurrent(context: EnterpriseTransportRequestContext): boolean {
+    return (
+      !this.isCleanedUp &&
+      this.enterpriseContext === context.enterpriseContext &&
+      this.sessionId === context.sessionId &&
+      this.clientId === context.clientId &&
+      this.enterpriseContext.sessionBindingGeneration === context.sessionBindingGeneration &&
+      this.inheritedTransportRequests.get(context.requestId) === context &&
+      this.inboundAuthorityRequestAuthorizer?.isPrincipalGrantCurrent() === true &&
+      isActiveInboundDaemonAuthorizationCurrent(
+        this.authorization,
+        context.activeDaemonAuthorization,
+        context.requestType,
+        context.daemonPermission,
+      )
+    );
+  }
+
+  private isEnterpriseTransportResponsePair(
+    context: EnterpriseTransportRequestContext,
+    response: SessionOutboundMessage,
+  ): boolean {
+    const acceptedRevision =
+      "payload" in response &&
+      response.payload &&
+      typeof response.payload === "object" &&
+      "acceptedRevision" in response.payload
+        ? response.payload.acceptedRevision
+        : undefined;
+    return (
+      response.type === context.responseType &&
+      this.outboundRequestId(response) === context.requestId &&
+      (context.correlatedRevision === undefined ||
+        acceptedRevision === context.correlatedRevision) &&
+      OUTBOUND_INHERITED_CONTEXT_EVENTS.includes(
+        response.type as (typeof OUTBOUND_INHERITED_CONTEXT_EVENTS)[number],
+      )
+    );
+  }
+
+  private isEnterpriseTransportInheritedEmission(
+    context: EnterpriseTransportRequestContext,
+    event: SessionOutboundMessage,
+  ): boolean {
+    if (!this.isEnterpriseTransportRequestCurrent(context)) return false;
+    if (event.type === "rpc_error") {
+      return (
+        event.payload.requestId === context.requestId &&
+        event.payload.requestType === context.requestType
+      );
+    }
+    return this.isEnterpriseTransportResponsePair(context, event);
+  }
+
+  private emitEnterpriseTransportUnavailable(context: EnterpriseTransportRequestContext): void {
+    this.emit({
+      type: "rpc_error",
+      payload: {
+        requestId: context.requestId,
+        requestType: context.requestType,
+        error: ENTERPRISE_UNAVAILABLE_ERROR,
+        code: "unavailable",
+      },
+    });
+  }
+
   private emit(msg: SessionOutboundMessage, context?: OutboundAuthorizationContext): void {
     if (!this.enterpriseContext) {
       this.deliver(msg);
@@ -9453,6 +9688,14 @@ export class Session {
         let resolvedContext: OutboundAuthorizationContext | undefined = authorizationContext;
         if (!resolvedContext) {
           const emissionRequestId = this.outboundRequestId(event);
+          const inheritedTransportContext = emissionRequestId
+            ? this.inheritedTransportRequests.get(emissionRequestId)
+            : undefined;
+          if (inheritedTransportContext) {
+            return this.isEnterpriseTransportInheritedEmission(inheritedTransportContext, event)
+              ? this.deliverForSource(event, source)
+              : false;
+          }
           const correlation = emissionRequestId
             ? this.pendingAuthorityRequests.get(emissionRequestId)
             : undefined;
@@ -9795,6 +10038,10 @@ export class Session {
     this.enterpriseAgentEventIngressSealed = true;
     const agentUpdatesDrain = this.agentUpdates.sealAndDrain();
     this.isCleanedUp = true;
+    for (const context of this.inheritedTransportRequests.values()) {
+      closeActiveInboundDaemonAuthorization(this.authorization, context.activeDaemonAuthorization);
+    }
+    this.inheritedTransportRequests.clear();
     const cleanupErrors: unknown[] = [];
     const unsubscribeAgentEvents = this.unsubscribeAgentEvents;
     this.unsubscribeAgentEvents = null;
