@@ -61,6 +61,14 @@ function equal(a: unknown, b: unknown): boolean {
     ak.every((k) => bk.includes(k) && equal(Reflect.get(a, k), Reflect.get(b, k)))
   );
 }
+function requestIdOf(
+  workspace: ReturnType<typeof EnterpriseWorkspaceContentReadRequestSchema.safeParse>,
+  app: ReturnType<typeof EnterpriseAppSlotContentReadRequestSchema.safeParse>,
+): string {
+  if (workspace.success) return workspace.data.requestId;
+  if (app.success) return app.data.requestId;
+  return "";
+}
 
 export function createEnterpriseContentReadDispatcherRegistration(
   input: EnterpriseContentReadFactoryInput,
@@ -128,9 +136,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
           handle: async ({ sessionContext, message }): Promise<SessionOutboundMessage | false> => {
             const parsed = EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
             const parsedApp = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
-            let requestId = "";
-            if (parsed.success) requestId = parsed.data.requestId;
-            else if (parsedApp.success) requestId = parsedApp.data.requestId;
+            const requestId = requestIdOf(parsed, parsedApp);
             if (
               (!parsed.success && !parsedApp.success) ||
               !current(sessionContext) ||
