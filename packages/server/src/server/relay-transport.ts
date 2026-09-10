@@ -437,7 +437,7 @@ async function attachEncryptedSocket(
       }
       pendingMessages.push(data);
     };
-    const challenge = randomBytes(32).toString("base64url");
+    const challenge = authenticateEnterprise ? randomBytes(32).toString("base64url") : null;
     let authenticated = !authenticateEnterprise;
     let authenticating = false;
     let authSettled = authenticated;
@@ -466,9 +466,12 @@ async function attachEncryptedSocket(
                 typeof data === "string" ? data : new TextDecoder().decode(data),
               );
               if (
+                !challenge ||
                 parsed?.type !== "encrypted_auth_preface_v1" ||
                 parsed.challenge !== challenge ||
-                typeof parsed.token !== "string"
+                typeof parsed.token !== "string" ||
+                parsed.token.length === 0 ||
+                Object.keys(parsed).sort().join(",") !== "challenge,token,type"
               ) {
                 throw new Error("invalid encrypted auth preface");
               }
@@ -512,7 +515,7 @@ async function attachEncryptedSocket(
           emitter.emit("error", error);
         },
       },
-      { authPreface: { challenge } },
+      challenge ? { authPreface: { challenge } } : {},
     );
     await authPromise;
     const encryptedSocket = createEncryptedRelaySocket({
