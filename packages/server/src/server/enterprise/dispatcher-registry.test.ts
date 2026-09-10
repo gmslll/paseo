@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EnterpriseDispatchContext } from "../session/enterprise-dispatcher.js";
-import { createEnterpriseDispatcherRegistry } from "./dispatcher-registry.js";
+import {
+  createEnterpriseDispatcherRegistry,
+  createEnterpriseSessionDispatcherRegistration,
+} from "./dispatcher-registry.js";
 
 const context = {} as EnterpriseDispatchContext;
 const request = { type: "enterprise.identity.get_current.request", requestId: "req_1" } as never;
@@ -129,5 +132,122 @@ describe("enterprise dispatcher registry", () => {
       enterpriseAuditV1: true,
     });
     expect("enterpriseDistributedNodeV1" in registry.features).toBe(false);
+  });
+
+  it("opens each family per session and routes through one composite lease", async () => {
+    const closeIdentity = vi.fn();
+    const closeResources = vi.fn();
+    const identityResponse = {
+      type: "enterprise.identity.get_current.response",
+      payload: { requestId: "req_identity" },
+    } as never;
+    const resourceResponse = {
+      type: "enterprise.organization.list_resources.response",
+      payload: { requestId: "req_resources", principals: [], resources: [], nextCursor: null },
+    } as never;
+    const registration = createEnterpriseSessionDispatcherRegistration([
+      {
+        manifest: { operations: [request.type] },
+        open: vi.fn(() => ({
+          dispatcher: { handle: () => identityResponse },
+          close: closeIdentity,
+        })),
+      },
+      {
+        manifest: { operations: ["enterprise.organization.list_resources.request"] },
+        open: vi.fn(() => ({
+          dispatcher: {
+            handle: () => resourceResponse,
+            requestPolicyForType: () => "resources" as const,
+            consumeResponse: ({ response: messageResponse }: { response: never }) => ({
+              response: messageResponse,
+              receiptClassification: "resources" as const,
+              authorizationContext: {
+                kind: "resources",
+                organizationId: "org",
+                principals: [],
+                resources: [],
+                nextCursor: null,
+              },
+            }),
+          },
+          close: closeResources,
+        })),
+      },
+    ]);
+    expect(registration).not.toBeNull();
+    const lease = registration?.open({
+      sessionId: "session",
+      clientId: "client",
+      context,
+      authorizationRuntime: {},
+    });
+    await expect(
+      lease?.dispatcher.handle({ sessionContext: context, message: request }),
+    ).resolves.toBe(identityResponse);
+    await expect(
+      lease?.dispatcher.handle({
+        sessionContext: context,
+        message: {
+          type: "enterprise.organization.list_resources.request",
+          requestId: "req_resources",
+        } as never,
+      }),
+    ).resolves.toBe(resourceResponse);
+    expect(
+      lease?.dispatcher.requestPolicyForType?.("enterprise.organization.list_resources.request"),
+    ).toBe("resources");
+    const consumed = lease?.dispatcher.consumeResponse?.({
+      sessionContext: context,
+      message: {
+        type: "enterprise.organization.list_resources.request",
+        requestId: "req_resources",
+      } as never,
+      response: resourceResponse,
+    });
+    expect(consumed?.receiptClassification).toBe("resources");
+    await lease?.close();
+    await lease?.close();
+    expect(closeIdentity).toHaveBeenCalledTimes(1);
+    expect(closeResources).toHaveBeenCalledTimes(1);
+    await expect(
+      lease?.dispatcher.handle({ sessionContext: context, message: request }),
+    ).resolves.toBe(false);
+  });
+
+  it("rolls back already opened leases when a later family fails", () => {
+    const close = vi.fn();
+    const registration = createEnterpriseSessionDispatcherRegistration([
+      {
+        manifest: { operations: ["a.request"] },
+        open: () => ({ dispatcher: { handle: () => false }, close }),
+      },
+      {
+        manifest: { operations: ["b.request"] },
+        open: () => {
+          throw new Error("open failed");
+        },
+      },
+    ]);
+    expect(registration).not.toBeNull();
+    expect(() => registration?.open({ sessionId: "s", clientId: "c", context })).toThrow(
+      "open failed",
+    );
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects duplicate operations in a composite manifest", () => {
+    expect(
+      createEnterpriseSessionDispatcherRegistration([
+        {
+          manifest: { operations: ["same.request"] },
+          open: () => ({ dispatcher: { handle: () => false }, close: () => undefined }),
+        },
+        {
+          manifest: { operations: ["same.request"] },
+          open: () => ({ dispatcher: { handle: () => false }, close: () => undefined }),
+        },
+      ]),
+    ).toBeNull();
   });
 });

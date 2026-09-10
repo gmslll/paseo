@@ -1,7 +1,11 @@
-import type { SessionOutboundMessage } from "../messages.js";
+import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
 import type {
+  EnterpriseDispatchContext,
   EnterpriseDispatchResponse,
   EnterpriseResponseContextConsumer,
+  EnterpriseDispatcherLease,
+  EnterpriseDispatcherManifest,
+  EnterpriseSessionDispatcherFactoryRegistration,
   EnterpriseSessionDispatcher,
 } from "../session/enterprise-dispatcher.js";
 
@@ -140,4 +144,134 @@ export function createEnterpriseDispatcherRegistry(
     }) satisfies EnterpriseResponseContextConsumer["consumeResponse"],
   };
   return Object.freeze(registry);
+}
+
+/**
+ * Combines per-session family registrations into the single registration slot
+ * accepted by Session. Registrations remain opaque and are opened only after a
+ * Session has a nominal authorization runtime; no authority is reconstructed
+ * from structural context here.
+ */
+export function createEnterpriseSessionDispatcherRegistration(
+  registrations: readonly EnterpriseSessionDispatcherFactoryRegistration[],
+): EnterpriseSessionDispatcherFactoryRegistration | null {
+  if (registrations.length === 0) return null;
+  const operations: string[] = [];
+  const seen = new Set<string>();
+  for (const registration of registrations) {
+    if (!isValidManifest(registration.manifest)) return null;
+    for (const operation of registration.manifest.operations) {
+      if (seen.has(operation)) return null;
+      seen.add(operation);
+      operations.push(operation);
+    }
+  }
+  const manifest: EnterpriseDispatcherManifest = Object.freeze({
+    operations: Object.freeze(operations),
+  });
+  return Object.freeze({
+    manifest,
+    open(input: Parameters<EnterpriseSessionDispatcherFactoryRegistration["open"]>[0]) {
+      const leases: EnterpriseDispatcherLease[] = [];
+      try {
+        for (const registration of registrations) leases.push(registration.open(input));
+      } catch (error) {
+        closeLeasesWithoutMasking(leases);
+        throw error;
+      }
+      const active = { value: true };
+      const requestMap = new Map<string, EnterpriseSessionDispatcher>();
+      for (let index = 0; index < leases.length; index += 1) {
+        for (const requestType of registrations[index].manifest.operations)
+          requestMap.set(requestType, leases[index].dispatcher);
+      }
+      const dispatcher: EnterpriseSessionDispatcher = Object.freeze({
+        requestPolicyForType: (requestType: string) => {
+          if (!active.value) return null;
+          const delegate = requestMap.get(requestType);
+          if (!delegate?.requestPolicyForType) return null;
+          try {
+            return delegate.requestPolicyForType(requestType);
+          } catch {
+            return null;
+          }
+        },
+        handle: async ({
+          sessionContext,
+          message,
+        }: {
+          readonly sessionContext: EnterpriseDispatchContext;
+          readonly message: SessionInboundMessage;
+        }) => {
+          if (!active.value) return false;
+          const delegate = requestMap.get(message.type);
+          if (!delegate) return false;
+          try {
+            const result = await delegate.handle({ sessionContext, message });
+            return active.value && result !== false ? result : false;
+          } catch {
+            return false;
+          }
+        },
+        consumeResponse: ({
+          sessionContext,
+          message,
+          response,
+        }: Parameters<EnterpriseResponseContextConsumer["consumeResponse"]>[0]) => {
+          if (!active.value) return null;
+          const delegate = requestMap.get(message.type);
+          if (!delegate?.consumeResponse)
+            return { response, receiptClassification: "authority" as const };
+          try {
+            return delegate.consumeResponse({ sessionContext, message, response });
+          } catch {
+            return null;
+          }
+        },
+      });
+      return Object.freeze({
+        dispatcher,
+        close: async () => {
+          if (!active.value) return;
+          active.value = false;
+          const errors: unknown[] = [];
+          for (let index = leases.length - 1; index >= 0; index -= 1) {
+            try {
+              await leases[index].close();
+            } catch (error) {
+              errors.push(error);
+            }
+          }
+          if (errors.length === 1) throw errors[0];
+          if (errors.length > 1)
+            throw new AggregateError(errors, "Enterprise dispatcher lease cleanup failed", {
+              cause: errors[0],
+            });
+        },
+      });
+    },
+  });
+}
+
+function isValidManifest(
+  value: EnterpriseDispatcherManifest | undefined,
+): value is EnterpriseDispatcherManifest {
+  return Boolean(
+    value &&
+    Array.isArray(value.operations) &&
+    value.operations.length > 0 &&
+    value.operations.every((operation) => typeof operation === "string" && operation.length > 0),
+  );
+}
+
+function closeLeasesWithoutMasking(leases: readonly EnterpriseDispatcherLease[]): void {
+  for (let index = leases.length - 1; index >= 0; index -= 1) {
+    try {
+      const result = leases[index].close();
+      if (result && typeof (result as PromiseLike<unknown>).then === "function")
+        void Promise.resolve(result).catch(() => undefined);
+    } catch {
+      // Preserve the synchronous open failure; Session cleanup reports later errors.
+    }
+  }
 }
