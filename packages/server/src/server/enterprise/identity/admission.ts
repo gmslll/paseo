@@ -15,6 +15,11 @@ import {
   type PrincipalGrantSource,
 } from "./registry.js";
 import {
+  isAuthoritativeGrantStoreForAudit,
+  readAuthoritativeGrantRecord,
+  type GrantStore,
+} from "../access/grant-store.js";
+import {
   bindEnterpriseAdmissionSession,
   createEnterpriseAdmissionAuthorizationIssuer,
   issueEnterpriseAdmissionEvidence,
@@ -43,6 +48,36 @@ export interface EnterpriseIdentitySideDependencies extends Omit<
 > {
   readonly principalSource: PrincipalGrantSource;
   readonly invalidation: CredentialInvalidationSink;
+}
+
+/** Composes durable principal metadata with the single audit-bound W2 GrantStore. */
+export function createPrincipalGrantSourceFromGrantStore(input: {
+  readonly grantStore: GrantStore;
+  readonly audit: ProductionAuditCapability;
+  readonly resolvePrincipalType: (
+    principalId: string,
+    organizationId: string,
+  ) => Promise<"human" | "service">;
+}): PrincipalGrantSource {
+  if (!isAuthoritativeGrantStoreForAudit(input.grantStore, input.audit)) {
+    throw new Error("enterprise identity requires the audit-bound GrantStore");
+  }
+  return {
+    async resolvePrincipal(principalId, organizationId) {
+      const [record, principalType] = await Promise.all([
+        readAuthoritativeGrantRecord(input.grantStore, principalId),
+        input.resolvePrincipalType(principalId, organizationId),
+      ]);
+      if (!record || record.organizationId !== organizationId) return null;
+      return {
+        principalId,
+        organizationId,
+        principalType,
+        grants: record.grants,
+        grantVersion: record.grantVersion,
+      };
+    },
+  };
 }
 
 export function createEnterpriseIdentitySide(
