@@ -6597,14 +6597,21 @@ export class Session {
         }
       }
 
-      this.emit({
-        type: "fetch_agents_response",
-        payload: {
-          requestId: request.requestId,
-          ...(subscriptionId ? { subscriptionId } : {}),
-          ...payload,
+      this.emit(
+        {
+          type: "fetch_agents_response",
+          payload: {
+            requestId: request.requestId,
+            ...(subscriptionId ? { subscriptionId } : {}),
+            ...payload,
+          },
         },
-      });
+        this.createWorkspaceOutboundContextForIds(
+          payload.entries
+            .map((entry) => entry.agent.workspaceId)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
 
       if (subscriptionId) {
         this.agentUpdates.flushBootstrapped(subscriptionId, { snapshotUpdatedAtByAgentId });
@@ -6637,13 +6644,20 @@ export class Session {
     }
     try {
       const payload = await this.listFetchAgentsEntries(request);
-      this.emit({
-        type: "fetch_agent_history_response",
-        payload: {
-          requestId: request.requestId,
-          ...payload,
+      this.emit(
+        {
+          type: "fetch_agent_history_response",
+          payload: {
+            requestId: request.requestId,
+            ...payload,
+          },
         },
-      });
+        this.createWorkspaceOutboundContextForIds(
+          payload.entries
+            .map((entry) => entry.agent.workspaceId)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
     } catch (error) {
       const code = error instanceof SessionRequestError ? error.code : "fetch_agent_history_failed";
       const message = error instanceof Error ? error.message : "Failed to fetch agent history";
@@ -6758,14 +6772,17 @@ export class Session {
         payload.emptyProjects,
       );
 
-      this.emit({
-        type: "fetch_workspaces_response",
-        payload: {
-          requestId: request.requestId,
-          ...(subscriptionId ? { subscriptionId } : {}),
-          ...payload,
+      this.emit(
+        {
+          type: "fetch_workspaces_response",
+          payload: {
+            requestId: request.requestId,
+            ...(subscriptionId ? { subscriptionId } : {}),
+            ...payload,
+          },
         },
-      });
+        this.createWorkspaceOutboundContextForIds(payload.entries.map((entry) => entry.id)),
+      );
 
       if (subscriptionId && this.workspaceUpdatesSubscription?.subscriptionId === subscriptionId) {
         this.flushBootstrappedWorkspaceUpdates(snapshot);
@@ -9104,6 +9121,19 @@ export class Session {
     const resource = this.createWorkspaceResource(workspaceId);
     if (!resource) return undefined;
     const resources = [resource];
+    Object.freeze(resources);
+    return Object.freeze({ kind: "resources", resources });
+  }
+
+  private createWorkspaceOutboundContextForIds(
+    workspaceIds: readonly string[],
+  ): OutboundAuthorizationContext | undefined {
+    const resources = [...new Set(workspaceIds)]
+      .map((workspaceId) => this.createWorkspaceResource(workspaceId))
+      .filter((resource): resource is Extract<GlobalResourceRef, { resourceKind: "workspace" }> =>
+        Boolean(resource),
+      );
+    if (resources.length === 0) return undefined;
     Object.freeze(resources);
     return Object.freeze({ kind: "resources", resources });
   }
