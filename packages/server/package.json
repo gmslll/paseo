@@ -47,6 +47,8 @@
     "measure:agent-tools": "tsx scripts/measure-agent-tools-context.ts",
     "measure:git-observation": "tsx scripts/measure-git-observation.ts",
     "measure:file-observer": "tsx scripts/measure-file-observer.ts",
+    "enterprise:case20:part-a": "tsx scripts/enterprise-case20/part-a.ts",
+    "enterprise:case20:part-b:paid-real-providers": "tsx scripts/enterprise-case20/part-b.ts",
     "repro:file-observer-teardown": "tsx scripts/reproduce-file-observer-teardown.ts",
     "speech:models": "tsx scripts/list-speech-models.ts",
     "speech:download": "tsx scripts/download-speech-models.ts",
