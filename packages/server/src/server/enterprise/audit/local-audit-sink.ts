@@ -886,6 +886,7 @@ function redact(input: AuditEventInput): AuditEventInput {
     ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
     ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
     outcome: input.outcome,
+    ...(input.priority !== undefined ? { priority: input.priority } : {}),
     ...(input.reasonCode !== undefined ? { reasonCode: input.reasonCode } : {}),
     ...(frozenMetadata !== undefined ? { metadata: frozenMetadata } : {}),
   });

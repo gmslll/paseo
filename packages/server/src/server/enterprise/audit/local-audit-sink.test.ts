@@ -445,6 +445,17 @@ async function temporaryDirectory(prefix: string): Promise<string> {
 }
 
 describe("LocalAuditSink", () => {
+  it("round-trips high priority and preserves legacy undefined priority", async () => {
+    const storage = new MemoryStorage();
+    const sink = new LocalAuditSink(dependencies(storage));
+    const high = await sink.append({ ...input, priority: "high" }, { durability: "required" });
+    const legacy = await sink.append(input, { durability: "required" });
+
+    expect(high.priority).toBe("high");
+    expect(legacy).not.toHaveProperty("priority");
+    expect(storage.events.map((event) => event.priority)).toEqual(["high", undefined]);
+  });
+
   it("owns authority fields, redacts metadata, and resumes the verified chain", async () => {
     const storage = new MemoryStorage();
     const first = new LocalAuditSink(dependencies(storage));

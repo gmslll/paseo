@@ -107,6 +107,7 @@ describe.runIf(enabled)("production break-glass provisioning audit evidence", ()
             actorPrincipalId: "owner",
             outcome: "allowed",
             organizationId,
+            priority: "high",
           }),
           expect.objectContaining({
             action: "identity.credential.issue",
