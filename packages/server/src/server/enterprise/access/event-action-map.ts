@@ -67,6 +67,12 @@ const browserManagePolicy: OutboundResourceActionPolicy = {
   browser_profile: ["browser.profile.manage"],
   app_slot: noActions,
 };
+const browserListProfilesPolicy: OutboundResourceActionPolicy = {
+  workspace: ["browser.use", "browser.profile.manage"],
+  agent: ["browser.use", "browser.profile.manage"],
+  browser_profile: ["browser.use", "browser.profile.manage"],
+  app_slot: noActions,
+};
 
 const executionResourcePolicy: OutboundResourceActionPolicy = {
   workspace: ["browser.use", "app.use"],
@@ -93,7 +99,7 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "enterprise.access.update_grants.request": ["identity.manage"],
   "enterprise.audit.list_events.request": ["audit.read"],
   "enterprise.browser.bind_profile.request": ["browser.profile.manage"],
-  "enterprise.browser.list_profiles.request": ["browser.use"],
+  "enterprise.browser.list_profiles.request": ["browser.use", "browser.profile.manage"],
   "enterprise.identity.list_principals.request": ["identity.manage"],
   "enterprise.organization.list_resources.request": ["workspace.metadata.read"],
   "enterprise.placement.resolve_workspace.request": ["workspace.metadata.read"],
@@ -364,7 +370,11 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
   },
   {
     policy: browserUsePolicy,
-    events: ["browser.automation.execute.request", "enterprise.browser.list_profiles.response"],
+    events: ["browser.automation.execute.request"],
+  },
+  {
+    policy: browserListProfilesPolicy,
+    events: ["enterprise.browser.list_profiles.response"],
   },
   {
     policy: browserManagePolicy,
