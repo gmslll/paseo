@@ -6,10 +6,17 @@ import {
   HumanPrincipalIdSchema,
   OrganizationIdSchema,
   ResourceGrantSchema,
+  type NodeContext,
   type EnterprisePrincipalRecord,
   type PrincipalContext,
   type ResourceGrant,
 } from "@getpaseo/protocol/messages";
+import type { ProductionAuthorizationRuntimeProvider } from "./access/production-authorization-runtime-provider.js";
+import { provisionInitialGrant } from "./access/production-grant-provisioner.js";
+import {
+  productionAuditCapabilityIssuer,
+  type ProductionAuditCapability,
+} from "./audit/production-audit-runtime.js";
 
 export interface ProductionInitialCredential {
   readonly credentialId: string;
@@ -21,7 +28,7 @@ export interface ProductionInitialCredential {
 export interface ProductionEnterpriseProvisioningPorts {
   current(): boolean;
   authenticateBreakGlass(password: string): Promise<PrincipalContext | null>;
-  ensurePrincipal(input: {
+  ensurePrincipalIntent(input: {
     readonly principalId: EnterprisePrincipalRecord["principalId"];
     readonly organizationId: EnterprisePrincipalRecord["organizationId"];
     readonly principalType: "human";
@@ -38,7 +45,61 @@ export interface ProductionEnterpriseProvisioningPorts {
     readonly actor: PrincipalContext;
     readonly principalId: string;
     readonly organizationId: string;
-  }): Promise<ProductionInitialCredential>;
+  }): Promise<
+    | { readonly status: "issued"; readonly token: string; readonly credentialId: string }
+    | { readonly status: "already_provisioned"; readonly credentialIds: readonly string[] }
+  >;
+}
+
+/** Adapts the already assembled production authority objects without creating stores. */
+export function createProductionEnterpriseProvisioningPorts(input: {
+  readonly audit: ProductionAuditCapability;
+  readonly admission: {
+    readonly node: NodeContext;
+    readonly authenticator: {
+      authenticateBearer(token: string, context: unknown): Promise<PrincipalContext | null>;
+    };
+    readonly registry: {
+      issueInitialCredential(input: {
+        actor: PrincipalContext;
+        principalId: string;
+        organizationId: string;
+      }): Promise<
+        Awaited<ReturnType<ProductionEnterpriseProvisioningPorts["issueInitialCredential"]>>
+      >;
+    };
+  };
+  readonly provider: ProductionAuthorizationRuntimeProvider;
+  readonly principalProvisioning: {
+    ensurePrincipalIntent(input: {
+      readonly principalId: EnterprisePrincipalRecord["principalId"];
+      readonly organizationId: EnterprisePrincipalRecord["organizationId"];
+      readonly principalType: "human";
+      readonly status: "active";
+      readonly displayName?: string;
+    }): Promise<EnterprisePrincipalRecord>;
+  };
+}): ProductionEnterpriseProvisioningPorts {
+  return {
+    current: () => productionAuditCapabilityIssuer.current(input.audit),
+    authenticateBreakGlass: (password) =>
+      input.admission.authenticator.authenticateBearer(password, {
+        node: input.admission.node,
+        transport: "direct",
+        peer: "loopback",
+      }),
+    ensurePrincipalIntent: input.principalProvisioning.ensurePrincipalIntent,
+    provisionInitialGrant: ({ actor, principalId, organizationId, grants }) =>
+      provisionInitialGrant({
+        provider: input.provider,
+        actor,
+        principalId,
+        organizationId,
+        grants,
+      }),
+    issueInitialCredential: ({ actor, principalId, organizationId }) =>
+      input.admission.registry.issueInitialCredential({ actor, principalId, organizationId }),
+  };
 }
 
 const InputSchema = z.strictObject({
@@ -75,7 +136,7 @@ export async function provisionProductionEnterpriseInitialAdmin(
   try {
     const actor = await ports.authenticateBreakGlass(bootstrapPassword);
     if (!actor) throw new Error("local bootstrap authentication failed");
-    const principal = await ports.ensurePrincipal({
+    const principal = await ports.ensurePrincipalIntent({
       principalId: parsed.principalId,
       organizationId: parsed.organizationId,
       principalType: "human",
@@ -95,10 +156,16 @@ export async function provisionProductionEnterpriseInitialAdmin(
       principalId: principal.principalId,
       organizationId: principal.organizationId,
     });
-    if (!credential.alreadyProvisioned && !credential.token)
-      throw new Error("initial credential did not return a token");
+    const result =
+      credential.status === "issued"
+        ? {
+            credentialId: credential.credentialId,
+            token: credential.token,
+            alreadyProvisioned: false,
+          }
+        : { credentialId: credential.credentialIds[0]!, alreadyProvisioned: true };
     if (!ports.current()) throw new Error("enterprise authority changed during provisioning");
-    return Object.freeze({ principalId: principal.principalId, ...credential });
+    return Object.freeze({ principalId: principal.principalId, ...result });
   } finally {
     await lock.close().catch(() => undefined);
     await unlink(lockPath).catch(() => undefined);

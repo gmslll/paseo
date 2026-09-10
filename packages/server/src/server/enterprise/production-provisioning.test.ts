@@ -14,12 +14,15 @@ describe("production enterprise initial provisioning orchestration", () => {
     let provisioned = false;
     const issue = vi.fn(async () => {
       if (provisioned)
-        return { credentialId: "cred_aaaaaaaaaaaaaaaaaaaaaaaa", alreadyProvisioned: true };
+        return {
+          status: "already_provisioned",
+          credentialIds: ["cred_aaaaaaaaaaaaaaaaaaaaaaaa"],
+        };
       provisioned = true;
       return {
+        status: "issued",
         credentialId: "cred_aaaaaaaaaaaaaaaaaaaaaaaa",
         token: "pso_u_cred_aaaaaaaaaaaaaaaaaaaaaaaa.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        alreadyProvisioned: false,
       };
     });
     const ports = {
@@ -35,7 +38,11 @@ describe("production enterprise initial provisioning orchestration", () => {
             grants: [],
           }) as never,
       ),
-      ensurePrincipal: vi.fn(async (record) => record),
+      ensurePrincipalIntent: vi.fn(async (record) => ({
+        ...record,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      })),
       provisionInitialGrant: vi.fn(async () => ({ grantVersion: "grv_1" })),
       issueInitialCredential: issue,
     };
@@ -62,7 +69,7 @@ describe("production enterprise initial provisioning orchestration", () => {
     const ports = {
       current: () => false,
       authenticateBreakGlass: vi.fn(),
-      ensurePrincipal: vi.fn(),
+      ensurePrincipalIntent: vi.fn(),
       provisionInitialGrant: vi.fn(),
       issueInitialCredential: vi.fn(),
     };

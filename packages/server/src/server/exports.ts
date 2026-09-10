@@ -12,6 +12,7 @@ export {
 export { hashDaemonPassword, isBearerTokenValid } from "./auth.js";
 export {
   provisionProductionEnterpriseInitialAdmin,
+  createProductionEnterpriseProvisioningPorts,
   type ProductionEnterpriseProvisioningPorts,
   type ProductionInitialCredential,
 } from "./enterprise/production-provisioning.js";
