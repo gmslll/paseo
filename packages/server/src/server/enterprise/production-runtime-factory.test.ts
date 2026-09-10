@@ -87,6 +87,50 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
       const principal = await runtime.admission.authenticate(issued.token, connection);
       expect(principal).toMatchObject({ principalId, organizationId, grantVersion: "grv_1" });
       expect(runtime.grantVersionGuard.isCurrent(principal!)).toBe(true);
+      const identityRegistration = createProductionIdentityDispatcherRegistration({
+        admission: runtime.admission,
+        audit,
+        provider: runtime.authorizationRuntimeProvider!,
+      });
+      const enterpriseContext = Object.freeze({
+        principal: principal!,
+        node: runtime.node,
+        sessionBindingGeneration: "identity-generation",
+      });
+      const identityLease = identityRegistration!.open({
+        sessionId: "identity-session",
+        clientId: "identity-client",
+        context: enterpriseContext,
+      });
+      const dispatchContext = Object.freeze({
+        sessionId: "identity-session",
+        clientId: "identity-client",
+        credentialId: principal!.credentialId,
+        sessionBindingGeneration: "identity-generation",
+        enterpriseContext,
+      });
+      await expect(
+        identityLease.dispatcher.handle({
+          sessionContext: dispatchContext,
+          message: { type: "enterprise.identity.get_current.request", requestId: "identity-1" },
+        }),
+      ).resolves.toMatchObject({ type: "enterprise.identity.get_current.response" });
+      await expect(
+        identityLease.dispatcher.handle({
+          sessionContext: dispatchContext,
+          message: { type: "enterprise.identity.list_principals.request", requestId: "identity-2" },
+        }),
+      ).resolves.toMatchObject({
+        type: "enterprise.identity.list_principals.response",
+        payload: { principals: [{ principalId, status: "active" }] },
+      });
+      await identityLease.close();
+      await expect(
+        identityLease.dispatcher.handle({
+          sessionContext: dispatchContext,
+          message: { type: "enterprise.identity.get_current.request", requestId: "identity-3" },
+        }),
+      ).resolves.toBe(false);
 
       await audit.close();
       restartedAudit = await issueAudit(root);
