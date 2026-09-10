@@ -12,7 +12,10 @@ import {
   createAuthenticatedBrowserHostSession,
   createBrowserPageIdentityVerifier,
 } from "../../browser-tools/page-identity-registry.js";
-import { EnterpriseBrowserPageIdentityObservationRequestSchema } from "@getpaseo/protocol/messages";
+import {
+  EnterpriseBrowserPageIdentityInvalidationRequestSchema,
+  EnterpriseBrowserPageIdentityObservationRequestSchema,
+} from "@getpaseo/protocol/messages";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import { EnterpriseWorkspaceContentReadResponseSchema } from "@getpaseo/protocol/messages";
 import { createProductionAppSlotRegistry } from "../runtime/production-app-slot-registry.js";
@@ -22,6 +25,16 @@ import {
   createProductionRuntimeFixture,
   node as fixtureNode,
 } from "./production-runtime-test-fixture.js";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
 
 describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", () => {
   test("reads canonical workspace content and consumes once", async () => {
@@ -646,15 +659,27 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
         },
         onClose: () => {},
       });
+      let expectedHostname = "SHOP.EXAMPLE.";
+      let nextProfileReadBarrier:
+        | { entered: ReturnType<typeof deferred<void>>; release: ReturnType<typeof deferred<void>> }
+        | undefined;
       const identityRegistry = new BrowserPageIdentityRegistry({
         profiles: {
-          get: async () => ({
-            ...created,
-            expectedIdentity: {
-              hostnames: ["SHOP.EXAMPLE."],
-              accountLabelHash: "sha256:account-a",
-            },
-          }),
+          get: async () => {
+            const barrier = nextProfileReadBarrier;
+            nextProfileReadBarrier = undefined;
+            if (barrier) {
+              barrier.entered.resolve();
+              await barrier.release.promise;
+            }
+            return {
+              ...created,
+              expectedIdentity: {
+                hostnames: [expectedHostname],
+                accountLabelHash: "sha256:account-a",
+              },
+            };
+          },
         },
       });
       const identityHost = createAuthenticatedBrowserHostSession({
@@ -681,6 +706,19 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
           bindingRevision: "binding-1",
           lifecycleGeneration: fixture.context.sessionBindingGeneration,
         }),
+      );
+      const registrationWithoutVerifier = createEnterpriseContentReadDispatcherRegistration({
+        provider: fixture.provider,
+        audit: fixture.audit,
+        agents: {
+          listAgents: async () => [],
+          getAgent: async () => null,
+          getTimelineRows: async () => [],
+        },
+        createBrowserProfileSource: () => source,
+      });
+      expect(registrationWithoutVerifier?.manifest.operations).not.toContain(
+        "enterprise.browser_profile.content.read.request",
       );
       const registration = createEnterpriseContentReadDispatcherRegistration({
         provider: fixture.provider,
@@ -744,25 +782,106 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       expect(
         lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
       ).toBeNull();
-      const readsBeforeMismatch = reads;
-      const auditBeforeMismatch = (await fixture.audit.snapshotEvents()).filter(
-        (event) => event.action === "browser.use" && event.outcome === "allowed",
-      ).length;
-      const mismatch = await lease.dispatcher.handle({
-        sessionContext: fixture.context,
-        message: {
-          ...message,
-          requestId: "r-browser-mismatch",
-          resource: { ...message.resource, organizationId: "org_ffffffffffffffff" },
-        },
-      });
-      expect(mismatch).toBe(false);
-      expect(reads).toBe(readsBeforeMismatch);
-      expect(
+      const allowedAuditCount = async () =>
         (await fixture.audit.snapshotEvents()).filter(
           (event) => event.action === "browser.use" && event.outcome === "allowed",
-        ).length,
-      ).toBe(auditBeforeMismatch);
+        ).length;
+      const readsBeforeDenials = reads;
+      const auditBeforeDenials = await allowedAuditCount();
+      const expectDeniedBeforeRead = async (requestId: string) => {
+        expect(
+          await lease.dispatcher.handle({
+            sessionContext: fixture.context,
+            message: { ...message, requestId },
+          }),
+        ).toBe(false);
+        expect(reads).toBe(readsBeforeDenials);
+        expect(await allowedAuditCount()).toBe(auditBeforeDenials);
+      };
+
+      expectedHostname = "other.example";
+      await expectDeniedBeforeRead("r-browser-page-mismatch");
+      expectedHostname = "SHOP.EXAMPLE.";
+
+      await identityRegistry.invalidateObservation(
+        identityHost,
+        EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse({
+          type: "enterprise.browser.page_identity.invalidate.request",
+          requestId: "invalidate-browser-1",
+          browser: { browserId, browserProfileId: created.browserProfileId },
+          observationRevision: "observation-1",
+          bindingRevision: "binding-1",
+          lifecycleGeneration: fixture.context.sessionBindingGeneration,
+        }),
+      );
+      await expectDeniedBeforeRead("r-browser-invalidated");
+
+      await identityRegistry.observe(
+        identityHost,
+        EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+          type: "enterprise.browser.page_identity.observe.request",
+          requestId: "observe-browser-2",
+          browser: { browserId, browserProfileId: created.browserProfileId },
+          hostname: "shop.example",
+          accountLabelHash: "sha256:account-a",
+          observationRevision: "observation-2",
+          bindingRevision: "binding-1",
+          lifecycleGeneration: fixture.context.sessionBindingGeneration,
+        }),
+      );
+      const invalidateBarrier = { entered: deferred<void>(), release: deferred<void>() };
+      nextProfileReadBarrier = invalidateBarrier;
+      const invalidateRace = lease.dispatcher.handle({
+        sessionContext: fixture.context,
+        message: { ...message, requestId: "r-browser-invalidate-race" },
+      });
+      await invalidateBarrier.entered.promise;
+      await identityRegistry.invalidateObservation(
+        identityHost,
+        EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse({
+          type: "enterprise.browser.page_identity.invalidate.request",
+          requestId: "invalidate-browser-2",
+          browser: { browserId, browserProfileId: created.browserProfileId },
+          observationRevision: "observation-2",
+          bindingRevision: "binding-1",
+          lifecycleGeneration: fixture.context.sessionBindingGeneration,
+        }),
+      );
+      invalidateBarrier.release.resolve();
+      expect(await invalidateRace).toBe(false);
+      expect(reads).toBe(readsBeforeDenials);
+      expect(await allowedAuditCount()).toBe(auditBeforeDenials);
+
+      await identityRegistry.observe(
+        identityHost,
+        EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+          type: "enterprise.browser.page_identity.observe.request",
+          requestId: "observe-browser-3",
+          browser: { browserId, browserProfileId: created.browserProfileId },
+          hostname: "shop.example",
+          accountLabelHash: "sha256:account-a",
+          observationRevision: "observation-3",
+          bindingRevision: "binding-1",
+          lifecycleGeneration: fixture.context.sessionBindingGeneration,
+        }),
+      );
+      const rebindBarrier = { entered: deferred<void>(), release: deferred<void>() };
+      nextProfileReadBarrier = rebindBarrier;
+      const rebindRace = lease.dispatcher.handle({
+        sessionContext: fixture.context,
+        message: { ...message, requestId: "r-browser-rebind-race" },
+      });
+      await rebindBarrier.entered.promise;
+      identityRegistry.registerBrowser({
+        host: identityHost,
+        browserId,
+        browserProfileId: created.browserProfileId,
+        bindingRevision: "binding-2",
+      });
+      rebindBarrier.release.resolve();
+      expect(await rebindRace).toBe(false);
+      expect(reads).toBe(readsBeforeDenials);
+      expect(await allowedAuditCount()).toBe(auditBeforeDenials);
       expect(
         (await fixture.audit.snapshotEvents()).some(
           (event) => event.action === "browser.use" && event.outcome === "allowed",
