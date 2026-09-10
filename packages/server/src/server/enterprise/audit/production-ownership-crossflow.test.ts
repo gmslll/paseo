@@ -1019,6 +1019,7 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     }
   }, 30_000);
 
+  /* eslint-disable complexity -- production crossflow intentionally exercises each protocol denial. */
   test("default production factory serves audit.list_events over Darwin WebSocket", async () => {
     const root = path.join(suiteRoot, "default-ws");
     const paseoHome = path.join(root, ".paseo");
@@ -1326,9 +1327,30 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           code: "access_denied",
         });
       }
+      const grantsPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "rpc_error" || (v?.type === "session" && v.message?.type === "rpc_error"),
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.access.list_grants.request",
+            requestId: "deny-access",
+            principalId: principalA,
+          },
+        }),
+      );
+      const grants = await grantsPromise;
+      expect(grants.payload ?? grants.message?.payload).toMatchObject({
+        requestId: "deny-access",
+        code: "access_denied",
+      });
     } finally {
       for (const socket of sockets) socket.close();
       await daemon.stop().catch(() => undefined);
     }
   }, 45_000);
+  /* eslint-enable complexity */
 });
