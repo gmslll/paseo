@@ -32,6 +32,15 @@ held by the old owner and reject late events from the old owner/generation. The 
 access the resource only through a newly evaluated Grant and current Session binding; no old
 receipt, subscription, cache, or event is reusable.
 
+The server emits a separate strict
+`enterprise.workspace.ownership.transfer.tombstone` event to the old Principal's current Sessions.
+It is server-minted and binds the canonical Workspace `GlobalResourceRef`, old Principal, new
+revision, and the transfer receipt. The receipt/event identifier is one-time and non-replayable;
+ordinary `workspace_update` removal is not an authority substitute because post-CAS ownership
+checks would reject it. The `enterpriseWorkspaceOwnershipTransferV1` capability remains absent
+until W2 authorization-context issuance, W3 Session fanout and client eviction, and W7 production
+E2E evidence are complete.
+
 ## Production and compatibility rule
 
 This decision does not add a generic mutation fallback or reinterpret existing Workspace/Agent

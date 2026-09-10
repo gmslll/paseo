@@ -4305,6 +4305,21 @@ export const EnterpriseResourceOwnershipTransferResponseSchema = z.strictObject(
   }),
 });
 
+export const EnterpriseWorkspaceOwnershipTransferTombstoneSchema = z.strictObject({
+  type: z.literal("enterprise.workspace.ownership.transfer.tombstone"),
+  payload: z.strictObject({
+    eventId: z.string().min(1),
+    resource: z.strictObject({
+      ...GlobalResourceRefSharedShape,
+      resourceKind: z.literal("workspace"),
+      localResourceId: z.string().min(1),
+    }),
+    oldPrincipalId: PrincipalIdSchema,
+    newRevision: z.string().min(1),
+    transferReceiptId: z.string().min(1),
+  }),
+});
+
 export const EnterpriseAccessListGrantsRequestSchema = z.object({
   type: z.literal("enterprise.access.list_grants.request"),
   requestId: z.string().min(1),
@@ -4594,6 +4609,9 @@ export type EnterpriseWorkspaceOwnershipTransferRequest = Omit<
     { resourceKind: "workspace" }
   >;
 };
+export type EnterpriseWorkspaceOwnershipTransferTombstone = z.infer<
+  typeof EnterpriseWorkspaceOwnershipTransferTombstoneSchema
+>;
 export type EnterpriseAccessListGrantsRequest = z.infer<
   typeof EnterpriseAccessListGrantsRequestSchema
 >;
@@ -8146,6 +8164,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseBrowserProfileContentReadResponseSchema,
   EnterpriseAppSlotContentReadResponseSchema,
   EnterpriseResourceOwnershipTransferResponseSchema,
+  EnterpriseWorkspaceOwnershipTransferTombstoneSchema,
   EnterpriseBrowserPageIdentityObservationResponseSchema,
   EnterpriseBrowserPageIdentityInvalidationResponseSchema,
   EnterpriseAccessListGrantsResponseSchema,

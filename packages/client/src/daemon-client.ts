@@ -335,6 +335,14 @@ export type DaemonEvent =
       payload: Extract<SessionOutboundMessage, { type: "workspace_update" }>["payload"];
     }
   | {
+      type: "workspace_ownership_transfer_tombstone";
+      workspaceId: string;
+      payload: Extract<
+        SessionOutboundMessage,
+        { type: "enterprise.workspace.ownership.transfer.tombstone" }
+      >["payload"];
+    }
+  | {
       type: "project.update";
       payload: Extract<SessionOutboundMessage, { type: "project.update" }>["payload"];
     }
@@ -6589,6 +6597,12 @@ export class DaemonClient {
         return {
           type: "workspace_update",
           workspaceId: msg.payload.kind === "upsert" ? msg.payload.workspace.id : msg.payload.id,
+          payload: msg.payload,
+        };
+      case "enterprise.workspace.ownership.transfer.tombstone":
+        return {
+          type: "workspace_ownership_transfer_tombstone",
+          workspaceId: msg.payload.resource.localResourceId,
           payload: msg.payload,
         };
       case "project.update":

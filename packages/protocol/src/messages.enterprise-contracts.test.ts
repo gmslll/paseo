@@ -32,6 +32,7 @@ import {
   EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseResourceOwnershipTransferRequestSchema,
   EnterpriseResourceOwnershipTransferResponseSchema,
+  EnterpriseWorkspaceOwnershipTransferTombstoneSchema,
   EnterpriseBrowserPageIdentityObservationRequestSchema,
   EnterpriseBrowserPageIdentityObservationResponseSchema,
   EnterpriseBrowserPageIdentityInvalidationRequestSchema,
@@ -353,6 +354,55 @@ describe("enterprise ownership-transfer contract", () => {
           revision: "rev-2",
           receiptId: "receipt-1",
           extra: true,
+        },
+      }),
+    ).toThrow();
+  });
+});
+
+describe("enterprise ownership-transfer tombstone contract", () => {
+  const tombstone = {
+    type: "enterprise.workspace.ownership.transfer.tombstone" as const,
+    payload: {
+      eventId: "event-1",
+      resource: {
+        organizationId: "org_1111111111111111",
+        nodeId: "nod_2222222222222222",
+        resourceKind: "workspace" as const,
+        localResourceId: "workspace-1",
+      },
+      oldPrincipalId: "usr_3333333333333333",
+      newRevision: "rev-2",
+      transferReceiptId: "receipt-1",
+    },
+  };
+
+  test("accepts server-minted transition tombstone", () => {
+    expect(EnterpriseWorkspaceOwnershipTransferTombstoneSchema.parse(tombstone)).toEqual(tombstone);
+  });
+
+  test("rejects caller authority and non-workspace fields", () => {
+    for (const extra of [
+      { requestId: "request-1" },
+      { clientId: "client-1" },
+      { homeNodeId: "node-1" },
+      { path: "/tmp/profile" },
+      { pat: "token" },
+      { lease: "lease-1" },
+    ]) {
+      expect(() =>
+        EnterpriseWorkspaceOwnershipTransferTombstoneSchema.parse({
+          ...tombstone,
+          payload: { ...tombstone.payload, ...extra },
+        }),
+      ).toThrow();
+    }
+    expect(() =>
+      EnterpriseWorkspaceOwnershipTransferTombstoneSchema.parse({
+        ...tombstone,
+        payload: {
+          ...tombstone.payload,
+          resource: { ...tombstone.payload.resource, resourceKind: "agent" },
         },
       }),
     ).toThrow();
