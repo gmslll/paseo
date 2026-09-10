@@ -170,6 +170,7 @@ export const REVIEWED_INBOUND_ENTRIES = [
   "enterprise.audit.list_events.request",
   "enterprise.browser.bind_profile.request",
   "enterprise.browser.list_profiles.request",
+  "enterprise.browser.page_identity.observe.request",
   "enterprise.browser_profile.content.read.request",
   "enterprise.identity.get_current.request",
   "enterprise.identity.list_principals.request",

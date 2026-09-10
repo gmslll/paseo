@@ -100,6 +100,7 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "enterprise.audit.list_events.request": ["audit.read"],
   "enterprise.browser.bind_profile.request": ["browser.profile.manage"],
   "enterprise.browser.list_profiles.request": ["workspace.metadata.read"],
+  "enterprise.browser.page_identity.observe.request": [],
   "enterprise.identity.list_principals.request": ["identity.manage"],
   "enterprise.organization.list_resources.request": ["workspace.metadata.read"],
   "enterprise.placement.resolve_workspace.request": ["workspace.metadata.read"],
@@ -549,6 +550,7 @@ export const OUTBOUND_SELF_LIFECYCLE_EVENTS = [
 
 export const OUTBOUND_INHERITED_CONTEXT_EVENTS = [
   "rpc_error",
+  "enterprise.browser.page_identity.observe.response",
 ] as const satisfies readonly SessionOutboundMessage["type"][];
 
 export const OUTBOUND_EVENTS_WITHOUT_RESOURCE_POLICY = [
