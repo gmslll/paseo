@@ -114,6 +114,9 @@ import {
 } from "./websocket/physical-socket.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
 import {
+  isCurrentEnterpriseAdmissionAuthorization,
+  bindOrReplaceEnterpriseAdmissionSession,
+  getEnterpriseAdmissionEvidenceLockPartition,
   resolveCurrentEnterpriseAdmissionAuthorization,
   type EnterpriseAdmissionAuthenticationEvidence,
   type EnterpriseAdmissionAuthorizationHandle,
@@ -155,6 +158,20 @@ const AdmissionSchema = z.discriminatedUnion("kind", [
 function freezeAdmission(value: SessionAdmission): SessionAdmission {
   const top = captureRecord(value);
   if (top.kind === "enterprise") {
+    if (Object.hasOwn(top, "authorizationEvidence")) {
+      exact(top, ["kind", "authorizationEvidence"]);
+      if (
+        !top.authorizationEvidence ||
+        (typeof top.authorizationEvidence !== "object" &&
+          typeof top.authorizationEvidence !== "function")
+      )
+        throw new Error("invalid enterprise evidence");
+      return Object.freeze({
+        kind: "enterprise" as const,
+        authorizationEvidence:
+          top.authorizationEvidence as EnterpriseAdmissionAuthenticationEvidence,
+      });
+    }
     exact(top, ["kind", "principalId", "permissions", "enterprise"]);
     const e = captureRecord(top.enterprise);
     exact(e, ["principal", "node", "runtime", "grantVersionGuard"]);
@@ -316,6 +333,13 @@ export type SessionAdmission =
       principalId: string;
       permissions: readonly DaemonPermission[];
       hubExecutionAgents?: HubExecutionAgents;
+      enterprise?: never;
+    }
+  | {
+      kind: "enterprise";
+      authorizationEvidence: EnterpriseAdmissionAuthenticationEvidence;
+      principalId?: never;
+      permissions?: never;
       enterprise?: never;
     }
   | {
@@ -749,6 +773,10 @@ export class VoiceAssistantWebSocketServer {
   private readonly logger: pino.Logger;
   private readonly wss: WebSocketServer;
   private readonly pendingConnections: Map<WebSocketLike, PendingConnection> = new Map();
+  /** Handshakes remain owned while async hello admission/server_info work runs. */
+  private readonly handshakeConnections: Map<WebSocketLike, PendingConnection> = new Map();
+  /** Authentication promises are owned by shutdown until they settle. */
+  private readonly authenticationTasks: Map<WebSocketLike, Promise<void>> = new Map();
   private readonly sessions: Map<WebSocketLike, SessionConnection> = new Map();
   private readonly socketIdentities: Map<WebSocketLike, WebSocketConnectionIdentity> = new Map();
   private readonly externalSessionsByKey: Map<string, ReconnectableSessionConnection> = new Map();
@@ -758,7 +786,11 @@ export class VoiceAssistantWebSocketServer {
   private readonly pendingMessageDraining = new Set<WebSocketLike>();
   private readonly pendingMessageReplaying = new Set<WebSocketLike>();
   private readonly pendingMessageOwners = new Map<WebSocketLike, PendingConnection>();
+  private readonly pendingMessageTasks = new Map<WebSocketLike, Promise<void>>();
+  private readonly pendingMessageErrors = new Map<WebSocketLike, unknown>();
+  private readonly connectionCleanupPromises = new WeakMap<SessionConnection, Promise<void>>();
   private readonly handshakeInFlight = new Set<WebSocketLike>();
+  private readonly handshakeLocks = new Map<string, Promise<void>>();
   private readonly pluginSocketIds = new WeakMap<WebSocketLike, string>();
   private readonly pluginSocketCleanup = new WeakMap<WebSocketLike, () => void>();
   private readonly serverId: string;
@@ -1042,7 +1074,12 @@ export class VoiceAssistantWebSocketServer {
       },
     });
     wss.on("connection", (ws, request) => {
-      void this.attachAuthenticatedSocket(ws, request, password);
+      const task = this.attachAuthenticatedSocket(ws, request, password);
+      this.authenticationTasks.set(ws, task);
+      void task.then(
+        () => this.authenticationTasks.delete(ws),
+        () => this.authenticationTasks.delete(ws),
+      );
     });
     return wss;
   }
@@ -1126,6 +1163,19 @@ export class VoiceAssistantWebSocketServer {
     request: IncomingMessage,
     password: string | undefined,
   ): Promise<void> {
+    try {
+      await this.attachAuthenticatedSocketImpl(ws, request, password);
+    } catch (error) {
+      this.logger.warn({ err: error }, "WebSocket authentication failed unexpectedly");
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication failed");
+    }
+  }
+
+  private async attachAuthenticatedSocketImpl(
+    ws: WebSocket,
+    request: IncomingMessage,
+    password: string | undefined,
+  ): Promise<void> {
     if (this.enterpriseRuntime) {
       const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
       const token = extractWsBearerToken(protocol);
@@ -1145,6 +1195,9 @@ export class VoiceAssistantWebSocketServer {
           ...(metadata.userAgent ? { userAgent: metadata.userAgent } : {}),
         },
       );
+      if (ws.readyState !== 1 || this.connectionLifecycle === "stopping") {
+        return;
+      }
       if (!authorizationEvidence) {
         ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication failed");
         return;
@@ -1154,7 +1207,7 @@ export class VoiceAssistantWebSocketServer {
         request,
         undefined,
         false,
-        OWNER_SESSION_ADMISSION,
+        { kind: "enterprise", authorizationEvidence },
         undefined,
         authorizationEvidence,
       );
@@ -1226,13 +1279,30 @@ export class VoiceAssistantWebSocketServer {
     admission: SessionAdmission = OWNER_SESSION_ADMISSION,
     initialHello?: WSHelloMessage,
   ): Promise<void> {
-    if (this.enterpriseRuntime && !admission.enterprise) {
-      throw new Error("enterprise external socket requires typed admission");
+    // Enterprise external admission is established by the authenticated
+    // WebSocket path.  This public bridge must never inspect caller supplied
+    // admission objects: relay/hub callers are untrusted and may provide a
+    // throwing Proxy or structural authority substitute.
+    if (this.enterpriseRuntime) {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission required");
+      return;
     }
+    const authorizationEvidence =
+      admission.kind === "enterprise" && "authorizationEvidence" in admission
+        ? admission.authorizationEvidence
+        : undefined;
     if (metadata?.transport === "relay") {
       this.incrementRuntimeCounter("relayExternalSocketAttached");
     }
-    await this.attachSocket(ws, undefined, metadata, false, admission, initialHello);
+    await this.attachSocket(
+      ws,
+      undefined,
+      metadata,
+      false,
+      admission,
+      initialHello,
+      authorizationEvidence,
+    );
   }
 
   public async attachPluginSocket(
@@ -1306,12 +1376,20 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private async closeImpl(initialErrors: readonly unknown[]): Promise<void> {
-    const errors: unknown[] = [...initialErrors];
+    const errors: unknown[] = [];
+    const appendError = (error: unknown): void => {
+      if (error instanceof AggregateError) {
+        for (const nested of error.errors) appendError(nested);
+        return;
+      }
+      if (!errors.includes(error)) errors.push(error);
+    };
+    for (const error of initialErrors) appendError(error);
     const captureSync = (fn: () => void) => {
       try {
         fn();
       } catch (error) {
-        errors.push(error);
+        appendError(error);
       }
     };
     captureSync(() => this.unsubscribeSpeechReadiness?.());
@@ -1338,7 +1416,12 @@ export class VoiceAssistantWebSocketServer {
       ...this.externalSessionsByKey.values(),
     ]);
 
-    const pendingSockets = new Set<WebSocketLike>(this.pendingConnections.keys());
+    const pendingSockets = new Set<WebSocketLike>([
+      ...this.pendingConnections.keys(),
+      ...this.handshakeConnections.keys(),
+      ...this.authenticationTasks.keys(),
+      ...this.pendingMessageTasks.keys(),
+    ]);
     for (const pending of this.pendingConnections.values()) {
       if (pending.helloTimeout) {
         clearTimeout(pending.helloTimeout);
@@ -1347,6 +1430,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const cleanupPromises: Promise<void>[] = [];
+    const connectionCleanupErrors: unknown[] = [];
     for (const connection of uniqueConnections) {
       if (connection.lifecycle === "reconnectable" && connection.externalDisconnectCleanupTimeout) {
         clearTimeout(connection.externalDisconnectCleanupTimeout);
@@ -1357,9 +1441,9 @@ export class VoiceAssistantWebSocketServer {
 
       cleanupPromises.push(
         Promise.resolve()
-          .then(() => connection.session.cleanup())
+          .then(() => this.cleanupConnection(connection, "Server closing session"))
           .catch((error) => {
-            errors.push(error);
+            if (!connectionCleanupErrors.includes(error)) connectionCleanupErrors.push(error);
           }),
       );
       for (const ws of connection.sockets) {
@@ -1374,7 +1458,7 @@ export class VoiceAssistantWebSocketServer {
             try {
               ws.close();
             } catch (error) {
-              errors.push(error);
+              appendError(error);
               resolve();
             }
           }),
@@ -1393,7 +1477,7 @@ export class VoiceAssistantWebSocketServer {
           try {
             ws.close();
           } catch (error) {
-            errors.push(error);
+            appendError(error);
             resolve();
           }
         }),
@@ -1401,16 +1485,25 @@ export class VoiceAssistantWebSocketServer {
     }
 
     await Promise.all(cleanupPromises);
+    await Promise.all(this.authenticationTasks.values());
+    await Promise.all(this.pendingMessageTasks.values());
+    for (const error of this.pendingMessageErrors.values()) appendError(error);
+    for (const error of connectionCleanupErrors) appendError(error);
     await Promise.resolve()
       .then(() => this.providerSnapshotManager.destroy())
-      .catch((e) => errors.push(e));
+      .catch((e) => appendError(e));
     await Promise.resolve()
       .then(() => this.checkoutDiffManager.dispose())
-      .catch((e) => errors.push(e));
+      .catch((e) => appendError(e));
     await Promise.resolve()
       .then(() => this.workspaceGitService.dispose())
-      .catch((e) => errors.push(e));
+      .catch((e) => appendError(e));
     this.pendingConnections.clear();
+    this.handshakeConnections.clear();
+    this.authenticationTasks.clear();
+    this.pendingMessageTasks.clear();
+    this.pendingMessageErrors.clear();
+    this.handshakeLocks.clear();
     this.sessions.clear();
     this.socketIdentities.clear();
     this.externalSessionsByKey.clear();
@@ -1419,12 +1512,12 @@ export class VoiceAssistantWebSocketServer {
       try {
         this.unregisterBrowserToolsClient(clientId);
       } catch (error) {
-        errors.push(error);
+        appendError(error);
       }
     }
     await Promise.resolve()
       .then(() => this.wss.close())
-      .catch((e) => errors.push(e));
+      .catch((e) => appendError(e));
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1)
       throw new AggregateError(errors, "websocket close failed", { cause: errors[0] });
@@ -1568,8 +1661,8 @@ export class VoiceAssistantWebSocketServer {
     authorizationEvidence?: EnterpriseAdmissionAuthenticationEvidence,
   ): Promise<void> {
     if (
-      (this.enterpriseRuntime &&
-        (!authorizationEvidence || admission !== OWNER_SESSION_ADMISSION)) ||
+      ws.readyState !== 1 ||
+      (this.enterpriseRuntime && (!authorizationEvidence || admission.kind !== "enterprise")) ||
       (!this.enterpriseRuntime && authorizationEvidence)
     ) {
       safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Invalid enterprise admission");
@@ -1673,7 +1766,7 @@ export class VoiceAssistantWebSocketServer {
     clientCapabilities: Record<string, unknown> | null;
     connectionLogger: pino.Logger;
     lifecycle: { kind: "reconnectable" } | { kind: "ephemeral-plugin"; pluginId: string };
-    admission: SessionAdmission;
+    admission: Exclude<SessionAdmission, { authorizationEvidence: unknown }>;
     enterpriseAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
   }): SessionConnection {
     const { ws, clientId, appVersion, clientCapabilities, connectionLogger, lifecycle, admission } =
@@ -1875,13 +1968,70 @@ export class VoiceAssistantWebSocketServer {
     return pending;
   }
 
+  private isHandshakeCurrent(ws: WebSocketLike, pending: PendingConnection): boolean {
+    return (
+      this.connectionLifecycle !== "stopping" &&
+      ws.readyState === 1 &&
+      this.socketIdentities.get(ws) === pending.identity
+    );
+  }
+
   // oxlint-disable-next-line complexity -- protocol validation and enterprise reconnect fence.
-  private async handleHello(params: {
+  private handleHello(params: {
+    ws: WebSocketLike;
+    message: WSHelloMessage;
+    pending: PendingConnection;
+  }): Promise<void> {
+    if (
+      this.pendingConnections.get(params.ws) !== params.pending ||
+      params.ws.readyState !== 1 ||
+      this.connectionLifecycle === "stopping"
+    ) {
+      return Promise.resolve();
+    }
+    const enterprisePrincipal = params.pending.admission.enterprise?.principal;
+    const admissionPrincipalId =
+      "principalId" in params.pending.admission ? params.pending.admission.principalId : "opaque";
+    const fallbackLockKey = `${
+      enterprisePrincipal?.organizationId ?? "legacy"
+    }:${enterprisePrincipal?.principalId ?? admissionPrincipalId}:${params.message.clientId.trim()}`;
+    const lockKey =
+      params.pending.authorizationEvidence && this.enterpriseRuntime
+        ? (getEnterpriseAdmissionEvidenceLockPartition(
+            this.enterpriseRuntime.admission.authorizationIssuer,
+            params.pending.authorizationEvidence,
+            params.message.clientId.trim(),
+          ) ?? fallbackLockKey)
+        : fallbackLockKey;
+    if (lockKey.length === 0) {
+      return this.handleHelloUnlocked(params);
+    }
+    const prior = this.handshakeLocks.get(lockKey);
+    const run = () => this.handleHelloUnlocked(params);
+    const task = prior ? prior.then(run, run) : run();
+    this.handshakeLocks.set(lockKey, task);
+    void task.then(
+      () => this.handshakeLocks.get(lockKey) === task && this.handshakeLocks.delete(lockKey),
+      () => this.handshakeLocks.get(lockKey) === task && this.handshakeLocks.delete(lockKey),
+    );
+    return task;
+  }
+
+  // oxlint-disable-next-line complexity -- protocol validation and enterprise reconnect fence.
+  private async handleHelloUnlocked(params: {
     ws: WebSocketLike;
     message: WSHelloMessage;
     pending: PendingConnection;
   }): Promise<void> {
     const { ws, message, pending } = params;
+
+    if (
+      (this.pendingConnections.get(ws) !== pending &&
+        this.handshakeConnections.get(ws) !== pending) ||
+      !this.isHandshakeCurrent(ws, pending)
+    ) {
+      return;
+    }
 
     if (message.protocolVersion !== WS_PROTOCOL_VERSION) {
       this.clearPendingConnection(ws);
@@ -1925,6 +2075,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     this.clearPendingConnection(ws);
+    this.handshakeConnections.set(ws, pending);
     pending.identity.clientId = clientId;
     if (message.appVersion) {
       pending.identity.appVersion = message.appVersion;
@@ -1936,30 +2087,17 @@ export class VoiceAssistantWebSocketServer {
     if (pending.authorizationEvidence) {
       const runtime = this.enterpriseRuntime;
       if (!runtime) {
+        this.handshakeConnections.delete(ws);
         safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise runtime unavailable");
         return;
       }
-      const candidates = pluginId
-        ? []
-        : [...new Set(this.externalSessionsByKey.values())].filter(
-            (connection) =>
-              connection.clientId === clientId && connection.enterpriseAuthorizationHandle,
+      const handle = pluginId
+        ? runtime.admission.bindSession(pending.authorizationEvidence, clientId)
+        : bindOrReplaceEnterpriseAdmissionSession(
+            runtime.admission.authorizationIssuer,
+            pending.authorizationEvidence,
+            clientId,
           );
-      if (candidates.length > 1) {
-        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Ambiguous enterprise session");
-        return;
-      }
-      existing = candidates[0];
-      let handle: EnterpriseAdmissionAuthorizationHandle | null;
-      if (existing?.enterpriseAuthorizationHandle) {
-        handle = runtime.admission.replaceSession(
-          existing.enterpriseAuthorizationHandle,
-          pending.authorizationEvidence,
-          clientId,
-        );
-      } else {
-        handle = runtime.admission.bindSession(pending.authorizationEvidence, clientId);
-      }
       const resolved = handle
         ? resolveCurrentEnterpriseAdmissionAuthorization(
             runtime.admission.authorizationIssuer,
@@ -1967,6 +2105,10 @@ export class VoiceAssistantWebSocketServer {
           )
         : null;
       if (!handle || !resolved) {
+        if (handle) {
+          runtime.admission.releaseSession(handle);
+        }
+        this.handshakeConnections.delete(ws);
         safeCloseSocket(
           ws,
           WS_CLOSE_DAEMON_AUTH_FAILED,
@@ -1980,11 +2122,7 @@ export class VoiceAssistantWebSocketServer {
         clientId,
         resolved.principal,
       );
-      if (existing && existing.sessionKey !== sessionKey) {
-        runtime.admission.releaseSession(handle);
-        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission changed");
-        return;
-      }
+      existing = pluginId ? undefined : this.externalSessionsByKey.get(sessionKey);
       admission = Object.freeze({
         kind: "enterprise",
         principalId: resolved.principal.principalId,
@@ -1998,10 +2136,40 @@ export class VoiceAssistantWebSocketServer {
       });
       if (existing) {
         existing.enterpriseAuthorizationHandle = handle;
-        await this.resumeSession({ ws, message, pending, existing });
+        try {
+          await this.resumeSession({ ws, message, pending, existing });
+        } catch (error) {
+          this.releaseEnterpriseAuthorization(existing);
+          const oldSockets = [...existing.sockets];
+          try {
+            await this.cleanupConnection(existing, "Enterprise session resume failed");
+          } catch (cleanupError) {
+            // oxlint-disable-next-line max-depth -- cleanup error aggregation.
+            for (const oldSocket of oldSockets) {
+              safeCloseSocket(
+                oldSocket,
+                WS_CLOSE_DAEMON_AUTH_FAILED,
+                "Enterprise session replaced",
+              );
+            }
+            // oxlint-disable-next-line preserve-caught-error
+            throw new AggregateError([error, cleanupError], "enterprise resume failed", {
+              cause: error,
+            });
+          }
+          for (const oldSocket of oldSockets) {
+            safeCloseSocket(oldSocket, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise session replaced");
+          }
+          throw error;
+        }
         return;
       }
     } else {
+      if ("authorizationEvidence" in admission) {
+        this.handshakeConnections.delete(ws);
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission is incomplete");
+        return;
+      }
       sessionKey = sessionConnectionKey(
         admission.principalId,
         clientId,
@@ -2019,57 +2187,90 @@ export class VoiceAssistantWebSocketServer {
       return;
     }
 
+    if ("authorizationEvidence" in admission) {
+      this.handshakeConnections.delete(ws);
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission is incomplete");
+      return;
+    }
+    const activeAdmission = admission;
     const connectionLogger = pending.connectionLogger.child({ clientId });
     this.incrementRuntimeCounter("helloNew");
-    const connection = this.createSessionConnection({
-      ws,
-      clientId,
-      appVersion: message.appVersion ?? null,
-      clientCapabilities: message.capabilities ?? null,
-      connectionLogger,
-      lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
-      admission,
-      ...(enterpriseAuthorizationHandle ? { enterpriseAuthorizationHandle } : {}),
-    });
-    const initialInfo = this.sendServerInfoToClient(ws, connection.session);
-    let initialAllowed: boolean;
+    let connection: SessionConnection | undefined;
+    let cleanupStarted = false;
     try {
-      initialAllowed = initialInfo instanceof Promise ? await initialInfo : initialInfo;
-    } catch (primary) {
-      this.releaseEnterpriseAuthorization(connection);
-      try {
+      connection = this.createSessionConnection({
+        ws,
+        clientId,
+        appVersion: message.appVersion ?? null,
+        clientCapabilities: message.capabilities ?? null,
+        connectionLogger,
+        lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
+        admission: activeAdmission,
+        ...(enterpriseAuthorizationHandle ? { enterpriseAuthorizationHandle } : {}),
+      });
+      const initialInfo = this.sendServerInfoToClient(
+        ws,
+        connection.session,
+        connection.enterpriseAuthorizationHandle,
+      );
+      const initialAllowed: boolean =
+        initialInfo instanceof Promise ? await initialInfo : initialInfo;
+      if (!this.isHandshakeCurrent(ws, pending)) {
+        throw new Error("WebSocket closed during enterprise handshake");
+      }
+      if (enterpriseAuthorizationHandle && this.enterpriseRuntime) {
+        const current = isCurrentEnterpriseAdmissionAuthorization(
+          this.enterpriseRuntime.admission.authorizationIssuer,
+          enterpriseAuthorizationHandle,
+        );
+        if (!current) throw new Error("Enterprise admission is no longer current");
+      }
+      if (!initialAllowed) {
+        this.releaseEnterpriseAuthorization(connection);
+        cleanupStarted = true;
         await connection.session.cleanup();
-      } catch (cleanupError) {
-        // oxlint-disable-next-line preserve-caught-error
-        throw new AggregateError([primary, cleanupError], "enterprise server_info failed", {
-          cause: primary,
-        });
+        this.handshakeConnections.delete(ws);
+        return;
+      }
+      this.sessions.set(ws, connection);
+      if (connection.lifecycle === "reconnectable") {
+        this.externalSessionsByKey.set(sessionKey, connection);
+        this.externalSessionsByBaseKey.set(
+          sessionConnectionBaseKey(activeAdmission.principalId, clientId),
+          connection,
+        );
+      }
+      pending.identity.sessionId = connection.session.getSessionId();
+      this.syncBrowserToolsClientRegistration(connection);
+      connection.connectionLogger.info(
+        {
+          ...toConnectionLogFields(pending.identity),
+          resumed: false,
+          totalSessions: this.sessions.size,
+        },
+        "Client connected via hello",
+      );
+      this.handshakeConnections.delete(ws);
+    } catch (primary) {
+      this.handshakeConnections.delete(ws);
+      if (connection) {
+        this.releaseEnterpriseAuthorization(connection);
+        if (!cleanupStarted) {
+          try {
+            cleanupStarted = true;
+            await connection.session.cleanup();
+          } catch (cleanupError) {
+            // oxlint-disable-next-line preserve-caught-error
+            throw new AggregateError([primary, cleanupError], "enterprise hello failed", {
+              cause: primary,
+            });
+          }
+        }
+      } else if (enterpriseAuthorizationHandle && this.enterpriseRuntime) {
+        this.enterpriseRuntime.admission.releaseSession(enterpriseAuthorizationHandle);
       }
       throw primary;
     }
-    if (!initialAllowed) {
-      this.releaseEnterpriseAuthorization(connection);
-      await connection.session.cleanup();
-      return;
-    }
-    this.sessions.set(ws, connection);
-    if (connection.lifecycle === "reconnectable") {
-      this.externalSessionsByKey.set(sessionKey, connection);
-      this.externalSessionsByBaseKey.set(
-        sessionConnectionBaseKey(admission.principalId, clientId),
-        connection,
-      );
-    }
-    pending.identity.sessionId = connection.session.getSessionId();
-    this.syncBrowserToolsClientRegistration(connection);
-    connection.connectionLogger.info(
-      {
-        ...toConnectionLogFields(pending.identity),
-        resumed: false,
-        totalSessions: this.sessions.size,
-      },
-      "Client connected via hello",
-    );
   }
 
   private async resumeSession(params: {
@@ -2079,11 +2280,39 @@ export class VoiceAssistantWebSocketServer {
     existing: ReconnectableSessionConnection;
   }): Promise<void> {
     const { ws, message, pending, existing } = params;
+    const expectedHandle = existing.enterpriseAuthorizationHandle;
     this.incrementRuntimeCounter("helloResumed");
     const newAppVersion = message.appVersion ?? null;
     const newClientCapabilities = message.capabilities ?? null;
-    const resumedInfo = this.sendServerInfoToClient(ws, existing.session);
-    if (!(resumedInfo instanceof Promise ? await resumedInfo : resumedInfo)) return;
+    const resumedInfo = this.sendServerInfoToClient(
+      ws,
+      existing.session,
+      existing.enterpriseAuthorizationHandle,
+    );
+    const resumedAllowed = resumedInfo instanceof Promise ? await resumedInfo : resumedInfo;
+    if (!this.isHandshakeCurrent(ws, pending)) {
+      throw new Error("WebSocket closed during session resume");
+    }
+    if (existing.enterpriseAuthorizationHandle !== expectedHandle) {
+      throw new Error("Enterprise session handle changed during resume");
+    }
+    if (expectedHandle && this.enterpriseRuntime) {
+      if (
+        !isCurrentEnterpriseAdmissionAuthorization(
+          this.enterpriseRuntime.admission.authorizationIssuer,
+          expectedHandle,
+        )
+      ) {
+        throw new Error("Enterprise admission is no longer current");
+      }
+    }
+    if (!resumedAllowed) {
+      if (expectedHandle) {
+        throw new Error("Enterprise server_info denied");
+      }
+      this.handshakeConnections.delete(ws);
+      return;
+    }
     if (existing.externalDisconnectCleanupTimeout) {
       clearTimeout(existing.externalDisconnectCleanupTimeout);
       existing.externalDisconnectCleanupTimeout = null;
@@ -2102,6 +2331,7 @@ export class VoiceAssistantWebSocketServer {
     }
     existing.sockets.add(ws);
     this.sessions.set(ws, existing);
+    this.handshakeConnections.delete(ws);
     pending.identity.sessionId = existing.session.getSessionId();
     this.syncBrowserToolsClientRegistration(existing);
     pending.connectionLogger.info(
@@ -2283,10 +2513,14 @@ export class VoiceAssistantWebSocketServer {
     };
   }
 
-  private sendServerInfoToClient(ws: WebSocketLike, session: Session): boolean | Promise<boolean> {
+  private sendServerInfoToClient(
+    ws: WebSocketLike,
+    session: Session,
+    authorizationHandle?: EnterpriseAdmissionAuthorizationHandle,
+  ): boolean | Promise<boolean> {
     const message = this.createServerInfoMessage(session);
     if (this.enterpriseRuntime) {
-      return this.sendEnterpriseServerInfo(ws, session, message);
+      return this.sendEnterpriseServerInfo(ws, session, message, authorizationHandle);
     }
     this.sendToClient(ws, message);
     return true;
@@ -2296,6 +2530,7 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike,
     session: Session,
     message: WSOutboundMessage,
+    authorizationHandle?: EnterpriseAdmissionAuthorizationHandle,
   ): Promise<boolean> {
     const context = session.getEnterpriseSessionContext();
     if (!context || message.type !== "session") return false;
@@ -2306,6 +2541,17 @@ export class VoiceAssistantWebSocketServer {
     );
     if (!allowed) {
       ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authorization failed");
+      return false;
+    }
+    if (
+      ws.readyState !== 1 ||
+      this.connectionLifecycle === "stopping" ||
+      (authorizationHandle &&
+        !isCurrentEnterpriseAdmissionAuthorization(
+          this.enterpriseRuntime!.admission.authorizationIssuer,
+          authorizationHandle,
+        ))
+    ) {
       return false;
     }
     this.sendToClient(ws, message);
@@ -2325,7 +2571,13 @@ export class VoiceAssistantWebSocketServer {
   private broadcastCapabilitiesUpdate(): void {
     for (const connection of new Set(this.sessions.values())) {
       for (const socket of connection.sockets) {
-        void Promise.resolve(this.sendServerInfoToClient(socket, connection.session))
+        void Promise.resolve(
+          this.sendServerInfoToClient(
+            socket,
+            connection.session,
+            connection.enterpriseAuthorizationHandle,
+          ),
+        )
           .then((sent) =>
             sent ? undefined : this.cleanupConnection(connection, "server_info denied"),
           )
@@ -2387,6 +2639,7 @@ export class VoiceAssistantWebSocketServer {
     const identity = this.socketIdentities.get(ws);
     const identityFields = identity ? toConnectionLogFields(identity) : {};
     const pending = this.clearPendingConnection(ws);
+    this.handshakeConnections.delete(ws);
     if (pending) {
       this.incrementRuntimeCounter("pendingDisconnected");
       pending.connectionLogger.info(
@@ -2482,7 +2735,15 @@ export class VoiceAssistantWebSocketServer {
     resolve();
   }
 
-  private async cleanupConnection(
+  private cleanupConnection(connection: SessionConnection, logMessage: string): Promise<void> {
+    const existing = this.connectionCleanupPromises.get(connection);
+    if (existing) return existing;
+    const cleanup = this.cleanupConnectionImpl(connection, logMessage);
+    this.connectionCleanupPromises.set(connection, cleanup);
+    return cleanup;
+  }
+
+  private async cleanupConnectionImpl(
     connection: SessionConnection,
     logMessage: string,
   ): Promise<void> {
@@ -2696,7 +2957,8 @@ export class VoiceAssistantWebSocketServer {
     this.pendingMessageQueues.set(ws, queue);
     if (this.pendingMessageDraining.has(ws)) return;
     this.pendingMessageDraining.add(ws);
-    void this.drainPendingMessages(ws).catch((error) => {
+    const task = this.drainPendingMessages(ws).catch((error) => {
+      this.pendingMessageErrors.set(ws, error);
       this.logger.warn({ err: error }, "pending websocket message failed");
       this.pendingMessageQueues.delete(ws);
       this.pendingMessageOwners.delete(ws);
@@ -2707,6 +2969,19 @@ export class VoiceAssistantWebSocketServer {
         /* ignore */
       }
     });
+    this.pendingMessageTasks.set(ws, task);
+    void task.then(
+      () => {
+        if (this.pendingMessageTasks.get(ws) === task) this.pendingMessageTasks.delete(ws);
+        if (this.connectionLifecycle !== "stopping") this.pendingMessageErrors.delete(ws);
+        return undefined;
+      },
+      () => {
+        if (this.pendingMessageTasks.get(ws) === task) this.pendingMessageTasks.delete(ws);
+        if (this.connectionLifecycle !== "stopping") this.pendingMessageErrors.delete(ws);
+        return undefined;
+      },
+    );
   }
 
   // oxlint-disable max-depth -- serialized pending dispatch.

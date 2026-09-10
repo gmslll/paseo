@@ -22,6 +22,7 @@ import type { EnterpriseAdmissionPort } from "./enterprise/identity/runtime.js";
 import {
   bindEnterpriseAdmissionSession,
   createEnterpriseAdmissionAuthorizationIssuer,
+  getEnterpriseAdmissionEvidenceLockPartition,
   issueEnterpriseAdmissionEvidence,
   releaseEnterpriseAdmissionSession,
   replaceEnterpriseAdmissionSession,
@@ -122,7 +123,7 @@ vi.mock("./push/index.js", () => ({
 }));
 
 import { z } from "zod";
-import { VoiceAssistantWebSocketServer } from "./websocket-server";
+import { VoiceAssistantWebSocketServer, type SessionAdmission } from "./websocket-server";
 import { DAEMON_PERMISSIONS, parseServerInfoStatusPayload } from "./messages.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
 
@@ -242,6 +243,8 @@ function createEnterpriseRuntimeHarness() {
     runtime,
     node,
     principal,
+    authorizationIssuer,
+    mintSecret,
     authenticate,
     authenticateEvidence,
     bindSession,
@@ -1373,6 +1376,377 @@ describe("enterprise admission", () => {
   beforeEach(() => {
     sessionMock.instances.length = 0;
   });
+  test("public external enterprise bridge does not inspect caller admission", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    let reads = 0;
+    const callerAdmission = new Proxy(
+      {},
+      {
+        get() {
+          reads++;
+          throw new Error("caller admission must not be read");
+        },
+        ownKeys() {
+          reads++;
+          throw new Error("caller admission must not be enumerated");
+        },
+      },
+    ) as unknown as SessionAdmission;
+    try {
+      await server.attachExternalSocket(socket, { transport: "relay" }, callerAdmission);
+      expect(reads).toBe(0);
+      expect(socket.readyState).toBe(3);
+      expect(h.authenticateEvidence).not.toHaveBeenCalled();
+      expect(h.bindSession).not.toHaveBeenCalled();
+      expect(sessionMock.instances).toHaveLength(0);
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The closed handshake is the expected failure for this case.
+      }
+    }
+  });
+
+  test("does not publish a session when server_info is blocked and socket closes", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseCanEmit!: () => void;
+    const canEmitGate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await canEmitGate;
+      return true;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-close-race")));
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      socket.close();
+      let closeSettled = false;
+      const closePromise = server.close().finally(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      releaseCanEmit();
+      await expect(closePromise).rejects.toThrow("WebSocket closed during enterprise handshake");
+      expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce();
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+      expect(socket.readyState).toBe(3);
+    } finally {
+      releaseCanEmit();
+      try {
+        await server.close();
+      } catch {
+        // The handshake failure is the expected close result in this case.
+      }
+    }
+  });
+
+  test("drops queued hello work after the pending socket closes", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseCanEmit!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("queued-close")));
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      socket.emit("message", JSON.stringify(createHelloMessage("queued-close")));
+      socket.close();
+      const closePromise = server.close();
+      releaseCanEmit();
+      await expect(closePromise).rejects.toThrow("WebSocket closed during enterprise handshake");
+      expect(sessionMock.instances).toHaveLength(1);
+      expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce();
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.pendingConnections.size).toBe(0);
+    } finally {
+      releaseCanEmit();
+      try {
+        await server.close();
+      } catch {
+        // The closed handshake is the expected failure for this case.
+      }
+    }
+  });
+
+  test("drops a closed queued socket without affecting the active same-client hello", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseCanEmit!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const activeSocket = new MockSocket();
+    const queuedSocket = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, activeSocket);
+      await attachEnterpriseAuthenticated(server, queuedSocket);
+      const hello = JSON.stringify(createHelloMessage("same-client-queue"));
+      activeSocket.emit("message", hello);
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      queuedSocket.emit("message", hello);
+      queuedSocket.close();
+      releaseCanEmit();
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(activeSocket)).toHaveLength(1));
+      await Promise.resolve();
+      expect(h.bindSession).not.toHaveBeenCalled();
+      expect(h.replaceSession).not.toHaveBeenCalled();
+      expect(sessionMock.instances).toHaveLength(1);
+      expect(sentServerInfoEnvelopes(queuedSocket)).toHaveLength(0);
+    } finally {
+      releaseCanEmit();
+      try {
+        await server.close();
+      } catch {
+        // The queued socket was intentionally closed during the handshake.
+      }
+    }
+  });
+
+  test("lock partition accessor preserves evidence for later bind", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let evidence: EnterpriseAdmissionAuthenticationEvidence | null = null;
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) => {
+      evidence = issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        h.node,
+        connection as never,
+      );
+      return evidence;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    await attachEnterpriseAuthenticated(server, new MockSocket());
+    expect(evidence).not.toBeNull();
+    const partition = getEnterpriseAdmissionEvidenceLockPartition(
+      h.authorizationIssuer,
+      evidence!,
+      "partition-client",
+    );
+    expect(partition).toBe("org_aaaaaaaaaaaaaaaa:usr_aaaaaaaaaaaaaaaa:partition-client");
+    expect(
+      getEnterpriseAdmissionEvidenceLockPartition(
+        h.authorizationIssuer,
+        evidence!,
+        new Proxy(
+          {},
+          {
+            get: () => {
+              throw new Error("client getter");
+            },
+          },
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      bindEnterpriseAdmissionSession(h.authorizationIssuer, evidence!, "partition-client"),
+    ).not.toBeNull();
+    await server.close();
+  });
+
+  test("different organizations with one client do not share the handshake lock", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await firstGate;
+      return true;
+    });
+    const foreignPrincipal = PrincipalContextSchema.parse({
+      ...h.principal,
+      organizationId: "org_bbbbbbbbbbbbbbbb",
+      principalId: "usr_bbbbbbbbbbbbbbbb",
+      credentialId: "cred-b",
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) =>
+      issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        foreignPrincipal,
+        h.node,
+        connection as never,
+      ),
+    );
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, first);
+      await attachEnterpriseAuthenticated(server, second);
+      first.emit("message", JSON.stringify(createHelloMessage("partition-parallel")));
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      second.emit("message", JSON.stringify(createHelloMessage("partition-parallel")));
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+      expect(sentServerInfoEnvelopes(first)).toHaveLength(0);
+      releaseFirst();
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(first)).toHaveLength(1));
+      expect(sessionMock.instances).toHaveLength(2);
+    } finally {
+      releaseFirst();
+      await server.close();
+    }
+  });
+
+  test("a rejected same-partition hello does not poison its queued successor", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    h.canEmit.mockRejectedValueOnce(new Error("first authorization failed"));
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, first);
+      await attachEnterpriseAuthenticated(server, second);
+      const hello = JSON.stringify(createHelloMessage("partition-retry"));
+      first.emit("message", hello);
+      second.emit("message", hello);
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+      expect(sentServerInfoEnvelopes(first)).toHaveLength(0);
+      expect(sessionMock.instances.length).toBeGreaterThanOrEqual(2);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The first rejected handshake is expected to be observed by close.
+      }
+    }
+  });
+
+  test("resume authorization close waits for shared connection cleanup", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("resume-close")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    let releaseCanEmit!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("resume-close")));
+    await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledTimes(2));
+    const cleanupError = new Error("resume cleanup failed");
+    sessionMock.instances[0]!.cleanup.mockRejectedValueOnce(cleanupError);
+    const closePromise = server.close();
+    releaseCanEmit();
+    let closeError: unknown;
+    try {
+      await closePromise;
+    } catch (error) {
+      closeError = error;
+    }
+    expect(closeError).toBeInstanceOf(AggregateError);
+    const closeErrors = (closeError as AggregateError).errors;
+    expect(closeErrors).toHaveLength(2);
+    expect((closeErrors[0] as Error).message).toBe("WebSocket closed during session resume");
+    expect(closeErrors[1]).toBe(cleanupError);
+    expect((closeError as AggregateError).cause).toBe(closeErrors[0]);
+    expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce();
+    expect(h.releaseSession).toHaveBeenCalledOnce();
+  });
+
+  test("does not attach a closed socket after deferred enterprise authentication", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseAuthentication!: () => void;
+    const authenticationGate = new Promise<void>((resolve) => {
+      releaseAuthentication = resolve;
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) => {
+      await authenticationGate;
+      return issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        h.node,
+        connection as never,
+      );
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    try {
+      const request = createDirectRequest();
+      request.headers["sec-websocket-protocol"] = "paseo.bearer.pat-test";
+      const webSocketServer = wsModuleMock.MockWebSocketServer.instances.at(-1);
+      webSocketServer?.handlers.get("connection")?.(socket, request);
+      await vi.waitFor(() => expect(h.authenticateEvidence).toHaveBeenCalledOnce());
+      socket.close();
+      let closeSettled = false;
+      const closePromise = server.close().finally(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      releaseAuthentication();
+      await closePromise;
+      expect(internals.pendingConnections.size).toBe(0);
+      expect(internals.socketIdentities.size).toBe(0);
+      expect(internals.sessions.size).toBe(0);
+      expect(sessionMock.instances).toHaveLength(0);
+    } finally {
+      releaseAuthentication();
+      await server.close();
+    }
+  });
+
+  test("rechecks socket and admission immediately before server_info send", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    h.canEmit.mockImplementationOnce(async () => {
+      socket.close();
+      return true;
+    });
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-send-fence")));
+      await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
+      expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The closed handshake is the expected failure for this case.
+      }
+    }
+  });
   test("legacy admission preserves hub execution agents", async () => {
     const server = createServer();
     const socket = new MockSocket();
@@ -1421,8 +1795,7 @@ describe("enterprise admission", () => {
       expect(socket.readyState).toBe(1);
       const internals = asInternals<WebSocketServerInternals>(server);
       socket.emit("message", JSON.stringify(createHelloMessage("enterprise-throw")));
-      await vi.waitFor(() => expect(h.bindSession).toHaveBeenCalledOnce());
-      expect(h.bindSession.mock.results[0]?.value).not.toBeNull();
+      await vi.waitFor(() => expect(sessionMock.instances[0]).toBeDefined());
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
       const earlyWarning = logger.warn.mock.calls.find(
         (call) => call[1] === "pending websocket message failed",
@@ -1442,7 +1815,11 @@ describe("enterprise admission", () => {
       expect(internals.externalSessionsByBaseKey.size).toBe(0);
       expect(h.releaseSession).toHaveBeenCalledOnce();
     } finally {
-      await server.close();
+      try {
+        await server.close();
+      } catch {
+        // The rejected handshake is asserted above.
+      }
     }
   });
 
@@ -1480,7 +1857,11 @@ describe("enterprise admission", () => {
       expect((warningError as AggregateError).cause).toBe(primary);
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
     } finally {
-      await server.close();
+      try {
+        await server.close();
+      } catch {
+        // The aggregated handshake failure is asserted above.
+      }
     }
   });
 
@@ -1504,7 +1885,11 @@ describe("enterprise admission", () => {
       expect(internals.externalSessionsByKey.size).toBe(0);
       expect(internals.externalSessionsByBaseKey.size).toBe(0);
     } finally {
-      await server.close();
+      try {
+        await server.close();
+      } catch {
+        // The failed handshake cleanup is observed by the test above.
+      }
     }
   });
 
@@ -2017,17 +2402,82 @@ describe("enterprise admission", () => {
     await attachEnterpriseAuthenticated(server, first);
     first.emit("message", JSON.stringify(createHelloMessage("enterprise-reconnect")));
     await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
-    expect(h.bindSession).toHaveBeenCalledOnce();
+    expect(h.bindSession).not.toHaveBeenCalled();
 
     await attachEnterpriseAuthenticated(server, second);
     second.emit("message", JSON.stringify(createHelloMessage("enterprise-reconnect")));
-    await vi.waitFor(() => expect(h.replaceSession).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
     expect(sessionMock.instances).toHaveLength(1);
     expect(h.releaseSession).not.toHaveBeenCalled();
 
     await server.close();
     expect(h.releaseSession).toHaveBeenCalledOnce();
   });
+
+  test("keeps same-client foreign principal in a separate session", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("same-client-foreign")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    const foreignPrincipal = PrincipalContextSchema.parse({
+      ...h.principal,
+      organizationId: "org_bbbbbbbbbbbbbbbb",
+      principalId: "usr_bbbbbbbbbbbbbbbb",
+      credentialId: "cred-foreign",
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) =>
+      issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        foreignPrincipal,
+        h.node,
+        connection as never,
+      ),
+    );
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("same-client-foreign")));
+    await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+    expect(h.replaceSession).not.toHaveBeenCalled();
+    expect(h.releaseSession).not.toHaveBeenCalled();
+    expect(sessionMock.instances).toHaveLength(2);
+    expect(sessionMock.instances[0]?.cleanup).not.toHaveBeenCalled();
+    expect(asInternals<WebSocketServerInternals>(server).sessions.get(first)).toBeDefined();
+    await server.close();
+  });
+
+  test("burns same-slot wrong-node evidence without touching the old session", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("same-slot-node")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    const wrongNode = NodeContextSchema.parse({
+      ...h.node,
+      nodeId: "nod_bbbbbbbbbbbbbbbb",
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) =>
+      issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        wrongNode,
+        connection as never,
+      ),
+    );
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("same-slot-node")));
+    await vi.waitFor(() => expect(second.readyState).toBe(3));
+    expect(sessionMock.instances).toHaveLength(1);
+    expect(sessionMock.instances[0]?.cleanup).not.toHaveBeenCalled();
+    expect(asInternals<WebSocketServerInternals>(server).sessions.get(first)).toBeDefined();
+    await server.close();
+  });
+
   test("rejects caller structural enterprise authority without reading it", async () => {
     const h = createEnterpriseRuntimeHarness();
     const server = createServer({ enterpriseRuntime: h.runtime });

@@ -236,6 +236,68 @@ export function bindEnterpriseAdmissionSession(
   state.slots.set(key, active);
   return handle;
 }
+
+/** Atomically binds an evidence to its canonical slot, replacing only a current
+ * handle with the exact same principal/credential/grant/client tuple. */
+export function bindOrReplaceEnterpriseAdmissionSession(
+  issuer: EnterpriseAdmissionAuthorizationIssuer,
+  evidence: EnterpriseAdmissionAuthenticationEvidence,
+  clientId: unknown,
+): EnterpriseAdmissionAuthorizationHandle | null {
+  const state = getState(issuer);
+  if (!state || !safeAuditCurrent(state)) return null;
+  const pending = state.evidence.get(evidence as object);
+  if (!pending || typeof clientId !== "string" || clientId.length === 0) {
+    state.evidence.delete(evidence as object);
+    return null;
+  }
+  const key = createEnterpriseSessionBindingKey({
+    organizationId: pending.snapshot.principal.organizationId,
+    principalId: pending.snapshot.principal.principalId,
+    credentialId: pending.credentialId,
+    grantVersion: pending.grantVersion,
+    clientId,
+  });
+  const old = state.slots.get(key);
+  if (old && !isCurrent(state, old)) {
+    state.evidence.delete(evidence as object);
+    return null;
+  }
+  if (old && (old.nodeKey !== pending.nodeKey || old.principalType !== pending.principalType)) {
+    state.evidence.delete(evidence as object);
+    return null;
+  }
+  if (old) state.slots.delete(key);
+  const next = bindEnterpriseAdmissionSession(issuer, evidence, clientId);
+  if (!next) {
+    if (old) state.slots.set(key, old);
+    return null;
+  }
+  if (old) old.active = false;
+  return next;
+}
+
+export function getEnterpriseAdmissionEvidenceLockPartition(
+  issuer: EnterpriseAdmissionAuthorizationIssuer,
+  evidence: EnterpriseAdmissionAuthenticationEvidence,
+  clientId: unknown,
+): string | null {
+  try {
+    const state = getState(issuer);
+    const pending = state?.evidence.get(evidence as object);
+    if (
+      !state ||
+      !pending ||
+      !safeAuditCurrent(state) ||
+      typeof clientId !== "string" ||
+      clientId.length === 0
+    )
+      return null;
+    return `${pending.snapshot.principal.organizationId}:${pending.snapshot.principal.principalId}:${clientId}`;
+  } catch {
+    return null;
+  }
+}
 // oxlint-disable-next-line complexity -- replacement atomically validates opaque state and tuple
 // oxlint-disable-next-line complexity -- exact replacement validates the full binding tuple.
 export function replaceEnterpriseAdmissionSession(
