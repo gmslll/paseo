@@ -8,6 +8,7 @@ import {
 import { DarwinWorkspaceFileSystem } from "../runtime/darwin-workspace-fs.js";
 import { randomBytes } from "node:crypto";
 const sourceBrand = Symbol("EnterpriseBrowserProfileContentReadSource");
+const sources = new WeakSet<object>();
 
 export interface EnterpriseBrowserProfileContentPage {
   readonly items: readonly EnterpriseBrowserProfileContentItem[];
@@ -24,6 +25,11 @@ export interface EnterpriseBrowserProfileContentReadSource {
   }): Promise<EnterpriseBrowserProfileContentPage>;
   close?(): Promise<void> | void;
 }
+export function isEnterpriseBrowserProfileContentReadSource(
+  value: unknown,
+): value is EnterpriseBrowserProfileContentReadSource {
+  return typeof value === "object" && value !== null && sources.has(value);
+}
 
 export function createEnterpriseBrowserProfileContentReadSource(input: {
   readonly readProfile: (input: {
@@ -35,13 +41,15 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
   }) => Promise<EnterpriseBrowserProfileContentPage>;
   readonly onClose?: () => void;
 }): EnterpriseBrowserProfileContentReadSource {
+  const readProfile = captureDataFunction(input, "readProfile");
+  const onClose = captureDataOptionalFunction(input, "onClose");
   let closed = false;
-  return Object.freeze({
+  const source = Object.freeze({
     [sourceBrand]: true as const,
     read: async ({ profile, selector, cursor, limit }) => {
       if (closed) throw new Error("Browser profile content source is closed.");
       const parsedSelector = EnterpriseBrowserProfileContentSelectorSchema.parse(selector);
-      const page = await input.readProfile({
+      const page = await readProfile({
         profile,
         browserProfileId: profile.browserProfileId,
         view: parsedSelector.view,
@@ -57,9 +65,29 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
     close: () => {
       if (closed) return;
       closed = true;
-      input.onClose?.();
+      onClose?.();
     },
   });
+  sources.add(source);
+  return source;
+}
+
+// oxlint-disable-next-line no-explicit-any -- captured descriptor is narrowed by the caller contract
+function captureDataFunction(input: object, key: string): (...args: any[]) => any {
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+    throw new Error(`Invalid ${key}`);
+  return descriptor.value;
+}
+function captureDataOptionalFunction(input: object, key: string): (() => void) | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  if (!descriptor) return undefined;
+  if (
+    !("value" in descriptor) ||
+    (descriptor.value !== undefined && typeof descriptor.value !== "function")
+  )
+    throw new Error(`Invalid ${key}`);
+  return descriptor.value;
 }
 
 export function createProductionEnterpriseBrowserProfileContentReadSource(input: {
