@@ -176,7 +176,16 @@ export function createEnterpriseSessionDispatcherRegistration(
       try {
         for (const registration of registrations) leases.push(registration.open(input));
       } catch (error) {
-        closeLeasesWithoutMasking(leases);
+        const rollbackErrors = closeLeasesCollectingErrors(leases);
+        if (rollbackErrors.length > 0)
+          // oxlint-disable-next-line preserve-caught-error -- retain primary and rollback failures.
+          throw new AggregateError(
+            [error, ...rollbackErrors],
+            "Enterprise dispatcher open failed",
+            {
+              cause: error,
+            },
+          );
         throw error;
       }
       const active = { value: true };
@@ -221,7 +230,9 @@ export function createEnterpriseSessionDispatcherRegistration(
           if (!active.value) return null;
           const delegate = requestMap.get(message.type);
           if (!delegate?.consumeResponse)
-            return { response, receiptClassification: "authority" as const };
+            return delegate?.requestPolicyForType?.(message.type) === "resources"
+              ? null
+              : { response, receiptClassification: "authority" as const };
           try {
             return delegate.consumeResponse({ sessionContext, message, response });
           } catch {
@@ -264,14 +275,16 @@ function isValidManifest(
   );
 }
 
-function closeLeasesWithoutMasking(leases: readonly EnterpriseDispatcherLease[]): void {
+function closeLeasesCollectingErrors(leases: readonly EnterpriseDispatcherLease[]): unknown[] {
+  const errors: unknown[] = [];
   for (let index = leases.length - 1; index >= 0; index -= 1) {
     try {
       const result = leases[index].close();
       if (result && typeof (result as PromiseLike<unknown>).then === "function")
         void Promise.resolve(result).catch(() => undefined);
-    } catch {
-      // Preserve the synchronous open failure; Session cleanup reports later errors.
+    } catch (error) {
+      errors.push(error);
     }
   }
+  return errors;
 }

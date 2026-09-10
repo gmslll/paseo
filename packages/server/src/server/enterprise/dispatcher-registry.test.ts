@@ -250,4 +250,61 @@ describe("enterprise dispatcher registry", () => {
       ]),
     ).toBeNull();
   });
+
+  it("rejects resource responses when the family cannot consume them", async () => {
+    const registration = createEnterpriseSessionDispatcherRegistration([
+      {
+        manifest: { operations: ["enterprise.organization.list_resources.request"] },
+        open: () => ({
+          dispatcher: {
+            handle: () => response,
+            requestPolicyForType: () => "resources" as const,
+          },
+          close: () => undefined,
+        }),
+      },
+    ]);
+    const lease = registration?.open({ sessionId: "s", clientId: "c", context });
+    expect(
+      lease?.dispatcher.consumeResponse?.({
+        sessionContext: context,
+        message: { type: "enterprise.organization.list_resources.request" } as never,
+        response,
+      }),
+    ).toBeNull();
+    await lease?.close();
+  });
+
+  it("reports synchronous rollback failures with the open primary error", () => {
+    const rollbackError = new Error("rollback failed");
+    const registration = createEnterpriseSessionDispatcherRegistration([
+      {
+        manifest: { operations: ["a.request"] },
+        open: () => ({
+          dispatcher: { handle: () => false },
+          close: () => {
+            throw rollbackError;
+          },
+        }),
+      },
+      {
+        manifest: { operations: ["b.request"] },
+        open: () => {
+          throw new Error("open failed");
+        },
+      },
+    ]);
+    expect(() => registration?.open({ sessionId: "s", clientId: "c", context })).toThrow(
+      AggregateError,
+    );
+    try {
+      registration?.open({ sessionId: "s", clientId: "c", context });
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).errors).toEqual([
+        expect.objectContaining({ message: "open failed" }),
+        rollbackError,
+      ]);
+    }
+  });
 });
