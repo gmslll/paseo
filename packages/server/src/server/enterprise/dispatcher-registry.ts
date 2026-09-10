@@ -280,8 +280,12 @@ function closeLeasesCollectingErrors(leases: readonly EnterpriseDispatcherLease[
   for (let index = leases.length - 1; index >= 0; index -= 1) {
     try {
       const result = leases[index].close();
-      if (result && typeof (result as PromiseLike<unknown>).then === "function")
+      if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+        errors.push(
+          new Error("Enterprise dispatcher lease close must be synchronous during open rollback"),
+        );
         void Promise.resolve(result).catch(() => undefined);
+      }
     } catch (error) {
       errors.push(error);
     }
