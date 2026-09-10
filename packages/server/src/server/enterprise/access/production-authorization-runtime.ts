@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   NodeContextSchema,
   PrincipalContextSchema,
+  normalizeResourceGrants,
   type NodeContext,
   type PrincipalContext,
   type SessionOutboundMessage,
@@ -557,8 +558,9 @@ export function isCurrentProductionAuthorizationRuntimeForSession(
   try {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
     const record = runtimeRecords.get(value as object);
+    if (!record?.active) return false;
     const session = captureRuntimeSessionInput(input);
-    if (!record?.active || !session) return false;
+    if (!session) return false;
     return (
       record.admissionAuthorizationIssuer === session.admissionAuthorizationIssuer &&
       record.admissionAuthorizationHandle === session.admissionAuthorizationHandle &&
@@ -597,14 +599,18 @@ function captureRuntimeSessionInput(
   if (!context) return null;
   const principalSnapshot = snapshotOwnData(context.principal);
   const nodeSnapshot = snapshotOwnData(context.node);
-  const principal = PrincipalContextSchema.parse(principalSnapshot);
+  const parsedPrincipal = PrincipalContextSchema.parse(principalSnapshot);
   const node = NodeContextSchema.parse(nodeSnapshot);
   if (
-    !sameCanonicalValue(principalSnapshot, principal) ||
+    !sameCanonicalValue(principalSnapshot, parsedPrincipal) ||
     !sameCanonicalValue(nodeSnapshot, node)
   ) {
     return null;
   }
+  const principal = {
+    ...parsedPrincipal,
+    grants: normalizeResourceGrants(parsedPrincipal.grants),
+  };
   if (
     typeof top.sessionId !== "string" ||
     typeof top.clientId !== "string" ||

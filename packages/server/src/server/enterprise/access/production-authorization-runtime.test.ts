@@ -50,6 +50,10 @@ const principal: PrincipalContext = {
       action: "workspace.content.read",
       selector: { kind: "workspace", workspaceIds: ["wks_a"] },
     },
+    {
+      action: "workspace.metadata.read",
+      selector: { kind: "workspace", workspaceIds: ["wks_a"] },
+    },
   ],
 };
 const grantRecord = {
@@ -242,6 +246,20 @@ describe("production enterprise authorization runtime", () => {
       const input = runtimeSessionInput(runtime, fixture);
 
       expect(isCurrentProductionAuthorizationRuntimeForSession(runtime, input)).toBe(true);
+      expect(
+        isCurrentProductionAuthorizationRuntimeForSession(runtime, {
+          ...input,
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            principal: {
+              ...input.enterpriseContext.principal,
+              grants: input.enterpriseContext.principal.grants
+                .toReversed()
+                .flatMap((grant) => [structuredClone(grant), structuredClone(grant)]),
+            },
+          },
+        }),
+      ).toBe(true);
       expect(isCurrentProductionAuthorizationRuntimeForSession({ ...runtime }, input)).toBe(false);
       expect(
         isCurrentProductionAuthorizationRuntimeForSession(runtime, {
@@ -292,6 +310,30 @@ describe("production enterprise authorization runtime", () => {
             principal: { ...input.enterpriseContext.principal, grants: [] },
           },
         },
+        {
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            principal: {
+              ...input.enterpriseContext.principal,
+              grants: input.enterpriseContext.principal.grants.map((grant, index) =>
+                index === 0 ? { ...grant, action: "workspace.content.write" as const } : grant,
+              ),
+            },
+          },
+        },
+        {
+          enterpriseContext: {
+            ...input.enterpriseContext,
+            principal: {
+              ...input.enterpriseContext.principal,
+              grants: input.enterpriseContext.principal.grants.map((grant, index) =>
+                index === 0
+                  ? { ...grant, selector: { kind: "workspace" as const, workspaceIds: ["wks_b"] } }
+                  : grant,
+              ),
+            },
+          },
+        },
       ]) {
         expect(
           isCurrentProductionAuthorizationRuntimeForSession(runtime, { ...input, ...mismatch }),
@@ -310,7 +352,18 @@ describe("production enterprise authorization runtime", () => {
       expect(getterCalls).toBe(0);
 
       await runtime.release();
-      expect(isCurrentProductionAuthorizationRuntimeForSession(runtime, input)).toBe(false);
+      let releasedInputTouches = 0;
+      const releasedInput = new Proxy(
+        {},
+        {
+          ownKeys() {
+            releasedInputTouches += 1;
+            throw new Error("released runtime must not inspect session input");
+          },
+        },
+      );
+      expect(isCurrentProductionAuthorizationRuntimeForSession(runtime, releasedInput)).toBe(false);
+      expect(releasedInputTouches).toBe(0);
       await fixture.audit.close();
     },
   );
