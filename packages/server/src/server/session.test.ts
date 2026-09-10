@@ -1300,7 +1300,12 @@ test("stale Grant guard fails closed without registering", async () => {
   });
   await session.handleMessage({ type: "daemon.get_status.request", requestId: "stale" });
   expect(register).not.toHaveBeenCalled();
-  expect(messages).toHaveLength(0);
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "stale", code: "access_denied" }),
+    }),
+  ]);
   await session.cleanup();
 });
 
@@ -1328,7 +1333,12 @@ test("same-value permission generation replacement before registration fails clo
   expect(grantChecks).toBe(1);
   expect(register).not.toHaveBeenCalled();
   expect(dispatch).not.toHaveBeenCalled();
-  expect(messages).toHaveLength(0);
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "stale-permission", code: "access_denied" }),
+    }),
+  ]);
   await session.cleanup();
 });
 
@@ -2252,7 +2262,12 @@ test("identity-self requests fail closed when the current grant is stale", async
   });
 
   expect(handle).not.toHaveBeenCalled();
-  expect(messages).toHaveLength(0);
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "identity-stale-1", code: "access_denied" }),
+    }),
+  ]);
   await session.cleanup();
 });
 
@@ -2283,6 +2298,56 @@ test("denied enterprise principal receives an immediate access-denied envelope",
         code: "access_denied",
       },
     },
+  ]);
+  expect(JSON.stringify(messages)).not.toContain("canary");
+  await session.cleanup();
+});
+
+test("coarse workspace access denies missing enterprise actions without receipt or dispatch", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const handle = vi.fn(() => false);
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(authorityReceiptState, "register");
+  const context = enterpriseContext("generation-action-denial");
+  const session = createSessionForTest({
+    messages,
+    permissions: ["workspace.read"],
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState,
+    enterpriseDispatcher: { handle },
+  });
+
+  await session.handleMessage({
+    type: "enterprise.audit.list_events.request",
+    requestId: "audit-denied",
+  });
+  await session.handleMessage({
+    type: "enterprise.access.list_grants.request",
+    requestId: "grants-denied",
+    principalId: context.principal.principalId,
+  });
+
+  expect(handle).not.toHaveBeenCalled();
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(2);
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({
+        requestId: "audit-denied",
+        requestType: "enterprise.audit.list_events.request",
+        code: "access_denied",
+      }),
+    }),
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({
+        requestId: "grants-denied",
+        requestType: "enterprise.access.list_grants.request",
+        code: "access_denied",
+      }),
+    }),
   ]);
   expect(JSON.stringify(messages)).not.toContain("canary");
   await session.cleanup();

@@ -2428,7 +2428,16 @@ export class Session {
               ? this.inboundAuthorityRequestAuthorizer.consumeForRegistration(msg, evidence)
               : null;
             // oxlint-disable-next-line max-depth -- authorization transaction keeps reservation and registration adjacent.
-            if (!consumed) {
+            if (!evidence || !consumed) {
+              this.onMessage({
+                type: "rpc_error",
+                payload: {
+                  requestId,
+                  requestType: msg.type,
+                  error: `Session is not authorized for ${msg.type}`,
+                  code: "access_denied",
+                },
+              });
               return;
             }
             // oxlint-disable-next-line max-depth -- request correlation is checked inside the registration transaction.
