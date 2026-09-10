@@ -6,8 +6,11 @@ import {
 } from "@getpaseo/protocol/messages";
 import type {
   EnterpriseDispatchContext,
+  EnterpriseDispatchResponse,
   EnterpriseSessionDispatcher,
+  EnterpriseResponseContextConsumer,
 } from "../../session/enterprise-dispatcher.js";
+import { isIdentitySelfResponse } from "../../session/enterprise-dispatcher.js";
 
 export interface EnterpriseIdentityHandlerDeps {
   readonly listPrincipals: (
@@ -57,5 +60,12 @@ export function createEnterpriseIdentityDispatcher(
       }
       return false;
     },
+    consumeResponse: (({ response }) =>
+      isIdentitySelfResponse(response)
+        ? ({
+            response,
+            receiptClassification: "identity_self",
+          } satisfies EnterpriseDispatchResponse)
+        : null) satisfies EnterpriseResponseContextConsumer["consumeResponse"],
   };
 }
