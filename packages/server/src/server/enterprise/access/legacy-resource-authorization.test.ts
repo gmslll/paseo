@@ -133,15 +133,27 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
   test("fails closed when release races async assertions", async () => {
     const fixture = await createProductionRuntimeFixture("legacy-race");
     try {
+      const agent = {
+        id: "agt_0123456789abcdef",
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        nodeId: fixture.context.enterpriseContext.node.nodeId,
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        workspaceId: "wks_0123456789abcdef",
+      };
+      fixture.provider.owners.registerAgent(agent);
       const authorization = createEnterpriseLegacyResourceAuthorization({
         authorizationRuntime: fixture.runtime,
       });
       if (!authorization) throw new Error("authorization");
+      await expect(
+        authorization.assertAgent("workspace.content.read", agent.id),
+      ).resolves.not.toBeNull();
       const pendingWorkspace = authorization.assertWorkspace(
         "workspace.content.read",
         "wks_0123456789abcdef",
       );
-      const pendingAgents = authorization.filterAgents([]);
+      const pendingAgents = authorization.filterAgents([agent]);
       await fixture.runtime.release();
       await expect(pendingWorkspace).resolves.toBeNull();
       await expect(pendingAgents).resolves.toEqual([]);
