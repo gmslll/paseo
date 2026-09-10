@@ -9,6 +9,7 @@ import { isCurrentProductionAuthorizationRuntimeProvider } from "./production-au
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import {
   EnterpriseWorkspaceContentReadRequestSchema,
+  GlobalResourceRefSchema,
   EnterpriseWorkspaceContentReadResponseSchema,
   type GlobalResourceRef,
 } from "@getpaseo/protocol/messages";
@@ -78,6 +79,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
       });
       if (!source) throw new Error("workspace source unavailable");
       let closed = false;
+      let closePromise: Promise<void> | null = null;
       const reservations = new Set<string>();
       const current = (ctx: {
         sessionId: string;
@@ -113,6 +115,21 @@ export function createEnterpriseContentReadDispatcherRegistration(
               return false;
             reservations.add(parsed.data.requestId);
             try {
+              const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
+              if (!authority) return false;
+              const workspace = await authority.resourceAuthorization.assertWorkspace(
+                sessionContext.enterpriseContext.principal,
+                "workspace.content.read",
+                parsed.data.resource.localResourceId,
+              );
+              if (!resolveCurrentProductionRuntimeAuthority(runtime, provider)) return false;
+              const canonical = GlobalResourceRefSchema.parse({
+                organizationId: workspace.organizationId,
+                nodeId: workspace.nodeId,
+                resourceKind: "workspace",
+                localResourceId: workspace.workspaceId,
+              });
+              if (!equal(parsed.data.resource, canonical)) return false;
               return false;
             } finally {
               reservations.delete(parsed.data.requestId);
@@ -120,10 +137,11 @@ export function createEnterpriseContentReadDispatcherRegistration(
           },
         },
         close: async () => {
-          if (closed) return;
+          if (closePromise) return closePromise;
           closed = true;
           reservations.clear();
-          await source.close();
+          closePromise = source.close();
+          return closePromise;
         },
       };
     },
