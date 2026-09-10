@@ -200,7 +200,7 @@ describe("InboundAuthorityRequestAuthorizer", () => {
   );
 
   test("requires the policy's exact enterprise action", () => {
-    const deniedAuthorization = new SessionAuthorization(["access.manage"]);
+    const deniedAuthorization = new SessionAuthorization(["workspace.read"]);
     const deniedAuthorizer = createAuthorizer({
       authorization: deniedAuthorization,
       principal: principal([
@@ -216,7 +216,7 @@ describe("InboundAuthorityRequestAuthorizer", () => {
       authorize(deniedAuthorizer, deniedAuthorization, "enterprise.access.list_grants.request"),
     ).toBeNull();
 
-    const allowedAuthorization = new SessionAuthorization(["access.manage"]);
+    const allowedAuthorization = new SessionAuthorization(["workspace.read"]);
     const allowedAuthorizer = createAuthorizer({
       authorization: allowedAuthorization,
       principal: principal([
@@ -231,14 +231,10 @@ describe("InboundAuthorityRequestAuthorizer", () => {
     ).not.toBeNull();
   });
 
-  test("rejects resource-scoped, identity-self, and unknown request types", () => {
+  test("rejects resource-scoped and unknown request types", () => {
     const authorization = new SessionAuthorization(OWNER_PERMISSIONS);
     const authorizer = createAuthorizer({ authorization });
-    for (const type of [
-      "fetch_agent_request",
-      "create_agent_request",
-      "enterprise.identity.get_current.request",
-    ] as const) {
+    for (const type of ["fetch_agent_request", "create_agent_request"] as const) {
       expect(authorize(authorizer, authorization, type)).toBeNull();
     }
     expect(authorityReceiptPolicyForRequestType("future.unknown.request")).toBeNull();
@@ -371,7 +367,7 @@ describe("InboundAuthorityRequestAuthorizer", () => {
   });
 
   test("uses a strict frozen Principal snapshot despite caller mutation", () => {
-    const authorization = new SessionAuthorization(["access.manage"]);
+    const authorization = new SessionAuthorization(["workspace.read"]);
     const actor = principal([
       {
         action: "identity.manage",
@@ -512,8 +508,8 @@ describe("InboundAuthorityRequestAuthorizer", () => {
     const requestTypes = new Set(
       ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES.map((policy) => policy.requestType),
     );
-    expect(ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES).toHaveLength(42);
-    expect(requestTypes.size).toBe(41);
+    expect(ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES).toHaveLength(44);
+    expect(requestTypes.size).toBe(43);
 
     const actor = principal(
       (["identity.manage", "audit.read"] as const).map((action) => ({
