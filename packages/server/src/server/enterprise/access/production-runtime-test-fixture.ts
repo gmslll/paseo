@@ -17,6 +17,7 @@ import {
   createProductionAuthorizationRuntimeProvider,
 } from "./production-authorization-runtime-provider.js";
 import type { AppSlotRegistry } from "./resource-authorization.js";
+import type { BrowserProfileRegistry } from "./resource-authorization.js";
 
 export const node: NodeContext = {
   nodeId: "nod_0123456789abcdef",
@@ -56,7 +57,11 @@ let audit: Awaited<ReturnType<typeof createProductionAuditRuntime>> | undefined;
 const secret = Object.freeze({});
 export async function createProductionRuntimeFixture(
   name: string,
-  options: { readonly grants?: readonly ResourceGrant[]; readonly appSlots?: AppSlotRegistry } = {},
+  options: {
+    readonly grants?: readonly ResourceGrant[];
+    readonly appSlots?: AppSlotRegistry;
+    readonly browserProfiles?: BrowserProfileRegistry;
+  } = {},
 ) {
   if (!audit) {
     root = await mkdtemp(path.join(os.tmpdir(), "paseo-w2-fixture-"));
@@ -76,6 +81,7 @@ export async function createProductionRuntimeFixture(
     audit,
     grantFilePath: path.join(root, `${name}.json`),
     appSlots: options.appSlots,
+    browserProfiles: options.browserProfiles,
   });
   if (!provider) throw new Error("provider");
   const workspaceId = "wks_0123456789abcdef";
