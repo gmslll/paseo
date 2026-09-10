@@ -153,8 +153,17 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 { durability: "required" },
               );
               if (!current(sessionContext)) return false;
-              void page;
-              return false;
+              return deepFreeze(
+                EnterpriseWorkspaceContentReadResponseSchema.parse({
+                  type: "enterprise.workspace.content.read.response",
+                  payload: {
+                    requestId: parsed.data.requestId,
+                    resource: canonical,
+                    selector,
+                    page,
+                  },
+                }),
+              );
             } finally {
               reservations.delete(parsed.data.requestId);
             }
