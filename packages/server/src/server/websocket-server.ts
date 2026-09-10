@@ -735,6 +735,7 @@ interface SocketSessionOptions {
   sessionId?: string;
   sessionAuthorization?: SessionAuthorization;
   enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  enterpriseSessionBindingGeneration?: string;
   enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
   admissionInvalidationSink?: SessionOptions["admissionInvalidationSink"];
   admissionAuthorizationIssuer?: EnterpriseAdmissionRuntime["admission"]["authorizationIssuer"];
@@ -1798,6 +1799,7 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  // oxlint-disable-next-line complexity -- Session ownership wiring is explicit.
   private createSessionConnection(params: {
     ws: WebSocketLike;
     clientId: string;
@@ -1810,6 +1812,7 @@ export class VoiceAssistantWebSocketServer {
     sessionId?: string;
     sessionAuthorization?: SessionAuthorization;
     enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+    enterpriseSessionBindingGeneration?: string;
     onEnterpriseWorkspaceRuntimeConstructionFailure?: (
       runtime: EnterpriseWorkspaceFilesRuntime,
     ) => void;
@@ -1825,6 +1828,7 @@ export class VoiceAssistantWebSocketServer {
       sessionId,
       sessionAuthorization,
       enterpriseAuthorizationRuntime,
+      enterpriseSessionBindingGeneration,
       onEnterpriseWorkspaceRuntimeConstructionFailure,
     } = params;
     let connection: SessionConnection | null = null;
@@ -1898,6 +1902,7 @@ export class VoiceAssistantWebSocketServer {
         ...(sessionId ? { sessionId } : {}),
         ...(sessionAuthorization ? { sessionAuthorization } : {}),
         ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+        ...(enterpriseSessionBindingGeneration ? { enterpriseSessionBindingGeneration } : {}),
         ...(this.enterpriseRuntime && params.enterpriseAuthorizationHandle
           ? { admissionAuthorizationIssuer: this.enterpriseRuntime.admission.authorizationIssuer }
           : {}),
@@ -1946,7 +1951,9 @@ export class VoiceAssistantWebSocketServer {
             enterpriseContext: {
               principal: options.enterprise.principal,
               node: options.enterprise.node,
-              sessionBindingGeneration: options.enterprise.runtime.nextSessionBindingGeneration(),
+              sessionBindingGeneration:
+                options.enterpriseSessionBindingGeneration ??
+                options.enterprise.runtime.nextSessionBindingGeneration(),
             },
             enterpriseAgentContextRegistry: options.enterprise.runtime.agentContextRegistry,
             authorityReceiptState: options.enterprise.runtime.authorityReceiptState,
@@ -2196,6 +2203,7 @@ export class VoiceAssistantWebSocketServer {
     let admission = pending.admission;
     let enterpriseAuthorizationHandle: EnterpriseAdmissionAuthorizationHandle | undefined;
     let enterpriseAuthorizationRuntime: ProductionAuthorizationRuntime | undefined;
+    let enterpriseSessionBindingGeneration: string | undefined;
     let sessionAuthorization: SessionAuthorization | undefined;
     let sessionId: string | undefined;
     let sessionKey: string;
@@ -2232,6 +2240,7 @@ export class VoiceAssistantWebSocketServer {
         );
         return;
       }
+      enterpriseSessionBindingGeneration = resolved.sessionBindingGeneration;
       enterpriseAuthorizationHandle = handle;
       if (runtime.authorizationRuntimeProvider) {
         sessionAuthorization = new SessionAuthorization(OWNER_PERMISSIONS);
@@ -2369,6 +2378,7 @@ export class VoiceAssistantWebSocketServer {
         ...(sessionId ? { sessionId } : {}),
         ...(sessionAuthorization ? { sessionAuthorization } : {}),
         ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+        ...(enterpriseSessionBindingGeneration ? { enterpriseSessionBindingGeneration } : {}),
         onEnterpriseWorkspaceRuntimeConstructionFailure: (runtime) => {
           workspaceCleanupPromise ??= runtime.cleanup("session-closed");
         },
