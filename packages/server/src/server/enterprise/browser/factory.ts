@@ -124,10 +124,10 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
       );
       if (!authority) return null;
       const resolvedAuthority: EnterpriseBrowserLeaseAuthorityPort = {
-        assertWorkspace: (context, action, workspaceId) =>
-          authority.resourceAuthorization.assertWorkspace(context, action, workspaceId),
-        assertBrowserProfile: (context, action, profileId) =>
-          authority.resourceAuthorization.assertBrowserProfile(context, action, profileId),
+        assertWorkspace: (principalContext, action, workspaceId) =>
+          authority.resourceAuthorization.assertWorkspace(principalContext, action, workspaceId),
+        assertBrowserProfile: (principalContext, action, profileId) =>
+          authority.resourceAuthorization.assertBrowserProfile(principalContext, action, profileId),
         resolveAgentHandle: ({ agentId }) => input.registry.resolve(agentId),
         isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
         resolveLeaseAuthorization: async (handle) => {
