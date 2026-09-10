@@ -70,9 +70,14 @@ import {
   unregisterPaseoBrowserFromHost,
   unregisterPaseoBrowserProfile,
   registerAttachedPaseoBrowser,
+  registerAttachedPaseoBrowserAfterPageIdentityBarrier,
+  createBrowserPageIdentityPublisherRegistry,
+  installBrowserPageIdentityTransportRoutes,
+  installPaseoBrowserPageIdentityPublisher,
   setWorkspaceActivePaseoBrowserId,
   unregisterPaseoBrowserHost,
 } from "./features/browser-webviews/index.js";
+
 import {
   BrowserProfileRuntimeAuthorizationRegistry,
   clearPaseoBrowserProfile,
@@ -114,12 +119,27 @@ import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import { installAppUpdateOnQuit } from "./features/auto-updater.js";
 import {
+  closeBrowserPageIdentityLifecycle,
+  createBrowserPageIdentityCloseBarrier,
+} from "./page-identity-lifecycle.js";
+import {
   buildAgentDeepLinkRoute,
   parseAgentDeepLink,
   type AgentDeepLinkTarget,
 } from "@getpaseo/protocol/agent-deep-link";
 import { AgentNavigationInbox, parseAgentDeepLinkFromArgv } from "./agent-navigation.js";
 import { loadPersistedConfig, resolvePaseoHome } from "@getpaseo/server";
+
+const browserPageIdentityPublisherRegistry = createBrowserPageIdentityPublisherRegistry({
+  registry: getPaseoBrowserWebviewRegistry(),
+});
+const browserPageIdentityTransportController = installBrowserPageIdentityTransportRoutes({
+  ipcMain,
+  routeLifecycle: browserPageIdentityPublisherRegistry.routeLifecycle,
+});
+const browserPageIdentityPublisherDisposer = installPaseoBrowserPageIdentityPublisher(
+  browserPageIdentityPublisherRegistry,
+);
 
 const DEV_SERVER_URL = process.env.EXPO_DEV_URL ?? "http://localhost:8081";
 const APP_SCHEME = "paseo";
@@ -300,7 +320,7 @@ function resolveBrowserProfileAuthorization(
 function createBrowserProfileAuthorizationCleanup(hostWebContentsId: number) {
   const guestIdsByProfile = new Map<string, readonly number[]>();
   return {
-    unregisterProfile(authorization: BrowserProfileRuntimeAuthorization): void {
+    async unregisterProfile(authorization: BrowserProfileRuntimeAuthorization): Promise<void> {
       const browserIds = listRegisteredPaseoBrowserIdsForProfile({
         hostWebContentsId,
         authorization,
@@ -324,7 +344,7 @@ function createBrowserProfileAuthorizationCleanup(hostWebContentsId: number) {
         authorization.browserProfileId,
         Object.freeze([...new Set([...registeredGuestIds, ...profileGuestIds])]),
       );
-      unregisterPaseoBrowserProfile({ hostWebContentsId, authorization });
+      await unregisterPaseoBrowserProfile({ hostWebContentsId, authorization });
     },
     findGuests(profileId: string): readonly unknown[] {
       const guestIds = guestIdsByProfile.get(profileId) ?? [];
@@ -617,7 +637,7 @@ ipcMain.handle("paseo:agent-navigation:ready", (event) => {
   return agentNavigationInbox.windowReady(event.sender.id);
 });
 
-ipcMain.handle("paseo:browser:register-attached", (event, rawInput: unknown) => {
+ipcMain.handle("paseo:browser:register-attached", async (event, rawInput: unknown) => {
   const input = readAttachedBrowserInput(rawInput);
   if (!input) {
     throw new Error("Invalid attached browser registration");
@@ -628,20 +648,34 @@ ipcMain.handle("paseo:browser:register-attached", (event, rawInput: unknown) => 
   if (profileAuthorization && profileAuthorization.workspaceId !== input.workspaceId) {
     throw new Error("Browser Profile authorization does not match the Browser Workspace.");
   }
+  if (profileAuthorization) {
+    await browserPageIdentityPublisherDisposer;
+    const route = browserPageIdentityTransportController.getRoute(event.sender);
+    if (!route) throw new Error("Browser page identity transport route is unavailable");
+  }
   const profileSession = profileAuthorization
     ? session.fromPartition(
         getEnterpriseBrowserProfilePartition(profileAuthorization.browserProfileId),
       )
     : getPaseoBrowserProfileSession(session);
-  const registered = registerAttachedPaseoBrowser({
-    browserId: input.browserId,
-    workspaceId: input.workspaceId,
-    webContentsId: input.webContentsId,
-    ...(profileAuthorization ? { profileAuthorization } : {}),
-    sender: event.sender,
-    profileSession,
-    findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
-  });
+  const registered = profileAuthorization
+    ? await registerAttachedPaseoBrowserAfterPageIdentityBarrier({
+        browserId: input.browserId,
+        workspaceId: input.workspaceId,
+        webContentsId: input.webContentsId,
+        ...(profileAuthorization ? { profileAuthorization } : {}),
+        sender: event.sender,
+        profileSession,
+        findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
+      })
+    : registerAttachedPaseoBrowser({
+        browserId: input.browserId,
+        workspaceId: input.workspaceId,
+        webContentsId: input.webContentsId,
+        sender: event.sender,
+        profileSession,
+        findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
+      });
   if (!registered) {
     throw new Error("Attached browser registration was rejected");
   }
@@ -670,7 +704,7 @@ ipcMain.handle("paseo:browser:unregister-workspace-browser", async (event, brows
       event.sender.id,
       normalizedBrowserId,
     );
-    unregisterPaseoBrowserFromHost(event.sender.id, normalizedBrowserId);
+    await unregisterPaseoBrowserFromHost(event.sender.id, normalizedBrowserId);
     // COMPAT(browserProfile): added in v0.1.108; remove after 2027-01-15.
     const legacyProfile = hasOtherHost
       ? null
@@ -953,6 +987,24 @@ async function createWindow(
   applyDesktopWindowChromeMode({ win: mainWindow, mode: DESKTOP_WINDOW_CHROME_MODE });
 
   const webContentsId = mainWindow.webContents.id;
+  let closeReleased = false;
+  const closeBarrier = createBrowserPageIdentityCloseBarrier({
+    retireRoute: () => browserPageIdentityTransportController.retireRoute(mainWindow.webContents),
+    unregisterHost: () => unregisterPaseoBrowserHost(webContentsId),
+    release: () => {
+      closeReleased = true;
+      mainWindow.close();
+    },
+    onError: (error) => {
+      log.error("[browser-page-identity] close barrier failed", error);
+      closeReleased = true;
+      mainWindow.destroy();
+    },
+  });
+  mainWindow.on("close", (event) => {
+    if (closeReleased) return;
+    closeBarrier(() => event.preventDefault());
+  });
   options.onCreated?.(webContentsId);
   mainWindow.webContents.on("did-start-navigation", (_event, _url, isSameDocument, isMainFrame) => {
     if (isMainFrame && !isSameDocument) {
@@ -1290,7 +1342,15 @@ function showDaemonShutdownDialog(): void {
 
 const quitLifecycle = createQuitLifecycle({
   app,
-  closeTransportSessions: closeAllTransportSessions,
+  closeTransportSessions: async () =>
+    closeBrowserPageIdentityLifecycle({
+      controllerClose: () => browserPageIdentityTransportController.close(),
+      disposer: async () => (await browserPageIdentityPublisherDisposer)(),
+      registryClose: () => browserPageIdentityPublisherRegistry.close(),
+      transportClose: async () => {
+        closeAllTransportSessions();
+      },
+    }),
   stopDesktopManagedDaemonIfNeeded: () =>
     stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: getDesktopSettingsStore(),
