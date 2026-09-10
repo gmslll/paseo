@@ -73,7 +73,7 @@ function receipt(patch: Partial<AuthorizedRequestReceipt> = {}): AuthorizedReque
     expiresAt: now + 1_000,
     authorization: {
       succeeded: true,
-      daemonPermission: "access.manage",
+      daemonPermission: "workspace.read",
       enterpriseActions: ["identity.manage"],
     },
     ...patch,
