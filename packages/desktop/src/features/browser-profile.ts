@@ -185,26 +185,52 @@ export class BrowserProfileRuntimeAuthorizationRegistry {
     this.trustedNodeId = parsePattern(trustedNodeId, ENTERPRISE_NODE_ID_PATTERN, "trusted node ID");
   }
 
-  public hydrateGeneration(hostWebContentsId: number, authorizations: readonly unknown[], lifecycleGeneration: string): readonly BrowserProfileRuntimeAuthorization[] {
+  public hydrateGeneration(
+    hostWebContentsId: number,
+    authorizations: readonly unknown[],
+    lifecycleGeneration: string,
+  ): readonly BrowserProfileRuntimeAuthorization[] {
     assertHostWebContentsId(hostWebContentsId);
     const parsed = authorizations.map((value) => {
       const authorization = parseBrowserProfileRuntimeAuthorization(value);
-      if (authorization.lifecycleGeneration !== lifecycleGeneration || authorization.homeNodeId !== this.trustedNodeId) throw new Error("Invalid Browser Profile generation.");
+      if (
+        authorization.lifecycleGeneration !== lifecycleGeneration ||
+        authorization.homeNodeId !== this.trustedNodeId
+      )
+        throw new Error("Invalid Browser Profile generation.");
       return authorization;
     });
-    const keys = parsed.map((authorization) => runtimeAuthorizationKey(hostWebContentsId, authorization));
-    if (new Set(keys).size !== keys.length) throw new Error("Duplicate Browser Profile authorization.");
-    const previous = [...this.authorizations.entries()].filter(([key]) => key.startsWith(`[${hostWebContentsId},`));
-    const revoked = previous.filter(([key, old]) => !keys.includes(key) || !parsed.some((next) => runtimeAuthorizationsEqual(next, old))).map(([, old]) => old);
+    const keys = parsed.map((authorization) =>
+      runtimeAuthorizationKey(hostWebContentsId, authorization),
+    );
+    if (new Set(keys).size !== keys.length)
+      throw new Error("Duplicate Browser Profile authorization.");
+    const previous = [...this.authorizations.entries()].filter(([key]) =>
+      key.startsWith(`[${hostWebContentsId},`),
+    );
+    const revoked = previous
+      .filter(
+        ([key, old]) =>
+          !keys.includes(key) || !parsed.some((next) => runtimeAuthorizationsEqual(next, old)),
+      )
+      .map(([, old]) => old);
     for (const [key] of previous) this.authorizations.delete(key);
     this.lifecycleByHost.set(hostWebContentsId, lifecycleGeneration);
-    for (const authorization of parsed) this.authorizations.set(runtimeAuthorizationKey(hostWebContentsId, authorization), authorization);
+    for (const authorization of parsed)
+      this.authorizations.set(
+        runtimeAuthorizationKey(hostWebContentsId, authorization),
+        authorization,
+      );
     return Object.freeze(revoked.map(cloneRuntimeAuthorization));
   }
 
-  public revokeGeneration(hostWebContentsId: number, lifecycleGeneration: string): readonly BrowserProfileRuntimeAuthorization[] {
+  public revokeGeneration(
+    hostWebContentsId: number,
+    lifecycleGeneration: string,
+  ): readonly BrowserProfileRuntimeAuthorization[] {
     assertHostWebContentsId(hostWebContentsId);
-    if (this.lifecycleByHost.get(hostWebContentsId) !== lifecycleGeneration) return Object.freeze([]);
+    if (this.lifecycleByHost.get(hostWebContentsId) !== lifecycleGeneration)
+      return Object.freeze([]);
     return Object.freeze(this.revokeHost(hostWebContentsId).map(cloneRuntimeAuthorization));
   }
 

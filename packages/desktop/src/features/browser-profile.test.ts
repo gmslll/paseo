@@ -33,6 +33,32 @@ const LEASE_CONTEXT = {
   leaseRevision: "lease-revision-a",
 };
 
+describe("BrowserProfileRuntimeAuthorizationRegistry generation reconciliation", () => {
+  test("keeps unchanged entries and rejects duplicate batches without mutation", () => {
+    const registry = new BrowserProfileRuntimeAuthorizationRegistry(NODE_ID);
+    registry.hydrateGeneration(7, [RUNTIME_AUTHORIZATION], "lifecycle-a");
+
+    expect(registry.hydrateGeneration(7, [RUNTIME_AUTHORIZATION], "lifecycle-a")).toEqual([]);
+    expect(() =>
+      registry.hydrateGeneration(7, [RUNTIME_AUTHORIZATION, RUNTIME_AUTHORIZATION], "lifecycle-a"),
+    ).toThrow(/duplicate/i);
+    expect(registry.revokeGeneration(7, "lifecycle-a")).toEqual([RUNTIME_AUTHORIZATION]);
+  });
+
+  test("removes omitted same-generation profiles and revokes old generation atomically", () => {
+    const registry = new BrowserProfileRuntimeAuthorizationRegistry(NODE_ID);
+    const second = { ...RUNTIME_AUTHORIZATION, browserProfileId: PROFILE_B };
+    registry.hydrateGeneration(8, [RUNTIME_AUTHORIZATION, second], "lifecycle-a");
+
+    expect(registry.hydrateGeneration(8, [RUNTIME_AUTHORIZATION], "lifecycle-a")).toEqual([second]);
+    const nextGeneration = { ...second, lifecycleGeneration: "lifecycle-b" };
+    expect(registry.hydrateGeneration(8, [nextGeneration], "lifecycle-b")).toEqual([
+      RUNTIME_AUTHORIZATION,
+    ]);
+    expect(registry.revokeGeneration(8, "lifecycle-a")).toEqual([]);
+  });
+});
+
 class FakeProfileSession {
   public readonly storageClears: unknown[] = [];
   public cacheClears = 0;

@@ -1,7 +1,10 @@
-import type { BrowserProfileRuntimeAuthorizationRegistry } from "../browser-profile.js";
+import type {
+  BrowserProfileRuntimeAuthorization,
+  BrowserProfileRuntimeAuthorizationRegistry,
+} from "../browser-profile.js";
 
 export interface BrowserProfileAuthorizationCleanup {
-  unregisterProfile(profileId: string): void | Promise<void>;
+  unregisterProfile(authorization: BrowserProfileRuntimeAuthorization): void | Promise<void>;
   findGuests(profileId: string): readonly unknown[];
   destroyGuest(guest: unknown): void | Promise<void>;
   cleanupGuest?(guest: unknown): void | Promise<void>;
@@ -14,7 +17,11 @@ export function createBrowserProfileAuthorizationHandler(input: {
 }) {
   return {
     async hydrate(authorizations: readonly unknown[], lifecycleGeneration: string) {
-      const revoked = input.registry.hydrateGeneration(input.hostWebContentsId, authorizations, lifecycleGeneration);
+      const revoked = input.registry.hydrateGeneration(
+        input.hostWebContentsId,
+        authorizations,
+        lifecycleGeneration,
+      );
       await cleanupRevoked(revoked, input.cleanup);
       return revoked;
     },
@@ -27,17 +34,27 @@ export function createBrowserProfileAuthorizationHandler(input: {
 }
 
 async function cleanupRevoked(
-  revoked: readonly { browserProfileId: string }[],
+  revoked: readonly BrowserProfileRuntimeAuthorization[],
   cleanup: BrowserProfileAuthorizationCleanup,
 ): Promise<void> {
   const errors: unknown[] = [];
   for (const authorization of revoked) {
     try {
-      await cleanup.unregisterProfile(authorization.browserProfileId);
+      await cleanup.unregisterProfile(authorization);
       for (const guest of cleanup.findGuests(authorization.browserProfileId)) {
-        try { await cleanup.destroyGuest(guest); await cleanup.cleanupGuest?.(guest); } catch (error) { errors.push(error); }
+        try {
+          await cleanup.destroyGuest(guest);
+          await cleanup.cleanupGuest?.(guest);
+        } catch (error) {
+          errors.push(error);
+        }
       }
-    } catch (error) { errors.push(error); }
+    } catch (error) {
+      errors.push(error);
+    }
   }
-  if (errors.length > 0) throw new AggregateError(errors, "Browser Profile authorization cleanup failed.", { cause: errors[0] });
+  if (errors.length > 0)
+    throw new AggregateError(errors, "Browser Profile authorization cleanup failed.", {
+      cause: errors[0],
+    });
 }

@@ -13,7 +13,9 @@ export interface BrowserProfileAuthorizationBridge {
     authorizations: readonly BrowserProfileRuntimeAuthorization[];
     lifecycleGeneration: string;
   }): Promise<readonly BrowserProfileRuntimeAuthorization[]>;
-  revoke(input: { lifecycleGeneration: string }): Promise<readonly BrowserProfileRuntimeAuthorization[]>;
+  revoke(input: {
+    lifecycleGeneration: string;
+  }): Promise<readonly BrowserProfileRuntimeAuthorization[]>;
 }
 
 export function createBrowserProfileAuthorizationBridge(input: {
