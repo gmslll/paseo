@@ -1978,6 +1978,7 @@ export const ru: TranslationResources = {
       usage: "Использование",
       terminals: "Терминалы",
       plugins: "Плагины",
+      enterprise: "Корпоративный",
       host: "Обзор",
     },
     plugins: pluginSettings.ru,

@@ -1992,6 +1992,7 @@ export const en = {
       usage: "Usage",
       terminals: "Terminals",
       plugins: "Plugins",
+      enterprise: "Enterprise",
       host: "Overview",
     },
     plugins: {

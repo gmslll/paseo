@@ -199,7 +199,7 @@ const HOST_SECTION_ITEMS: HostSectionItem[] = [
   { id: "usage", labelKey: "settings.hostSections.usage", icon: Gauge },
   { id: "terminals", labelKey: "settings.hostSections.terminals", icon: SquareTerminal },
   { id: "plugins", labelKey: "settings.hostSections.plugins", icon: Blocks },
-  { id: "enterprise", labelKey: "settings.hostSections.host", icon: Shield },
+  { id: "enterprise", labelKey: "settings.hostSections.enterprise", icon: Shield },
 ];
 
 function renderHostSettingsContent(

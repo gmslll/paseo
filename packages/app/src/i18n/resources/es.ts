@@ -1993,6 +1993,7 @@ export const es: TranslationResources = {
       usage: "Uso",
       terminals: "Terminals",
       plugins: "Plugins",
+      enterprise: "Empresa",
       host: "Resumen",
     },
     plugins: pluginSettings.es,

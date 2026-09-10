@@ -1957,6 +1957,7 @@ export const ko: TranslationResources = {
       usage: "사용량",
       terminals: "터미널",
       plugins: "플러그인",
+      enterprise: "엔터프라이즈",
       host: "개요",
     },
     plugins: pluginSettings.ko,
