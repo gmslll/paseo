@@ -8,6 +8,7 @@ import {
 import {
   DAEMON_PERMISSIONS,
   OWNER_PERMISSIONS,
+  deriveEnterpriseSessionPermissions,
   SessionAuthorization,
   closeActiveDaemonPermission,
   consumeCurrentInboundDaemonAuthorizationDecision,
@@ -45,6 +46,38 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
 }
 
 describe("SessionAuthorization", () => {
+  test("derives identity management without global permissions", () => {
+    const base = {
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef",
+      grantVersion: "v1",
+    };
+    const human = {
+      ...base,
+      principalType: "human" as const,
+      principalId: "usr_0123456789abcdef",
+      grants: [
+        {
+          action: "identity.manage" as const,
+          selector: { kind: "organization" as const, organizationId: base.organizationId },
+        },
+      ],
+    };
+    const permissions = deriveEnterpriseSessionPermissions(human);
+    expect(permissions).toEqual(["workspace.read", "workspace.write"]);
+    expect(Object.isFrozen(permissions)).toBe(true);
+    expect(permissions).not.toContain("daemon.read");
+    const none = deriveEnterpriseSessionPermissions({ ...human, grants: [] });
+    expect(none).toEqual([]);
+    expect(
+      deriveEnterpriseSessionPermissions({
+        ...base,
+        principalType: "break_glass_owner",
+        principalId: "owner",
+        grants: [],
+      }),
+    ).toEqual(OWNER_PERMISSIONS);
+  });
   test("enterprise operations have explicit coarse permission requirements", () => {
     const inboundRequirements = {
       "enterprise.access.list_grants.request": "workspace.read",

@@ -40,6 +40,7 @@ export function deriveEnterpriseSessionPermissions(
     "workspace.content.read",
     "provider.history.read",
     "audit.read",
+    "identity.manage",
   ];
   if (readActions.some((a) => actions.has(a))) permissions.add("workspace.read");
   const writeActions: readonly EnterpriseAction[] = [
@@ -47,6 +48,7 @@ export function deriveEnterpriseSessionPermissions(
     "provider.history.import",
     "workspace.script.execute",
     "browser.profile.manage",
+    "identity.manage",
   ];
   if (writeActions.some((a) => actions.has(a))) permissions.add("workspace.write");
   if (actions.has("workspace.manage")) permissions.add("workspace.manage");
