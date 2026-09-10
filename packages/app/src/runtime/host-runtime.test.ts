@@ -33,6 +33,10 @@ import {
 } from "./host-runtime";
 import type { ReplicaRow, ReplicaRowStore } from "./replica-cache/row-store";
 import { createEnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
+import {
+  createWorkspaceLayoutWithExplorerSidebar,
+  useWorkspaceLayoutStore,
+} from "@/stores/workspace-layout-store";
 
 class FakeDaemonClient {
   private state: ConnectionState = { status: "idle" };
@@ -751,7 +755,7 @@ describe("HostRuntimeController", () => {
     const controller = new HostRuntimeController({
       host,
       deps: {
-        createEnterpriseIdentityLifecycle: ({ vault }) => {
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
           receivedVault = vault;
           lifecycle = new MemoryEnterpriseIdentityLifecycle(
             vault,
@@ -770,17 +774,24 @@ describe("HostRuntimeController", () => {
               sessionBindingKey: "binding-a",
               teardownAttempt: async () => {},
             }),
-            {
-              stopNetworkAndSubscriptions: async () => {},
-              disposeRuntimeAndCachePartition: async () => {},
-              destroyDaemonClient: async () => {},
-              startNewClient: async () => {},
-              hydrateScope: async () => {},
-            },
+            ports.teardown,
             { logoutAll: async () => {} },
           );
           return lifecycle;
         },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async () => {
+            throw new Error("unused");
+          },
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {},
+            disposeRuntimeAndCachePartition: async () => {},
+            destroyDaemonClient: async () => {},
+            startNewClient: async () => {},
+            hydrateScope: async () => {},
+          },
+          remoteLogout: { logoutAll: async () => {} },
+        }),
         createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
         connectToDaemon: async () => {
           throw new Error("probe unavailable");
@@ -802,9 +813,32 @@ describe("HostRuntimeController", () => {
     await identity!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
     const firstGeneration = controller.getEnterpriseScopeGeneration();
     expect(firstGeneration).toEqual(expect.any(String));
+    const enterpriseLayoutKey = `${host.serverId}:default-workspace`;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: {
+          getItem: () => null,
+          setItem: () => {},
+          removeItem: () => {},
+        },
+      },
+    });
+    useWorkspaceLayoutStore.setState((state) => ({
+      layoutByWorkspace: {
+        ...state.layoutByWorkspace,
+        [enterpriseLayoutKey]: createWorkspaceLayoutWithExplorerSidebar(),
+      },
+    }));
+    expect(useWorkspaceLayoutStore.getState().layoutByWorkspace).toHaveProperty(
+      enterpriseLayoutKey,
+    );
     expect(generations.at(-1)).toBe(firstGeneration);
     await identity!.logoutCurrent(host.serverId);
     expect(controller.getEnterpriseScopeGeneration()).toBeNull();
+    expect(useWorkspaceLayoutStore.getState().layoutByWorkspace).not.toHaveProperty(
+      enterpriseLayoutKey,
+    );
     expect(generations.at(-1)).toBeUndefined();
     unsubscribe();
   });

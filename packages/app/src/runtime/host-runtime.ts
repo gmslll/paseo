@@ -80,6 +80,10 @@ import type { EnterpriseResidueResetAdapter } from "@/stores/enterprise/enterpri
 import { createEnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
 import type { EnterpriseResidueResetTargets } from "@/stores/enterprise/enterprise-residue-reset";
 import {
+  createProductionEnterpriseResidueResetAdapter,
+  type ProductionEnterpriseResidueResetAdapter,
+} from "@/stores/enterprise/enterprise-production-residue";
+import {
   invalidateServerDataQueriesAfterReconnect,
   mountServerDataPushRouter,
 } from "@/data/push-router";
@@ -831,7 +835,10 @@ export class HostRuntimeController {
   private readonly enterpriseCredentialVault: ProcessCredentialVault | null;
   private readonly enterpriseIdentityLifecycle: EnterpriseIdentityLifecycle | null;
   private readonly browserProfileRuntimeBridge: BrowserProfileRuntimeBridge | null;
-  private readonly enterpriseResidueResetAdapter: EnterpriseResidueResetAdapter | null;
+  private readonly enterpriseResidueResetAdapter:
+    | EnterpriseResidueResetAdapter
+    | ProductionEnterpriseResidueResetAdapter
+    | null;
   private browserProfileLifecycleGeneration: string | null = null;
   private lastRevokedBrowserProfileGeneration: string | null = null;
   private browserProfileRevocationInFlight: {
@@ -856,11 +863,17 @@ export class HostRuntimeController {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
     this.browserProfileRuntimeBridge = this.deps.browserProfileRuntimeBridge ?? null;
-    this.enterpriseResidueResetAdapter =
-      this.deps.enterpriseResidueResetAdapter ??
-      (this.deps.enterpriseResidueResetTargets
-        ? createEnterpriseResidueResetAdapter(this.deps.enterpriseResidueResetTargets)
-        : null);
+    if (this.deps.enterpriseResidueResetAdapter) {
+      this.enterpriseResidueResetAdapter = this.deps.enterpriseResidueResetAdapter;
+    } else if (this.deps.enterpriseResidueResetTargets) {
+      this.enterpriseResidueResetAdapter = createEnterpriseResidueResetAdapter(
+        this.deps.enterpriseResidueResetTargets,
+      );
+    } else if (this.deps.createEnterpriseIdentityLifecycle) {
+      this.enterpriseResidueResetAdapter = createProductionEnterpriseResidueResetAdapter();
+    } else {
+      this.enterpriseResidueResetAdapter = null;
+    }
     this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
       ? createProcessCredentialVault()
       : null;
