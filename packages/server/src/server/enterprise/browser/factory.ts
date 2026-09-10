@@ -4,6 +4,13 @@ import type {
   EnterpriseSessionDispatcherFactoryRegistration,
 } from "../../session/enterprise-dispatcher.js";
 import type { EnterpriseSessionContext } from "../../session/enterprise-agent-session-context-registry.js";
+import type { EnterpriseAgentSessionContextRegistry } from "../../session/enterprise-agent-session-context-registry.js";
+import {
+  resolveAuthoritativeAgent,
+  resolveCurrentProductionRuntimeAuthority,
+} from "../access/production-runtime-authority.js";
+import type { ProductionAuthorizationRuntimeProvider } from "../access/production-authorization-runtime-provider.js";
+import type { ProductionBrowserLeaseBundle } from "./production-bundle.js";
 import {
   EnterpriseBrowserLeaseHandler,
   type EnterpriseBrowserLeaseAuthorityPort,
@@ -82,6 +89,67 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
       });
     },
   });
+}
+
+export function createProductionBrowserLeaseDispatcherRegistration(input: {
+  provider: ProductionAuthorizationRuntimeProvider;
+  registry: EnterpriseAgentSessionContextRegistry;
+  bundle: ProductionBrowserLeaseBundle;
+  runtime: EnterpriseBrowserLeaseSessionRuntime;
+}): EnterpriseSessionDispatcherFactoryRegistration | null {
+  const base = createEnterpriseBrowserLeaseDispatcherRegistration({
+    runtime: input.runtime,
+    authority: createUnavailableAuthority(),
+    authorityForSessionRuntime: ({ authorizationRuntime }) => {
+      const authority = resolveCurrentProductionRuntimeAuthority(
+        authorizationRuntime,
+        input.provider,
+      );
+      if (!authority) return null;
+      return {
+        assertWorkspace: (context, action, workspaceId) =>
+          authority.resourceAuthorization.assertWorkspace(context, action, workspaceId),
+        assertBrowserProfile: (context, action, profileId) =>
+          authority.resourceAuthorization.assertBrowserProfile(context, action, profileId),
+        resolveAgentHandle: ({ agentId }) => input.registry.resolve(agentId),
+        isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
+        resolveLeaseAuthorization: async (handle) => {
+          if (!input.registry.isCurrentHandle(handle)) throw new Error("Stale agent handle.");
+          const agent = resolveAuthoritativeAgent(authority.owners, handle.agentId);
+          if (!agent) throw new Error("Agent is not authoritative.");
+          const workspace = await authority.resourceAuthorization.assertWorkspace(
+            handle.context.principal,
+            "workspace.metadata.read",
+            agent.workspaceId,
+          );
+          const profile = await authority.resourceAuthorization.assertBrowserProfile(
+            handle.context.principal,
+            "browser.use",
+            (await input.bundle.bindings.resolveForAgent({ workspace, agent }))?.browserProfileId ??
+              "",
+          );
+          const binding = await input.bundle.bindings.resolveForAgent({ workspace, agent });
+          if (!binding || !input.registry.isCurrentHandle(handle))
+            throw new Error("Binding unavailable.");
+          return { workspace, agent, profile, bindingRevision: binding.boundAt };
+        },
+      };
+    },
+  });
+  return base;
+}
+
+function createUnavailableAuthority(): EnterpriseBrowserLeaseAuthorityPort {
+  const fail = async (): Promise<never> => {
+    throw new Error("Production authority is unavailable.");
+  };
+  return {
+    assertWorkspace: fail,
+    assertBrowserProfile: fail,
+    resolveAgentHandle: () => null,
+    isCurrentHandle: () => false,
+    resolveLeaseAuthorization: fail,
+  };
 }
 
 function captureFactoryOptions(
