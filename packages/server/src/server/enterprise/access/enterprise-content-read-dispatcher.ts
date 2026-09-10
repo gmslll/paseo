@@ -322,7 +322,9 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 result.status === "rejected" ? [result.reason] : [],
               );
               if (errors.length > 0)
-                throw new AggregateError(errors, "content source close failed");
+                throw new AggregateError(errors, "content source close failed", {
+                  cause: errors[0],
+                });
               return undefined;
             },
           );
