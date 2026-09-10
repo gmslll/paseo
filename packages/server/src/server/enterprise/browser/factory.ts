@@ -163,7 +163,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
   if (!base) return null;
   return Object.freeze({
     manifest: base.manifest,
-    open(openInput) {
+    open(openInput: Parameters<EnterpriseSessionDispatcherFactoryRegistration["open"]>[0]) {
       let lease: EnterpriseDispatcherLease;
       try {
         lease = base.open(openInput);
