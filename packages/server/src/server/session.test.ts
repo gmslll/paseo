@@ -1411,11 +1411,31 @@ describe.runIf(process.platform === "darwin")("enterprise production binary auth
       binaryInternals.emitAuthorizedWorkspaceBinary(begin, "workspace-1", sourceB),
     ]);
     expect(targetedBinaryMessages).toHaveLength(5);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceA)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin]);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceB)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin]);
     await Promise.all([
       binaryInternals.emitAuthorizedWorkspaceBinary(end, "workspace-1", sourceA),
       binaryInternals.emitAuthorizedWorkspaceBinary(end, "workspace-1", sourceB),
     ]);
     expect(targetedBinaryMessages).toHaveLength(7);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceA)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin, FileTransferOpcode.FileEnd]);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceB)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin, FileTransferOpcode.FileEnd]);
 
     const raceSource = Object.freeze({ id: "race-source" });
     const raceBegin = encodeFileTransferFrame({
@@ -1466,6 +1486,94 @@ describe.runIf(process.platform === "darwin")("enterprise production binary auth
     await session.cleanup();
     expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
     await fixture.audit.close();
+  });
+
+  test("cleanup clears active and opening streams without reviving an awaited Begin", async () => {
+    const beginFrame = (requestId: string) =>
+      encodeFileTransferFrame({
+        opcode: FileTransferOpcode.FileBegin,
+        requestId,
+        metadata: {
+          mime: "text/plain",
+          size: 0,
+          encoding: "binary",
+          modifiedAt: "2026-09-10T00:00:00.000Z",
+          revision: `revision-${requestId}`,
+        },
+      });
+    const internals = (session: Session) =>
+      session as unknown as {
+        emitAuthorizedWorkspaceBinary(
+          frame: Uint8Array,
+          workspaceId: string,
+          source?: object,
+        ): Promise<void>;
+        activeFileBinaryStreams: Map<object | undefined, Map<string, unknown>>;
+      };
+
+    const activeFixture = await createBinaryAuthorizationFixture("cleanup-active");
+    const activeMessages: Array<{ source: object; frame: Uint8Array }> = [];
+    const activeSession = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      targetedBinaryMessages: activeMessages,
+      enterpriseContext: activeFixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: activeFixture.authorityState,
+      principalGrantVersionGuard: activeFixture.runtime.grantVersionGuard,
+      resourceAuthorization: activeFixture.runtime.resourceAuthorization,
+      sessionId: activeFixture.sessionId,
+      sessionAuthorization: activeFixture.sessionAuthorization,
+      admissionAuthorizationIssuer: activeFixture.issuer,
+      admissionAuthorizationHandle: activeFixture.handle,
+      enterpriseAuthorizationRuntime: activeFixture.runtime,
+    });
+    const activeInternals = internals(activeSession);
+    const activeSource = Object.freeze({ id: "active-source" });
+    await activeInternals.emitAuthorizedWorkspaceBinary(
+      beginFrame("active-cleanup"),
+      "workspace-1",
+      activeSource,
+    );
+    expect(activeInternals.activeFileBinaryStreams.size).toBe(1);
+    expect(activeMessages).toHaveLength(1);
+    await activeSession.cleanup();
+    expect(activeInternals.activeFileBinaryStreams.size).toBe(0);
+    await activeFixture.audit.close();
+
+    const openingFixture = await createBinaryAuthorizationFixture("cleanup-opening");
+    const openingMessages: Array<{ source: object; frame: Uint8Array }> = [];
+    const openingSession = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      targetedBinaryMessages: openingMessages,
+      enterpriseContext: openingFixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: openingFixture.authorityState,
+      principalGrantVersionGuard: openingFixture.runtime.grantVersionGuard,
+      resourceAuthorization: openingFixture.runtime.resourceAuthorization,
+      sessionId: openingFixture.sessionId,
+      sessionAuthorization: openingFixture.sessionAuthorization,
+      admissionAuthorizationIssuer: openingFixture.issuer,
+      admissionAuthorizationHandle: openingFixture.handle,
+      enterpriseAuthorizationRuntime: openingFixture.runtime,
+    });
+    const openingInternals = internals(openingSession);
+    const pendingBegin = openingInternals.emitAuthorizedWorkspaceBinary(
+      beginFrame("opening-cleanup"),
+      "workspace-1",
+      Object.freeze({ id: "opening-source" }),
+    );
+    expect(openingInternals.activeFileBinaryStreams.size).toBe(1);
+    const cleanup = openingSession.cleanup();
+    expect(openingInternals.activeFileBinaryStreams.size).toBe(0);
+    await Promise.all([pendingBegin, cleanup]);
+    await Promise.resolve();
+    expect(openingInternals.activeFileBinaryStreams.size).toBe(0);
+    expect(openingMessages).toHaveLength(0);
+    await openingFixture.audit.close();
   });
 
   test("rejects a wrong Session identity and leaves construction rollback to the caller", async () => {
