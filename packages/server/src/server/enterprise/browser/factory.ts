@@ -92,12 +92,10 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
 
 function captureFactoryOptions(
   options: EnterpriseBrowserLeaseDispatcherFactoryOptions | null | undefined,
-):
-  | {
-      readonly options: EnterpriseBrowserLeaseHandlerOptions;
-      readonly runtime: EnterpriseBrowserLeaseSessionRuntime;
-    }
-  | null {
+): {
+  readonly options: EnterpriseBrowserLeaseHandlerOptions;
+  readonly runtime: EnterpriseBrowserLeaseSessionRuntime;
+} | null {
   try {
     if (!options) return null;
     const runtime = options.runtime;

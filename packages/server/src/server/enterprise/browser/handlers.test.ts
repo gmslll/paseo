@@ -1030,11 +1030,11 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     const leases = new MemoryLeases();
     const authority = new MemoryAuthority();
     const runtime = createEnterpriseBrowserLeaseSessionRuntime({
-        profiles,
-        bindings,
-        leases,
-        leaseTtlMs: 60_000,
-      });
+      profiles,
+      bindings,
+      leases,
+      leaseTtlMs: 60_000,
+    });
     const registration = createEnterpriseBrowserLeaseDispatcherRegistration({
       runtime,
       authority,
