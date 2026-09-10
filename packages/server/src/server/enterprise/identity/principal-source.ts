@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { constants } from "node:fs";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   type EnterprisePrincipalRecord,
   OrganizationIdSchema,
@@ -115,15 +118,24 @@ export function createProductionPrincipalProvisioning(input: {
         version: 1 as const,
         principals: { ...document.principals, [record.principalId]: record },
       };
-      const tmp = `${input.filePath}.tmp-${Date.now()}`;
-      const fd = fs.open(tmp, 0x241, 0o600);
+      const tmp = `${input.filePath}.${randomBytes(8).toString("hex")}.tmp`;
+      const fd = fs.open(
+        tmp,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | fs.noFollowFlag,
+        0o600,
+      );
       try {
         fs.write(fd, JSON.stringify(next));
+        fs.fchmod(fd, 0o600);
+        const stat = fs.fstat(fd);
+        if (!stat.isFile() || (stat.mode & 0o777) !== 0o600)
+          throw new Error("principal temp is not private");
         fs.fsync(fd);
       } finally {
         fs.close(fd);
       }
       fs.rename(tmp, input.filePath);
+      fs.fsync(fs.open(path.dirname(input.filePath), fs.noFollowFlag));
       productionAuditCapabilityIssuer.requireCurrent(input.audit);
       return Object.freeze({ ...record });
     },
