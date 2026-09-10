@@ -1,4 +1,12 @@
 import { describe, expect, test } from "vitest";
+import { execFile } from "node:child_process";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { createProductionEnterpriseBrowserProfileContentReadSource } from "./content-source.js";
+const executeFile = promisify(execFile);
 import { createEnterpriseBrowserProfileContentReadSource } from "./content-source.js";
 
 const profile = {
@@ -95,4 +103,43 @@ describe("browser profile content source", () => {
       }),
     ).resolves.toMatchObject({ items: [{ reference: "b" }] });
   });
+
+  test.runIf(process.platform === "darwin")(
+    "reads native production state and closes",
+    async () => {
+      const buildDirectory = await mkdtemp(path.join(tmpdir(), "paseo-browser-content-native-"));
+      const addonPath = path.join(buildDirectory, "darwin-workspace-fs.node");
+      await executeFile(process.execPath, [
+        fileURLToPath(new URL("../runtime/native/build-darwin-workspace-fs.mjs", import.meta.url)),
+        "--output",
+        addonPath,
+      ]);
+      const downloadRoot = await realpath(
+        await mkdtemp(path.join(tmpdir(), "paseo-browser-content-root-")),
+      );
+      try {
+        const source = createProductionEnterpriseBrowserProfileContentReadSource({ addonPath });
+        expect(source).not.toBeNull();
+        if (!source) return;
+        await expect(
+          source.read({
+            profile: { ...profile, downloadRoot },
+            selector: { kind: "browser_profile", view: "state" },
+            limit: 1,
+          }),
+        ).resolves.toMatchObject({ items: [{ kind: "state", label: "Profile" }] });
+        await source.close?.();
+        await expect(
+          source.read({
+            profile: { ...profile, downloadRoot },
+            selector: { kind: "browser_profile", view: "state" },
+            limit: 1,
+          }),
+        ).rejects.toThrow();
+      } finally {
+        await rm(downloadRoot, { recursive: true, force: true });
+        await rm(buildDirectory, { recursive: true, force: true });
+      }
+    },
+  );
 });
