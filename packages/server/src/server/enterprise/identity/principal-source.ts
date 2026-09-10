@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  type EnterprisePrincipalRecord,
   OrganizationIdSchema,
   PrincipalIdSchema,
   type OrganizationId,
@@ -21,6 +22,9 @@ const PrincipalMetadataSchema = z
     principalId: PrincipalIdSchema,
     organizationId: OrganizationIdSchema,
     principalType: z.enum(["human", "service"]),
+    status: z.enum(["active", "disabled", "revoked"]),
+    createdAt: z.string().min(1),
+    updatedAt: z.string().min(1),
     displayName: z.string().min(1).optional(),
     metadata: z.record(z.string(), z.string()).optional(),
   })
@@ -46,6 +50,9 @@ type GrantProjectionWithoutType = Omit<PrincipalGrantProjection, "principalType"
 export interface ProductionPrincipalGrantSource extends PrincipalGrantSource {
   ready(): Promise<void>;
   validateCurrent(): Promise<boolean>;
+  listPrincipalRecords(
+    organizationId: OrganizationId,
+  ): Promise<readonly EnterprisePrincipalRecord[]>;
 }
 
 function readIdentityDocument(
@@ -89,7 +96,8 @@ export function createFilePrincipalGrantSource(input: {
         return null;
       }
       const metadata = document.principals[principalId];
-      if (!metadata || metadata.organizationId !== organizationId) return null;
+      if (!metadata || metadata.organizationId !== organizationId || metadata.status !== "active")
+        return null;
       const grant = await input.grants.resolvePrincipal(principalId, organizationId);
       if (!grant || grant.principalId !== principalId || grant.organizationId !== organizationId)
         return null;
@@ -111,6 +119,18 @@ export function createProductionPrincipalGrantSource(input: {
   }
   const grantStore = input.grantStore;
   const fs = input.fs ?? nodeIdentityRegistryFs;
+  const validateAll = async () => {
+    productionAuditCapabilityIssuer.requireCurrent(audit);
+    const document = readIdentityDocument(input.filePath, fs);
+    for (const metadata of Object.values(document.principals)) {
+      const record = await readAuthoritativeGrantRecord(grantStore, metadata.principalId);
+      productionAuditCapabilityIssuer.requireCurrent(audit);
+      if (!record || record.organizationId !== metadata.organizationId) {
+        throw new Error("enterprise principal metadata and GrantStore do not match");
+      }
+    }
+    productionAuditCapabilityIssuer.requireCurrent(audit);
+  };
   const source = createFilePrincipalGrantSource({
     filePath: input.filePath,
     fs,
@@ -132,19 +152,24 @@ export function createProductionPrincipalGrantSource(input: {
   return Object.freeze({
     ...source,
     async ready() {
-      productionAuditCapabilityIssuer.requireCurrent(audit);
-      readIdentityDocument(input.filePath, fs);
-      productionAuditCapabilityIssuer.requireCurrent(audit);
+      await validateAll();
     },
     async validateCurrent() {
       try {
-        productionAuditCapabilityIssuer.requireCurrent(audit);
-        readIdentityDocument(input.filePath, fs);
-        productionAuditCapabilityIssuer.requireCurrent(audit);
+        await validateAll();
         return true;
       } catch {
         return false;
       }
+    },
+    async listPrincipalRecords(organizationId: OrganizationId) {
+      productionAuditCapabilityIssuer.requireCurrent(audit);
+      const document = readIdentityDocument(input.filePath, fs);
+      const records = Object.values(document.principals)
+        .filter((record) => record.organizationId === organizationId)
+        .map(({ metadata: _metadata, ...record }) => Object.freeze(record));
+      productionAuditCapabilityIssuer.requireCurrent(audit);
+      return Object.freeze(records);
     },
   });
 }

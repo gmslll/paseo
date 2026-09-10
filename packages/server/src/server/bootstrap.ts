@@ -198,7 +198,11 @@ import {
   EnterpriseMultiUserSchema,
 } from "./persisted-config.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
-import { createProductionAuthorizationRuntimeProvider } from "./enterprise/access/production-authorization-runtime-provider.js";
+import {
+  createProductionAuthorizationRuntimeProvider,
+  isCurrentProductionAuthorizationRuntimeProvider,
+} from "./enterprise/access/production-authorization-runtime-provider.js";
+import { isAuthoritativeGrantStoreForAudit } from "./enterprise/access/grant-store.js";
 import { createProductionEnterpriseWorkspaceFilesProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import type {
@@ -213,7 +217,9 @@ import type {
   EnterpriseFeatureAdvertisement,
 } from "./enterprise/dispatcher-registry.js";
 import { createEnterpriseDispatcherRegistry } from "./enterprise/dispatcher-registry.js";
-import { createEnterpriseAuditDispatcher } from "./enterprise/audit/handlers.js";
+import { createEnterpriseSessionDispatcherRegistration } from "./enterprise/dispatcher-registry.js";
+import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
+import { createProductionAuditDispatcherRegistration } from "./enterprise/production-runtime-factory.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -561,12 +567,11 @@ async function resolveEnterpriseRuntime(
     const capturedReceiptState = runtime.authorityReceiptState;
     const capturedGrantGuard = runtime.grantVersionGuard;
     const capturedResourceAuthorization = runtime.resourceAuthorization;
-    const authorizationRuntimeProvider = createProductionAuthorizationRuntimeProvider({
+    const authorizationRuntimeProvider = resolveAuthorizationRuntimeProvider(
+      runtime,
       audit,
-      grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
-    });
-    if (!authorizationRuntimeProvider)
-      throw new Error("enterprise authorization provider unavailable");
+      paseoHome,
+    );
     const capturedGenerationSource = runtime.nextSessionBindingGeneration.bind(runtime);
     if (
       !capturedResourceAuthorization ||
@@ -596,6 +601,9 @@ async function resolveEnterpriseRuntime(
       nextSessionBindingGeneration: generation,
       resourceAuthorization: capturedResourceAuthorization,
       authorizationRuntimeProvider,
+      ...(runtime.admissionInvalidationSink
+        ? { admissionInvalidationSink: runtime.admissionInvalidationSink }
+        : {}),
     });
   } catch (primary) {
     try {
@@ -608,6 +616,26 @@ async function resolveEnterpriseRuntime(
     }
     throw primary;
   }
+}
+
+function resolveAuthorizationRuntimeProvider(
+  runtime: EnterpriseAdmissionRuntime,
+  audit: ProductionAuditCapability,
+  paseoHome: string,
+) {
+  const provider =
+    runtime.authorizationRuntimeProvider ??
+    createProductionAuthorizationRuntimeProvider({
+      audit,
+      grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
+    });
+  if (
+    !isCurrentProductionAuthorizationRuntimeProvider(provider) ||
+    !isAuthoritativeGrantStoreForAudit(provider.grantStore, audit)
+  ) {
+    throw new Error("enterprise authorization provider unavailable");
+  }
+  return provider;
 }
 
 function createBootstrapManagedProcessRegistry(
@@ -718,6 +746,10 @@ export async function createPaseoDaemon(
   let enterpriseWorkspaceFilesProvider:
     | ReturnType<typeof createProductionEnterpriseWorkspaceFilesProvider>
     | undefined;
+  let productionEnterpriseDispatcherRegistration:
+    | EnterpriseSessionDispatcherFactoryRegistration
+    | undefined;
+  let productionEnterpriseFeatureFlags: EnterpriseFeatureAdvertisement | undefined;
   const logger = rootLogger.child({ module: "bootstrap" });
   const capturedPaseoHome = structuredClone(config.paseoHome);
   if (typeof capturedPaseoHome !== "string" || capturedPaseoHome.length === 0) {
@@ -1144,6 +1176,34 @@ export async function createPaseoDaemon(
       if (!enterpriseWorkspaceFilesProvider || !enterpriseWorkspaceFilesProvider.releaseReady) {
         throw new Error("enterprise workspace files provider unavailable");
       }
+      const authorizationRuntimeProvider = enterpriseRuntime.authorizationRuntimeProvider;
+      if (!authorizationRuntimeProvider) {
+        throw new Error("enterprise authorization provider unavailable");
+      }
+      const resourceBundle = await createProductionResourceBundle({
+        provider: authorizationRuntimeProvider,
+        workspaceRegistry,
+        nodeId: enterpriseRuntime.node.nodeId,
+      });
+      const auditRegistration = createProductionAuditDispatcherRegistration({
+        audit: enterpriseRuntime.audit,
+        provider: authorizationRuntimeProvider,
+      });
+      if (!resourceBundle || !auditRegistration) {
+        throw new Error("enterprise dispatcher production bundle unavailable");
+      }
+      productionEnterpriseDispatcherRegistration =
+        createEnterpriseSessionDispatcherRegistration([
+          resourceBundle.dispatcherFactory,
+          auditRegistration,
+        ]) ?? undefined;
+      if (!productionEnterpriseDispatcherRegistration) {
+        throw new Error("enterprise dispatcher production registration unavailable");
+      }
+      productionEnterpriseFeatureFlags = Object.freeze({
+        enterpriseResourceAuthorizationV1: true,
+        enterpriseAuditV1: true,
+      });
     }
     const workspaceLabelService = createWorkspaceLabelService({
       paseoHome: capturedPaseoHome,
@@ -2029,18 +2089,6 @@ export async function createPaseoDaemon(
               const suppliedDispatcherRegistrations =
                 dependencies.enterpriseDispatcherRegistrations ?? [];
               const dispatcherRegistrations = [...suppliedDispatcherRegistrations];
-              if (
-                enterpriseAudit &&
-                !dispatcherRegistrations.some((registration) => registration.family === "audit")
-              ) {
-                dispatcherRegistrations.push({
-                  family: "audit",
-                  requestTypes: ["enterprise.audit.list_events.request"],
-                  dispatcher: createEnterpriseAuditDispatcher({
-                    audit: productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit),
-                  }),
-                });
-              }
               const enterpriseDispatcherRegistry =
                 dependencies.enterpriseDispatcherRegistry ??
                 (dispatcherRegistrations.length > 0
@@ -2122,9 +2170,12 @@ export async function createPaseoDaemon(
                 enterpriseWorkspaceFilesProvider ?? undefined,
                 enterpriseDispatcherRegistry ?? dependencies.enterpriseDispatcher,
                 dependencies.enterpriseIdentitySelfAuthorization,
-                enterpriseDispatcherRegistry?.features ?? dependencies.enterpriseFeatureFlags,
+                enterpriseDispatcherRegistry?.features ??
+                  dependencies.enterpriseFeatureFlags ??
+                  productionEnterpriseFeatureFlags,
                 dependencies.enterpriseDispatcherFactory,
-                dependencies.enterpriseDispatcherRegistration,
+                dependencies.enterpriseDispatcherRegistration ??
+                  productionEnterpriseDispatcherRegistration,
               );
               requireStartAudit();
               pluginRuntime.bindPaseoSessionHost(wsServer);

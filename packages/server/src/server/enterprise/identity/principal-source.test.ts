@@ -76,6 +76,9 @@ function documentFor(value: Record<string, unknown> = {}) {
         principalId,
         organizationId,
         principalType: "human",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
         ...value,
       },
     },
@@ -138,6 +141,26 @@ describe("file principal grant source", () => {
     await expect(source.resolvePrincipal(principalId, "org_bbbbbbbbbbbbbbbb")).resolves.toBeNull();
     expect(grantSource.resolvePrincipal).toHaveBeenCalledOnce();
   });
+
+  test.each(["disabled", "revoked"] as const)(
+    "rejects %s principals without consulting grants",
+    async (status) => {
+      const fs = fixture(documentFor({ status }));
+      const grantSource = grants({
+        principalId,
+        organizationId,
+        grants: [],
+        grantVersion: "g1",
+      });
+      const source = createFilePrincipalGrantSource({
+        filePath: "/identities.json",
+        fs: fs.fs,
+        grants: grantSource,
+      });
+      await expect(source.resolvePrincipal(principalId, organizationId)).resolves.toBeNull();
+      expect(grantSource.resolvePrincipal).not.toHaveBeenCalled();
+    },
+  );
 
   test.each(["open", "read", "close"] as const)("returns null on fs %s failure", async (method) => {
     const fs = fixture(documentFor());
@@ -219,6 +242,16 @@ describe("file principal grant source", () => {
           grants: [],
           grantVersion: "grv_current",
         });
+        await expect(source.listPrincipalRecords(organizationId)).resolves.toEqual([
+          {
+            principalId,
+            organizationId,
+            principalType: "human",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ]);
         expect(() =>
           createProductionPrincipalGrantSource({
             filePath: path.join(root, "principals.json"),
