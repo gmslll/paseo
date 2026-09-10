@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isEnterpriseWorkbenchSignedIn } from "./enterprise-workbench-assembly";
+import {
+  createBrowserProfileProjectionHydrator,
+  isEnterpriseBrowserProfilesEnabled,
+  isEnterpriseWorkbenchSignedIn,
+} from "./enterprise-workbench-assembly";
 import { normalizeHostSectionSlug } from "@/utils/host-routes";
 import { en } from "@/i18n/resources/en";
 import { zhCN } from "@/i18n/resources/zh-CN";
@@ -40,5 +44,42 @@ describe("enterprise workbench host assembly", () => {
         projection: undefined,
       }),
     ).toBe(false);
+  });
+
+  it("routes browser profile projections to the exact enabled host", async () => {
+    expect(isEnterpriseBrowserProfilesEnabled({ enterpriseBrowserProfilesV1: true })).toBe(true);
+    expect(isEnterpriseBrowserProfilesEnabled({ enterpriseBrowserProfilesV1: false })).toBe(false);
+    expect(isEnterpriseBrowserProfilesEnabled(undefined)).toBe(false);
+
+    const calls: unknown[] = [];
+    const hydrate = createBrowserProfileProjectionHydrator(
+      {
+        hydrateBrowserProfileAuthorizationsFromProjections: async (...args) => {
+          calls.push(args);
+        },
+      },
+      "server-a",
+    );
+    const input = {
+      serverId: "server-a",
+      profiles: [],
+      bindings: [],
+      lifecycleGeneration: "generation-a",
+    };
+    await hydrate(input);
+    expect(calls).toEqual([
+      [
+        "server-a",
+        {
+          profiles: input.profiles,
+          bindings: input.bindings,
+          lifecycleGeneration: "generation-a",
+        },
+      ],
+    ]);
+    await expect(hydrate({ ...input, serverId: "server-b" })).rejects.toThrow(
+      "Browser profile hydration host does not match",
+    );
+    expect(calls).toHaveLength(1);
   });
 });

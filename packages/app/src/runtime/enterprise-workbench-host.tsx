@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo } from "react";
-import { isEnterpriseWorkbenchSignedIn } from "@/runtime/enterprise-workbench-assembly";
 import {
+  createBrowserProfileProjectionHydrator,
+  isEnterpriseBrowserProfilesEnabled,
+  isEnterpriseWorkbenchSignedIn,
+} from "@/runtime/enterprise-workbench-assembly";
+import {
+  getHostRuntimeStore,
   useHostEnterpriseIdentityLifecycle,
   useHostEnterpriseIdentitySnapshot,
   useHostRuntimeClient,
@@ -32,13 +37,30 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   const capability = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features ?? null,
   );
+  const browserProfilesEnabled = useCallback(
+    () => isEnterpriseBrowserProfilesEnabled(capability),
+    [capability],
+  );
+  const hydrateBrowserProfileAuthorizations = useMemo(
+    () => createBrowserProfileProjectionHydrator(getHostRuntimeStore(), serverId),
+    [serverId],
+  );
   const models = useMemo(() => {
     if (!lifecycle || !daemonClient) return null;
     void identitySnapshot?.generation;
     void identitySnapshot?.projection?.organizationId;
-    return { lifecycle, daemonClient, serverId, contentReaders: unavailableContentReaders };
+    return {
+      lifecycle,
+      daemonClient,
+      serverId,
+      contentReaders: unavailableContentReaders,
+      browserProfilesEnabled,
+      hydrateBrowserProfileAuthorizations,
+    };
   }, [
+    browserProfilesEnabled,
     daemonClient,
+    hydrateBrowserProfileAuthorizations,
     identitySnapshot?.generation,
     identitySnapshot?.projection?.organizationId,
     lifecycle,
@@ -93,6 +115,8 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
       patModel={patModel}
       bossStore={bossStore}
       legacyContent={null}
+      browserProfilesEnabled={browserProfilesEnabled}
+      hydrateBrowserProfileAuthorizations={hydrateBrowserProfileAuthorizations}
     />
   );
 }
