@@ -532,10 +532,12 @@ describe("secure Browser Profile registry files", () => {
       actor: principalContext(),
     });
 
-    expect((await fs.stat(profileDirectory)).mode & 0o777).toBe(0o700);
-    expect((await fs.stat(bindingDirectory)).mode & 0o777).toBe(0o700);
-    expect((await fs.stat(profilePath)).mode & 0o777).toBe(0o600);
-    expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await fs.stat(profileDirectory)).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(bindingDirectory)).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(profilePath)).mode & 0o777).toBe(0o600);
+      expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
+    }
 
     await Promise.all([
       fs.chmod(profileDirectory, 0o777),
@@ -558,9 +560,11 @@ describe("secure Browser Profile registry files", () => {
         agent: authorizedAgent(),
       }),
     ).resolves.toMatchObject({ browserProfileId: PROFILE_ID });
-    expect((await fs.stat(profileDirectory)).mode & 0o777).toBe(0o700);
-    expect((await fs.stat(bindingDirectory)).mode & 0o777).toBe(0o700);
-    expect((await fs.stat(profilePath)).mode & 0o777).toBe(0o600);
-    expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await fs.stat(profileDirectory)).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(bindingDirectory)).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(profilePath)).mode & 0o777).toBe(0o600);
+      expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
+    }
   });
 });
