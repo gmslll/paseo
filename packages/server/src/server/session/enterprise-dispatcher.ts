@@ -1,4 +1,5 @@
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
+import type { OutboundAuthorityReceiptPolicy } from "../enterprise/access/event-action-map.js";
 import type { EnterpriseSessionContext } from "../enterprise/identity/session-context.js";
 
 /** The server-bound context supplied to an enterprise RPC handler. */
@@ -57,6 +58,29 @@ export function isIdentitySelfResponse(message: SessionOutboundMessage): boolean
     message.type === "enterprise.identity.get_current.response" ||
     message.type === "enterprise.identity.logout_all.response"
   );
+}
+export function resolveEnterpriseReceiptPolicy(
+  requestType: string,
+): OutboundAuthorityReceiptPolicy | null {
+  if (requestType === "enterprise.identity.get_current.request") {
+    return {
+      event: "enterprise.identity.get_current.response",
+      requestType: "enterprise.identity.get_current.request",
+      daemonPermission: null,
+      enterpriseActions: ["identity.manage"],
+      emission: "terminal",
+    };
+  }
+  if (requestType === "enterprise.identity.logout_all.request") {
+    return {
+      event: "enterprise.identity.logout_all.response",
+      requestType: "enterprise.identity.logout_all.request",
+      daemonPermission: null,
+      enterpriseActions: ["identity.manage"],
+      emission: "terminal",
+    };
+  }
+  return null;
 }
 
 /** W3 routing seam; domain policy and handlers remain owned by their workstreams. */

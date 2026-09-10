@@ -35,6 +35,7 @@ import { SessionOutboundMessageSchema } from "@getpaseo/protocol/messages";
 import {
   ENTERPRISE_UNAVAILABLE_ERROR,
   dispatchEnterpriseRequest,
+  resolveEnterpriseReceiptPolicy,
   isEnterpriseRequest,
   type EnterpriseSessionDispatcher,
 } from "./session/enterprise-dispatcher.js";
@@ -2256,7 +2257,10 @@ export class Session {
         isEnterpriseRequest(msg) &&
         (!this.enterpriseDispatcher ||
           !this.enterpriseContext ||
-          !authorityReceiptPolicyForRequestType(msg.type))
+          !(
+            authorityReceiptPolicyForRequestType(msg.type) ??
+            resolveEnterpriseReceiptPolicy(msg.type)
+          ))
       ) {
         const requestId = sessionRequestId(msg);
         if (!this.enterpriseDispatcher || !this.enterpriseContext) {
@@ -2282,7 +2286,9 @@ export class Session {
         this.enterpriseSessionBindingKey
       ) {
         const requestId = sessionRequestId(msg);
-        const policy = authorityReceiptPolicyForRequestType(msg.type);
+        const policy =
+          authorityReceiptPolicyForRequestType(msg.type) ??
+          resolveEnterpriseReceiptPolicy(msg.type);
         if (policy) {
           if (this.authoritySubsystemFailed) return;
           if (
