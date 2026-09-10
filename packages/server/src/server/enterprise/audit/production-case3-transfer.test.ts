@@ -130,6 +130,7 @@ describe.runIf(process.platform === "darwin")("production Case3 workspace transf
       await harness.start();
       const issuedA = await harness.issuePersonalAccessToken(principalA);
       const a = await harness.connectAndHello({ token: issuedA.token, clientId: "case3-a" });
+      const a2 = await harness.connectAndHello({ token: issuedA.token, clientId: "case3-a2" });
       const issuedB = await harness.issuePersonalAccessToken(principalB);
       const persistedWorkspace = JSON.parse(
         await readFile(path.join(harness.paseoHome, "projects", "workspaces.json"), "utf8"),
@@ -232,6 +233,23 @@ describe.runIf(process.platform === "darwin")("production Case3 workspace transf
       expect(subscribedMessage.payload?.entries).toEqual(
         expect.arrayContaining([expect.objectContaining({ id: workspaceId })]),
       );
+      const tombstoneForA = (socket: { on: Function; off: Function; send: Function }) =>
+        waitFor(
+          socket,
+          (v) =>
+            v.type === "enterprise.workspace.ownership.transfer.tombstone" ||
+            v.message?.type === "enterprise.workspace.ownership.transfer.tombstone",
+        );
+      const aTombstone = tombstoneForA(a.socket).catch((error) => {
+        throw new Error(
+          `case3 A tombstone: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+      const a2Tombstone = tombstoneForA(a2.socket).catch((error) => {
+        throw new Error(
+          `case3 A2 tombstone: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
       const transfer = waitFor(a.socket, (v) => v.message?.payload?.requestId === "case3-transfer");
       a.socket.send(
         JSON.stringify({
@@ -272,6 +290,17 @@ describe.runIf(process.platform === "darwin")("production Case3 workspace transf
         metadata: { phase: "intent", revision: "1", newOwnerPrincipalId: principalB },
       });
       expect(transferEvents[0]?.eventId).toBe(receiptId);
+      const tombstoneA = await aTombstone;
+      const tombstoneA2 = await a2Tombstone;
+      for (const tombstone of [tombstoneA, tombstoneA2]) {
+        expect(tombstone.message?.payload ?? tombstone.payload).toMatchObject({
+          eventId: expect.any(String),
+          resource: { localResourceId: workspaceId },
+          oldPrincipalId: principalA,
+          newRevision: "1",
+          transferReceiptId: receiptId,
+        });
+      }
       const oldAContent = waitFor(
         a.socket,
         (v) =>
