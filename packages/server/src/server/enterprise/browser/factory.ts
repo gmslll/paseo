@@ -122,7 +122,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
         input.provider,
       );
       if (!authority) return null;
-      return {
+      const resolvedAuthority: EnterpriseBrowserLeaseAuthorityPort = {
         assertWorkspace: (context, action, workspaceId) =>
           authority.resourceAuthorization.assertWorkspace(context, action, workspaceId),
         assertBrowserProfile: (context, action, profileId) =>
@@ -150,6 +150,12 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
           return { workspace, agent, profile, bindingRevision: binding.boundAt };
         },
       };
+      input.bundle.bindSessionAuthority({
+        generation: input.context.sessionBindingGeneration,
+        isCurrentHandle: resolvedAuthority.isCurrentHandle,
+        resolveAuthorization: resolvedAuthority.resolveLeaseAuthorization,
+      });
+      return resolvedAuthority;
     },
   });
   return base;

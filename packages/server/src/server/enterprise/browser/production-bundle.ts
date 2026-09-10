@@ -20,6 +20,8 @@ import {
   type BrowserProfileLeaseManagerOptions,
 } from "./lease-manager.js";
 import { readSecureJsonFile, writeSecureJsonFile } from "./secure-json-file.js";
+import type { EnterpriseAgentContextHandle } from "../../session/enterprise-agent-session-context-registry.js";
+import type { BrowserProfileLeaseAuthorization } from "./lease-manager.js";
 
 export class JsonFileBrowserProfileLeaseGenerationStorage implements BrowserProfileLeaseGenerationStorage {
   public constructor(private readonly filePath: string) {}
@@ -62,6 +64,22 @@ export interface ProductionBrowserLeaseBundle {
   readonly close: () => Promise<void>;
   readonly invalidateHost: (hostClientId: string) => Promise<void>;
   readonly invalidateSession: (generation: string) => Promise<void>;
+  readonly bindSessionAuthority: (input: {
+    generation: string;
+    isCurrentHandle: (handle: EnterpriseAgentContextHandle) => boolean;
+    resolveAuthorization: (
+      handle: EnterpriseAgentContextHandle,
+      profileId: string,
+    ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
+  }) => () => void;
+}
+
+interface SessionAuthority {
+  readonly isCurrentHandle: (handle: EnterpriseAgentContextHandle) => boolean;
+  readonly resolveAuthorization: (
+    handle: EnterpriseAgentContextHandle,
+    profileId: string,
+  ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
 }
 
 /** Builds the non-memory W4 runtime at the canonical paseoHome paths. */
@@ -87,8 +105,20 @@ export function createProductionBrowserLeaseBundle(
     profiles,
     quarantine: options.quarantine,
   });
+  const authorities = new Map<string, SessionAuthority>();
+  const current = (handle: EnterpriseAgentContextHandle): boolean =>
+    [...authorities.values()].some((authority) => authority.isCurrentHandle(handle));
+  const resolve = (handle: EnterpriseAgentContextHandle, profileId: string) => {
+    for (const authority of authorities.values()) {
+      if (authority.isCurrentHandle(handle))
+        return authority.resolveAuthorization(handle, profileId);
+    }
+    throw new Error("No current browser authority for session.");
+  };
   const leases = new BrowserProfileLeaseManager({
     ...options,
+    isCurrentHandle: current,
+    resolveAuthorization: resolve,
     generationStorage: new JsonFileBrowserProfileLeaseGenerationStorage(
       path.join(browserRoot, "lease-generation.json"),
     ),
@@ -101,9 +131,19 @@ export function createProductionBrowserLeaseBundle(
     leases,
     invalidateHost: (hostClientId) => leases.invalidateHost(hostClientId),
     invalidateSession: (generation) => leases.invalidateSession(generation),
+    bindSessionAuthority: (input) => {
+      authorities.set(input.generation, input);
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        if (authorities.get(input.generation) === input) authorities.delete(input.generation);
+      };
+    },
     close: async () => {
       if (closed) return;
       closed = true;
+      authorities.clear();
       await leases.close();
     },
   };
