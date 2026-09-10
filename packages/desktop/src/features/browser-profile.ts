@@ -192,7 +192,11 @@ export class BrowserProfileRuntimeAuthorizationRegistry {
       if (authorization.lifecycleGeneration !== lifecycleGeneration || authorization.homeNodeId !== this.trustedNodeId) throw new Error("Invalid Browser Profile generation.");
       return authorization;
     });
-    const revoked = [...this.revokeHost(hostWebContentsId)];
+    const keys = parsed.map((authorization) => runtimeAuthorizationKey(hostWebContentsId, authorization));
+    if (new Set(keys).size !== keys.length) throw new Error("Duplicate Browser Profile authorization.");
+    const previous = [...this.authorizations.entries()].filter(([key]) => key.startsWith(`[${hostWebContentsId},`));
+    const revoked = previous.filter(([key, old]) => !keys.includes(key) || !parsed.some((next) => runtimeAuthorizationsEqual(next, old))).map(([, old]) => old);
+    for (const [key] of previous) this.authorizations.delete(key);
     this.lifecycleByHost.set(hostWebContentsId, lifecycleGeneration);
     for (const authorization of parsed) this.authorizations.set(runtimeAuthorizationKey(hostWebContentsId, authorization), authorization);
     return Object.freeze(revoked.map(cloneRuntimeAuthorization));
