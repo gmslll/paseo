@@ -41,16 +41,26 @@ async function cleanupRevoked(
   for (const authorization of revoked) {
     try {
       await cleanup.unregisterProfile(authorization);
-      for (const guest of cleanup.findGuests(authorization.browserProfileId)) {
-        try {
-          await cleanup.destroyGuest(guest);
-          await cleanup.cleanupGuest?.(guest);
-        } catch (error) {
-          errors.push(error);
-        }
-      }
     } catch (error) {
       errors.push(error);
+    }
+    let guests: readonly unknown[] = [];
+    try {
+      guests = cleanup.findGuests(authorization.browserProfileId);
+    } catch (error) {
+      errors.push(error);
+    }
+    for (const guest of guests) {
+      try {
+        await cleanup.destroyGuest(guest);
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await cleanup.cleanupGuest?.(guest);
+      } catch (error) {
+        errors.push(error);
+      }
     }
   }
   if (errors.length > 0)

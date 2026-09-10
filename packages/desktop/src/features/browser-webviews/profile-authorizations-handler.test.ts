@@ -64,19 +64,39 @@ describe("browser profile authorization handler", () => {
 
   it("keeps registry revoked and aggregates cleanup failures", async () => {
     const registry = new BrowserProfileRuntimeAuthorizationRegistry(NODE_ID);
+    const destroyGuest = vi.fn(() => {
+      throw new Error("destroy failed");
+    });
+    const cleanupGuest = vi.fn(() => {
+      throw new Error("cleanup failed");
+    });
+    const unregisterError = new Error("unregister failed");
     const handler = createBrowserProfileAuthorizationHandler({
       registry,
       hostWebContentsId: 43,
       cleanup: {
         unregisterProfile: () => {
-          throw new Error("unregister failed");
+          throw unregisterError;
         },
         findGuests: () => ["guest"],
-        destroyGuest: vi.fn(),
+        destroyGuest,
+        cleanupGuest,
       },
     });
     await handler.hydrate([baseAuthorization], "generation-a");
-    await expect(handler.revoke("generation-a")).rejects.toBeInstanceOf(AggregateError);
+    let caught: unknown;
+    try {
+      await handler.revoke("generation-a");
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    if (caught instanceof AggregateError) {
+      expect(caught.cause).toBe(unregisterError);
+      expect(caught.errors).toHaveLength(3);
+    }
+    expect(destroyGuest).toHaveBeenCalledWith("guest");
+    expect(cleanupGuest).toHaveBeenCalledWith("guest");
     expect(registry.revokeGeneration(43, "generation-a")).toEqual([]);
     expect(getEnterpriseBrowserProfilePartition(baseAuthorization.browserProfileId)).toBe(
       "persist:paseo-enterprise-brp_1111111111111111",
