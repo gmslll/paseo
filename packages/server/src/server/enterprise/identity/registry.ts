@@ -91,6 +91,9 @@ export interface CurrentCredentialContext {
   credentialId: string;
   grantVersion: string;
 }
+export type InitialCredentialResult =
+  | { readonly status: "issued"; readonly token: string; readonly credentialId: string }
+  | { readonly status: "already_provisioned"; readonly credentialIds: readonly string[] };
 export interface CredentialInvalidationSink {
   publish?(event: CredentialInvalidation): Promise<void>;
   publishCredentialInvalidation?(event: CredentialInvalidation): Promise<void>;
@@ -625,6 +628,30 @@ export class IdentityRegistry {
         principal: authenticatedPrincipal,
       };
     });
+  }
+
+  async issueInitialCredential(input: {
+    actor: CredentialActor;
+    principalId: string;
+    organizationId: OrganizationId;
+    expiresAt?: string;
+  }): Promise<InitialCredentialResult> {
+    const existing = await this.serial(async () => {
+      const now = this.captureClock();
+      return Object.values(this.document.credentials)
+        .filter(
+          (credential) =>
+            credential.principalId === input.principalId &&
+            credential.organizationId === input.organizationId &&
+            !credential.revokedAt &&
+            (!credential.expiresAt || !isExpired(credential.expiresAt, now)),
+        )
+        .map((credential) => credential.credentialId);
+    });
+    if (existing.length > 0)
+      return { status: "already_provisioned", credentialIds: Object.freeze(existing) };
+    const issued = await this.issueToken(input);
+    return { status: "issued", token: issued.token, credentialId: issued.credentialId };
   }
   async authenticate(token: string, node: NodeContext): Promise<PrincipalContext | null> {
     if (this.poisoned) return null;
