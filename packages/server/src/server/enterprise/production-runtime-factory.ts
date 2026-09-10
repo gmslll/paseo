@@ -44,6 +44,10 @@ import type { CredentialInvalidation, CredentialInvalidationSink } from "./ident
 import type { EnterpriseAdmissionRuntime } from "./identity/runtime.js";
 import { prepareProductionBrowserProfileRegistry } from "./browser/production-bundle.js";
 import type { BrowserProfileRegistry } from "./browser/profile-registry.js";
+import {
+  createProductionAppSlotRegistry,
+  isCurrentProductionAppSlotRegistry,
+} from "./runtime/production-app-slot-registry.js";
 import type {
   EnterpriseDispatcherLease,
   EnterpriseSessionDispatcher,
@@ -125,78 +129,105 @@ export function createProductionEnterpriseRuntimeFactory(
       nodeId: node.nodeId,
       downloadBaseRoot: path.join(paseoHome, "enterprise", "browser", "profile-data"),
     });
-    productionAuditCapabilityIssuer.requireCurrent(currentAudit);
-    const authorizationRuntimeProvider = createProductionAuthorizationRuntimeProvider({
-      audit: currentAudit,
-      grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
-      browserProfiles,
-    });
-    if (!authorizationRuntimeProvider) {
-      throw new Error("enterprise authorization provider unavailable");
-    }
-    const admissionInvalidationSink = createAdmissionInvalidationSink();
-    const principalSource = createProductionPrincipalGrantSource({
-      filePath: path.join(paseoHome, "enterprise", "principals.json"),
-      grantStore: authorizationRuntimeProvider.grantStore,
-      audit: currentAudit,
-    });
-    await principalSource.ready();
-
-    let admission: ReturnType<typeof createEnterpriseAdmission> | null = null;
-    const invalidation = createCredentialInvalidationBridge({
-      getAdmission: () => admission,
-      provider: authorizationRuntimeProvider,
-      sessionSink: admissionInvalidationSink,
-      audit: currentAudit,
-    });
-    admission = createEnterpriseAdmission({
-      filePath: path.join(paseoHome, "enterprise", "credentials.json"),
-      principalSource,
-      invalidation,
-      node,
-      audit: currentAudit,
+    const appSlots = createProductionAppSlotRegistry({
+      paseoHome,
       organizationId: config.organizationId,
-      ...(daemonPassword ? { daemonPassword } : {}),
-    });
-    await admission.registry.load();
-    productionAuditCapabilityIssuer.requireCurrent(currentAudit);
-
-    const agentContextRegistry = createEnterpriseAgentSessionContextRegistry();
-    const authorityReceiptState = new MemoryAuthorityReceiptState();
-    const grantVersionGuard = new GrantStorePrincipalGrantVersionGuard(
-      authorizationRuntimeProvider.grantStore,
-    );
-    const resourceAuthorization = new ResourceAuthorizationService({
-      owners: authorizationRuntimeProvider.owners,
-      nodeId: node.nodeId,
-      grantVersionGuard,
-      authorityVerifier: new StrictOutboundAuthorityVerifier(node.nodeId, authorityReceiptState),
-      browserProfiles,
-    });
-    productionAuditCapabilityIssuer.requireCurrent(currentAudit);
-    const runtime = Object.freeze({
-      audit: currentAudit,
-      admission,
       node,
-      agentContextRegistry,
-      authorityReceiptState,
-      grantVersionGuard,
-      resourceAuthorization,
-      authorizationRuntimeProvider,
-      admissionInvalidationSink,
-      nextSessionBindingGeneration: createSessionBindingGeneration,
     });
-    productionIdentityRecords.set(
-      admission,
-      Object.freeze({
-        admission,
-        source: principalSource,
+    if (!appSlots) throw new Error("enterprise App Slot registry unavailable");
+    try {
+      await appSlots.initialize();
+      if (!isCurrentProductionAppSlotRegistry(appSlots)) {
+        throw new Error("enterprise App Slot registry unavailable");
+      }
+    } catch (error) {
+      await appSlots.close();
+      throw error;
+    }
+    productionAuditCapabilityIssuer.requireCurrent(currentAudit);
+    try {
+      const authorizationRuntimeProvider = createProductionAuthorizationRuntimeProvider({
         audit: currentAudit,
-        provider: authorizationRuntimeProvider,
+        grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
         browserProfiles,
-      }),
-    );
-    return runtime;
+        appSlots,
+      });
+      if (!authorizationRuntimeProvider) {
+        throw new Error("enterprise authorization provider unavailable");
+      }
+      const admissionInvalidationSink = createAdmissionInvalidationSink();
+      const principalSource = createProductionPrincipalGrantSource({
+        filePath: path.join(paseoHome, "enterprise", "principals.json"),
+        grantStore: authorizationRuntimeProvider.grantStore,
+        audit: currentAudit,
+      });
+      await principalSource.ready();
+
+      let admission: ReturnType<typeof createEnterpriseAdmission> | null = null;
+      const invalidation = createCredentialInvalidationBridge({
+        getAdmission: () => admission,
+        provider: authorizationRuntimeProvider,
+        sessionSink: admissionInvalidationSink,
+        audit: currentAudit,
+      });
+      admission = createEnterpriseAdmission({
+        filePath: path.join(paseoHome, "enterprise", "credentials.json"),
+        principalSource,
+        invalidation,
+        node,
+        audit: currentAudit,
+        organizationId: config.organizationId,
+        ...(daemonPassword ? { daemonPassword } : {}),
+      });
+      await admission.registry.load();
+      productionAuditCapabilityIssuer.requireCurrent(currentAudit);
+
+      const agentContextRegistry = createEnterpriseAgentSessionContextRegistry();
+      const authorityReceiptState = new MemoryAuthorityReceiptState();
+      const grantVersionGuard = new GrantStorePrincipalGrantVersionGuard(
+        authorizationRuntimeProvider.grantStore,
+      );
+      const resourceAuthorization = new ResourceAuthorizationService({
+        owners: authorizationRuntimeProvider.owners,
+        nodeId: node.nodeId,
+        grantVersionGuard,
+        authorityVerifier: new StrictOutboundAuthorityVerifier(node.nodeId, authorityReceiptState),
+        browserProfiles,
+        appSlots,
+      });
+      productionAuditCapabilityIssuer.requireCurrent(currentAudit);
+      let closePromise: Promise<void> | null = null;
+      const runtime = Object.freeze({
+        audit: currentAudit,
+        admission,
+        node,
+        agentContextRegistry,
+        authorityReceiptState,
+        grantVersionGuard,
+        resourceAuthorization,
+        authorizationRuntimeProvider,
+        admissionInvalidationSink,
+        nextSessionBindingGeneration: createSessionBindingGeneration,
+        close() {
+          closePromise ??= appSlots.close();
+          return closePromise;
+        },
+      });
+      productionIdentityRecords.set(
+        admission,
+        Object.freeze({
+          admission,
+          source: principalSource,
+          audit: currentAudit,
+          provider: authorizationRuntimeProvider,
+          browserProfiles,
+        }),
+      );
+      return runtime;
+    } catch (error) {
+      await appSlots.close();
+      throw error;
+    }
   };
 }
 

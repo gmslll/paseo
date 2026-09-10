@@ -575,8 +575,9 @@ async function resolveEnterpriseRuntime(
   });
   productionAuditCapabilityIssuer.requireCurrent(audit);
   const closeAudit = audit.close.bind(audit);
+  let runtime: EnterpriseAdmissionRuntime | undefined;
   try {
-    const runtime = await factory({ config: enterpriseConfig, audit });
+    runtime = await factory({ config: enterpriseConfig, audit });
     productionAuditCapabilityIssuer.requireCurrent(audit);
     const capturedAudit = runtime.audit;
     const capturedAdmission = runtime.admission;
@@ -587,6 +588,7 @@ async function resolveEnterpriseRuntime(
     const capturedReceiptState = runtime.authorityReceiptState;
     const capturedGrantGuard = runtime.grantVersionGuard;
     const capturedResourceAuthorization = runtime.resourceAuthorization;
+    const capturedClose = runtime.close?.bind(runtime);
     const authorizationRuntimeProvider = resolveAuthorizationRuntimeProvider(
       runtime,
       audit,
@@ -624,18 +626,27 @@ async function resolveEnterpriseRuntime(
       ...(runtime.admissionInvalidationSink
         ? { admissionInvalidationSink: runtime.admissionInvalidationSink }
         : {}),
+      ...(capturedClose ? { close: capturedClose } : {}),
     });
   } catch (primary) {
-    try {
-      await closeAudit();
-    } catch (closeError) {
-      // oxlint-disable-next-line preserve-caught-error
-      throw new AggregateError([primary, closeError], "enterprise runtime construction failed", {
-        cause: primary,
-      });
-    }
-    throw primary;
+    return closeFailedEnterpriseRuntime(runtime, closeAudit, primary);
   }
+}
+
+async function closeFailedEnterpriseRuntime(
+  runtime: EnterpriseAdmissionRuntime | undefined,
+  closeAudit: () => Promise<void>,
+  primary: unknown,
+): Promise<never> {
+  const errors = [primary];
+  const closeRuntime = runtime?.close?.bind(runtime);
+  if (closeRuntime) await runCleanupStep(errors, closeRuntime);
+  await runCleanupStep(errors, closeAudit);
+  if (errors.length > 1) {
+    // oxlint-disable-next-line preserve-caught-error -- the primary construction error is retained as cause.
+    throw new AggregateError(errors, "enterprise runtime construction failed", { cause: primary });
+  }
+  throw primary;
 }
 
 function resolveAuthorizationRuntimeProvider(
@@ -810,8 +821,16 @@ export async function createPaseoDaemon(
     if (!outerAuditClosePromise) outerAuditClosePromise = boundEnterpriseAuditClose();
     await outerAuditClosePromise;
   };
+  const boundEnterpriseRuntimeClose = enterpriseRuntime?.close?.bind(enterpriseRuntime);
+  let enterpriseRuntimeClosePromise: Promise<void> | null = null;
+  const closeEnterpriseRuntime = async () => {
+    if (!boundEnterpriseRuntimeClose) return;
+    enterpriseRuntimeClosePromise ??= boundEnterpriseRuntimeClose();
+    await enterpriseRuntimeClosePromise;
+  };
   // oxlint-disable-next-line complexity -- bootstrap owns ordered production provider construction.
   const constructAfterEnterpriseRuntime = async (): Promise<PaseoDaemon> => {
+    constructionCleanupStack.push(() => closeEnterpriseRuntime());
     requireConstructionAudit();
     configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
     const obsoleteTimelineDirectory = path.join(capturedPaseoHome, "agent-timelines");
@@ -2100,6 +2119,7 @@ export async function createPaseoDaemon(
             unlinkSync(listenTarget.path);
           }
         });
+        await runCleanupStep(errors, () => closeEnterpriseRuntime());
         await runCleanupStep(errors, () => closeEnterpriseAudit());
         return errors;
       });

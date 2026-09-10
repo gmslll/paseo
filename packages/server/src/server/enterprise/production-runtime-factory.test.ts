@@ -14,6 +14,7 @@ import {
   type ProductionAuditCapability,
 } from "./audit/production-audit-runtime.js";
 import { EnterpriseAdmission } from "./identity/admission.js";
+import type { EnterpriseAdmissionRuntime } from "./identity/runtime.js";
 import {
   createProductionEnterpriseRuntimeFactory,
   createProductionIdentityDispatcherRegistration,
@@ -25,6 +26,7 @@ const executeFile = promisify(execFile);
 const organizationId = "org_aaaaaaaaaaaaaaaa" as const;
 const principalId = "usr_aaaaaaaaaaaaaaaa" as const;
 const nodeId = "nod_aaaaaaaaaaaaaaaa" as const;
+const appSlotId = "aps_aaaaaaaaaaaaaaaa" as const;
 const connection: ConnectionContext = {
   node: { nodeId, paseoServerId: "srv_production_factory", mode: "standalone" },
   transport: "direct",
@@ -112,13 +114,15 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
     const daemonPassword = await hash("break-glass", 4);
     let audit: ProductionAuditCapability | undefined;
     let restartedAudit: ProductionAuditCapability | undefined;
+    let runtime: EnterpriseAdmissionRuntime | undefined;
+    let restarted: EnterpriseAdmissionRuntime | undefined;
     try {
       audit = await issueAudit(root);
       const factory = createProductionEnterpriseRuntimeFactory({
         paseoHome: root,
         daemonPassword,
       });
-      const runtime = await factory({ config, audit });
+      runtime = await factory({ config, audit });
       expect(runtime.authorizationRuntimeProvider?.grantStore).toBeDefined();
       expect(runtime.admissionInvalidationSink).toBeDefined();
       expect(runtime.admission).toBeInstanceOf(EnterpriseAdmission);
@@ -163,6 +167,9 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
           browserProfile.browserProfileId,
         ),
       ).resolves.toMatchObject({ browserProfileId: browserProfile.browserProfileId });
+      await expect(
+        runtime.resourceAuthorization.assertAppSlot(principal!, "app.use", appSlotId),
+      ).resolves.toMatchObject({ appSlotId });
       const identityRegistration = createProductionIdentityDispatcherRegistration({
         admission: runtime.admission,
         audit,
@@ -208,9 +215,10 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
         }),
       ).resolves.toBe(false);
 
+      await runtime.close?.();
       await audit.close();
       restartedAudit = await issueAudit(root);
-      const restarted = await factory({ config, audit: restartedAudit });
+      restarted = await factory({ config, audit: restartedAudit });
       expect(restarted.admission).toBeInstanceOf(EnterpriseAdmission);
       if (!(restarted.admission instanceof EnterpriseAdmission)) throw new Error("wrong admission");
       const restoredPrincipal = await restarted.admission.authenticate(issued.token, connection);
@@ -237,6 +245,8 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
       await expect(restarted.admission.authenticate(issued.token, connection)).resolves.toBeNull();
       unsubscribe();
     } finally {
+      await runtime?.close?.().catch(() => undefined);
+      await restarted?.close?.().catch(() => undefined);
       await audit?.close().catch(() => undefined);
       await restartedAudit?.close().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
@@ -301,9 +311,34 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
           action: "browser.use",
           selector: { kind: "organization", organizationId: grantOrganizationId },
         },
+        {
+          action: "app.use",
+          selector: { kind: "organization", organizationId: grantOrganizationId },
+        },
       ],
       grantVersion: "grv_1",
     });
+    await writeFile(
+      path.join(enterpriseRoot, "app-slots.json"),
+      JSON.stringify({
+        version: 1,
+        records: [
+          {
+            appSlotId,
+            organizationId,
+            nodeId,
+            businessIdentityId: "bid_aaaaaaaaaaaaaaaa",
+            appBundleId: "com.example.production",
+            accountBindingKey: "production-account",
+            ownerPrincipalId: principalId,
+            concurrency: 1,
+            credentialRef: "keychain://production-app-slot",
+            status: "ready",
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
     return root;
   }
 

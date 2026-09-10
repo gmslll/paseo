@@ -58,4 +58,5 @@ export interface EnterpriseAdmissionRuntime {
   readonly authorizationRuntimeProvider?: ProductionAuthorizationRuntimeProvider;
   readonly admissionInvalidationSink?: AdmissionInvalidationSink;
   nextSessionBindingGeneration(): string;
+  close?(): Promise<void>;
 }
