@@ -70,4 +70,24 @@ describe("enterprise session dispatcher seam", () => {
     const dispatcher: EnterpriseSessionDispatcher = { handle: vi.fn(() => false) };
     await expect(dispatchEnterpriseRequest(dispatcher, context, message)).resolves.toBe(false);
   });
+
+  test("consumer supplies the explicit authorization classification for delivery", () => {
+    const contextual = {
+      response: message as unknown as SessionOutboundMessage,
+      receiptClassification: "resources" as const,
+    };
+    const consume = vi.fn(() => contextual);
+    const dispatcher: EnterpriseSessionDispatcher = {
+      handle: vi.fn(() => message as unknown as SessionOutboundMessage),
+      consumeResponse: consume,
+    };
+    const result = dispatcher.consumeResponse?.({
+      sessionContext: context,
+      message,
+      response: message as unknown as SessionOutboundMessage,
+    });
+    expect(result).toBe(contextual);
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(result?.receiptClassification).toBe("resources");
+  });
 });
