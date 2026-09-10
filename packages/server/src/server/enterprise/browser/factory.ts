@@ -81,7 +81,7 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
       ) {
         throw new Error("Enterprise browser authorization runtime does not match registration.");
       }
-      const dispatcher = new EnterpriseBrowserLeaseHandler(captured);
+      const dispatcher = new EnterpriseBrowserLeaseHandler(captured.options);
       return Object.freeze({
         dispatcher,
         close: () => dispatcher.close(),
@@ -92,7 +92,12 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
 
 function captureFactoryOptions(
   options: EnterpriseBrowserLeaseDispatcherFactoryOptions | null | undefined,
-): EnterpriseBrowserLeaseHandlerOptions | null {
+):
+  | {
+      readonly options: EnterpriseBrowserLeaseHandlerOptions;
+      readonly runtime: EnterpriseBrowserLeaseSessionRuntime;
+    }
+  | null {
   try {
     if (!options) return null;
     const runtime = options.runtime;
@@ -121,8 +126,10 @@ function captureFactoryOptions(
     });
     return Object.freeze({
       runtime,
-      ...runtime,
-      authority: capturedAuthority,
+      options: Object.freeze({
+        ...runtime,
+        authority: capturedAuthority,
+      }),
     });
   } catch {
     return null;
