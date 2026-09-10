@@ -147,8 +147,6 @@ const ENTERPRISE_RESOURCE_UNAVAILABLE = "Enterprise resource unavailable";
 export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatcher {
   private readonly runtime: EnterpriseBrowserLeaseHandlerRuntime;
   private readonly heldLeases = new Map<string, HeldBrowserLease>();
-  private closed = false;
-  private closePromise: Promise<void> | null = null;
 
   public constructor(options: EnterpriseBrowserLeaseHandlerOptions) {
     const profiles = options.profiles;
@@ -201,7 +199,6 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       return false;
     }
     if (!W4_REQUEST_TYPES.has(type)) return false;
-    if (this.closed) return false;
     let sessionContext: EnterpriseDispatchContext;
     try {
       sessionContext = snapshotDispatchContext(input.sessionContext);
@@ -222,29 +219,6 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       default:
         return false;
     }
-  }
-
-  public close(): Promise<void> {
-    if (this.closePromise) return this.closePromise;
-    this.closed = true;
-    const held = [...this.heldLeases.values()];
-    this.heldLeases.clear();
-    this.closePromise = (async () => {
-      const failures: unknown[] = [];
-      await Promise.all(
-        held.map(async (lease) => {
-          try {
-            await this.releaseHeldLease(lease, true);
-          } catch (error) {
-            failures.push(error);
-          }
-        }),
-      );
-      if (failures.length > 0) {
-        throw new AggregateError(failures, "Enterprise browser lease handler close failed.");
-      }
-    })();
-    return this.closePromise;
   }
 
   private async handleListProfiles(
@@ -325,7 +299,6 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       }
       assertLeaseMatchesAuthorization(acquired, handle, currentAuthorization, request.mode);
       held.authorization = currentAuthorization;
-      if (this.closed) throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       if (this.heldLeases.has(acquired.leaseId)) {
         throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       }
@@ -585,7 +558,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     sessionContext: EnterpriseSessionContext,
     fencingToken: number,
   ): void {
-    if (this.closed || held.released || held.lease.fencingToken !== fencingToken) {
+    if (held.released || held.lease.fencingToken !== fencingToken) {
       throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
     }
     this.assertCurrentSessionHandle(held.handle, sessionContext);
@@ -599,7 +572,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     }
   }
 
-  private async releaseHeldLease(held: HeldBrowserLease, propagateError = false): Promise<void> {
+  private async releaseHeldLease(held: HeldBrowserLease): Promise<void> {
     if (held.released) return;
     held.released = true;
     if (this.heldLeases.get(held.lease.leaseId) === held) {
@@ -607,9 +580,8 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     }
     try {
       await this.runtime.releaseLease({ handle: held.handle, lease: held.lease });
-    } catch (error) {
+    } catch {
       // The authorization failure remains primary; the manager owns release diagnostics.
-      if (propagateError) throw error;
     }
   }
 }
