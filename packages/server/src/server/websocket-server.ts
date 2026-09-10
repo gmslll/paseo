@@ -119,6 +119,7 @@ import {
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
 import { createProductionAuthorizationRuntimeForSession } from "./enterprise/access/production-authorization-runtime-provider.js";
 import type { ProductionAuthorizationRuntime } from "./enterprise/access/production-authorization-runtime.js";
+import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import {
   isCurrentEnterpriseAdmissionAuthorization,
   bindOrReplaceEnterpriseAdmissionSession,
@@ -867,6 +868,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private readonly enterpriseRuntime?: EnterpriseAdmissionRuntime;
+  private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
 
   constructor(
     server: HTTPServer,
@@ -915,10 +917,12 @@ export class VoiceAssistantWebSocketServer {
     orchestrationSkills?: SessionOptions["orchestrationSkills"],
     workspaceLabelService?: WorkspaceLabelService,
     enterpriseRuntime?: EnterpriseAdmissionRuntime,
+    enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.enterpriseRuntime = enterpriseRuntime;
+    this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -1796,6 +1800,17 @@ export class VoiceAssistantWebSocketServer {
       enterpriseAuthorizationRuntime,
     } = params;
     let connection: SessionConnection | null = null;
+    const enterpriseWorkspaceFilesRuntime =
+      enterpriseAuthorizationRuntime && this.enterpriseWorkspaceFilesProvider
+        ? this.enterpriseWorkspaceFilesProvider.createSessionRuntime(enterpriseAuthorizationRuntime)
+        : undefined;
+    if (
+      enterpriseAuthorizationRuntime &&
+      this.enterpriseWorkspaceFilesProvider &&
+      !enterpriseWorkspaceFilesRuntime
+    ) {
+      throw new Error("Enterprise workspace files runtime unavailable");
+    }
 
     const session = this.createSocketSession({
       clientId,
@@ -1849,6 +1864,7 @@ export class VoiceAssistantWebSocketServer {
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
       enterprise: admission.enterprise,
+      ...(enterpriseWorkspaceFilesRuntime ? { enterpriseWorkspaceFilesRuntime } : {}),
       ...(sessionId ? { sessionId } : {}),
       ...(sessionAuthorization ? { sessionAuthorization } : {}),
       ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),

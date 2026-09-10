@@ -199,6 +199,7 @@ import {
 } from "./persisted-config.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
 import { createProductionAuthorizationRuntimeProvider } from "./enterprise/access/production-authorization-runtime-provider.js";
+import { createProductionEnterpriseWorkspaceFilesProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -689,6 +690,9 @@ export async function createPaseoDaemon(
   dependencies: PaseoDaemonDependencies = {},
 ): Promise<PaseoDaemon> {
   let enterpriseRuntime: EnterpriseAdmissionRuntime | undefined;
+  let enterpriseWorkspaceFilesProvider:
+    | ReturnType<typeof createProductionEnterpriseWorkspaceFilesProvider>
+    | undefined;
   const logger = rootLogger.child({ module: "bootstrap" });
   const capturedPaseoHome = structuredClone(config.paseoHome);
   if (typeof capturedPaseoHome !== "string" || capturedPaseoHome.length === 0) {
@@ -728,6 +732,7 @@ export async function createPaseoDaemon(
     if (!outerAuditClosePromise) outerAuditClosePromise = boundEnterpriseAuditClose();
     await outerAuditClosePromise;
   };
+  // oxlint-disable-next-line complexity -- bootstrap owns ordered production provider construction.
   const constructAfterEnterpriseRuntime = async (): Promise<PaseoDaemon> => {
     requireConstructionAudit();
     configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
@@ -1046,6 +1051,14 @@ export async function createPaseoDaemon(
       path.join(capturedPaseoHome, "projects", "workspaces.json"),
       logger,
     );
+    if (enterpriseRuntime && workspaceRegistry) {
+      enterpriseWorkspaceFilesProvider = createProductionEnterpriseWorkspaceFilesProvider({
+        workspaceRoots: workspaceRegistry,
+      });
+      if (!enterpriseWorkspaceFilesProvider) {
+        throw new Error("enterprise workspace files provider unavailable");
+      }
+    }
     const workspaceLabelService = createWorkspaceLabelService({
       paseoHome: capturedPaseoHome,
       workspaceRegistry,
@@ -1869,6 +1882,7 @@ export async function createPaseoDaemon(
           };
           const onListening = () => {
             httpServer.off("error", onError);
+            // oxlint-disable-next-line complexity -- startup ordering is intentionally explicit.
             const logAndResolve = async () => {
               requireStartAudit();
               boundListenTarget = resolveBoundListenTarget(listenTarget, httpServer);
@@ -1999,6 +2013,7 @@ export async function createPaseoDaemon(
                 orchestrationSkills,
                 workspaceLabelService,
                 enterpriseRuntime,
+                enterpriseWorkspaceFilesProvider ?? undefined,
               );
               requireStartAudit();
               pluginRuntime.bindPaseoSessionHost(wsServer);
