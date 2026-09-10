@@ -194,10 +194,27 @@ export function createEnterpriseContentReadDispatcherRegistration(
             if (!capability) return null;
             issued.delete(response);
             pending.delete(capability);
-            void sessionContext;
-            void message;
-            void response;
-            return null;
+            try {
+              const request = EnterpriseWorkspaceContentReadRequestSchema.parse(message);
+              const parsedResponse = EnterpriseWorkspaceContentReadResponseSchema.parse(response);
+              if (capability.context !== sessionContext) return null;
+              if (capability.message !== message) return null;
+              if (capability.response !== response) return null;
+              if (!current(sessionContext)) return null;
+              if (parsedResponse.payload.requestId !== request.requestId) return null;
+              if (!equal(parsedResponse.payload.resource, capability.resource)) return null;
+              if (!equal(parsedResponse.payload.selector, request.selector)) return null;
+              return {
+                response: capability.response,
+                authorizationContext: {
+                  kind: "resources",
+                  resources: [capability.resource],
+                },
+                receiptClassification: "resources",
+              };
+            } catch {
+              return null;
+            }
           },
         },
         close: async () => {
