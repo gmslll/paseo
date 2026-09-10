@@ -2370,14 +2370,12 @@ export class VoiceAssistantWebSocketServer {
       );
       this.handshakeConnections.delete(ws);
     } catch (primary) {
+      const cleanupErrors: unknown[] = [];
       if (workspaceCleanupPromise) {
         try {
           await workspaceCleanupPromise;
         } catch (workspaceCleanup) {
-          // oxlint-disable-next-line preserve-caught-error
-          throw new AggregateError([primary, workspaceCleanup], "enterprise hello failed", {
-            cause: primary,
-          });
+          cleanupErrors.push(workspaceCleanup);
         }
       }
       this.handshakeConnections.delete(ws);
@@ -2388,17 +2386,24 @@ export class VoiceAssistantWebSocketServer {
             cleanupStarted = true;
             await connection.session.cleanup();
           } catch (cleanupError) {
-            // oxlint-disable-next-line preserve-caught-error
-            throw new AggregateError([primary, cleanupError], "enterprise hello failed", {
-              cause: primary,
-            });
+            cleanupErrors.push(cleanupError);
           }
         }
       } else if (enterpriseAuthorizationHandle && this.enterpriseRuntime) {
         this.enterpriseRuntime.admission.releaseSession(enterpriseAuthorizationHandle);
         if (enterpriseAuthorizationRuntime) {
-          await enterpriseAuthorizationRuntime.release().catch(() => undefined);
+          try {
+            await enterpriseAuthorizationRuntime.release();
+          } catch (runtimeCleanup) {
+            cleanupErrors.push(runtimeCleanup);
+          }
         }
+      }
+      if (cleanupErrors.length > 0) {
+        // oxlint-disable-next-line preserve-caught-error
+        throw new AggregateError([primary, ...cleanupErrors], "enterprise hello failed", {
+          cause: primary,
+        });
       }
       throw primary;
     }
