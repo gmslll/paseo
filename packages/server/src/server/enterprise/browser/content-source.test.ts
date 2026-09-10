@@ -169,6 +169,7 @@ describe("browser profile content source", () => {
       expect(first.items.map((item) => item.reference)).toEqual(["a.txt"]);
       expect(first.nextCursor).not.toBeNull();
       expect(first.nextCursor).not.toBe("1");
+      await writeFile(path.join(downloadRoot, "aa.txt"), "aa");
       const second = await source.read({
         profile: { ...profile, downloadRoot },
         selector: { kind: "browser_profile", view: "artifacts" },
@@ -176,6 +177,7 @@ describe("browser profile content source", () => {
         limit: 1,
       });
       expect(second.items.map((item) => item.reference)).toEqual(["b.txt"]);
+      expect(second.nextCursor).toBeNull();
       await expect(
         source.read({
           profile: { ...profile, downloadRoot },
@@ -189,5 +191,17 @@ describe("browser profile content source", () => {
       await rm(downloadRoot, { recursive: true, force: true });
       await rm(buildDirectory, { recursive: true, force: true });
     }
+  });
+
+  test("rejects extra and accessor source options", () => {
+    const readProfile = async () => ({ items: [], nextCursor: null });
+    expect(() =>
+      createEnterpriseBrowserProfileContentReadSource({ readProfile, extra: true } as never),
+    ).toThrow();
+    expect(() =>
+      createEnterpriseBrowserProfileContentReadSource(
+        Object.defineProperty({ readProfile }, "onClose", { get: () => undefined }) as never,
+      ),
+    ).toThrow();
   });
 });
