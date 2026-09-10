@@ -4227,7 +4227,7 @@ const NormalizedBrowserHostnameSchema = z
   .min(1)
   .max(253)
   .regex(/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/);
-const BrowserAccountLabelHashSchema = z.string().min(1).max(256);
+const BrowserAccountLabelHashSchema = z.string().min(1);
 
 export const EnterpriseBrowserPageIdentityObservationRequestSchema = z.strictObject({
   type: z.literal("enterprise.browser.page_identity.observe.request"),

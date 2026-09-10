@@ -189,6 +189,15 @@ describe("enterprise Browser page identity observation contract", () => {
     );
   });
 
+  test("accepts existing opaque profile hashes longer than 256 characters", () => {
+    expect(
+      EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+        ...request,
+        accountLabelHash: "opaque-hash-".repeat(64),
+      }),
+    ).toBeTruthy();
+  });
+
   test("rejects identity secrets, extras, invalid hash, and invalid revision", () => {
     for (const extra of [
       { url: "https://account.example.com/private" },
