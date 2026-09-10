@@ -253,4 +253,95 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       await closeProductionRuntimeFixture();
     }
   });
+
+  test("closes an in-flight workspace read and rejects reentry", async () => {
+    const fixture = await createProductionRuntimeFixture("content-close-race");
+    try {
+      let listCount = 0;
+      let listEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        listEntered = resolve;
+      });
+      let releaseList!: () => void;
+      const listReady = new Promise<void>((resolve) => {
+        releaseList = resolve;
+      });
+      let cleanupCount = 0;
+      const unused = async (..._args: never[]): Promise<never> => {
+        throw new Error("unused");
+      };
+      const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
+        stat: unused,
+        list: async () => {
+          listCount += 1;
+          listEntered();
+          await listReady;
+          return [];
+        },
+        openRead: unused,
+        write: unused,
+        create: unused,
+        rename: unused,
+        copy: unused,
+        delete: unused,
+        watch: unused,
+        issueDownloadToken: unused,
+        createUploadStore: () => {
+          throw new Error("unused");
+        },
+        cleanup: async () => {
+          cleanupCount += 1;
+        },
+      };
+      const registration = createEnterpriseContentReadDispatcherRegistration({
+        provider: fixture.provider,
+        audit: fixture.audit,
+        agents: {
+          listAgents: async () => [],
+          getAgent: async () => null,
+          getTimelineRows: async () => [],
+        },
+      });
+      if (!registration) throw new Error("registration");
+      const lease = registration.open({
+        sessionId: fixture.context.sessionId,
+        clientId: fixture.context.clientId,
+        context: fixture.context.enterpriseContext,
+        authorizationRuntime: fixture.runtime,
+        filesRuntime,
+      });
+      const message = {
+        type: "enterprise.workspace.content.read.request" as const,
+        requestId: "r-close-race",
+        resource: {
+          organizationId: fixture.context.enterpriseContext.principal.organizationId,
+          nodeId: fixture.context.enterpriseContext.node.nodeId,
+          resourceKind: "workspace" as const,
+          localResourceId: "wks_0123456789abcdef",
+        },
+        selector: { kind: "workspace" as const, view: "files" as const },
+        page: { limit: 1 },
+      };
+      const first = lease.dispatcher.handle({ sessionContext: fixture.context, message });
+      await entered;
+      expect(await lease.dispatcher.handle({ sessionContext: fixture.context, message })).toBe(
+        false,
+      );
+      expect(listCount).toBe(1);
+      const closing = lease.close();
+      releaseList();
+      await expect(first).resolves.toBe(false);
+      await closing;
+      await lease.close();
+      expect(cleanupCount).toBe(1);
+      expect(
+        (await fixture.audit.snapshotEvents()).some(
+          (event) => event.action === "workspace.content.read" && event.outcome === "allowed",
+        ),
+      ).toBe(false);
+      await fixture.runtime.release();
+    } finally {
+      await closeProductionRuntimeFixture();
+    }
+  });
 });
