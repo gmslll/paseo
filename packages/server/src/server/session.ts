@@ -4144,6 +4144,27 @@ export class Session {
     return (await authorization.assertWorkspace(action, workspaceId)) !== null;
   }
 
+  private async authorizeCurrentAgentMutation(
+    agentId: string,
+  ): Promise<AgentUpdatePublicationScope | null> {
+    if (!this.enterpriseContext || this.isCleanedUp) return null;
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return null;
+    const canonical = await authorization.assertAgent("workspace.write", agentId);
+    if (
+      !canonical ||
+      canonical.agentId !== agentId ||
+      !authorization.isCurrent() ||
+      this.isCleanedUp
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      agentId: canonical.agentId,
+      workspaceId: canonical.workspaceId,
+    });
+  }
+
   private emitLegacyResourceDenied(requestId: string, requestType: string, source?: object): void {
     const message: SessionOutboundMessage = {
       type: "rpc_error",
@@ -9166,23 +9187,38 @@ export class Session {
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
-    const resolved = await this.resolveAgentIdentifier(msg.agentId);
-    if (!resolved.ok) {
-      this.emit({
-        type: "send_agent_message_response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-          accepted: false,
-          error: resolved.error,
-        },
-      });
-      return;
+    let agentId: string;
+    let responseContext: OutboundAuthorizationContext | undefined;
+    if (this.enterpriseContext) {
+      const current = await this.authorizeCurrentAgentMutation(msg.agentId);
+      if (!current) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type);
+        return;
+      }
+      agentId = current.agentId;
+      responseContext = this.createAgentOutboundContext(current);
+      if (!responseContext) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type);
+        return;
+      }
+    } else {
+      const resolved = await this.resolveAgentIdentifier(msg.agentId);
+      if (!resolved.ok) {
+        this.emit({
+          type: "send_agent_message_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            accepted: false,
+            error: resolved.error,
+          },
+        });
+        return;
+      }
+      agentId = resolved.agentId;
     }
 
     try {
-      const agentId = resolved.agentId;
-
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
       this.sessionLogger.trace(
         {
@@ -9226,26 +9262,32 @@ export class Session {
         await send();
       }
 
-      this.emit({
-        type: "send_agent_message_response",
-        payload: {
-          requestId: msg.requestId,
-          agentId,
-          accepted: true,
-          error: null,
+      this.emit(
+        {
+          type: "send_agent_message_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId,
+            accepted: true,
+            error: null,
+          },
         },
-      });
+        responseContext,
+      );
     } catch (error) {
-      this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
-      this.emit({
-        type: "send_agent_message_response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: resolved.agentId,
-          accepted: false,
-          error: errorToFriendlyMessage(error),
+      this.handleAgentRunError(agentId, error, "Failed to send agent message");
+      this.emit(
+        {
+          type: "send_agent_message_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId,
+            accepted: false,
+            error: errorToFriendlyMessage(error),
+          },
         },
-      });
+        responseContext,
+      );
     }
   }
 
@@ -9887,6 +9929,27 @@ export class Session {
     const resources = [...resourcesByWorkspaceId.values()];
     Object.freeze(resources);
     return Object.freeze({ kind: "resources", resources });
+  }
+
+  private createAgentOutboundContext(
+    scope: AgentUpdatePublicationScope,
+  ): OutboundAuthorizationContext | undefined {
+    const workspace = this.createWorkspaceResource(scope.workspaceId);
+    if (!workspace || !this.enterpriseContext) return undefined;
+    try {
+      const agent = GlobalResourceRefSchema.parse({
+        resourceKind: "agent",
+        organizationId: this.enterpriseContext.principal.organizationId,
+        nodeId: this.enterpriseContext.node.nodeId,
+        localResourceId: scope.agentId,
+      });
+      if (agent.resourceKind !== "agent") return undefined;
+      const resources = [workspace, Object.freeze(agent)];
+      Object.freeze(resources);
+      return Object.freeze({ kind: "resources", resources });
+    } catch {
+      return undefined;
+    }
   }
 
   private createWorkspaceResource(

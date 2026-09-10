@@ -2142,6 +2142,114 @@ async function createBinaryAuthorizationFixture(
   };
 }
 
+const enterpriseSendAgentId = "agt_aaaaaaaaaaaaaaaa";
+const enterpriseSendWorkspaceId = "workspace-1";
+
+async function* emptyAgentRun() {}
+
+function makeEnterpriseSendManagedAgent(): ManagedAgent {
+  const timestamp = new Date("2026-09-11T00:00:00.000Z");
+  return {
+    id: enterpriseSendAgentId,
+    provider: "codex",
+    cwd: "/tmp/enterprise-send-agent",
+    workspaceId: enterpriseSendWorkspaceId,
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: true,
+      supportsMcpServers: true,
+      supportsReasoningStream: true,
+      supportsToolInvocations: true,
+    },
+    config: { provider: "codex", cwd: "/tmp/enterprise-send-agent" },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    availableModes: [],
+    currentModeId: null,
+    pendingPermissions: new Map(),
+    persistence: null,
+    lastUserMessageAt: null,
+    activeTurnId: null,
+    activeTurnStartedAt: null,
+    attention: { requiresAttention: false },
+    labels: {},
+    lifecycle: "running",
+    activeForegroundTurnId: null,
+  } as unknown as ManagedAgent;
+}
+
+async function createEnterpriseSendAgentHarness(
+  name: string,
+  options: { streamError?: Error } = {},
+) {
+  const fixture = await createBinaryAuthorizationFixture(
+    name,
+    [
+      {
+        action: "workspace.write",
+        selector: { kind: "workspace", workspaceIds: [enterpriseSendWorkspaceId] },
+      },
+    ],
+    ["workspace.write", "hub.execute"],
+  );
+  fixture.owners.registerAgent({
+    id: enterpriseSendAgentId,
+    workspaceId: enterpriseSendWorkspaceId,
+  });
+  const managedAgent = makeEnterpriseSendManagedAgent();
+  const listAgents = vi.fn(() => {
+    throw new Error("enterprise send must not enumerate live agents");
+  });
+  const listStorage = vi.fn(async () => {
+    throw new Error("enterprise send must not enumerate stored agents");
+  });
+  const getAgent = vi.fn(() => managedAgent);
+  const streamAgent = vi.fn(() => {
+    if (options.streamError) throw options.streamError;
+    return emptyAgentRun();
+  });
+  const waitForAgentRunStart = vi.fn(async () => {});
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    clientId: "client-test",
+    enterpriseContext: fixture.enterpriseSessionContext,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: fixture.authorityState,
+    principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+    resourceAuthorization: fixture.runtime.resourceAuthorization,
+    sessionId: fixture.sessionId,
+    sessionAuthorization: fixture.sessionAuthorization,
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    enterpriseAuthorizationRuntime: fixture.runtime,
+    agentManager: {
+      getAgent,
+      listAgents,
+      waitForAgentClose: vi.fn(async () => {}),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => false),
+      streamAgent,
+      waitForAgentRunStart,
+    },
+    agentStorage: {
+      get: vi.fn(async () => undefined),
+      list: listStorage,
+    },
+  });
+  return {
+    fixture,
+    getAgent,
+    listAgents,
+    listStorage,
+    messages,
+    session,
+    streamAgent,
+    waitForAgentRunStart,
+  };
+}
+
 function makeEnterpriseRuntime(
   cleanup: () => Promise<void>,
 ): NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]> {
@@ -9220,6 +9328,216 @@ describe("enterprise dispatcher integration seam", () => {
         code: "access_denied",
       },
     });
+  });
+
+  test("enterprise send-agent authorizes the exact agent once and delivers its accepted response", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseSendAgentHarness("send-agent-accepted");
+    const assertAgent = vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent");
+    const canEmit = vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit");
+    const response = {
+      type: "send_agent_message_response",
+      payload: {
+        requestId: "send-agent-accepted",
+        agentId: enterpriseSendAgentId,
+        accepted: true,
+        error: null,
+      },
+    } as const;
+
+    await h.session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: response.payload.requestId,
+      agentId: enterpriseSendAgentId,
+      text: "Run the authorized task",
+      attachments: [],
+    });
+
+    await vi.waitFor(() => expect(h.messages).toContainEqual(response));
+    expect(assertAgent).toHaveBeenCalledExactlyOnceWith(
+      h.fixture.enterpriseSessionContext.principal,
+      "workspace.write",
+      enterpriseSendAgentId,
+    );
+    expect(h.streamAgent).toHaveBeenCalledTimes(1);
+    expect(h.waitForAgentRunStart).toHaveBeenCalledExactlyOnceWith(
+      enterpriseSendAgentId,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(h.listAgents).not.toHaveBeenCalled();
+    expect(h.listStorage).not.toHaveBeenCalled();
+    const outboundContext = canEmit.mock.calls.find(
+      ([, event]) => event.type === "send_agent_message_response",
+    )?.[2];
+    expect(outboundContext).toEqual({
+      kind: "resources",
+      resources: [
+        {
+          resourceKind: "workspace",
+          organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+          nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+          localResourceId: enterpriseSendWorkspaceId,
+        },
+        {
+          resourceKind: "agent",
+          organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+          nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+          localResourceId: enterpriseSendAgentId,
+        },
+      ],
+    });
+    expect(Object.isFrozen(outboundContext)).toBe(true);
+    expect(
+      outboundContext?.kind === "resources" && Object.isFrozen(outboundContext.resources),
+    ).toBe(true);
+    if (outboundContext?.kind === "resources") {
+      expect(outboundContext.resources.every((resource) => Object.isFrozen(resource))).toBe(true);
+    }
+    await h.session.cleanup();
+  });
+
+  test("enterprise send-agent delivers a provider rejection with the authorized resource context", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseSendAgentHarness("send-agent-rejected", {
+      streamError: new Error("provider rejected prompt"),
+    });
+    const canEmit = vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit");
+
+    await h.session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: "send-agent-rejected",
+      agentId: enterpriseSendAgentId,
+      text: "Run the rejected task",
+      attachments: [],
+    });
+
+    await vi.waitFor(() =>
+      expect(h.messages).toContainEqual({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: "send-agent-rejected",
+          agentId: enterpriseSendAgentId,
+          accepted: false,
+          error: "provider rejected prompt",
+        },
+      }),
+    );
+    expect(h.streamAgent).toHaveBeenCalledTimes(1);
+    const outboundContext = canEmit.mock.calls.find(
+      ([, event]) => event.type === "send_agent_message_response",
+    )?.[2];
+    expect(outboundContext).toMatchObject({
+      kind: "resources",
+      resources: [
+        { resourceKind: "workspace", localResourceId: enterpriseSendWorkspaceId },
+        { resourceKind: "agent", localResourceId: enterpriseSendAgentId },
+      ],
+    });
+    await h.session.cleanup();
+  });
+
+  test("enterprise send-agent uniformly denies foreign, guessed, and stale ids before manager access", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseSendAgentHarness("send-agent-denied");
+    const foreignWorkspaceId = "wks_bbbbbbbbbbbbbbbb";
+    const foreignAgentId = "agt_bbbbbbbbbbbbbbbb";
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    h.fixture.owners.registerWorkspace({
+      id: foreignWorkspaceId,
+      organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+      nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    h.fixture.owners.registerAgent({ id: foreignAgentId, workspaceId: foreignWorkspaceId });
+    const denied = [
+      { requestId: "send-agent-foreign", agentId: foreignAgentId },
+      { requestId: "send-agent-prefix", agentId: "agt_aaaa" },
+      { requestId: "send-agent-title", agentId: "owned agent title" },
+    ];
+    for (const request of denied) {
+      await h.session.handleMessage({
+        type: "send_agent_message_request",
+        ...request,
+        text: "must not run",
+        attachments: [],
+      });
+    }
+    await h.fixture.runtime.release();
+    denied.push({ requestId: "send-agent-stale", agentId: enterpriseSendAgentId });
+    await h.session.handleMessage({
+      type: "send_agent_message_request",
+      ...denied.at(-1)!,
+      text: "must not run",
+      attachments: [],
+    });
+
+    expect(h.messages).toEqual(
+      denied.map(({ requestId }) => ({
+        type: "rpc_error",
+        payload: {
+          requestId,
+          requestType: "send_agent_message_request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      })),
+    );
+    expect(h.getAgent).not.toHaveBeenCalled();
+    expect(h.streamAgent).not.toHaveBeenCalled();
+    expect(h.listAgents).not.toHaveBeenCalled();
+    expect(h.listStorage).not.toHaveBeenCalled();
+    await h.session.cleanup();
+  });
+
+  test("legacy send-agent keeps title resolution and response delivery", async () => {
+    const managedAgent = makeEnterpriseSendManagedAgent();
+    const listStorage = vi.fn(async () => [
+      createStoredAgentRecord({
+        id: enterpriseSendAgentId,
+        cwd: managedAgent.cwd,
+        title: "legacy named agent",
+      }),
+    ]);
+    const streamAgent = vi.fn(() => emptyAgentRun());
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: {
+        getAgent: vi.fn(() => managedAgent),
+        listAgents: vi.fn(() => []),
+        waitForAgentClose: vi.fn(async () => {}),
+        tryRunOutOfBand: vi.fn(() => false),
+        hasInFlightRun: vi.fn(() => false),
+        streamAgent,
+        waitForAgentRunStart: vi.fn(async () => {}),
+      },
+      agentStorage: {
+        get: vi.fn(async () => undefined),
+        list: listStorage,
+      },
+    });
+
+    await session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: "send-agent-legacy-title",
+      agentId: "legacy named agent",
+      text: "legacy task",
+      attachments: [],
+    });
+
+    expect(listStorage).toHaveBeenCalledTimes(1);
+    expect(streamAgent).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: "send-agent-legacy-title",
+        agentId: enterpriseSendAgentId,
+        accepted: true,
+        error: null,
+      },
+    });
+    await session.cleanup();
   });
 
   test("enterprise timeline denial precedes load and timeline fetch", async () => {
