@@ -43,10 +43,16 @@ import {
   FileTransferOpcode,
   type BinaryFrame,
 } from "@getpaseo/protocol/binary-frames/index";
+import type { ActiveFileDownloadStreamHandle } from "./enterprise/access/file-binary-outbound-authorizer.js";
+import {
+  isCurrentProductionAuthorizationRuntimeForSession,
+  type ProductionAuthorizationRuntime,
+  type ProductionAuthorizationRuntimeSessionInput,
+} from "./enterprise/access/production-authorization-runtime.js";
 import type {
-  ActiveFileDownloadStreamHandle,
-  FileBinaryOutboundAuthorizer,
-} from "./enterprise/access/file-binary-outbound-authorizer.js";
+  EnterpriseAdmissionAuthorizationHandle,
+  EnterpriseAdmissionAuthorizationIssuer,
+} from "./enterprise/identity/admission-authorization.js";
 import { CursorError } from "./pagination/cursor.js";
 import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
 import { describeAgentHistoryMatches, rankAgentHistoryCandidates } from "./agent-history-search.js";
@@ -498,7 +504,11 @@ export interface SessionOptions {
   principalGrantVersionGuard?: PrincipalGrantVersionGuard;
   resourceAuthorization?: ResourceAuthorization;
   enterpriseWorkspaceFilesRuntime?: EnterpriseWorkspaceFilesRuntime;
-  fileBinaryOutboundAuthorizer?: FileBinaryOutboundAuthorizer;
+  sessionId?: string;
+  sessionAuthorization?: SessionAuthorization;
+  admissionAuthorizationIssuer?: EnterpriseAdmissionAuthorizationIssuer;
+  admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
+  enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -706,6 +716,20 @@ function workspaceLabelErrorCode(error: unknown): string {
   return "workspace_label_failed";
 }
 
+interface OpeningFileBinaryStream {
+  readonly phase: "opening";
+  readonly reservation: object;
+  readonly workspaceId: string;
+}
+
+interface ActiveFileBinaryStream {
+  readonly phase: "active";
+  readonly stream: ActiveFileDownloadStreamHandle;
+  readonly workspaceId: string;
+}
+
+type FileBinaryStreamEntry = OpeningFileBinaryStream | ActiveFileBinaryStream;
+
 export class Session {
   private readonly enterpriseContext?: EnterpriseSessionContext;
   private readonly enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
@@ -713,14 +737,11 @@ export class Session {
     OutboundAuthorityEmissionStatePort;
   private readonly resourceAuthorization?: ResourceAuthorization;
   private readonly outboundAuthorityEmissionAuthorizer?: OutboundAuthorityEmissionAuthorizer;
-  private readonly fileBinaryOutboundAuthorizer?: FileBinaryOutboundAuthorizer;
+  private readonly enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  private readonly productionAuthorizationSession?: ProductionAuthorizationRuntimeSessionInput;
   private readonly activeFileBinaryStreams = new Map<
-    string,
-    Readonly<{
-      stream: ActiveFileDownloadStreamHandle;
-      workspaceId: string;
-      source: object | undefined;
-    }>
+    object | undefined,
+    Map<string, FileBinaryStreamEntry>
   >();
   private readonly enterpriseSessionBindingKey?: string;
   private readonly inboundAuthorityRequestAuthorizer?: InboundAuthorityRequestAuthorizer;
@@ -852,7 +873,11 @@ export class Session {
       principalGrantVersionGuard,
       resourceAuthorization,
       enterpriseWorkspaceFilesRuntime,
-      fileBinaryOutboundAuthorizer,
+      sessionId,
+      sessionAuthorization,
+      admissionAuthorizationIssuer,
+      admissionAuthorizationHandle,
+      enterpriseAuthorizationRuntime,
       permissions,
       appVersion,
       clientCapabilities,
@@ -925,17 +950,71 @@ export class Session {
       );
     if (Boolean(enterpriseContext) !== Boolean(principalGrantVersionGuard))
       throw new Error("Enterprise grant guard must be configured with enterprise context");
-    if (fileBinaryOutboundAuthorizer && !enterpriseContext)
-      throw new Error("File binary authorization requires enterprise context");
-    this.enterpriseContext = enterpriseContext
+    const canonicalEnterpriseContext = enterpriseContext
       ? normalizeEnterpriseSessionContext(enterpriseContext)
       : undefined;
+    const canonicalSessionBindingKey = canonicalEnterpriseContext
+      ? createEnterpriseSessionBindingKey({
+          organizationId: canonicalEnterpriseContext.principal.organizationId,
+          principalId: canonicalEnterpriseContext.principal.principalId,
+          credentialId: canonicalEnterpriseContext.principal.credentialId,
+          grantVersion: canonicalEnterpriseContext.principal.grantVersion,
+          clientId,
+        })
+      : undefined;
+    const productionAuthorizationConfigured = Boolean(
+      enterpriseAuthorizationRuntime ||
+      admissionAuthorizationIssuer ||
+      admissionAuthorizationHandle ||
+      sessionAuthorization ||
+      sessionId,
+    );
+    let productionAuthorizationSession: ProductionAuthorizationRuntimeSessionInput | undefined;
+    if (productionAuthorizationConfigured) {
+      if (
+        !enterpriseAuthorizationRuntime ||
+        !admissionAuthorizationIssuer ||
+        !admissionAuthorizationHandle ||
+        !sessionAuthorization ||
+        !sessionId ||
+        !canonicalEnterpriseContext ||
+        !canonicalSessionBindingKey
+      )
+        throw new Error("Enterprise authorization runtime requires canonical session authority");
+      productionAuthorizationSession = Object.freeze({
+        admissionAuthorizationIssuer,
+        admissionAuthorizationHandle,
+        sessionAuthorization,
+        sessionId,
+        clientId,
+        sessionBindingKey: canonicalSessionBindingKey,
+        enterpriseContext: canonicalEnterpriseContext,
+      });
+      if (
+        !isCurrentProductionAuthorizationRuntimeForSession(
+          enterpriseAuthorizationRuntime,
+          productionAuthorizationSession,
+        )
+      )
+        throw new Error(
+          "Enterprise authorization runtime does not match canonical session authority",
+        );
+    }
+    if (
+      enterpriseContext &&
+      enterpriseWorkspaceFilesRuntime &&
+      (onBinaryMessage || onBinaryMessageToSource) &&
+      !enterpriseAuthorizationRuntime
+    )
+      throw new Error("Enterprise file binary channel requires production authorization runtime");
+    this.enterpriseContext = canonicalEnterpriseContext;
     this.enterpriseAgentContextRegistry = enterpriseAgentContextRegistry;
     this.authorityReceiptState = authorityReceiptState;
     this.resourceAuthorization = resourceAuthorization;
-    this.fileBinaryOutboundAuthorizer = fileBinaryOutboundAuthorizer;
+    this.enterpriseAuthorizationRuntime = enterpriseAuthorizationRuntime;
+    this.productionAuthorizationSession = productionAuthorizationSession;
     this.clientId = clientId;
-    this.authorization = new SessionAuthorization(permissions);
+    this.authorization = sessionAuthorization ?? new SessionAuthorization(permissions);
     if (this.enterpriseContext && principalGrantVersionGuard)
       this.inboundAuthorityRequestAuthorizer = new InboundAuthorityRequestAuthorizer({
         sessionAuthorization: this.authorization,
@@ -944,7 +1023,7 @@ export class Session {
       });
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
-    this.sessionId = uuidv4();
+    this.sessionId = sessionId ?? uuidv4();
     this.onMessage = onMessage;
     this.onMessageToSource = onMessageToSource ?? null;
     this.onBinaryMessage = onBinaryMessage ?? null;
@@ -1248,13 +1327,8 @@ export class Session {
 
     if (this.enterpriseContext && this.authorityReceiptState) {
       const { principal, node } = this.enterpriseContext;
-      const bindingKey = createEnterpriseSessionBindingKey({
-        organizationId: principal.organizationId,
-        principalId: principal.principalId,
-        credentialId: principal.credentialId,
-        grantVersion: principal.grantVersion,
-        clientId,
-      });
+      const bindingKey = canonicalSessionBindingKey;
+      if (!bindingKey) throw this.rollbackConstruction(new Error("Missing session binding key"));
       this.enterpriseSessionBindingKey = bindingKey;
       try {
         this.authorityReceiptState.registerSessionBinding({
@@ -1328,7 +1402,6 @@ export class Session {
       }
     };
     this.isCleanedUp = true;
-    attempt(() => this.fileBinaryOutboundAuthorizer?.closeAll("session_release"));
     this.activeFileBinaryStreams.clear();
     const authorityState = this.authorityReceiptState;
     const authorityContext = this.enterpriseContext;
@@ -8486,49 +8559,86 @@ export class Session {
     }
   }
 
+  private deleteActiveFileBinaryStream(
+    source: object | undefined,
+    requestId: string,
+    expected?: FileBinaryStreamEntry,
+  ): void {
+    const streams = this.activeFileBinaryStreams.get(source);
+    if (!streams) return;
+    if (expected && streams.get(requestId) !== expected) return;
+    streams.delete(requestId);
+    if (streams.size === 0 && this.activeFileBinaryStreams.get(source) === streams)
+      this.activeFileBinaryStreams.delete(source);
+  }
+
   // oxlint-disable-next-line complexity -- the binary stream state machine fails closed at each phase.
   private async emitAuthorizedWorkspaceBinary(
     frame: Uint8Array,
     workspaceId: string,
     source?: object,
   ): Promise<void> {
-    const authorizer = this.fileBinaryOutboundAuthorizer;
+    const runtime = this.enterpriseAuthorizationRuntime;
+    const productionAuthorizationSession = this.productionAuthorizationSession;
+    if (
+      !runtime ||
+      !productionAuthorizationSession ||
+      !isCurrentProductionAuthorizationRuntimeForSession(runtime, productionAuthorizationSession)
+    )
+      return;
+    const authorizer = runtime.fileBinaryOutboundAuthorizer;
     const resource = this.createWorkspaceResource(workspaceId);
     if (this.isCleanedUp || !authorizer || !resource) return;
-    const canonical = authorizer.canonicalizeFrame(frame);
-    const decoded = canonical ? decodeFileTransferFrame(new Uint8Array(frame)) : null;
+    const capturedFrame = new Uint8Array(frame);
+    const canonical = authorizer.canonicalizeFrame(new Uint8Array(capturedFrame));
+    const decoded = canonical ? decodeFileTransferFrame(capturedFrame) : null;
     if (!canonical || !decoded) return;
 
-    let active = this.activeFileBinaryStreams.get(decoded.requestId);
+    let streams = this.activeFileBinaryStreams.get(source);
+    const existing = streams?.get(decoded.requestId);
+    let active = existing?.phase === "active" ? existing : undefined;
     let stream = active?.stream;
     let emission;
     if (decoded.opcode === FileTransferOpcode.FileBegin) {
-      if (stream) {
-        authorizer.close(stream, "cancel");
-        this.activeFileBinaryStreams.delete(decoded.requestId);
+      if (existing) {
+        if (existing.phase === "active") {
+          authorizer.close(existing.stream, "cancel");
+          this.deleteActiveFileBinaryStream(source, decoded.requestId, existing);
+        }
         return;
       }
+      streams ??= new Map();
+      this.activeFileBinaryStreams.set(source, streams);
+      const opening = Object.freeze({
+        phase: "opening" as const,
+        reservation: Object.freeze(Object.create(null)) as object,
+        workspaceId,
+      });
+      streams.set(decoded.requestId, opening);
       const opened = await authorizer.open({ resource, frame: canonical });
-      if (!opened || this.isCleanedUp) {
+      if (
+        !opened ||
+        this.isCleanedUp ||
+        this.activeFileBinaryStreams.get(source)?.get(decoded.requestId) !== opening
+      ) {
         if (opened) authorizer.close(opened.stream, "session_release");
+        this.deleteActiveFileBinaryStream(source, decoded.requestId, opening);
         return;
       }
       stream = opened.stream;
       emission = opened.emission;
-      this.activeFileBinaryStreams.set(
-        decoded.requestId,
-        Object.freeze({ stream, workspaceId, source }),
-      );
+      active = Object.freeze({ phase: "active" as const, stream, workspaceId });
+      streams.set(decoded.requestId, active);
     } else {
-      if (!stream || active?.workspaceId !== workspaceId || active.source !== source) {
+      if (!stream || active?.workspaceId !== workspaceId) {
         if (stream) authorizer.close(stream, "authorization_failed");
-        this.activeFileBinaryStreams.delete(decoded.requestId);
+        if (active) this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
         return;
       }
       emission = await authorizer.authorizeNext({ stream, frame: canonical });
       if (!emission || this.isCleanedUp) {
         authorizer.close(stream, this.isCleanedUp ? "session_release" : "authorization_failed");
-        this.activeFileBinaryStreams.delete(decoded.requestId);
+        this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
         return;
       }
     }
@@ -8536,17 +8646,17 @@ export class Session {
     const bytes = authorizer.consumeForDelivery(stream, emission);
     if (!bytes) {
       authorizer.close(stream, "authorization_failed");
-      this.activeFileBinaryStreams.delete(decoded.requestId);
+      this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
       return;
     }
     if (decoded.opcode === FileTransferOpcode.FileEnd)
-      this.activeFileBinaryStreams.delete(decoded.requestId);
+      this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
     try {
       const send = this.emitBinaryForFileTransfer(bytes, source);
       await send;
     } catch (error) {
       authorizer.close(stream, "send_failed");
-      this.activeFileBinaryStreams.delete(decoded.requestId);
+      this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
       throw error;
     }
   }
@@ -8576,7 +8686,7 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
-    this.fileBinaryOutboundAuthorizer?.closeAll("session_release");
+    const cleanupErrors: unknown[] = [];
     this.activeFileBinaryStreams.clear();
     // Seal the outbound ingress synchronously, then drain both existing and
     // racing tasks. Tasks queued after the seal observe isCleanedUp and cannot
@@ -8592,7 +8702,11 @@ export class Session {
         ...this.outboundEmissionTasksWithoutRequest,
       ]);
     }
-    const cleanupErrors: unknown[] = [];
+    try {
+      await this.enterpriseAuthorizationRuntime?.release();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     try {
       await this.workspaceFilesSession.dispose();
     } catch (error) {

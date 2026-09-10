@@ -1,10 +1,11 @@
 import { createAgentRequestsStub } from "./test-utils/session-stubs.js";
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve as resolvePath } from "path";
+import { fileURLToPath } from "url";
 import pino from "pino";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import {
   assertPullRequestAutoMergeDisableReady,
@@ -31,8 +32,28 @@ import {
 } from "./session/enterprise-agent-session-context-registry.js";
 import { MemoryAuthorityReceiptState } from "./session/enterprise-authority-receipt-state.js";
 import { StrictOutboundAuthorityVerifier } from "./enterprise/access/authority-receipt-verifier.js";
-import type { FileBinaryOutboundAuthorizer } from "./enterprise/access/file-binary-outbound-authorizer.js";
-import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
+import {
+  createEnterpriseAuthorizationRuntime,
+  isCurrentProductionAuthorizationRuntime,
+} from "./enterprise/access/production-authorization-runtime.js";
+import { createProductionAuditRuntime } from "./enterprise/audit/production-audit-runtime.js";
+import {
+  bindEnterpriseAdmissionSession,
+  createEnterpriseAdmissionAuthorizationIssuer,
+  issueEnterpriseAdmissionEvidence,
+  resolveCurrentEnterpriseAdmissionAuthorization,
+} from "./enterprise/identity/admission-authorization.js";
+import {
+  FileBackedGrantStorage,
+  GrantStore,
+  type GrantVersionSource,
+} from "./enterprise/access/grant-store.js";
+import { OwnerRegistry } from "./enterprise/access/owner-registry.js";
+import {
+  OWNER_PERMISSIONS,
+  SessionAuthorization,
+  type DaemonPermission,
+} from "./authorization/index.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
@@ -351,7 +372,11 @@ interface SessionForTestOptions {
   autoPrincipalGrantVersionGuard?: boolean;
   resourceAuthorization?: SessionOptions["resourceAuthorization"];
   enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
-  fileBinaryOutboundAuthorizer?: SessionOptions["fileBinaryOutboundAuthorizer"];
+  sessionId?: SessionOptions["sessionId"];
+  sessionAuthorization?: SessionOptions["sessionAuthorization"];
+  admissionAuthorizationIssuer?: SessionOptions["admissionAuthorizationIssuer"];
+  admissionAuthorizationHandle?: SessionOptions["admissionAuthorizationHandle"];
+  enterpriseAuthorizationRuntime?: SessionOptions["enterpriseAuthorizationRuntime"];
 }
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
@@ -482,7 +507,11 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       options.resourceAuthorization ??
       (options.enterpriseContext ? ({ canEmit: vi.fn(async () => true) } as never) : undefined),
     enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime,
-    fileBinaryOutboundAuthorizer: options.fileBinaryOutboundAuthorizer,
+    sessionId: options.sessionId,
+    sessionAuthorization: options.sessionAuthorization,
+    admissionAuthorizationIssuer: options.admissionAuthorizationIssuer,
+    admissionAuthorizationHandle: options.admissionAuthorizationHandle,
+    enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime,
   };
   return new Session(sessionOptions);
 }
@@ -514,6 +543,132 @@ function enterpriseContext(
       ...nodeOverrides,
     },
     sessionBindingGeneration: generation,
+  };
+}
+
+class SessionTestGrantVersions implements GrantVersionSource {
+  private value = 1;
+  next(): string {
+    this.value += 1;
+    return `grant-v${this.value}`;
+  }
+}
+
+let binaryAuthorizationRoot = "";
+let binaryAuthorizationAddonPath = "";
+
+beforeAll(() => {
+  if (process.platform !== "darwin") return;
+  binaryAuthorizationRoot = mkdtempSync(join(tmpdir(), "paseo-session-binary-auth-"));
+  binaryAuthorizationAddonPath = join(binaryAuthorizationRoot, "darwin-audit-fs.node");
+  execFileSync(process.execPath, [
+    fileURLToPath(new URL("./enterprise/audit/native/build-darwin-audit-fs.mjs", import.meta.url)),
+    "--output",
+    binaryAuthorizationAddonPath,
+  ]);
+});
+
+afterAll(() => {
+  if (binaryAuthorizationRoot) rmSync(binaryAuthorizationRoot, { recursive: true, force: true });
+});
+
+async function createBinaryAuthorizationFixture(name: string) {
+  if (process.platform !== "darwin") throw new Error("Darwin authorization fixture unavailable");
+  const context = enterpriseContext(`generation-${name}`, {
+    grants: [
+      {
+        action: "workspace.content.read",
+        selector: { kind: "workspace", workspaceIds: ["workspace-1"] },
+      },
+    ],
+  });
+  const audit = await createProductionAuditRuntime({
+    node: context.node,
+    auditRoot: join(binaryAuthorizationRoot, `audit-${name}`),
+    nativeAddonPath: binaryAuthorizationAddonPath,
+  });
+  const storage = new FileBackedGrantStorage(join(binaryAuthorizationRoot, `grants-${name}.json`));
+  await storage.put({
+    principalId: context.principal.principalId,
+    organizationId: context.principal.organizationId,
+    grants: context.principal.grants,
+    grantVersion: context.principal.grantVersion,
+  });
+  const grantStore = new GrantStore(storage, new SessionTestGrantVersions(), audit);
+  const mintSecret = Object.freeze({});
+  const issuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret);
+  const evidence = issueEnterpriseAdmissionEvidence(
+    issuer,
+    mintSecret,
+    context.principal,
+    context.node,
+    { node: context.node, transport: "direct", peer: "loopback" },
+  );
+  if (!evidence) throw new Error("Expected admission evidence");
+  const handle = bindEnterpriseAdmissionSession(issuer, evidence, "client-test");
+  if (!handle) throw new Error("Expected admission handle");
+  const resolved = resolveCurrentEnterpriseAdmissionAuthorization(issuer, handle);
+  if (!resolved) throw new Error("Expected resolved admission handle");
+  const enterpriseSessionContext: EnterpriseSessionContext = {
+    principal: resolved.principal,
+    node: resolved.node,
+    sessionBindingGeneration: resolved.sessionBindingGeneration,
+  };
+  const owners = new OwnerRegistry();
+  owners.registerWorkspace({
+    id: "workspace-1",
+    organizationId: resolved.principal.organizationId,
+    nodeId: resolved.node.nodeId,
+    ownerPrincipalId: resolved.principal.principalId,
+    createdByPrincipalId: resolved.principal.principalId,
+  });
+  const sessionAuthorization = new SessionAuthorization(["workspace.read"]);
+  const sessionId = `session-${name}`;
+  const authorityState = new MemoryAuthorityReceiptState();
+  const runtime = await createEnterpriseAuthorizationRuntime({
+    admissionAuthorizationIssuer: issuer,
+    admissionAuthorizationHandle: handle,
+    grantStore,
+    audit,
+    sessionAuthorization,
+    sessionId,
+    owners,
+    authorityState,
+  });
+  if (!runtime) throw new Error("Expected production authorization runtime");
+  return {
+    audit,
+    issuer,
+    handle,
+    runtime,
+    sessionAuthorization,
+    sessionId,
+    authorityState,
+    enterpriseSessionContext,
+  };
+}
+
+function makeEnterpriseRuntime(
+  cleanup: () => Promise<void>,
+): NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]> {
+  return {
+    stat: vi.fn(),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => ({
+      begin: vi.fn(),
+      beginStaged: vi.fn(),
+      receiveFrame: vi.fn(),
+      cleanup: vi.fn(async () => {}),
+    }),
+    cleanup,
   };
 }
 
@@ -1115,131 +1270,247 @@ test("enterprise runtime construction failure rolls back registered authority bi
   expect(registryRelease).toHaveBeenCalledTimes(1);
 });
 
-test("enterprise binary workspace emission is authorized and consumed per frame", async () => {
-  const binaryMessages: Uint8Array[] = [];
-  const targetedBinaryMessages: Array<{ source: object; frame: Uint8Array }> = [];
-  const deliveryOrder: string[] = [];
-  const close = vi.fn(async () => {});
-  const frameBytes = new WeakMap<object, Uint8Array>();
-  const emissionBytes = new WeakMap<object, Uint8Array>();
-  const stream = Object.freeze(Object.create(null));
-  const canonicalizeFrame = vi.fn((frame: Uint8Array) => {
-    const canonical = Object.freeze(Object.create(null));
-    frameBytes.set(canonical, new Uint8Array(frame));
-    return canonical;
-  });
-  const open = vi.fn(async ({ frame }: { frame: object }) => {
-    const emission = Object.freeze(Object.create(null));
-    emissionBytes.set(emission, frameBytes.get(frame)!);
-    return { stream, emission };
-  });
-  const authorizeNext = vi.fn(async ({ frame }: { frame: object }) => {
-    const emission = Object.freeze(Object.create(null));
-    emissionBytes.set(emission, frameBytes.get(frame)!);
-    return emission;
-  });
-  const consumeForDelivery = vi.fn((_stream: object, emission: object) => {
-    deliveryOrder.push("consume");
-    return emissionBytes.get(emission);
-  });
-  const closeStream = vi.fn(() => true);
-  const closeAll = vi.fn();
-  const fileBinaryOutboundAuthorizer = {
-    canonicalizeFrame,
-    open,
-    authorizeNext,
-    consumeForDelivery,
-    close: closeStream,
-    closeAll,
-  } as unknown as FileBinaryOutboundAuthorizer;
-  const runtime = {
-    stat: vi.fn(),
-    list: vi.fn(),
-    openRead: vi.fn(async () => ({
-      workspaceId: "workspace-1",
-      relativePath: "notes.txt",
-      size: 1,
-      mtimeMs: 0,
-      revision: "r1",
-      read: async () => new Uint8Array([1]),
-      close,
-    })),
-    write: vi.fn(),
-    create: vi.fn(),
-    rename: vi.fn(),
-    copy: vi.fn(),
-    delete: vi.fn(),
-    watch: vi.fn(),
-    issueDownloadToken: vi.fn(),
-    createUploadStore: () => ({
-      begin: vi.fn(),
-      beginStaged: vi.fn(),
-      receiveFrame: vi.fn(),
-      cleanup: vi.fn(async () => {}),
+test("enterprise binary channel rejects construction without production authorization runtime", () => {
+  expect(() =>
+    createSessionForTest({
+      targetedBinaryMessages: [],
+      enterpriseContext: enterpriseContext("generation-binary-runtime-required"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: new MemoryAuthorityReceiptState(),
+      enterpriseWorkspaceFilesRuntime: makeEnterpriseRuntime(async () => {}),
     }),
-    cleanup: vi.fn(async () => {}),
-  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
-  const session = createSessionForTest({
-    binaryMessages,
-    targetedBinaryMessages,
-    enterpriseContext: enterpriseContext("generation-binary-blocked"),
-    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
-    authorityReceiptState: new MemoryAuthorityReceiptState(),
-    enterpriseWorkspaceFilesRuntime: runtime,
-    fileBinaryOutboundAuthorizer,
-    onBinaryMessageToSource: async (source, frame) => {
-      deliveryOrder.push("send");
-      targetedBinaryMessages.push({ source, frame });
-    },
-  });
-  await session.handleMessage(
-    {
-      type: "file_explorer_request",
-      cwd: "ignored",
-      workspaceId: "workspace-1",
-      path: "notes.txt",
-      mode: "file",
-      acceptBinary: true,
-      requestId: "binary-blocked-1",
-    },
-    {},
-  );
-  expect(binaryMessages).toHaveLength(0);
-  expect(targetedBinaryMessages).toHaveLength(3);
-  expect(targetedBinaryMessages.map(({ frame }) => decodeFileTransferFrame(frame)?.opcode)).toEqual(
-    [FileTransferOpcode.FileBegin, FileTransferOpcode.FileChunk, FileTransferOpcode.FileEnd],
-  );
-  expect(canonicalizeFrame).toHaveBeenCalledTimes(3);
-  expect(open).toHaveBeenCalledTimes(1);
-  expect(authorizeNext).toHaveBeenCalledTimes(2);
-  expect(consumeForDelivery).toHaveBeenCalledTimes(3);
-  expect(deliveryOrder).toEqual(["consume", "send", "consume", "send", "consume", "send"]);
-  expect(close).toHaveBeenCalledTimes(1);
-  await session.cleanup();
-  expect(closeAll).toHaveBeenCalledWith("session_release");
+  ).toThrow("Enterprise file binary channel requires production authorization runtime");
 });
 
-function makeEnterpriseRuntime(cleanup: () => Promise<void>) {
-  return {
-    stat: vi.fn(async () => ({ size: 1, mtimeMs: 0, revision: "r1" })),
-    list: vi.fn(),
-    openRead: vi.fn(),
-    write: vi.fn(),
-    create: vi.fn(),
-    rename: vi.fn(),
-    copy: vi.fn(),
-    delete: vi.fn(),
-    watch: vi.fn(),
-    issueDownloadToken: vi.fn(),
-    createUploadStore: () => ({
-      begin: vi.fn(),
-      beginStaged: vi.fn(),
-      receiveFrame: vi.fn(),
-      cleanup: vi.fn(async () => {}),
+test("enterprise Session rejects a structural authorization runtime without touching it", () => {
+  let getCalls = 0;
+  let ownKeysCalls = 0;
+  const structuralRuntime = new Proxy(Object.create(null), {
+    get() {
+      getCalls += 1;
+      throw new Error("runtime getter must not run");
+    },
+    ownKeys() {
+      ownKeysCalls += 1;
+      throw new Error("runtime keys must not run");
+    },
+  });
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-structural-runtime"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: new MemoryAuthorityReceiptState(),
+      sessionId: "session-structural-runtime",
+      sessionAuthorization: new SessionAuthorization(["workspace.read"]),
+      admissionAuthorizationIssuer: Object.freeze(Object.create(null)) as never,
+      admissionAuthorizationHandle: Object.freeze(Object.create(null)) as never,
+      enterpriseAuthorizationRuntime: structuralRuntime as never,
     }),
-    cleanup,
-  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
-}
+  ).toThrow("Enterprise authorization runtime does not match canonical session authority");
+  expect(getCalls).toBe(0);
+  expect(ownKeysCalls).toBe(0);
+});
+
+describe.runIf(process.platform === "darwin")("enterprise production binary authorization", () => {
+  test("authorizes detached frames, reserves concurrent Begin, and isolates sources", async () => {
+    const fixture = await createBinaryAuthorizationFixture("delivery");
+    const targetedBinaryMessages: Array<{ source: object; frame: Uint8Array }> = [];
+    const close = vi.fn(async () => {});
+    const workspaceRuntime = {
+      stat: vi.fn(),
+      list: vi.fn(),
+      openRead: vi.fn(async () => ({
+        workspaceId: "workspace-1",
+        relativePath: "notes.txt",
+        size: 1,
+        mtimeMs: 0,
+        revision: "r1",
+        read: async () => new Uint8Array([1]),
+        close,
+      })),
+      write: vi.fn(),
+      create: vi.fn(),
+      rename: vi.fn(),
+      copy: vi.fn(),
+      delete: vi.fn(),
+      watch: vi.fn(),
+      issueDownloadToken: vi.fn(),
+      createUploadStore: () => ({
+        begin: vi.fn(),
+        beginStaged: vi.fn(),
+        receiveFrame: vi.fn(),
+        cleanup: vi.fn(async () => {}),
+      }),
+      cleanup: vi.fn(async () => {}),
+    } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+    const session = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      targetedBinaryMessages,
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      enterpriseWorkspaceFilesRuntime: workspaceRuntime,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+    await session.handleMessage(
+      {
+        type: "file_explorer_request",
+        cwd: "ignored",
+        workspaceId: "workspace-1",
+        path: "notes.txt",
+        mode: "file",
+        acceptBinary: true,
+        requestId: "binary-authorized-1",
+      },
+      {},
+    );
+    expect(
+      targetedBinaryMessages.map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([
+      FileTransferOpcode.FileBegin,
+      FileTransferOpcode.FileChunk,
+      FileTransferOpcode.FileEnd,
+    ]);
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const binaryInternals = session as unknown as {
+      emitAuthorizedWorkspaceBinary(
+        frame: Uint8Array,
+        workspaceId: string,
+        source?: object,
+      ): Promise<void>;
+      activeFileBinaryStreams: Map<object | undefined, Map<string, unknown>>;
+    };
+    const sourceA = Object.freeze({ id: "source-a" });
+    const sourceB = Object.freeze({ id: "source-b" });
+    const begin = encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId: "shared-request",
+      metadata: {
+        mime: "text/plain",
+        size: 0,
+        encoding: "binary",
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        revision: "revision-shared",
+      },
+    });
+    const end = encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileEnd,
+      requestId: "shared-request",
+    });
+    await Promise.all([
+      binaryInternals.emitAuthorizedWorkspaceBinary(begin, "workspace-1", sourceA),
+      binaryInternals.emitAuthorizedWorkspaceBinary(begin, "workspace-1", sourceB),
+    ]);
+    expect(targetedBinaryMessages).toHaveLength(5);
+    await Promise.all([
+      binaryInternals.emitAuthorizedWorkspaceBinary(end, "workspace-1", sourceA),
+      binaryInternals.emitAuthorizedWorkspaceBinary(end, "workspace-1", sourceB),
+    ]);
+    expect(targetedBinaryMessages).toHaveLength(7);
+
+    const raceSource = Object.freeze({ id: "race-source" });
+    const raceBegin = encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId: "race-request",
+      metadata: {
+        mime: "text/plain",
+        size: 0,
+        encoding: "binary",
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        revision: "revision-race",
+      },
+    });
+    const firstRace = binaryInternals.emitAuthorizedWorkspaceBinary(
+      raceBegin,
+      "workspace-1",
+      raceSource,
+    );
+    raceBegin.fill(0);
+    const secondRace = binaryInternals.emitAuthorizedWorkspaceBinary(
+      encodeFileTransferFrame({
+        opcode: FileTransferOpcode.FileBegin,
+        requestId: "race-request",
+        metadata: {
+          mime: "text/plain",
+          size: 0,
+          encoding: "binary",
+          modifiedAt: "2026-09-10T00:00:00.000Z",
+          revision: "revision-race",
+        },
+      }),
+      "workspace-1",
+      raceSource,
+    );
+    await Promise.all([firstRace, secondRace]);
+    expect(targetedBinaryMessages).toHaveLength(8);
+    await binaryInternals.emitAuthorizedWorkspaceBinary(
+      encodeFileTransferFrame({
+        opcode: FileTransferOpcode.FileEnd,
+        requestId: "race-request",
+      }),
+      "workspace-1",
+      raceSource,
+    );
+    expect(targetedBinaryMessages).toHaveLength(9);
+    expect(binaryInternals.activeFileBinaryStreams.size).toBe(0);
+
+    await session.cleanup();
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
+    await fixture.audit.close();
+  });
+
+  test("rejects a wrong Session identity and leaves construction rollback to the caller", async () => {
+    const fixture = await createBinaryAuthorizationFixture("construction-owner");
+    const common = {
+      clientId: "client-test",
+      permissions: ["workspace.read"] as const,
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    };
+    expect(() => createSessionForTest({ ...common, sessionId: "wrong-session" })).toThrow(
+      "Enterprise authorization runtime does not match canonical session authority",
+    );
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(true);
+
+    const createError = new Error("upload store construction failed");
+    const failingWorkspaceRuntime = {
+      ...makeEnterpriseRuntime(async () => {}),
+      createUploadStore: () => {
+        throw createError;
+      },
+    };
+    expect(() =>
+      createSessionForTest({
+        ...common,
+        sessionId: fixture.sessionId,
+        enterpriseWorkspaceFilesRuntime: failingWorkspaceRuntime,
+      }),
+    ).toThrow("Session construction rollback failed");
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(true);
+    await fixture.runtime.release();
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
+    expect(() => createSessionForTest({ ...common, sessionId: fixture.sessionId })).toThrow(
+      "Enterprise authorization runtime does not match canonical session authority",
+    );
+    await fixture.audit.close();
+  });
+});
 
 test("cleanup waits for workspace runtime before releasing authority", async () => {
   let resolveCleanup!: () => void;
