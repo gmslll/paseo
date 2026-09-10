@@ -873,6 +873,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseRuntime?: EnterpriseAdmissionRuntime;
   private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
   private readonly enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 
   constructor(
     server: HTTPServer,
@@ -923,12 +924,14 @@ export class VoiceAssistantWebSocketServer {
     enterpriseRuntime?: EnterpriseAdmissionRuntime,
     enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider,
     enterpriseDispatcher?: EnterpriseSessionDispatcher,
+    enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"],
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.enterpriseRuntime = enterpriseRuntime;
     this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
     this.enterpriseDispatcher = enterpriseDispatcher;
+    this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -1939,6 +1942,9 @@ export class VoiceAssistantWebSocketServer {
         ? { enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime }
         : {}),
       ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
+      ...(this.enterpriseIdentitySelfAuthorization
+        ? { enterpriseIdentitySelfAuthorization: this.enterpriseIdentitySelfAuthorization }
+        : {}),
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
       permissions: options.permissions,
