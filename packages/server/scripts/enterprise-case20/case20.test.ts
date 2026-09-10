@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -22,7 +22,11 @@ import {
   type Case20RunMeasurements,
 } from "./model.js";
 import { assertCase20PartBProviderPreflight } from "./provider-preflight.js";
-import { isCase20AccessDenial, isUnexpectedCase20ConnectionTerminal } from "./part-a.js";
+import {
+  classifyCase20AgentList,
+  isCase20AccessDenial,
+  isUnexpectedCase20ConnectionTerminal,
+} from "./part-a.js";
 import {
   case20ProviderOptions,
   isCompleteCase20ProviderProbe,
@@ -30,6 +34,7 @@ import {
 } from "./part-b.js";
 import { createCase20Provenance } from "./provenance.js";
 import {
+  captureCase20ImmutableProviderFiles,
   createCase20AllowlistedBaseEnvironment,
   getCase20RealProviderConfig,
   installCase20ProviderParentEnvironment,
@@ -64,14 +69,55 @@ function counts(overrides: Partial<Case20Counts> = {}): Case20Counts {
 
 function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20RunMeasurements {
   const startedAt = "2026-09-11T00:00:00.000Z";
-  const endedAt = "2026-09-11T00:30:00.000Z";
+  const endedAt = overrides.endedAt ?? "2026-09-11T00:30:00.000Z";
+  const measurementEndedAt = overrides.measurementEndedAt ?? endedAt;
+  const clients =
+    overrides.clients ??
+    Array.from({ length: CASE20_PART_A_CLIENT_COUNT }, (_, index) => ({
+      id: `client-${index}`,
+      principalId: `usr_${index.toString(16).padStart(16, "0")}`,
+      connectedAt: startedAt,
+      disconnectedAt: endedAt,
+    }));
+  const resourceSamples =
+    overrides.resourceSamples ??
+    Array.from({ length: 181 }, (_, index) => ({
+      tSec: index * 10,
+      rssMiB: 100,
+      fdCount: 20,
+      swapMiB: 0,
+      eventLoopP99Ms: 10,
+      sessions: 10,
+      sockets: 10,
+      processes: [],
+    }));
+  const part = overrides.part ?? "A";
+  const finalActiveSample =
+    overrides.finalActiveSample ??
+    (resourceSamples.at(-1)
+      ? {
+          at: measurementEndedAt,
+          sample: resourceSamples.at(-1)!,
+          ...(part === "A"
+            ? {
+                principalStreams: clients.map((client) => ({
+                  clientId: client.id,
+                  principalId: client.principalId,
+                  ownedCanaries: 1,
+                  timelineCanaries: 1,
+                })),
+              }
+            : {}),
+        }
+      : undefined);
   return {
     schemaVersion: 1,
     runId: "case20-test",
     startedAt,
     endedAt,
+    measurementEndedAt,
     durationSec: 1_800,
-    part: "A",
+    part,
     mode: "formal",
     provenance: {
       commit: "a".repeat(40),
@@ -86,12 +132,7 @@ function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20Run
       manifestSha256: "b".repeat(64),
       binaries: {},
     },
-    clients: Array.from({ length: CASE20_PART_A_CLIENT_COUNT }, (_, index) => ({
-      id: `client-${index}`,
-      principalId: `usr_${index.toString(16).padStart(16, "0")}`,
-      connectedAt: startedAt,
-      disconnectedAt: endedAt,
-    })),
+    clients,
     counts: counts(),
     feedbackLatencyMs: Array.from({ length: CASE20_PART_A_CLIENT_COUNT }, () => 100),
     rpcLatencyMs: {
@@ -102,16 +143,19 @@ function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20Run
       fetch_agents: [100, 100, 100],
       foreign_fetch_agent_denial: [100, 100, 100],
     },
-    resourceSamples: Array.from({ length: 181 }, (_, index) => ({
-      tSec: index * 10,
-      rssMiB: 100,
-      fdCount: 20,
-      swapMiB: 0,
-      eventLoopP99Ms: 10,
-      sessions: index === 180 ? 0 : 10,
-      sockets: index === 180 ? 0 : 10,
-      processes: [],
-    })),
+    resourceSamples,
+    ...(finalActiveSample ? { finalActiveSample } : {}),
+    ...(part === "A"
+      ? {
+          streamCoverageStartedAt: "2026-09-10T23:59:59.000Z",
+          postCloseResourceSample: {
+            ...resourceSamples.at(-1)!,
+            tSec: (resourceSamples.at(-1)?.tSec ?? 0) + 1,
+            sessions: 0,
+            sockets: 0,
+          },
+        }
+      : {}),
     sampleIntervalMs: 10_000,
     ...overrides,
   };
@@ -145,6 +189,16 @@ describe("Case20 evidence helpers", () => {
             processes: [],
           },
         ],
+        postCloseResourceSample: {
+          tSec: 1_800,
+          rssMiB: 999,
+          fdCount: 999,
+          swapMiB: 999,
+          eventLoopP99Ms: 999,
+          sessions: 1,
+          sockets: 1,
+          processes: [],
+        },
       }),
     );
     expect(failed.failures.map((failure) => failure.code)).toEqual(
@@ -172,6 +226,79 @@ describe("Case20 evidence helpers", () => {
         { tSec: 120, value: 102 },
       ]),
     ).toBe(1);
+  });
+
+  test("averages the two middle Theil-Sen slopes across the release threshold", () => {
+    const slope = theilSenSlopePerMinute([
+      { tSec: 0, value: 100 },
+      { tSec: 60, value: 100 },
+      { tSec: 120, value: 100 },
+      { tSec: 180, value: 107 },
+    ]);
+    expect(slope).toBeCloseTo(7 / 6);
+    expect(slope).toBeGreaterThan(1);
+  });
+
+  test("uses only active samples for duration and resource gates", () => {
+    const summary = buildCase20Summary(
+      measurements({
+        postCloseResourceSample: {
+          tSec: 99_999,
+          rssMiB: 10_000,
+          fdCount: 10_000,
+          swapMiB: 10_000,
+          eventLoopP99Ms: 10_000,
+          sessions: 0,
+          sockets: 0,
+          processes: [],
+        },
+      }),
+    );
+    expect(summary.pass).toBe(true);
+    expect(summary.durationSec).toBe(1_800);
+    expect(summary.resources).toMatchObject({
+      rss: { endMiB: 100, last20MinTheilSenMiBPerMin: 0 },
+      fd: { end: 20, sustainedPositiveSlope: false },
+      swap: { deltaMiB: 0 },
+      eventLoop: { p99Ms: 10 },
+      sessions: { activeEnd: 10, postClose: 0 },
+      sockets: { activeEnd: 10, postClose: 0 },
+    });
+  });
+
+  test("requires final active stream evidence for every Part A principal", () => {
+    const base = measurements();
+    const failed = buildCase20Summary(
+      measurements({
+        finalActiveSample: {
+          ...base.finalActiveSample!,
+          principalStreams: base.finalActiveSample?.principalStreams?.slice(1),
+        },
+      }),
+    );
+    expect(failed.failures.map((entry) => entry.code)).toContain(
+      "final_principal_stream_activity_missing",
+    );
+  });
+
+  test("requires exactly one bounded outcome per counted request", () => {
+    const failed = buildCase20Summary(
+      measurements({ counts: counts({ requests: 1_000, succeeded: 1_001, failed: 0 }) }),
+    );
+    expect(failed.failures.map((entry) => entry.code)).toEqual(
+      expect.arrayContaining(["request_outcome_mismatch", "invalid_business_success_rate"]),
+    );
+    expect(failed.latencyMs.business.successRate).toBe(1);
+  });
+
+  test("requires swap delta to be exactly zero", () => {
+    const active = Array.from(measurements().resourceSamples, (sample, index) => ({
+      ...sample,
+      swapMiB: index === 0 ? 1 : 0,
+    }));
+    const failed = buildCase20Summary(measurements({ resourceSamples: active }));
+    expect(failed.failures.map((entry) => entry.code)).toContain("swap_growth");
+    expect(failed.resources.swap.deltaMiB).toBe(-1);
   });
 
   test("rejects formal evidence from a dirty tracked worktree", () => {
@@ -309,6 +436,26 @@ describe("Case20 evidence helpers", () => {
     ).toThrow("secret-bearing key");
   });
 
+  test("deletes an unfinished run before inventory when the final scan finds a secret", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "case20-artifact-secret-"));
+    temporaryRoots.push(root);
+    const writer = await createCase20ArtifactWriter({ artifactRoot: root, runId: "rejected" });
+    const secret = "case20-private-material-7d3b2a9845f1";
+    await writer.append({
+      type: "client_connected",
+      at: "2026-09-11T00:00:00.000Z",
+      clientId: secret,
+      principalId: createHash("sha256").update(secret).digest("hex"),
+    });
+    await expect(
+      writer.finish(buildCase20Summary(measurements({ runId: "rejected" })), {
+        knownSecrets: [secret],
+      }),
+    ).rejects.toThrow("secret material");
+    await expect(stat(writer.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(writer.close()).resolves.toBeUndefined();
+  });
+
   test("bounds artifact backpressure instead of retaining an unbounded write queue", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "case20-artifact-pressure-"));
     temporaryRoots.push(root);
@@ -378,6 +525,17 @@ describe("Case20 evidence helpers", () => {
     expect(isCase20AccessDenial({ code: "not_found" })).toBe(true);
     expect(isCase20AccessDenial({ code: "internal_error" })).toBe(false);
     expect(isCase20AccessDenial(new Error("socket disconnected"))).toBe(false);
+  });
+
+  test("classifies a missing owned agent as a single failed isolation outcome", () => {
+    expect(classifyCase20AgentList("owned", [])).toEqual({
+      ownedAgentVisible: false,
+      foreignAgentCount: 0,
+    });
+    expect(classifyCase20AgentList("owned", ["owned"])).toEqual({
+      ownedAgentVisible: true,
+      foreignAgentCount: 0,
+    });
   });
 
   test("detects known secrets, fingerprints, JWTs, and bearer material in logs", async () => {
@@ -466,6 +624,24 @@ describe("Case20 evidence helpers", () => {
       isolation.restore();
     }
     expect(process.env.UNRELATED_SECRET).toBe(before);
+  });
+
+  test("verifies only the provider credential and config allowlist", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "case20-provider-allowlist-"));
+    temporaryRoots.push(root);
+    const credentialPath = path.join(root, "auth.json");
+    const configPath = path.join(root, "config.toml");
+    const unrelatedPath = path.join(root, "history.jsonl");
+    await Promise.all([
+      writeFile(credentialPath, "credential", { mode: 0o600 }),
+      writeFile(configPath, "config", { mode: 0o600 }),
+      writeFile(unrelatedPath, "history", { mode: 0o600 }),
+    ]);
+    const verify = await captureCase20ImmutableProviderFiles([credentialPath, configPath]);
+    await writeFile(unrelatedPath, "provider-owned history update", { mode: 0o600 });
+    await expect(verify()).resolves.toBeUndefined();
+    await writeFile(configPath, "changed", { mode: 0o600 });
+    await expect(verify()).rejects.toThrow("original source file");
   });
 
   test("binds provider process identity to PID, start time, and command", () => {

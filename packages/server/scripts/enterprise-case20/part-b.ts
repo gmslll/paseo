@@ -32,6 +32,7 @@ import {
   type Case20ClientRecord,
   type Case20Counts,
   type Case20Failure,
+  type Case20FinalActiveSample,
   type Case20ResourceSample,
   PartBManifestSchema,
   type PartBManifest,
@@ -888,7 +889,7 @@ async function sampleResources(
   eventLoopP99Ms: number,
   state: PartBState,
   observeProcesses: boolean,
-): Promise<void> {
+): Promise<Case20ResourceSample> {
   const sample = await sampleRunnerProcessTree({
     tSec: (Date.now() - startedAtMs) / 1_000,
     eventLoopP99Ms,
@@ -909,6 +910,7 @@ async function sampleResources(
     at: new Date().toISOString(),
     sample: providerSample,
   });
+  return providerSample;
 }
 
 function startResourceSampler(input: {
@@ -975,18 +977,6 @@ function providerBinary(provider: Provider): string {
   return process.env[`PASEO_CASE20_${provider.toUpperCase()}_BINARY`] || provider;
 }
 
-async function scanFinalEvidence(state: PartBState): Promise<void> {
-  const knownSecrets = [...new Set(state.providerRuns.flatMap((run) => run.knownSecrets))];
-  for (const filePath of [
-    state.artifact.rawPath,
-    state.artifact.summaryPath,
-    state.artifact.inventoryPath,
-    ...state.providerRuns.map((run) => run.logPath),
-  ]) {
-    await assertFileContainsNoSecrets({ filePath, knownSecrets });
-  }
-}
-
 // oxlint-disable-next-line complexity -- orchestration reports every independent evidence failure.
 async function runCase20PartBIsolated(
   manifest: PartBManifest,
@@ -1026,6 +1016,7 @@ async function runCase20PartBIsolated(
   eventLoop.enable();
   let measurementStartedAt = runStartedAt;
   let measurementEndedAt: Date | null = null;
+  let finalActiveSample: Case20FinalActiveSample | undefined;
   let primaryError: unknown;
   let stopSampler: (() => Promise<void>) | null = null;
   let providerSessionsClosed = false;
@@ -1114,13 +1105,22 @@ async function runCase20PartBIsolated(
     } finally {
       if (stopSampler) await stopSampler().catch((error) => (primaryError ??= error));
       try {
-        await sampleResources(
+        const sample = await sampleResources(
           measurementStartedAt.getTime(),
           eventLoop.percentile(99) / 1e6,
           state,
           true,
         );
         measurementEndedAt = new Date();
+        finalActiveSample = { at: measurementEndedAt.toISOString(), sample };
+        await artifact.append(
+          {
+            type: "final_active_sample",
+            measurementEndedAt: finalActiveSample.at,
+            ...finalActiveSample,
+          },
+          { durable: true },
+        );
       } catch (error) {
         primaryError ??= error;
         await recordFailure(state, {
@@ -1236,6 +1236,7 @@ async function runCase20PartBIsolated(
       runId: manifest.runId,
       startedAt: measurementStartedAt.toISOString(),
       endedAt: endedAt.toISOString(),
+      measurementEndedAt: endedAt.toISOString(),
       durationSec: (endedAt.getTime() - measurementStartedAt.getTime()) / 1_000,
       part: "B",
       mode: manifest.mode,
@@ -1246,6 +1247,7 @@ async function runCase20PartBIsolated(
       rpcLatencyMs: state.rpcLatencyMs,
       rpcBaselineLatencyMs: state.rpcBaselineLatencyMs,
       resourceSamples: state.resourceSamples,
+      finalActiveSample,
       sampleIntervalMs: RESOURCE_SAMPLE_INTERVAL_MS,
       providerSessionsClosed,
       paidProviderUseAcknowledged: true,
@@ -1257,11 +1259,18 @@ async function runCase20PartBIsolated(
         at: endedAt.toISOString(),
         pass: summary.pass,
       });
-      await artifact.finish(summary);
+      await artifact.finish(summary, {
+        knownSecrets: [
+          ...new Set([
+            ...runnerKnownSecrets,
+            ...state.providerRuns.flatMap((run) => run.knownSecrets),
+          ]),
+        ],
+        evidenceFiles: state.providerRuns.map((run) => run.logPath),
+      });
     } catch (error) {
       primaryError ??= error;
     }
-    await scanFinalEvidence(state).catch((error) => (primaryError ??= error));
     if (primaryError) throw primaryError;
     completedSummary = summary;
   } catch (error) {

@@ -18,6 +18,29 @@ function fingerprints(secrets: readonly string[]): readonly string[] {
     .flatMap((secret) => [secret, createHash("sha256").update(secret).digest("hex")]);
 }
 
+function containsSecret(line: string, needles: readonly string[]): boolean {
+  return (
+    needles.some((needle) => line.includes(needle)) ||
+    GENERIC_SECRET_PATTERNS.some((pattern) => pattern.test(line))
+  );
+}
+
+export function assertTextContainsNoSecrets(input: {
+  readonly text: string;
+  readonly label: string;
+  readonly knownSecrets: readonly string[];
+  readonly startingLine?: number;
+}): void {
+  const needles = fingerprints(input.knownSecrets);
+  for (const [index, line] of input.text.split(/\r?\n/).entries()) {
+    if (containsSecret(line, needles)) {
+      throw new Error(
+        `Case20 secret material detected in ${input.label}:${(input.startingLine ?? 1) + index}`,
+      );
+    }
+  }
+}
+
 export async function assertFileContainsNoSecrets(input: {
   readonly filePath: string;
   readonly knownSecrets: readonly string[];
@@ -30,12 +53,8 @@ export async function assertFileContainsNoSecrets(input: {
   let lineNumber = 0;
   for await (const line of lines) {
     lineNumber += 1;
-    if (
-      needles.some((needle) => line.includes(needle)) ||
-      GENERIC_SECRET_PATTERNS.some((pattern) => pattern.test(line))
-    ) {
+    if (containsSecret(line, needles))
       throw new Error(`Case20 secret material detected in ${input.filePath}:${lineNumber}`);
-    }
   }
 }
 

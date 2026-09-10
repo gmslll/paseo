@@ -4,6 +4,7 @@ import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs
 import path from "node:path";
 
 import type { Case20RawEvent, Case20Summary } from "./model.js";
+import { assertFileContainsNoSecrets, assertTextContainsNoSecrets } from "./secret-scan.js";
 
 const SECRET_KEY = /(token|password|authorization|cookie|secret|credential)/i;
 const CREDENTIAL_VALUE =
@@ -58,7 +59,13 @@ export interface Case20ArtifactWriter {
   readonly summaryPath: string;
   readonly inventoryPath: string;
   append(event: Case20RawEvent, options?: { readonly durable?: boolean }): Promise<void>;
-  finish(summary: Case20Summary): Promise<void>;
+  finish(
+    summary: Case20Summary,
+    options?: {
+      readonly knownSecrets?: readonly string[];
+      readonly evidenceFiles?: readonly string[];
+    },
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -166,27 +173,59 @@ export async function createCase20ArtifactWriter(input: {
     summaryPath,
     inventoryPath,
     append,
-    async finish(summary) {
-      assertSecretFree(summary);
-      await tail;
-      if (writerFailure) throw writerFailure;
-      await handle.sync();
-      await validateCase20RawJsonl(rawPath);
-      await writePrivateJson(summaryPath, summary);
-      const entries = [];
-      for (const name of (await readdir(directory)).sort()) {
-        if (name === path.basename(inventoryPath) || name.endsWith(".tmp")) continue;
-        const filePath = path.join(directory, name);
-        const info = await stat(filePath);
-        if (!info.isFile()) continue;
-        const contents = await readFile(filePath);
-        entries.push({
-          name,
-          size: info.size,
-          sha256: createHash("sha256").update(contents).digest("hex"),
+    async finish(summary, options) {
+      try {
+        assertSecretFree(summary);
+        await tail;
+        if (writerFailure) throw writerFailure;
+        await handle.sync();
+        await validateCase20RawJsonl(rawPath);
+        const knownSecrets = options?.knownSecrets ?? [];
+        assertTextContainsNoSecrets({
+          text: JSON.stringify(summary),
+          label: "summary.json",
+          knownSecrets,
         });
+        const evidenceFiles = new Set([rawPath, ...(options?.evidenceFiles ?? [])]);
+        for (const name of await readdir(directory)) {
+          if (name.endsWith(".tmp")) continue;
+          const filePath = path.join(directory, name);
+          if ((await stat(filePath)).isFile()) evidenceFiles.add(filePath);
+        }
+        for (const filePath of evidenceFiles) {
+          const info = await stat(filePath).catch(() => null);
+          if (info?.isFile()) await assertFileContainsNoSecrets({ filePath, knownSecrets });
+        }
+        await writePrivateJson(summaryPath, summary);
+        const entries = [];
+        for (const name of (await readdir(directory)).sort()) {
+          if (name === path.basename(inventoryPath) || name.endsWith(".tmp")) continue;
+          const filePath = path.join(directory, name);
+          const info = await stat(filePath);
+          if (!info.isFile()) continue;
+          const contents = await readFile(filePath);
+          entries.push({
+            name,
+            size: info.size,
+            sha256: createHash("sha256").update(contents).digest("hex"),
+          });
+        }
+        await writePrivateJson(inventoryPath, { schemaVersion: 1, entries });
+      } catch (error) {
+        const cleanupFailures: unknown[] = [];
+        await close().catch((failure) => cleanupFailures.push(failure));
+        await rm(directory, { recursive: true, force: true }).catch((failure) =>
+          cleanupFailures.push(failure),
+        );
+        if (cleanupFailures.length > 0)
+          // oxlint-disable-next-line preserve-caught-error -- AggregateError retains the rejected artifact error as cause and first member.
+          throw new AggregateError(
+            [error, ...cleanupFailures],
+            "Case20 rejected artifact cleanup failed",
+            { cause: error },
+          );
+        throw error;
       }
-      await writePrivateJson(inventoryPath, { schemaVersion: 1, entries });
     },
     close,
   };

@@ -1,4 +1,3 @@
-import { stat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 
 import { createPaseoApi, type PaseoApi } from "@getpaseo/client";
@@ -15,6 +14,7 @@ import {
   type Case20ClientRecord,
   type Case20Counts,
   type Case20Failure,
+  type Case20FinalActiveSample,
   type Case20ResourceSample,
   PartAManifestSchema,
   type PartAManifest,
@@ -25,7 +25,6 @@ import {
   type Case20PartAFixture,
 } from "./part-a-fixture.js";
 import { createCase20Provenance } from "./provenance.js";
-import { assertFileContainsNoSecrets } from "./secret-scan.js";
 import { buildCase20Summary } from "./summary.js";
 
 interface ConnectionLifecycle {
@@ -55,6 +54,7 @@ interface StreamCounter {
 
 interface CanaryWaiter {
   readonly armedAt: number;
+  readonly expectedCanary: string;
   readonly promise: Promise<number>;
   resolve(): void;
   cancel(): void;
@@ -72,6 +72,10 @@ interface PartAMeasurementState {
   readonly canaryWaiters: Map<string, CanaryWaiter>;
   readonly observedCanaries: Set<string>;
   readonly observedTimelineCanaries: Set<string>;
+  readonly finalCanaries: Map<string, string>;
+  readonly finalAgentCanaries: Set<string>;
+  readonly finalTimelineCanaries: Set<string>;
+  canarySequence: number;
 }
 
 function createCounts(): Case20Counts {
@@ -118,7 +122,11 @@ function streamCounter(state: PartAMeasurementState, clientId: string): StreamCo
   return counter;
 }
 
-function armCanaryWaiter(state: PartAMeasurementState, clientId: string): CanaryWaiter {
+function armCanaryWaiter(
+  state: PartAMeasurementState,
+  clientId: string,
+  expectedCanary: string,
+): CanaryWaiter {
   if (state.canaryWaiters.has(clientId))
     throw new Error(`Canary waiter already armed for ${clientId}`);
   const armedAt = performance.now();
@@ -137,6 +145,7 @@ function armCanaryWaiter(state: PartAMeasurementState, clientId: string): Canary
   }, 2_000);
   const waiter: CanaryWaiter = {
     armedAt,
+    expectedCanary,
     promise,
     resolve() {
       if (settled) return;
@@ -247,7 +256,11 @@ async function connectClient(
     if (ownedAgent && ownedCanary) {
       counter.ownedCanaries += 1;
       state.observedCanaries.add(config.clientId);
-      state.canaryWaiters.get(config.clientId)?.resolve();
+      const waiter = state.canaryWaiters.get(config.clientId);
+      if (waiter && serialized.includes(waiter.expectedCanary)) waiter.resolve();
+      const finalCanary = state.finalCanaries.get(config.clientId);
+      if (finalCanary && serialized.includes(finalCanary))
+        state.finalAgentCanaries.add(config.clientId);
     }
     if (ownedAgent && !foreignCanary) return;
     state.counts.crossPrincipalViolations += 1;
@@ -270,6 +283,9 @@ async function connectClient(
       ) {
         counter.timelineCanaries += 1;
         state.observedTimelineCanaries.add(config.clientId);
+        const finalCanary = state.finalCanaries.get(config.clientId);
+        if (finalCanary && JSON.stringify(message.payload.event).includes(finalCanary))
+          state.finalTimelineCanaries.add(config.clientId);
       }
     });
     await releaseTimeline.ready;
@@ -417,13 +433,23 @@ export function isCase20AccessDenial(error: unknown): boolean {
   return code === "access_denied" || code === "not_found";
 }
 
+export function classifyCase20AgentList(
+  ownedAgentId: string,
+  ids: readonly string[],
+): { readonly ownedAgentVisible: boolean; readonly foreignAgentCount: number } {
+  return {
+    ownedAgentVisible: ids.includes(ownedAgentId),
+    foreignAgentCount: ids.filter((id) => id !== ownedAgentId).length,
+  };
+}
+
 function recordIsolation(
   client: ConnectedClient,
   ids: readonly string[],
   state: PartAMeasurementState,
-): void {
-  if (!ids.includes(client.config.agentId)) {
-    state.counts.failed += 1;
+): boolean {
+  const result = classifyCase20AgentList(client.config.agentId, ids);
+  if (!result.ownedAgentVisible) {
     recordDurableFailure(state, {
       code: "owned_agent_missing",
       metric: "agent.list",
@@ -432,16 +458,17 @@ function recordIsolation(
       evidenceRef: "raw.jsonl",
     });
   }
-  const foreign = ids.filter((id) => id !== client.config.agentId);
-  if (foreign.length === 0) return;
-  state.counts.crossPrincipalViolations += foreign.length;
-  recordDurableFailure(state, {
-    code: "cross_principal_agent_visible",
-    metric: "agent.list.foreign",
-    observed: foreign.length,
-    threshold: 0,
-    evidenceRef: "raw.jsonl",
-  });
+  if (result.foreignAgentCount > 0) {
+    state.counts.crossPrincipalViolations += result.foreignAgentCount;
+    recordDurableFailure(state, {
+      code: "cross_principal_agent_visible",
+      metric: "agent.list.foreign",
+      observed: result.foreignAgentCount,
+      threshold: 0,
+      evidenceRef: "raw.jsonl",
+    });
+  }
+  return result.ownedAgentVisible && result.foreignAgentCount === 0;
 }
 
 async function runBaseline(
@@ -451,9 +478,56 @@ async function runBaseline(
 ): Promise<void> {
   for (let iteration = 0; iteration < 5; iteration += 1) {
     const ids = await measureAgentList(client, state, true);
-    recordIsolation(client, ids, state);
+    if (!recordIsolation(client, ids, state))
+      throw new Error(`Case20 baseline isolation failed for ${client.config.clientId}`);
     if (!(await measureWrongRoute(client, foreignAgentId, state, true)))
       throw new Error(`Case20 baseline did not deny a foreign agent for ${client.config.clientId}`);
+  }
+}
+
+function nextCanary(connected: ConnectedClient, state: PartAMeasurementState): string {
+  state.canarySequence += 1;
+  return `${connected.config.streamCanary}:${state.canarySequence}`;
+}
+
+async function sendOwnedCanary(
+  connected: ConnectedClient,
+  state: PartAMeasurementState,
+  expectedCanary = nextCanary(connected, state),
+): Promise<void> {
+  state.counts.requests += 1;
+  const waiter = armCanaryWaiter(state, connected.config.clientId, expectedCanary);
+  const canary = waiter.promise;
+  void canary.catch(() => undefined);
+  const started = performance.now();
+  let ok = false;
+  try {
+    await connected.client.agents.ref(connected.config.agentId).send(expectedCanary);
+    const latency = await canary;
+    state.feedbackLatencyMs.push(latency);
+    await state.artifact.append({
+      type: "feedback",
+      at: new Date().toISOString(),
+      clientId: connected.config.clientId,
+      durationMs: latency,
+      thresholdMs: 2_000,
+    });
+    state.counts.succeeded += 1;
+    ok = true;
+  } catch (error) {
+    waiter.cancel();
+    state.counts.failed += 1;
+    throw error;
+  } finally {
+    await state.artifact.append({
+      type: "rpc",
+      at: new Date().toISOString(),
+      clientId: connected.config.clientId,
+      name: "send_agent_message",
+      durationMs: performance.now() - started,
+      ok,
+      baseline: false,
+    });
   }
 }
 
@@ -461,46 +535,7 @@ async function startConversations(
   clients: readonly ConnectedClient[],
   state: PartAMeasurementState,
 ): Promise<void> {
-  await Promise.all(
-    clients.map(async (connected) => {
-      state.counts.requests += 1;
-      const waiter = armCanaryWaiter(state, connected.config.clientId);
-      const canary = waiter.promise;
-      void canary.catch(() => undefined);
-      const started = performance.now();
-      let ok = false;
-      try {
-        await connected.client.agents
-          .ref(connected.config.agentId)
-          .send(connected.config.streamCanary);
-        const firstCanaryLatency = await canary;
-        state.feedbackLatencyMs.push(firstCanaryLatency);
-        await state.artifact.append({
-          type: "feedback",
-          at: new Date().toISOString(),
-          clientId: connected.config.clientId,
-          durationMs: firstCanaryLatency,
-          thresholdMs: 2_000,
-        });
-        state.counts.succeeded += 1;
-        ok = true;
-      } catch (error) {
-        waiter.cancel();
-        state.counts.failed += 1;
-        throw error;
-      } finally {
-        await state.artifact.append({
-          type: "rpc",
-          at: new Date().toISOString(),
-          clientId: connected.config.clientId,
-          name: "send_agent_message",
-          durationMs: performance.now() - started,
-          ok,
-          baseline: false,
-        });
-      }
-    }),
-  );
+  await Promise.all(clients.map((connected) => sendOwnedCanary(connected, state)));
 }
 
 async function runWorkloadCycle(
@@ -514,28 +549,34 @@ async function runWorkloadCycle(
       state.counts.requests += 1;
       try {
         const ids = await measureAgentList(connected, state, false);
-        recordIsolation(connected, ids, state);
-        state.counts.succeeded += 1;
+        if (recordIsolation(connected, ids, state)) state.counts.succeeded += 1;
+        else state.counts.failed += 1;
       } catch (error) {
         state.counts.failed += 1;
         throw error;
       }
-      state.counts.requests += 1;
       const neighbour = clients[(index + 1) % clients.length];
       if (!neighbour) throw new Error("Case20 neighbour client missing");
-      if (await measureWrongRoute(connected, neighbour.config.agentId, state, false)) {
-        state.counts.succeeded += 1;
-      } else {
+      state.counts.requests += 1;
+      try {
+        if (await measureWrongRoute(connected, neighbour.config.agentId, state, false)) {
+          state.counts.succeeded += 1;
+        } else {
+          state.counts.failed += 1;
+          state.counts.wrongRouteViolations += 1;
+          recordDurableFailure(state, {
+            code: "foreign_route_not_denied",
+            metric: "foreign_fetch_agent_denial",
+            observed: connected.config.clientId,
+            threshold: "access_denied or not_found",
+            evidenceRef: "raw.jsonl",
+          });
+        }
+      } catch (error) {
         state.counts.failed += 1;
-        state.counts.wrongRouteViolations += 1;
-        recordDurableFailure(state, {
-          code: "foreign_route_not_denied",
-          metric: "foreign_fetch_agent_denial",
-          observed: connected.config.clientId,
-          threshold: "access_denied or not_found",
-          evidenceRef: "raw.jsonl",
-        });
+        throw error;
       }
+      await sendOwnedCanary(connected, state);
     }),
   );
 }
@@ -594,6 +635,63 @@ async function waitForClosedSessions(
   return last;
 }
 
+async function captureFinalActiveSample(input: {
+  readonly fixture: Case20PartAFixture;
+  readonly clients: readonly ConnectedClient[];
+  readonly state: PartAMeasurementState;
+  readonly startedAtMs: number;
+}): Promise<Case20FinalActiveSample> {
+  await flushStreamAggregates(input.state);
+  for (const client of input.clients) {
+    const canary = nextCanary(client, input.state);
+    input.state.finalCanaries.set(client.config.clientId, canary);
+  }
+  await Promise.all(
+    input.clients.map((client) => {
+      const canary = input.state.finalCanaries.get(client.config.clientId);
+      if (!canary) throw new Error(`Case20 final canary missing for ${client.config.clientId}`);
+      return sendOwnedCanary(client, input.state, canary);
+    }),
+  );
+  const streamDeadline = Date.now() + 2_000;
+  while (
+    Date.now() < streamDeadline &&
+    input.clients.some(
+      (client) =>
+        !input.state.finalAgentCanaries.has(client.config.clientId) ||
+        !input.state.finalTimelineCanaries.has(client.config.clientId),
+    )
+  )
+    await sleep(10);
+  const sample = await sampleDaemonResources({
+    daemonPid: input.fixture.daemonPid,
+    daemonLogPath: input.fixture.daemonLogPath,
+    tSec: (Date.now() - input.startedAtMs) / 1_000,
+  });
+  input.state.resourceSamples.push(sample);
+  const finalActive: Case20FinalActiveSample = {
+    at: new Date().toISOString(),
+    sample,
+    principalStreams: input.clients.map((client) => ({
+      clientId: client.config.clientId,
+      principalId: client.config.principalId,
+      ownedCanaries: input.state.finalAgentCanaries.has(client.config.clientId) ? 1 : 0,
+      timelineCanaries: input.state.finalTimelineCanaries.has(client.config.clientId) ? 1 : 0,
+    })),
+  };
+  await input.state.artifact.append({ type: "resource", at: finalActive.at, sample });
+  await input.state.artifact.append(
+    {
+      type: "final_active_sample",
+      measurementEndedAt: finalActive.at,
+      ...finalActive,
+    },
+    { durable: true },
+  );
+  await flushStreamAggregates(input.state);
+  return finalActive;
+}
+
 async function runMeasuredWorkload(input: {
   readonly manifest: PartAManifest;
   readonly fixture: Case20PartAFixture;
@@ -649,6 +747,10 @@ export async function runCase20PartA(manifest: PartAManifest) {
     canaryWaiters: new Map(),
     observedCanaries: new Set(),
     observedTimelineCanaries: new Set(),
+    finalCanaries: new Map(),
+    finalAgentCanaries: new Set(),
+    finalTimelineCanaries: new Set(),
+    canarySequence: 0,
   };
   const runStartedAt = new Date();
   const daemonLogPath = `${artifact.directory}/daemon.log`;
@@ -656,6 +758,10 @@ export async function runCase20PartA(manifest: PartAManifest) {
   let fixture: Case20PartAFixture | null = null;
   let clients: ConnectedClient[] = [];
   let measurementStartedAt = runStartedAt;
+  let measurementEndedAt: Date | null = null;
+  let streamCoverageStartedAt: Date | null = null;
+  let finalActiveSample: Case20FinalActiveSample | undefined;
+  let postCloseResourceSample: Case20ResourceSample | undefined;
   let primaryError: unknown;
   let runFailure: unknown;
   let artifactCloseFailure: unknown;
@@ -675,9 +781,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
         childLogPath,
         mode: manifest.mode,
       });
-      const warmup = await waitForInitialMetrics(fixture);
-      state.resourceSamples.push(warmup);
-      await artifact.append({ type: "resource", at: new Date().toISOString(), sample: warmup });
+      await waitForInitialMetrics(fixture);
       const firstConfig = fixture.clients[0];
       const foreignConfig = fixture.clients[1];
       if (!firstConfig || !foreignConfig) throw new Error("Case20 Part A fixture is incomplete");
@@ -694,6 +798,15 @@ export async function runCase20PartA(manifest: PartAManifest) {
           principalId: client.config.principalId,
         });
       }
+      streamCoverageStartedAt = new Date();
+      await artifact.append(
+        {
+          type: "stream_coverage_started",
+          at: streamCoverageStartedAt.toISOString(),
+          clients: clients.length,
+        },
+        { durable: true },
+      );
       await startConversations(clients, state);
       measurementStartedAt = new Date();
       await runMeasuredWorkload({
@@ -703,6 +816,13 @@ export async function runCase20PartA(manifest: PartAManifest) {
         state,
         startedAtMs: measurementStartedAt.getTime(),
       });
+      finalActiveSample = await captureFinalActiveSample({
+        fixture,
+        clients,
+        state,
+        startedAtMs: measurementStartedAt.getTime(),
+      });
+      measurementEndedAt = new Date(finalActiveSample.at);
     } catch (error) {
       primaryError = error;
       recordDurableFailure(state, {
@@ -713,6 +833,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
         evidenceRef: "raw.jsonl",
       });
     } finally {
+      measurementEndedAt ??= new Date();
       const disconnectedAt = new Date().toISOString();
       for (const waiter of state.canaryWaiters.values()) waiter.cancel();
       for (const client of clients) {
@@ -784,12 +905,14 @@ export async function runCase20PartA(manifest: PartAManifest) {
       }
       if (fixture) {
         try {
-          const finalSample = await waitForClosedSessions(fixture, measurementStartedAt.getTime());
-          state.resourceSamples.push(finalSample);
+          postCloseResourceSample = await waitForClosedSessions(
+            fixture,
+            measurementStartedAt.getTime(),
+          );
           await artifact.append({
-            type: "resource",
+            type: "post_close_resource",
             at: new Date().toISOString(),
-            sample: finalSample,
+            sample: postCloseResourceSample,
           });
         } catch (error) {
           primaryError ??= error;
@@ -818,27 +941,21 @@ export async function runCase20PartA(manifest: PartAManifest) {
           () => 1,
         );
       }
-      const knownSecrets = fixture?.clients.map((client) => client.personalAccessToken) ?? [];
-      for (const filePath of [childLogPath, daemonLogPath]) {
-        if (!(await stat(filePath).catch(() => null))?.isFile()) continue;
-        await assertFileContainsNoSecrets({ filePath, knownSecrets }).catch((error) => {
-          primaryError ??= error;
-          state.counts.auditErrors += 1;
-        });
-      }
     }
-    const endedAt = new Date();
+    const cleanupEndedAt = new Date();
+    const endedAt = measurementEndedAt ?? cleanupEndedAt;
     const clientRecords: Case20ClientRecord[] = clients.map((client) => ({
       id: client.config.clientId,
       principalId: client.config.principalId,
       connectedAt: client.connectedAt,
-      disconnectedAt: endedAt.toISOString(),
+      disconnectedAt: cleanupEndedAt.toISOString(),
     }));
     const summary = buildCase20Summary({
       schemaVersion: 1,
       runId: manifest.runId,
       startedAt: measurementStartedAt.toISOString(),
       endedAt: endedAt.toISOString(),
+      measurementEndedAt: endedAt.toISOString(),
       durationSec: (endedAt.getTime() - measurementStartedAt.getTime()) / 1_000,
       part: "A",
       mode: manifest.mode,
@@ -849,14 +966,20 @@ export async function runCase20PartA(manifest: PartAManifest) {
       rpcLatencyMs: state.rpcLatencyMs,
       rpcBaselineLatencyMs: state.rpcBaselineLatencyMs,
       resourceSamples: state.resourceSamples,
+      finalActiveSample,
+      postCloseResourceSample,
+      ...(streamCoverageStartedAt
+        ? { streamCoverageStartedAt: streamCoverageStartedAt.toISOString() }
+        : {}),
       sampleIntervalMs: manifest.sampleIntervalMs,
       evidenceFailures: state.evidenceFailures,
     });
     await artifact.append({ type: "run_finished", at: endedAt.toISOString(), pass: summary.pass });
-    await artifact.finish(summary);
     const knownSecrets = fixture?.clients.map((client) => client.personalAccessToken) ?? [];
-    for (const filePath of [artifact.rawPath, artifact.summaryPath, artifact.inventoryPath])
-      await assertFileContainsNoSecrets({ filePath, knownSecrets });
+    await artifact.finish(summary, {
+      knownSecrets,
+      evidenceFiles: [childLogPath, daemonLogPath],
+    });
     if (primaryError) throw primaryError;
     completedSummary = summary;
   } catch (error) {

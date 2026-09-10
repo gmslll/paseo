@@ -31,6 +31,15 @@ function distribution(values: readonly number[]): Distribution {
   };
 }
 
+function median(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const right = Math.floor(sorted.length / 2);
+  const rightValue = sorted[right] ?? 0;
+  if (sorted.length % 2 === 1) return rightValue;
+  return ((sorted[right - 1] ?? 0) + rightValue) / 2;
+}
+
 export function theilSenSlopePerMinute(
   samples: readonly { readonly tSec: number; readonly value: number }[],
 ): number {
@@ -42,7 +51,7 @@ export function theilSenSlopePerMinute(
         slopes.push((samples[right].value - samples[left].value) / elapsedMinutes);
     }
   }
-  return percentile(slopes, 0.5);
+  return median(slopes);
 }
 
 function failure(
@@ -144,7 +153,10 @@ function activeTail(samples: readonly Case20ResourceSample[]): readonly Case20Re
   return samples.filter((sample) => sample.tSec >= end - 20 * 60);
 }
 
-function buildResourceSummary(samples: readonly Case20ResourceSample[]) {
+function buildResourceSummary(
+  samples: readonly Case20ResourceSample[],
+  postClose: Case20ResourceSample | undefined,
+) {
   const first = samples[0] ?? {
     tSec: 0,
     rssMiB: 0,
@@ -186,10 +198,154 @@ function buildResourceSummary(samples: readonly Case20ResourceSample[]) {
     eventLoop: {
       p99Ms: samples.length === 0 ? 0 : Math.max(...samples.map((sample) => sample.eventLoopP99Ms)),
     },
-    sessions: { warmup: first.sessions, end: last.sessions },
-    sockets: { warmup: first.sockets, end: last.sockets },
+    sessions: {
+      warmup: first.sessions,
+      activeEnd: last.sessions,
+      postClose: postClose?.sessions ?? null,
+    },
+    sockets: {
+      warmup: first.sockets,
+      activeEnd: last.sockets,
+      postClose: postClose?.sockets ?? null,
+    },
     providerSessionsClosed: null,
   } as const;
+}
+
+function addMeasurementBoundaryFailures(
+  failures: Case20Failure[],
+  measurements: Case20RunMeasurements,
+): void {
+  const startedAtMs = Date.parse(measurements.startedAt);
+  const measurementEndedAtMs = Date.parse(measurements.measurementEndedAt);
+  const measuredDurationSec = (measurementEndedAtMs - startedAtMs) / 1_000;
+  if (
+    !Number.isFinite(measuredDurationSec) ||
+    Math.abs(measuredDurationSec - measurements.durationSec) > 0.001
+  ) {
+    failures.push(
+      failure(
+        "measurement_duration_mismatch",
+        "measurementEndedAt",
+        Number.isFinite(measuredDurationSec) ? measuredDurationSec : "invalid timestamp",
+        measurements.durationSec,
+        "raw.jsonl",
+      ),
+    );
+  }
+  if (measurements.endedAt !== measurements.measurementEndedAt) {
+    failures.push(
+      failure(
+        "measurement_end_mismatch",
+        "endedAt",
+        measurements.endedAt,
+        measurements.measurementEndedAt,
+        "summary.json",
+      ),
+    );
+  }
+  const finalActive = measurements.finalActiveSample;
+  const lastActive = measurements.resourceSamples.at(-1);
+  if (!finalActive || !lastActive) {
+    failures.push(
+      failure(
+        "final_active_sample_missing",
+        "finalActiveSample",
+        "missing",
+        "captured before teardown",
+        "raw.jsonl",
+      ),
+    );
+  } else {
+    if (finalActive.at !== measurements.measurementEndedAt)
+      failures.push(
+        failure(
+          "final_active_sample_time_mismatch",
+          "finalActiveSample.at",
+          finalActive.at,
+          measurements.measurementEndedAt,
+          "raw.jsonl",
+        ),
+      );
+    if (JSON.stringify(finalActive.sample) !== JSON.stringify(lastActive))
+      failures.push(
+        failure(
+          "final_active_sample_not_last",
+          "finalActiveSample.sample",
+          finalActive.sample.tSec,
+          lastActive.tSec,
+          "raw.jsonl",
+        ),
+      );
+  }
+  if (measurements.part !== "A") return;
+  const coverageStartedAtMs = Date.parse(measurements.streamCoverageStartedAt ?? "");
+  if (!Number.isFinite(coverageStartedAtMs) || coverageStartedAtMs > startedAtMs)
+    failures.push(
+      failure(
+        "stream_setup_coverage_missing",
+        "streamCoverageStartedAt",
+        measurements.streamCoverageStartedAt ?? "missing",
+        `<=${measurements.startedAt}`,
+        "raw.jsonl",
+      ),
+    );
+  const expected = new Map(
+    measurements.clients.map((client) => [client.id, client.principalId] as const),
+  );
+  const activities = finalActive?.principalStreams ?? [];
+  const observed = new Map(activities.map((activity) => [activity.clientId, activity] as const));
+  const everyPrincipalActive =
+    activities.length === expected.size &&
+    observed.size === expected.size &&
+    [...expected].every(([clientId, principalId]) => {
+      const activity = observed.get(clientId);
+      return (
+        activity?.principalId === principalId &&
+        activity.ownedCanaries > 0 &&
+        activity.timelineCanaries > 0
+      );
+    });
+  if (!everyPrincipalActive)
+    failures.push(
+      failure(
+        "final_principal_stream_activity_missing",
+        "finalActiveSample.principalStreams",
+        activities.filter((activity) => activity.ownedCanaries > 0 && activity.timelineCanaries > 0)
+          .length,
+        expected.size,
+        "raw.jsonl",
+      ),
+    );
+}
+
+function businessSuccessRate(
+  failures: Case20Failure[],
+  counts: Case20RunMeasurements["counts"],
+): number {
+  const outcomes = counts.succeeded + counts.failed;
+  if (outcomes !== counts.requests)
+    failures.push(
+      failure(
+        "request_outcome_mismatch",
+        "counts.succeeded+counts.failed",
+        outcomes,
+        counts.requests,
+        "raw.jsonl",
+      ),
+    );
+  const rawRate = counts.requests === 0 ? 0 : counts.succeeded / counts.requests;
+  if (!Number.isFinite(rawRate) || rawRate < 0 || rawRate > 1)
+    failures.push(
+      failure(
+        "invalid_business_success_rate",
+        "latencyMs.business.successRate",
+        Number.isFinite(rawRate) ? rawRate : "non-finite",
+        "0..1",
+        "raw.jsonl",
+      ),
+    );
+  return Math.min(1, Math.max(0, Number.isFinite(rawRate) ? rawRate : 0));
 }
 
 function addSamplingFailures(failures: Case20Failure[], measurements: Case20RunMeasurements): void {
@@ -298,10 +454,8 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
   }
   addProvenanceFailures(failures, measurements);
   addEqualityFailures(failures, measurements.counts);
-  const successRate =
-    measurements.counts.requests === 0
-      ? 0
-      : measurements.counts.succeeded / measurements.counts.requests;
+  addMeasurementBoundaryFailures(failures, measurements);
+  const successRate = businessSuccessRate(failures, measurements.counts);
   if (successRate < CASE20_THRESHOLDS.businessSuccessRate) {
     failures.push(
       failure(
@@ -423,7 +577,10 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
       );
     }
   }
-  const resourcesBase = buildResourceSummary(measurements.resourceSamples);
+  const resourcesBase = buildResourceSummary(
+    measurements.resourceSamples,
+    measurements.postCloseResourceSample,
+  );
   const resources = {
     ...resourcesBase,
     providerSessionsClosed: measurements.providerSessionsClosed ?? null,
@@ -457,7 +614,7 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
     failures.push(
       failure("fd_slope", "resources.fd.sustainedPositiveSlope", "true", "false", "raw.jsonl"),
     );
-  if (resources.swap.deltaMiB > CASE20_THRESHOLDS.swapDeltaMiB)
+  if (resources.swap.deltaMiB !== CASE20_THRESHOLDS.swapDeltaMiB)
     failures.push(
       failure(
         "swap_growth",
@@ -477,22 +634,22 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
         "raw.jsonl",
       ),
     );
-  if (measurements.part === "A" && resources.sessions.end !== CASE20_THRESHOLDS.endSessions)
+  if (measurements.part === "A" && resources.sessions.postClose !== CASE20_THRESHOLDS.endSessions)
     failures.push(
       failure(
         "sessions_not_closed",
-        "resources.sessions.end",
-        String(resources.sessions.end),
+        "resources.sessions.postClose",
+        String(resources.sessions.postClose),
         CASE20_THRESHOLDS.endSessions,
         "raw.jsonl",
       ),
     );
-  if (measurements.part === "A" && resources.sockets.end !== 0)
+  if (measurements.part === "A" && resources.sockets.postClose !== 0)
     failures.push(
       failure(
         "sockets_not_closed",
-        "resources.sockets.end",
-        String(resources.sockets.end),
+        "resources.sockets.postClose",
+        String(resources.sockets.postClose),
         0,
         "raw.jsonl",
       ),
@@ -512,6 +669,7 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
     runId: measurements.runId,
     startedAt: measurements.startedAt,
     endedAt: measurements.endedAt,
+    measurementEndedAt: measurements.measurementEndedAt,
     durationSec: measurements.durationSec,
     part: measurements.part,
     mode: measurements.mode,
@@ -522,6 +680,15 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
     provenance: measurements.provenance,
     clients: measurements.clients,
     counts: measurements.counts,
+    ...(measurements.finalActiveSample
+      ? { finalActiveSample: measurements.finalActiveSample }
+      : {}),
+    ...(measurements.postCloseResourceSample
+      ? { postCloseResourceSample: measurements.postCloseResourceSample }
+      : {}),
+    ...(measurements.streamCoverageStartedAt
+      ? { streamCoverageStartedAt: measurements.streamCoverageStartedAt }
+      : {}),
     latencyMs: { feedback, rpc, business: { successRate } },
     resources,
     thresholds: CASE20_THRESHOLDS,

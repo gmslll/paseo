@@ -8,7 +8,6 @@ import {
   mkdtemp,
   readFile,
   readdir,
-  readlink,
   rm,
   stat,
   writeFile,
@@ -171,40 +170,11 @@ async function assertSnapshotsUnchanged(before: readonly FileSnapshot[]): Promis
   }
 }
 
-async function treeFingerprint(root: string): Promise<string> {
-  const hash = createHash("sha256");
-  const visit = async (current: string, relative: string): Promise<void> => {
-    const info = await lstat(current).catch(() => null);
-    if (!info) {
-      hash.update(`${relative}\0absent\n`);
-      return;
-    }
-    const mode = info.mode & 0o777;
-    if (info.isSymbolicLink()) {
-      hash.update(`${relative}\0symlink\0${mode}\0${await readlink(current)}\n`);
-      return;
-    }
-    if (info.isDirectory()) {
-      hash.update(`${relative}\0directory\0${mode}\n`);
-      for (const entry of (await readdir(current)).sort())
-        await visit(path.join(current, entry), path.join(relative, entry));
-      return;
-    }
-    if (info.isFile()) {
-      hash.update(`${relative}\0file\0${mode}\0${info.size}\0`);
-      hash.update(await readFile(current));
-      hash.update("\n");
-      return;
-    }
-    hash.update(`${relative}\0special\0${mode}\n`);
-  };
-  await visit(root, ".");
-  return hash.digest("hex");
-}
-
-async function assertTreeUnchanged(root: string, expected: string): Promise<void> {
-  if ((await treeFingerprint(root)) !== expected)
-    throw new Error(`Case20 provider changed its original home: ${root}`);
+export async function captureCase20ImmutableProviderFiles(
+  filePaths: readonly string[],
+): Promise<() => Promise<void>> {
+  const snapshots = await Promise.all([...new Set(filePaths)].map(fileSnapshot));
+  return async () => await assertSnapshotsUnchanged(snapshots);
 }
 
 async function regularFiles(root: string): Promise<readonly string[]> {
@@ -295,9 +265,9 @@ async function prepareCodexHome(
   const originalRoot = path.join(PROVIDER_SOURCE_HOME, ".codex");
   const authSource = path.join(originalRoot, "auth.json");
   const configSource = path.join(originalRoot, "config.toml");
-  const originals = await Promise.all([fileSnapshot(authSource), fileSnapshot(configSource)]);
-  const originalTree = await treeFingerprint(originalRoot);
-  if (!originals[0]?.exists) throw new Error("Case20 Codex preflight requires ~/.codex/auth.json");
+  const verifyOriginals = await captureCase20ImmutableProviderFiles([authSource, configSource]);
+  if (!(await fileSnapshot(authSource)).exists)
+    throw new Error("Case20 Codex preflight requires ~/.codex/auth.json");
   const knownSecrets = [
     ...(await readKnownSecretsFromJson(authSource)),
     ...environmentSecrets(/(?:OPENAI|CODEX|OPENROUTER)/i),
@@ -332,11 +302,7 @@ async function prepareCodexHome(
       root,
       authPath,
       knownSecrets,
-      verifyOriginals: async () =>
-        await Promise.all([
-          assertSnapshotsUnchanged(originals),
-          assertTreeUnchanged(originalRoot, originalTree),
-        ]).then(() => undefined),
+      verifyOriginals,
     });
     if (cleanupFailures.length > 0)
       // oxlint-disable-next-line preserve-caught-error -- AggregateError retains the setup error as its cause and first member.
@@ -371,10 +337,7 @@ async function prepareCodexHome(
         failures.push(error);
       }
       try {
-        await Promise.all([
-          assertSnapshotsUnchanged(originals),
-          assertTreeUnchanged(originalRoot, originalTree),
-        ]);
+        await verifyOriginals();
       } catch (error) {
         failures.push(error);
       }
@@ -437,11 +400,10 @@ async function prepareClaudeHome(
   additionalKnownSecrets: readonly string[],
 ): Promise<PreparedProviderHome> {
   const claudeRoot = path.join(PROVIDER_SOURCE_HOME, ".claude");
-  const originals = await Promise.all([
-    fileSnapshot(path.join(PROVIDER_SOURCE_HOME, ".claude.json")),
-    fileSnapshot(path.join(claudeRoot, "settings.json")),
+  const verifyOriginals = await captureCase20ImmutableProviderFiles([
+    path.join(PROVIDER_SOURCE_HOME, ".claude.json"),
+    path.join(claudeRoot, "settings.json"),
   ]);
-  const originalTree = await treeFingerprint(claudeRoot);
   const credentialSource = await claudeCredentialContents();
   const knownSecrets = [
     ...readKnownSecretsFromJsonContents(credentialSource.contents.toString("utf8")),
@@ -479,11 +441,7 @@ async function prepareClaudeHome(
       authPath,
       knownSecrets,
       verifyOriginals: async () =>
-        await Promise.all([
-          assertSnapshotsUnchanged(originals),
-          assertTreeUnchanged(claudeRoot, originalTree),
-          credentialSource.verify(),
-        ]).then(() => undefined),
+        await Promise.all([verifyOriginals(), credentialSource.verify()]).then(() => undefined),
     });
     if (cleanupFailures.length > 0)
       // oxlint-disable-next-line preserve-caught-error -- AggregateError retains the setup error as its cause and first member.
@@ -518,11 +476,7 @@ async function prepareClaudeHome(
         failures.push(error);
       }
       try {
-        await Promise.all([
-          assertSnapshotsUnchanged(originals),
-          assertTreeUnchanged(claudeRoot, originalTree),
-          credentialSource.verify(),
-        ]);
+        await Promise.all([verifyOriginals(), credentialSource.verify()]);
       } catch (error) {
         failures.push(error);
       }

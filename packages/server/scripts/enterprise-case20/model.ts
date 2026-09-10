@@ -118,6 +118,19 @@ export interface Case20ResourceSample {
   }[];
 }
 
+export interface Case20PrincipalStreamActivity {
+  readonly clientId: string;
+  readonly principalId: string;
+  readonly ownedCanaries: number;
+  readonly timelineCanaries: number;
+}
+
+export interface Case20FinalActiveSample {
+  readonly at: string;
+  readonly sample: Case20ResourceSample;
+  readonly principalStreams?: readonly Case20PrincipalStreamActivity[];
+}
+
 export interface Case20Failure {
   readonly code: string;
   readonly metric: string;
@@ -131,6 +144,7 @@ export interface Case20RunMeasurements {
   readonly runId: string;
   readonly startedAt: string;
   readonly endedAt: string;
+  readonly measurementEndedAt: string;
   readonly durationSec: number;
   readonly part: "A" | "B";
   readonly mode: Case20Mode;
@@ -141,6 +155,9 @@ export interface Case20RunMeasurements {
   readonly rpcLatencyMs: Readonly<Record<string, readonly number[]>>;
   readonly rpcBaselineLatencyMs: Readonly<Record<string, readonly number[]>>;
   readonly resourceSamples: readonly Case20ResourceSample[];
+  readonly finalActiveSample?: Case20FinalActiveSample;
+  readonly postCloseResourceSample?: Case20ResourceSample;
+  readonly streamCoverageStartedAt?: string;
   readonly sampleIntervalMs: number;
   readonly providerSessionsClosed?: boolean;
   readonly paidProviderUseAcknowledged?: true;
@@ -152,6 +169,7 @@ export interface Case20Summary {
   readonly runId: string;
   readonly startedAt: string;
   readonly endedAt: string;
+  readonly measurementEndedAt: string;
   readonly durationSec: number;
   readonly part: "A" | "B";
   readonly mode: Case20Mode;
@@ -160,6 +178,9 @@ export interface Case20Summary {
   readonly provenance: Case20Provenance;
   readonly clients: readonly Case20ClientRecord[];
   readonly counts: Readonly<Case20Counts>;
+  readonly finalActiveSample?: Case20FinalActiveSample;
+  readonly postCloseResourceSample?: Case20ResourceSample;
+  readonly streamCoverageStartedAt?: string;
   readonly latencyMs: {
     readonly feedback:
       | {
@@ -205,8 +226,16 @@ export interface Case20Summary {
       readonly deltaMiB: number;
     };
     readonly eventLoop: { readonly p99Ms: number };
-    readonly sessions: { readonly warmup: number | null; readonly end: number | null };
-    readonly sockets: { readonly warmup: number | null; readonly end: number | null };
+    readonly sessions: {
+      readonly warmup: number | null;
+      readonly activeEnd: number | null;
+      readonly postClose: number | null;
+    };
+    readonly sockets: {
+      readonly warmup: number | null;
+      readonly activeEnd: number | null;
+      readonly postClose: number | null;
+    };
     readonly providerSessionsClosed: boolean | null;
   };
   readonly thresholds: typeof CASE20_THRESHOLDS;
@@ -242,6 +271,11 @@ export type Case20RawEvent =
       readonly at: string;
       readonly clientId: string;
       readonly principalId: string;
+    }
+  | {
+      readonly type: "stream_coverage_started";
+      readonly at: string;
+      readonly clients: number;
     }
   | { readonly type: "provenance"; readonly at: string; readonly value: Case20Provenance }
   | {
@@ -320,6 +354,15 @@ export type Case20RawEvent =
       readonly auditFiles: number;
     }
   | { readonly type: "resource"; readonly at: string; readonly sample: Case20ResourceSample }
+  | ({
+      readonly type: "final_active_sample";
+      readonly measurementEndedAt: string;
+    } & Case20FinalActiveSample)
+  | {
+      readonly type: "post_close_resource";
+      readonly at: string;
+      readonly sample: Case20ResourceSample;
+    }
   | {
       readonly type: "provider_turn";
       readonly at: string;
