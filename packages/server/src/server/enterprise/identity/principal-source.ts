@@ -95,8 +95,7 @@ export function createProductionPrincipalProvisioning(input: {
   return {
     async ensurePrincipal(record) {
       productionAuditCapabilityIssuer.requireCurrent(input.audit);
-      if (record.principalId === "owner" || !record.principalId || !record.organizationId)
-        throw new Error("invalid durable principal");
+      const validated = PrincipalMetadataSchema.parse(record);
       let document: z.infer<typeof IdentityDocumentSchema> = { version: 1, principals: {} };
       try {
         const fd = fs.open(input.filePath, fs.noFollowFlag);
@@ -108,22 +107,24 @@ export function createProductionPrincipalProvisioning(input: {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      const existing = document.principals[record.principalId];
+      const existing = document.principals[validated.principalId];
       if (existing) {
-        if (JSON.stringify(existing) !== JSON.stringify(record))
+        if (JSON.stringify(existing) !== JSON.stringify(validated))
           throw new Error("principal conflict");
         return Object.freeze({ ...existing });
       }
       const next = {
         version: 1 as const,
-        principals: { ...document.principals, [record.principalId]: record },
+        principals: { ...document.principals, [validated.principalId]: validated },
       };
       const tmp = `${input.filePath}.${randomBytes(8).toString("hex")}.tmp`;
+      fs.mkdir(path.dirname(input.filePath), 0o700);
       const fd = fs.open(
         tmp,
         constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | fs.noFollowFlag,
         0o600,
       );
+      let committed = false;
       try {
         fs.write(fd, JSON.stringify(next));
         fs.fchmod(fd, 0o600);
@@ -134,10 +135,28 @@ export function createProductionPrincipalProvisioning(input: {
       } finally {
         fs.close(fd);
       }
-      fs.rename(tmp, input.filePath);
-      fs.fsync(fs.open(path.dirname(input.filePath), fs.noFollowFlag));
+      try {
+        fs.rename(tmp, input.filePath);
+        committed = true;
+        const dirFd = fs.open(path.dirname(input.filePath), fs.noFollowFlag);
+        try {
+          const dirStat = fs.fstat(dirFd);
+          if (!dirStat.isDirectory()) throw new Error("identity parent is not a directory");
+          fs.fsync(dirFd);
+        } finally {
+          fs.close(dirFd);
+        }
+      } finally {
+        if (!committed) {
+          try {
+            fs.unlink(tmp);
+          } catch {
+            /* best effort */
+          }
+        }
+      }
       productionAuditCapabilityIssuer.requireCurrent(input.audit);
-      return Object.freeze({ ...record });
+      return Object.freeze({ ...validated });
     },
   };
 }
