@@ -84,7 +84,9 @@ function readIdentityDocument(
 
 export interface ProductionPrincipalProvisioning {
   ensurePrincipal(input: PrincipalMetadataRecord): Promise<PrincipalMetadataRecord>;
-  ensurePrincipalIntent(input: Omit<PrincipalMetadataRecord, "createdAt" | "updatedAt">): Promise<PrincipalMetadataRecord>;
+  ensurePrincipalIntent(
+    input: Omit<PrincipalMetadataRecord, "createdAt" | "updatedAt">,
+  ): Promise<PrincipalMetadataRecord>;
 }
 
 export function createProductionPrincipalProvisioning(input: {

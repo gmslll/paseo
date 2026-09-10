@@ -555,86 +555,86 @@ export class IdentityRegistry {
     expiresAt?: string;
   }): Promise<IssuedPersonalAccessToken> {
     const snapshotInput = { ...input, actor: PrincipalContextSchema.parse(input.actor) };
-      const actor = snapshotInput.actor;
-      if (actor.organizationId !== snapshotInput.organizationId)
-        throw new Error("Actor organization mismatch");
-      const principal = await this.options.principalSource.resolvePrincipal(
-        snapshotInput.principalId,
-        snapshotInput.organizationId,
+    const actor = snapshotInput.actor;
+    if (actor.organizationId !== snapshotInput.organizationId)
+      throw new Error("Actor organization mismatch");
+    const principal = await this.options.principalSource.resolvePrincipal(
+      snapshotInput.principalId,
+      snapshotInput.organizationId,
+    );
+    if (
+      !principal ||
+      principal.principalId !== snapshotInput.principalId ||
+      principal.organizationId !== snapshotInput.organizationId
+    )
+      throw new Error("Unknown principal");
+    const candidateCredentialId = this.ids.next();
+    const canonicalPrincipal = PrincipalContextSchema.parse({
+      ...principal,
+      credentialId: candidateCredentialId,
+    });
+    if (this.document.credentials[candidateCredentialId])
+      throw new Error("Credential ID collision");
+    const credentialId = candidateCredentialId;
+    const createdAt = this.captureClock();
+    if (snapshotInput.expiresAt) {
+      if (!z.string().datetime({ offset: true }).safeParse(snapshotInput.expiresAt).success)
+        throw new Error("Invalid expiration");
+      if (isExpired(snapshotInput.expiresAt, createdAt))
+        throw new Error("Credential already expired");
+    }
+    const secret = this.secrets.next();
+    if (!CREDENTIAL_ID_PATTERN.test(credentialId) || !isCanonicalSecret(secret))
+      throw new Error("Invalid credential source");
+    const record: CredentialRecord = {
+      credentialId,
+      principalId: snapshotInput.principalId,
+      organizationId: snapshotInput.organizationId,
+      secretHash: await this.hasher.hash(secret),
+      createdAt,
+      ...(snapshotInput.expiresAt ? { expiresAt: snapshotInput.expiresAt } : {}),
+    };
+    const valid = CredentialSchema.safeParse(record);
+    if (!valid.success) throw new Error("Invalid credential metadata");
+    const previous = this.snapshot();
+    this.document.credentials[credentialId] = valid.data;
+    try {
+      await this.options.audit.append(
+        {
+          organizationId: snapshotInput.organizationId,
+          actorPrincipalId: actor.principalId,
+          actorCredentialId: actor.credentialId,
+          action: "identity.credential.issue",
+          outcome: "allowed",
+          resource: { kind: "credential", id: credentialId },
+        },
+        { durability: "required" },
       );
-      if (
-        !principal ||
-        principal.principalId !== snapshotInput.principalId ||
-        principal.organizationId !== snapshotInput.organizationId
-      )
-        throw new Error("Unknown principal");
-      const candidateCredentialId = this.ids.next();
-      const canonicalPrincipal = PrincipalContextSchema.parse({
-        ...principal,
-        credentialId: candidateCredentialId,
-      });
-      if (this.document.credentials[candidateCredentialId])
-        throw new Error("Credential ID collision");
-      const credentialId = candidateCredentialId;
-      const createdAt = this.captureClock();
-      if (snapshotInput.expiresAt) {
-        if (!z.string().datetime({ offset: true }).safeParse(snapshotInput.expiresAt).success)
-          throw new Error("Invalid expiration");
-        if (isExpired(snapshotInput.expiresAt, createdAt))
-          throw new Error("Credential already expired");
-      }
-      const secret = this.secrets.next();
-      if (!CREDENTIAL_ID_PATTERN.test(credentialId) || !isCanonicalSecret(secret))
-        throw new Error("Invalid credential source");
-      const record: CredentialRecord = {
-        credentialId,
-        principalId: snapshotInput.principalId,
-        organizationId: snapshotInput.organizationId,
-        secretHash: await this.hasher.hash(secret),
-        createdAt,
-        ...(snapshotInput.expiresAt ? { expiresAt: snapshotInput.expiresAt } : {}),
-      };
-      const valid = CredentialSchema.safeParse(record);
-      if (!valid.success) throw new Error("Invalid credential metadata");
-      const previous = this.snapshot();
-      this.document.credentials[credentialId] = valid.data;
-      try {
-        await this.options.audit.append(
-          {
-            organizationId: snapshotInput.organizationId,
-            actorPrincipalId: actor.principalId,
-            actorCredentialId: actor.credentialId,
-            action: "identity.credential.issue",
-            outcome: "allowed",
-            resource: { kind: "credential", id: credentialId },
-          },
-          { durability: "required" },
-        );
-      } catch (error) {
-        delete this.document.credentials[credentialId];
-        throw error;
-      }
-      try {
-        this.persist(previous);
-      } catch (error) {
-        this.document = previous;
-        return this.auditFailure(
-          {
-            organizationId: snapshotInput.organizationId,
-            actorPrincipalId: actor.principalId,
-            actorCredentialId: actor.credentialId,
-            action: "identity.credential.issue",
-            resource: { kind: "credential", id: credentialId },
-          },
-          error,
-        );
-      }
-      const authenticatedPrincipal = canonicalPrincipal;
-      return {
-        token: formatPersonalAccessToken(credentialId, secret),
-        credentialId,
-        principal: authenticatedPrincipal,
-      };
+    } catch (error) {
+      delete this.document.credentials[credentialId];
+      throw error;
+    }
+    try {
+      this.persist(previous);
+    } catch (error) {
+      this.document = previous;
+      return this.auditFailure(
+        {
+          organizationId: snapshotInput.organizationId,
+          actorPrincipalId: actor.principalId,
+          actorCredentialId: actor.credentialId,
+          action: "identity.credential.issue",
+          resource: { kind: "credential", id: credentialId },
+        },
+        error,
+      );
+    }
+    const authenticatedPrincipal = canonicalPrincipal;
+    return {
+      token: formatPersonalAccessToken(credentialId, secret),
+      credentialId,
+      principal: authenticatedPrincipal,
+    };
   }
 
   async issueInitialCredential(input: {
@@ -656,7 +656,10 @@ export class IdentityRegistry {
         .map((credential) => credential.credentialId);
       if (existing.length > 0)
         return { status: "already_provisioned", credentialIds: Object.freeze(existing) };
-      const issued = await this.issueTokenUnlocked({ ...input, actor: PrincipalContextSchema.parse(input.actor) });
+      const issued = await this.issueTokenUnlocked({
+        ...input,
+        actor: PrincipalContextSchema.parse(input.actor),
+      });
       return { status: "issued", token: issued.token, credentialId: issued.credentialId };
     });
   }
