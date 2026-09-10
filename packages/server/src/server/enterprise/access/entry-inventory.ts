@@ -181,6 +181,7 @@ export const REVIEWED_INBOUND_ENTRIES = [
   "enterprise.resource.acquire_lease.request",
   "enterprise.resource.release_lease.request",
   "enterprise.resource.renew_lease.request",
+  "enterprise.resource.ownership.transfer.request",
   "enterprise.workspace.content.read.request",
   "fetch_agent_history_request",
   "fetch_agent_request",

@@ -110,6 +110,7 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "enterprise.resource.acquire_lease.request": ["browser.use", "app.use"],
   "enterprise.resource.release_lease.request": ["browser.use", "app.use"],
   "enterprise.resource.renew_lease.request": ["browser.use", "app.use"],
+  "enterprise.resource.ownership.transfer.request": ["workspace.manage"],
   fetch_recent_provider_sessions_request: ["provider.history.read"],
   fetch_workspaces_request: ["workspace.metadata.read"],
   import_agent_request: ["provider.history.import"],
@@ -419,6 +420,11 @@ export const OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS = [
 
 export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
   authorityReceiptPolicy("agent.skills.get_status.response", "agent.skills.get_status.request"),
+  authorityReceiptPolicy(
+    "enterprise.resource.ownership.transfer.response",
+    "enterprise.resource.ownership.transfer.request",
+    ["workspace.manage"],
+  ),
   authorityReceiptPolicy(
     "agent.skills.import_legacy_selection.response",
     "agent.skills.import_legacy_selection.request",
