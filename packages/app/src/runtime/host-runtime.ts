@@ -40,9 +40,13 @@ import {
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@getpaseo/protocol/connection-offer";
 import {
+  BrowserProfileBindingProjectionSchema,
   BrowserProfileIdSchema,
+  BrowserProfileSummarySchema,
   NodeIdSchema,
   OrganizationIdSchema,
+  type BrowserProfileBindingProjection,
+  type BrowserProfileSummary,
 } from "@getpaseo/protocol/messages";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
@@ -238,6 +242,12 @@ export interface BrowserProfileRuntimeBridge {
   revokeBrowserProfileGeneration(input: { readonly lifecycleGeneration: string }): Promise<void>;
 }
 
+export interface BrowserProfileRuntimeProjectionInput {
+  readonly profiles: readonly BrowserProfileSummary[];
+  readonly bindings: readonly BrowserProfileBindingProjection[];
+  readonly lifecycleGeneration: string;
+}
+
 const BrowserProfileRuntimeAuthorizationSchema = z
   .object({
     organizationId: OrganizationIdSchema,
@@ -250,6 +260,57 @@ const BrowserProfileRuntimeAuthorizationSchema = z
   .strict();
 
 const BrowserProfileLifecycleGenerationSchema = z.string().min(1);
+const StrictBrowserProfileSummarySchema = BrowserProfileSummarySchema.strict();
+const StrictBrowserProfileBindingProjectionSchema = BrowserProfileBindingProjectionSchema.strict();
+const PROJECTION_INPUT_KEYS = ["profiles", "bindings", "lifecycleGeneration"] as const;
+const PROFILE_KEYS = [
+  "browserProfileId",
+  "organizationId",
+  "homeNodeId",
+  "ownerPrincipalId",
+  "platform",
+  "label",
+  "status",
+] as const;
+const BINDING_KEYS = [
+  "organizationId",
+  "nodeId",
+  "workspaceId",
+  "browserProfileId",
+  "boundAt",
+] as const;
+
+function strictOwnDataSnapshot(
+  input: unknown,
+  expectedKeys: readonly string[],
+): Record<string, unknown> | null {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  try {
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== expectedKeys.length ||
+      ownKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+    )
+      return null;
+    const snapshot: Record<string, unknown> = {};
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch {
+    return null;
+  }
+}
+
+function createBrowserProfileBindingRevision(): string {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (typeof randomUUID !== "function") {
+    throw new Error("Browser profile binding revision unavailable");
+  }
+  return randomUUID.call(globalThis.crypto);
+}
 
 /**
  * Binds the lifecycle-owned credential vault to a host transport without
@@ -770,6 +831,14 @@ export class HostRuntimeController {
     promise: Promise<void>;
   } | null = null;
   private browserProfileBridgeSealed = false;
+  private readonly browserProfileBindingRevisions = new Map<
+    string,
+    { fingerprint: string; revision: string }
+  >();
+  private lastHydratedBrowserProfileProjection: {
+    generation: string;
+    fingerprint: string;
+  } | null = null;
 
   constructor(input: {
     host: HostProfile;
@@ -900,6 +969,111 @@ export class HostRuntimeController {
       this.browserProfileBridgeSealed = true;
       throw error;
     }
+  }
+
+  // oxlint-disable-next-line complexity -- projection validation and staged revision fencing.
+  async hydrateBrowserProfileAuthorizationsFromProjections(
+    input: BrowserProfileRuntimeProjectionInput,
+  ): Promise<void> {
+    const currentSnapshot = this.enterpriseIdentityLifecycle?.readSnapshot();
+    const outerSnapshot = strictOwnDataSnapshot(input, PROJECTION_INPUT_KEYS);
+    const requestedGeneration = BrowserProfileLifecycleGenerationSchema.safeParse(
+      outerSnapshot?.lifecycleGeneration,
+    );
+    if (
+      currentSnapshot?.state !== "signed_in" ||
+      !currentSnapshot.generation ||
+      !requestedGeneration.success ||
+      requestedGeneration.data !== currentSnapshot.generation
+    ) {
+      throw new Error("Browser profile projection generation is not current");
+    }
+    const rawProfiles = outerSnapshot?.profiles;
+    const rawBindings = outerSnapshot?.bindings;
+    if (!Array.isArray(rawProfiles) || !Array.isArray(rawBindings)) {
+      throw new Error("Invalid browser profile projections");
+    }
+    const profiles = rawProfiles.map((profile) => {
+      const snapshot = strictOwnDataSnapshot(profile, PROFILE_KEYS);
+      const parsed = StrictBrowserProfileSummarySchema.safeParse(snapshot);
+      if (!parsed.success) throw new Error("Invalid browser profile projection");
+      return structuredClone(parsed.data);
+    });
+    const bindings = rawBindings.map((binding) => {
+      const snapshot = strictOwnDataSnapshot(binding, BINDING_KEYS);
+      const parsed = StrictBrowserProfileBindingProjectionSchema.safeParse(snapshot);
+      if (!parsed.success) throw new Error("Invalid browser profile binding projection");
+      return structuredClone(parsed.data);
+    });
+    const profileIds = new Set<string>();
+    for (const profile of profiles) {
+      if (profileIds.has(profile.browserProfileId)) {
+        throw new Error("Duplicate browser profile projection");
+      }
+      profileIds.add(profile.browserProfileId);
+    }
+    const profilesById = new Map(profiles.map((profile) => [profile.browserProfileId, profile]));
+    const bindingKeys = new Set<string>();
+    const stagedRevisions = new Map(this.browserProfileBindingRevisions);
+    const authorizations: BrowserProfileRuntimeAuthorization[] = [];
+    for (const binding of bindings) {
+      const profile = profilesById.get(binding.browserProfileId);
+      if (
+        !profile ||
+        profile.organizationId !== binding.organizationId ||
+        profile.homeNodeId !== binding.nodeId
+      ) {
+        throw new Error("Browser profile binding does not match profile projection");
+      }
+      const key = JSON.stringify([binding.workspaceId, binding.browserProfileId]);
+      if (bindingKeys.has(key)) throw new Error("Duplicate browser profile binding projection");
+      bindingKeys.add(key);
+      const fingerprint = JSON.stringify({
+        organizationId: binding.organizationId,
+        homeNodeId: binding.nodeId,
+        workspaceId: binding.workspaceId,
+        browserProfileId: binding.browserProfileId,
+        boundAt: binding.boundAt,
+      });
+      const previous = stagedRevisions.get(key);
+      const revision =
+        previous?.fingerprint === fingerprint
+          ? previous.revision
+          : createBrowserProfileBindingRevision();
+      stagedRevisions.set(key, { fingerprint, revision });
+      authorizations.push({
+        organizationId: binding.organizationId,
+        homeNodeId: binding.nodeId,
+        workspaceId: binding.workspaceId,
+        browserProfileId: binding.browserProfileId,
+        bindingRevision: revision,
+        lifecycleGeneration: requestedGeneration.data,
+      });
+    }
+    authorizations.sort((left, right) =>
+      `${left.workspaceId}\u0000${left.browserProfileId}`.localeCompare(
+        `${right.workspaceId}\u0000${right.browserProfileId}`,
+      ),
+    );
+    const fingerprint = JSON.stringify(authorizations);
+    if (
+      this.lastHydratedBrowserProfileProjection?.generation === requestedGeneration.data &&
+      this.lastHydratedBrowserProfileProjection.fingerprint === fingerprint
+    ) {
+      return;
+    }
+    await this.hydrateBrowserProfileAuthorizations({
+      authorizations,
+      lifecycleGeneration: requestedGeneration.data,
+    });
+    this.browserProfileBindingRevisions.clear();
+    for (const [key, revision] of stagedRevisions) {
+      if (bindingKeys.has(key)) this.browserProfileBindingRevisions.set(key, revision);
+    }
+    this.lastHydratedBrowserProfileProjection = {
+      generation: requestedGeneration.data,
+      fingerprint,
+    };
   }
 
   private async revokeBrowserProfileGeneration(generation: string): Promise<void> {
@@ -2622,6 +2796,15 @@ export class HostRuntimeStore {
 
   getEnterpriseScopeGeneration(serverId: string): string | null {
     return this.controllers.get(serverId)?.getEnterpriseScopeGeneration() ?? null;
+  }
+
+  hydrateBrowserProfileAuthorizationsFromProjections(
+    serverId: string,
+    input: BrowserProfileRuntimeProjectionInput,
+  ): Promise<void> {
+    const controller = this.controllers.get(serverId);
+    if (!controller) return Promise.reject(new Error(`Unknown host runtime for ${serverId}`));
+    return controller.hydrateBrowserProfileAuthorizationsFromProjections(input);
   }
 
   subscribe(serverId: string, listener: () => void): () => void {

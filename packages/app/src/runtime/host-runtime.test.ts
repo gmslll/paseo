@@ -961,6 +961,116 @@ describe("HostRuntimeController", () => {
       lifecycleGeneration: generationB!,
     });
     expect(bridge.hydrateBrowserProfileAuthorizations).toHaveBeenCalledTimes(2);
+
+    const profiles = [
+      {
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa" as const,
+        organizationId: "org_aaaaaaaaaaaaaaaa" as const,
+        homeNodeId: "nod_aaaaaaaaaaaaaaaa" as const,
+        ownerPrincipalId: "usr_aaaaaaaaaaaaaaaa" as const,
+        platform: "generic" as const,
+        label: "Profile A",
+        status: "ready" as const,
+      },
+    ];
+    const bindings = [
+      {
+        organizationId: "org_aaaaaaaaaaaaaaaa" as const,
+        nodeId: "nod_aaaaaaaaaaaaaaaa" as const,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa" as const,
+        boundAt: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles,
+        bindings,
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow("not current");
+    const hydrateSpy = bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>;
+    expect(hydrateSpy).toHaveBeenCalledTimes(2);
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles,
+      bindings,
+      lifecycleGeneration: generationB!,
+    });
+    const projectionCallCount = hydrateSpy.mock.calls.length;
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles,
+      bindings,
+      lifecycleGeneration: generationB!,
+    });
+    expect(hydrateSpy).toHaveBeenCalledTimes(projectionCallCount);
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles,
+      bindings: [{ ...bindings[0], boundAt: "2026-01-02T00:00:00.000Z" }],
+      lifecycleGeneration: generationB!,
+    });
+    expect(hydrateSpy).toHaveBeenCalledTimes(projectionCallCount + 1);
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles,
+        bindings: [{ ...bindings[0], organizationId: "org_bbbbbbbbbbbbbbbb" }],
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("does not match");
+    expect(hydrateSpy).toHaveBeenCalledTimes(projectionCallCount + 1);
+    const profilesWithSecond = [
+      ...profiles,
+      {
+        ...profiles[0],
+        browserProfileId: "brp_bbbbbbbbbbbbbbbb" as const,
+        label: "Profile B",
+      },
+    ];
+    const bindingsWithSecond = [
+      ...bindings,
+      {
+        ...bindings[0],
+        browserProfileId: "brp_bbbbbbbbbbbbbbbb" as const,
+        boundAt: "2026-01-03T00:00:00.000Z",
+      },
+    ];
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles: profilesWithSecond,
+      bindings: bindingsWithSecond,
+      lifecycleGeneration: generationB!,
+    });
+    const sortedCallCount = hydrateSpy.mock.calls.length;
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles: profilesWithSecond.toReversed(),
+      bindings: bindingsWithSecond.toReversed(),
+      lifecycleGeneration: generationB!,
+    });
+    expect(hydrateSpy).toHaveBeenCalledTimes(sortedCallCount);
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles: [...profilesWithSecond, profilesWithSecond[0]!],
+        bindings: bindingsWithSecond,
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("Duplicate browser profile");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles: profilesWithSecond,
+        bindings: [...bindingsWithSecond, bindingsWithSecond[0]!],
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("Duplicate browser profile binding");
+    const extraInput = Object.assign(
+      {
+        profiles: profilesWithSecond,
+        bindings: bindingsWithSecond,
+        lifecycleGeneration: generationB!,
+      },
+      { extra: true },
+    );
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections(extraInput),
+    ).rejects.toThrow("projection generation");
+    expect(hydrateSpy).toHaveBeenCalledTimes(sortedCallCount);
   });
 
   it("seals browser capability when generation revoke fails", async () => {
