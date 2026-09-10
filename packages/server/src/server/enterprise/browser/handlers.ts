@@ -83,6 +83,7 @@ export interface EnterpriseBrowserLeaseAuthorityPort {
     sessionContext: EnterpriseSessionContext;
     agentId: string;
   }): EnterpriseAgentContextHandle | null | Promise<EnterpriseAgentContextHandle | null>;
+  releaseAgentHandle(handle: EnterpriseAgentContextHandle): void;
   isCurrentHandle(handle: EnterpriseAgentContextHandle): boolean;
   resolveLeaseAuthorization(
     handle: EnterpriseAgentContextHandle,
@@ -109,6 +110,7 @@ interface EnterpriseBrowserLeaseHandlerRuntime {
   assertWorkspace: EnterpriseBrowserLeaseAuthorityPort["assertWorkspace"];
   assertBrowserProfile: EnterpriseBrowserLeaseAuthorityPort["assertBrowserProfile"];
   resolveAgentHandle: EnterpriseBrowserLeaseAuthorityPort["resolveAgentHandle"];
+  releaseAgentHandle: EnterpriseBrowserLeaseAuthorityPort["releaseAgentHandle"];
   isCurrentHandle: EnterpriseBrowserLeaseAuthorityPort["isCurrentHandle"];
   resolveLeaseAuthorization: EnterpriseBrowserLeaseAuthorityPort["resolveLeaseAuthorization"];
   isCurrentSession: (context: EnterpriseDispatchContext) => boolean;
@@ -229,6 +231,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     const assertWorkspace = authority.assertWorkspace;
     const assertBrowserProfile = authority.assertBrowserProfile;
     const resolveAgentHandle = authority.resolveAgentHandle;
+    const releaseAgentHandle = authority.releaseAgentHandle;
     const isCurrentHandle = authority.isCurrentHandle;
     const resolveLeaseAuthorization = authority.resolveLeaseAuthorization;
     const isCurrentSession = options.isCurrentSession ?? (() => true);
@@ -249,6 +252,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       assertWorkspace: assertWorkspace.bind(authority),
       assertBrowserProfile: assertBrowserProfile.bind(authority),
       resolveAgentHandle: resolveAgentHandle.bind(authority),
+      releaseAgentHandle: releaseAgentHandle.bind(authority),
       isCurrentHandle: isCurrentHandle.bind(authority),
       resolveLeaseAuthorization: resolveLeaseAuthorization.bind(authority),
       isCurrentSession,
@@ -354,18 +358,15 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     for (const issued of this.pending) this.issued.delete(issued.response);
     this.pending.clear();
     const held = [...this.heldLeases.values()];
-    this.heldLeases.clear();
     this.closePromise = (async () => {
       const failures: unknown[] = [];
-      await Promise.all(
-        held.map(async (lease) => {
-          try {
-            await this.releaseHeldLease(lease, true);
-          } catch (error) {
-            failures.push(error);
-          }
-        }),
-      );
+      for (const lease of held) {
+        try {
+          await this.releaseHeldLease(lease, true);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
       if (failures.length > 0) {
         throw new AggregateError(failures, "Enterprise browser lease handler close failed.");
       }
@@ -423,9 +424,10 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       return false;
     }
     if (request.resourceKind !== "browser_profile") return false;
+    let handle: EnterpriseAgentContextHandle | null = null;
     let held: HeldBrowserLease | null = null;
     try {
-      const handle = await this.runtime.resolveAgentHandle({
+      handle = await this.runtime.resolveAgentHandle({
         sessionContext: input.sessionContext.enterpriseContext,
         agentId: request.agentId,
       });
@@ -468,10 +470,13 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         authorization: currentAuthorization,
       });
       const response = this.issuePending(input, result);
-      if (response === false) await this.releaseHeldLease(held);
+      if (response === false) {
+        await this.releaseHeldLease(held);
+      }
       return response;
     } catch {
       if (held) await this.releaseHeldLease(held);
+      else if (handle) this.releaseAgentHandle(handle);
       return denied(request.type, request.requestId);
     }
   }
@@ -557,9 +562,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       }
       assertLeaseMatchesAuthorization(held.lease, held.handle, authorization, held.lease.mode);
-      held.released = true;
-      this.heldLeases.delete(held.lease.leaseId);
-      await this.runtime.releaseLease({ handle: held.handle, lease: held.lease });
+      await this.releaseHeldLease(held, true);
       return this.issuePending(
         input,
         leaseResourceResult({
@@ -830,6 +833,17 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     }
   }
 
+  private releaseAgentHandle(handle: EnterpriseAgentContextHandle): void {
+    if ([...this.heldLeases.values()].some((held) => !held.released && held.handle === handle)) {
+      return;
+    }
+    try {
+      this.runtime.releaseAgentHandle(handle);
+    } catch {
+      // The request denial remains primary; production cleanup is exact-handle guarded.
+    }
+  }
+
   private async releaseHeldLease(held: HeldBrowserLease, propagateError = false): Promise<void> {
     if (held.released) return;
     held.released = true;
@@ -841,6 +855,8 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     } catch (error) {
       // The authorization failure remains primary; the manager owns release diagnostics.
       if (propagateError) throw error;
+    } finally {
+      this.releaseAgentHandle(held.handle);
     }
   }
 }

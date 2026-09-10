@@ -3,8 +3,13 @@ import type {
   EnterpriseDispatcherLease,
   EnterpriseSessionDispatcherFactoryRegistration,
 } from "../../session/enterprise-dispatcher.js";
-import type { EnterpriseSessionContext } from "../../session/enterprise-agent-session-context-registry.js";
-import type { EnterpriseAgentSessionContextRegistry } from "../../session/enterprise-agent-session-context-registry.js";
+import {
+  isEnterpriseAgentContextCurrentForSession,
+  type EnterpriseAgentContextHandle,
+  type EnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "../../session/enterprise-agent-session-context-registry.js";
+import type { AuthorizedAgent, ResourceAuthorization } from "@getpaseo/protocol/messages";
 import {
   resolveAuthoritativeAgent,
   resolveCurrentProductionRuntimeAuthority,
@@ -189,15 +194,96 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
         }
         waitingContext = requestLifecycle;
       }
+      const boundAgentHandles = new WeakSet<object>();
       const isCurrentHandle: EnterpriseBrowserLeaseAuthorityPort["isCurrentHandle"] = (handle) =>
-        handle.context.sessionBindingGeneration === sessionContext.sessionBindingGeneration &&
-        input.registry.isCurrentHandle(handle);
+        boundAgentHandles.has(handle) &&
+        isCurrentProductionAgentHandle({
+          provider,
+          authorizationRuntime,
+          resourceAuthorization: authority.resourceAuthorization,
+          registry: input.registry,
+          handle,
+          sessionContext,
+        });
+      const releaseAgentHandle: EnterpriseBrowserLeaseAuthorityPort["releaseAgentHandle"] = (
+        handle,
+      ) => releaseExactBoundAgentHandle(input.registry, boundAgentHandles, handle);
       const resolvedAuthority: EnterpriseBrowserLeaseAuthorityPort = {
         assertWorkspace: (principalContext, action, workspaceId) =>
           authority.resourceAuthorization.assertWorkspace(principalContext, action, workspaceId),
         assertBrowserProfile: (principalContext, action, profileId) =>
           authority.resourceAuthorization.assertBrowserProfile(principalContext, action, profileId),
-        resolveAgentHandle: ({ agentId }) => input.registry.resolve(agentId),
+        resolveAgentHandle: async ({ sessionContext: requestContext, agentId }) => {
+          let handle: EnterpriseAgentContextHandle | null = null;
+          let succeeded = false;
+          try {
+            if (!sameSessionContext(requestContext, sessionContext)) return null;
+            const before = resolveCurrentProductionAgent({
+              provider,
+              authorizationRuntime,
+              resourceAuthorization: authority.resourceAuthorization,
+              sessionContext: requestContext,
+              agentId,
+            });
+            if (!before) return null;
+            const authorized = await authority.resourceAuthorization.assertAgent(
+              requestContext.principal,
+              "browser.use",
+              agentId,
+            );
+            const afterAuthorization = resolveCurrentProductionAgent({
+              provider,
+              authorizationRuntime,
+              resourceAuthorization: authority.resourceAuthorization,
+              sessionContext: requestContext,
+              agentId,
+            });
+            if (
+              !afterAuthorization ||
+              !sameAuthorizedAgent(before, afterAuthorization) ||
+              !sameAuthorizedAgent(afterAuthorization, authorized)
+            ) {
+              return null;
+            }
+            const existing = input.registry.resolve(agentId);
+            if (
+              existing &&
+              boundAgentHandles.has(existing) &&
+              isCurrentProductionAgentHandle({
+                provider,
+                authorizationRuntime,
+                resourceAuthorization: authority.resourceAuthorization,
+                registry: input.registry,
+                handle: existing,
+                sessionContext,
+              })
+            ) {
+              succeeded = true;
+              return existing;
+            }
+            handle = input.registry.bind({ agentId, context: requestContext });
+            boundAgentHandles.add(handle);
+            if (
+              !isCurrentProductionAgentHandle({
+                provider,
+                authorizationRuntime,
+                resourceAuthorization: authority.resourceAuthorization,
+                registry: input.registry,
+                handle,
+                sessionContext,
+              })
+            ) {
+              return null;
+            }
+            succeeded = true;
+            return handle;
+          } catch {
+            return null;
+          } finally {
+            if (handle && !succeeded) releaseAgentHandle(handle);
+          }
+        },
+        releaseAgentHandle,
         isCurrentHandle,
         resolveLeaseAuthorization: async (handle) => {
           if (!isCurrentHandle(handle)) throw new Error("Stale agent handle.");
@@ -216,8 +302,17 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
             binding.browserProfileId,
           );
           const currentBinding = await input.bundle.bindings.resolveForAgent({ workspace, agent });
+          const currentAgent = resolveCurrentProductionAgent({
+            provider,
+            authorizationRuntime,
+            resourceAuthorization: authority.resourceAuthorization,
+            sessionContext: handle.context,
+            agentId: handle.agentId,
+          });
           if (
             !isCurrentHandle(handle) ||
+            !currentAgent ||
+            !sameAuthorizedAgent(agent, currentAgent) ||
             !currentBinding ||
             binding.organizationId !== workspace.organizationId ||
             binding.nodeId !== workspace.nodeId ||
@@ -298,6 +393,104 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
   });
 }
 
+function resolveCurrentProductionAgent(input: {
+  readonly provider: ProductionAuthorizationRuntimeProvider;
+  readonly authorizationRuntime: unknown;
+  readonly resourceAuthorization: ResourceAuthorization;
+  readonly sessionContext: EnterpriseSessionContext;
+  readonly agentId: string;
+}): AuthorizedAgent | null {
+  const current = resolveCurrentProductionRuntimeAuthority(
+    input.authorizationRuntime,
+    input.provider,
+  );
+  if (!current || current.resourceAuthorization !== input.resourceAuthorization) return null;
+  const agent = resolveAuthoritativeAgent(current.owners, input.agentId);
+  if (
+    !agent ||
+    agent.agentId !== input.agentId ||
+    agent.organizationId !== input.sessionContext.principal.organizationId ||
+    agent.nodeId !== input.sessionContext.node.nodeId
+  ) {
+    return null;
+  }
+  return agent;
+}
+
+function isCurrentProductionAgentHandle(input: {
+  readonly provider: ProductionAuthorizationRuntimeProvider;
+  readonly authorizationRuntime: unknown;
+  readonly resourceAuthorization: ResourceAuthorization;
+  readonly registry: EnterpriseAgentSessionContextRegistry;
+  readonly handle: EnterpriseAgentContextHandle;
+  readonly sessionContext: EnterpriseSessionContext;
+}): boolean {
+  try {
+    if (
+      !input.registry.isCurrentHandle(input.handle) ||
+      !isEnterpriseAgentContextCurrentForSession(input.handle, input.sessionContext)
+    ) {
+      return false;
+    }
+    return (
+      resolveCurrentProductionAgent({
+        provider: input.provider,
+        authorizationRuntime: input.authorizationRuntime,
+        resourceAuthorization: input.resourceAuthorization,
+        sessionContext: input.handle.context,
+        agentId: input.handle.agentId,
+      }) !== null
+    );
+  } catch {
+    return false;
+  }
+}
+
+function releaseExactBoundAgentHandle(
+  registry: EnterpriseAgentSessionContextRegistry,
+  boundHandles: WeakSet<object>,
+  handle: EnterpriseAgentContextHandle,
+): void {
+  if (!boundHandles.delete(handle)) return;
+  try {
+    if (registry.resolve(handle.agentId) !== handle || !registry.isCurrentHandle(handle)) return;
+    registry.release({
+      agentId: handle.agentId,
+      sessionBindingGeneration: handle.context.sessionBindingGeneration,
+    });
+  } catch {
+    // The handle is no longer trusted; never broaden cleanup beyond the exact current binding.
+  }
+}
+
+function sameSessionContext(
+  left: EnterpriseSessionContext,
+  right: EnterpriseSessionContext,
+): boolean {
+  return (
+    left.sessionBindingGeneration === right.sessionBindingGeneration &&
+    left.principal.organizationId === right.principal.organizationId &&
+    left.principal.principalType === right.principal.principalType &&
+    left.principal.principalId === right.principal.principalId &&
+    left.principal.credentialId === right.principal.credentialId &&
+    left.principal.grantVersion === right.principal.grantVersion &&
+    left.node.nodeId === right.node.nodeId &&
+    left.node.paseoServerId === right.node.paseoServerId &&
+    left.node.mode === right.node.mode
+  );
+}
+
+function sameAuthorizedAgent(left: AuthorizedAgent, right: AuthorizedAgent): boolean {
+  return (
+    left.agentId === right.agentId &&
+    left.workspaceId === right.workspaceId &&
+    left.organizationId === right.organizationId &&
+    left.nodeId === right.nodeId &&
+    left.ownerPrincipalId === right.ownerPrincipalId &&
+    left.createdByPrincipalId === right.createdByPrincipalId
+  );
+}
+
 function createUnavailableAuthority(): EnterpriseBrowserLeaseAuthorityPort {
   const fail = async (): Promise<never> => {
     throw new Error("Production authority is unavailable.");
@@ -306,6 +499,7 @@ function createUnavailableAuthority(): EnterpriseBrowserLeaseAuthorityPort {
     assertWorkspace: fail,
     assertBrowserProfile: fail,
     resolveAgentHandle: () => null,
+    releaseAgentHandle: () => undefined,
     isCurrentHandle: () => false,
     resolveLeaseAuthorization: fail,
   };
@@ -328,12 +522,14 @@ function captureFactoryOptions(
     const authorityAssertWorkspace = authority.assertWorkspace;
     const authorityAssertProfile = authority.assertBrowserProfile;
     const authorityResolveHandle = authority.resolveAgentHandle;
+    const authorityReleaseHandle = authority.releaseAgentHandle;
     const authorityIsCurrent = authority.isCurrentHandle;
     const authorityResolveLease = authority.resolveLeaseAuthorization;
     if (
       typeof authorityAssertWorkspace !== "function" ||
       typeof authorityAssertProfile !== "function" ||
       typeof authorityResolveHandle !== "function" ||
+      typeof authorityReleaseHandle !== "function" ||
       typeof authorityIsCurrent !== "function" ||
       typeof authorityResolveLease !== "function"
     ) {
@@ -343,6 +539,7 @@ function captureFactoryOptions(
       assertWorkspace: authorityAssertWorkspace.bind(authority),
       assertBrowserProfile: authorityAssertProfile.bind(authority),
       resolveAgentHandle: authorityResolveHandle.bind(authority),
+      releaseAgentHandle: authorityReleaseHandle.bind(authority),
       isCurrentHandle: authorityIsCurrent.bind(authority),
       resolveLeaseAuthorization: authorityResolveLease.bind(authority),
     });

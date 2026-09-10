@@ -237,6 +237,7 @@ class MemoryAuthority implements EnterpriseBrowserLeaseAuthorityPort {
   public profileAvailable = true;
   public leaseAuthorizationAvailable = true;
   public resolveLeaseAuthorizationCalls = 0;
+  public readonly releasedHandles: EnterpriseAgentContextHandle[] = [];
   public bindingRevision = "binding-revision-1";
 
   public constructor() {
@@ -287,6 +288,15 @@ class MemoryAuthority implements EnterpriseBrowserLeaseAuthorityPort {
       return null;
     }
     return this.resolvedHandle;
+  }
+
+  public releaseAgentHandle(handle: EnterpriseAgentContextHandle): void {
+    this.releasedHandles.push(handle);
+    if (this.registry.resolve(handle.agentId) !== handle) return;
+    this.registry.release({
+      agentId: handle.agentId,
+      sessionBindingGeneration: handle.context.sessionBindingGeneration,
+    });
   }
 
   public isCurrentHandle(handle: EnterpriseAgentContextHandle): boolean {
@@ -832,6 +842,34 @@ describe("EnterpriseBrowserLeaseHandler", () => {
         ttlMs: 60_000,
       },
     ]);
+    expect(authority.releasedHandles).toEqual([]);
+  });
+
+  test("releases the resolved Agent handle when acquire authorization fails", async () => {
+    const authority = new MemoryAuthority();
+    authority.leaseAuthorizationAvailable = false;
+    const { handler, leases } = createHandler({ authority });
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.acquire_lease.request",
+          requestId: "request-acquire-authorization-failure",
+          workspaceId: WORKSPACE_ID,
+          agentId: AGENT_ID,
+          resourceKind: "browser_profile",
+          mode: "write",
+        },
+      }),
+    ).resolves.toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "request-acquire-authorization-failure", code: "access_denied" },
+    });
+
+    expect(leases.acquired).toEqual([]);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
   });
 
   test.each<LeaseOperation>(["acquire", "renew", "release"])(
@@ -1128,6 +1166,8 @@ describe("EnterpriseBrowserLeaseHandler", () => {
         mode: "write",
       },
     });
+    expect(authority.registry.resolve(AGENT_ID)).toBe(authority.handle);
+    expect(authority.releasedHandles).toEqual([]);
     const renewResponse = await handler.handle({
       sessionContext: dispatchContext(),
       message: {
@@ -1160,6 +1200,8 @@ describe("EnterpriseBrowserLeaseHandler", () => {
       { handle: authority.handle, lease: lease({ leaseRevision: "2" }) },
     ]);
     expect(authorizationCallsAtRelease).toBe(4);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
   });
 
   test("denies release without current authorization and issues no response sidecar", async () => {
@@ -1346,6 +1388,8 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     expect(leases.released).toEqual([
       { handle: authority.handle, lease: lease({ leaseRevision: "2" }) },
     ]);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
   });
 
   test("rejects a stale fencing token without invoking renew or release", async () => {
@@ -1627,6 +1671,8 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     await sessionLease.close();
 
     expect(leases.released).toEqual([{ handle: authority.handle, lease: lease() }]);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
     await expect(
       sessionLease.dispatcher.handle({
         sessionContext: dispatchContext(openContext),
