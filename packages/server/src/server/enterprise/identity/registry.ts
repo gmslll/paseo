@@ -92,7 +92,8 @@ export interface CurrentCredentialContext {
   grantVersion: string;
 }
 export interface CredentialInvalidationSink {
-  publish(event: CredentialInvalidation): Promise<void>;
+  publish?(event: CredentialInvalidation): Promise<void>;
+  publishCredentialInvalidation?(event: CredentialInvalidation): Promise<void>;
 }
 export class CredentialInvalidationCommittedError extends Error {
   readonly committed = true as const;
@@ -329,12 +330,18 @@ export class IdentityRegistry {
   }
   private async publishInvalidation(event: CredentialInvalidation): Promise<void> {
     try {
-      await this.options.invalidation.publish(Object.freeze(JSON.parse(JSON.stringify(event))));
+      const sink =
+        this.options.invalidation.publishCredentialInvalidation ??
+        this.options.invalidation.publish;
+      if (!sink) throw new Error("Credential invalidation sink is unavailable");
+      await sink(Object.freeze(JSON.parse(JSON.stringify(event))));
     } catch (error) {
       throw new CredentialInvalidationCommittedError(event, error);
     }
   }
   constructor(options: IdentityRegistryOptions) {
+    if (!options.invalidation.publish && !options.invalidation.publishCredentialInvalidation)
+      throw new Error("Credential invalidation sink is required");
     this.options = { ...options, node: NodeContextSchema.parse(options.node) };
     this.clock = options.clock ?? defaultClock;
     this.ids = options.credentialIds ?? defaultIds;
