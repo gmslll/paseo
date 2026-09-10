@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { isEnterpriseWorkbenchSignedIn } from "@/runtime/enterprise-workbench-assembly";
 import {
   useHostEnterpriseIdentityLifecycle,
@@ -46,6 +46,15 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   ]);
 
   const bundle = useMemo(() => (models ? createEnterpriseUiBundle(models) : null), [models]);
+  const authenticatePat = useCallback(
+    (token: string, signal: AbortSignal) => {
+      if (!bundle) {
+        return Promise.reject(new Error("enterprise.identity.unavailable"));
+      }
+      return bundle.uiPort.authenticatePat({ serverId, token, signal });
+    },
+    [bundle, serverId],
+  );
   const signedIn = isEnterpriseWorkbenchSignedIn(identitySnapshot);
   const bossStore = useMemo(
     () =>
@@ -74,12 +83,7 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
 
   if (!models || !bundle || !patModel) return null;
   if (!signedIn) {
-    return (
-      <EnterprisePatLoginForm
-        model={patModel}
-        authenticate={(token, signal) => bundle.uiPort.authenticatePat({ serverId, token, signal })}
-      />
-    );
+    return <EnterprisePatLoginForm model={patModel} authenticate={authenticatePat} />;
   }
   if (!bossStore) return null;
   return (

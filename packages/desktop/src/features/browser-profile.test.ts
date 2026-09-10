@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   BrowserProfileRuntimeAuthorizationRegistry,
@@ -162,7 +163,7 @@ describe("enterprise browser profiles", () => {
       "persist:paseo-enterprise-brp_2222222222222222",
     );
     expect(getEnterpriseBrowserProfileDownloadRoot("/trusted/profiles", PROFILE_A)).toBe(
-      "/trusted/profiles/brp_1111111111111111/downloads",
+      path.join(path.resolve("/trusted/profiles"), PROFILE_A, "downloads"),
     );
     expect(() => getEnterpriseBrowserProfilePartition("brp_../escape")).toThrow(/invalid/i);
   });
