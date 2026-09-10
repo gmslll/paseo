@@ -8,7 +8,12 @@ import {
   PrincipalContextSchema,
 } from "@getpaseo/protocol/messages";
 import { EnterprisePrincipalAuthenticator } from "./authenticator.js";
-import { IdentityRegistry, type IdentityRegistryOptions } from "./registry.js";
+import {
+  IdentityRegistry,
+  type CredentialInvalidationSink,
+  type IdentityRegistryOptions,
+  type PrincipalGrantSource,
+} from "./registry.js";
 import {
   bindEnterpriseAdmissionSession,
   createEnterpriseAdmissionAuthorizationIssuer,
@@ -29,6 +34,25 @@ export interface EnterpriseAdmissionOptions extends Omit<
   audit: ProductionAuditCapability;
   organizationId: string;
   daemonPassword?: string;
+}
+
+/** Integration-owned durable identity inputs; no storage or grant store is created here. */
+export interface EnterpriseIdentitySideDependencies extends Omit<
+  EnterpriseAdmissionOptions,
+  "node" | "audit" | "organizationId"
+> {
+  readonly principalSource: PrincipalGrantSource;
+  readonly invalidation: CredentialInvalidationSink;
+}
+
+export function createEnterpriseIdentitySide(
+  input: EnterpriseIdentitySideDependencies & {
+    readonly node: NodeContext;
+    readonly audit: ProductionAuditCapability;
+    readonly organizationId: string;
+  },
+): EnterpriseAdmission {
+  return new EnterpriseAdmission(input);
 }
 
 /** Typed production seam for integration-owned runtime assembly. */
