@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { NodeContext, PrincipalContext } from "@getpaseo/protocol/messages";
+import { FileTransferOpcode, type FileTransferFrame } from "@getpaseo/protocol/binary-frames/index";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { SessionAuthorization } from "../../authorization/index.js";
 import { FileBackedGrantStorage, type GrantRecord } from "../access/grant-store.js";
@@ -167,6 +168,44 @@ describe("production enterprise workspace files provider", () => {
       });
       expect(Buffer.concat(response.chunks).toString()).toBe("enterprise-file");
       expect(response.ended).toBe(true);
+
+      const uploadStore = runtime!.createUploadStore();
+      uploadStore.beginStaged({
+        workspaceId: "wks_a",
+        requestId: "upload-1",
+        fileName: "attachment.txt",
+        mimeType: "text/plain",
+        size: 17,
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+      });
+      await expect(
+        uploadStore.receiveFrame(uploadFrame(FileTransferOpcode.FileBegin)),
+      ).resolves.toBeNull();
+      await expect(
+        uploadStore.receiveFrame(
+          uploadFrame(FileTransferOpcode.FileChunk, new TextEncoder().encode("enterprise-upload")),
+        ),
+      ).resolves.toBeNull();
+      const uploaded = await uploadStore.receiveFrame(uploadFrame(FileTransferOpcode.FileEnd));
+      const uploadedPath = uploaded?.payload.file?.path;
+      expect(uploaded).toMatchObject({
+        type: "file.upload.response",
+        payload: {
+          requestId: "upload-1",
+          workspaceId: "wks_a",
+          error: null,
+          file: {
+            workspaceId: "wks_a",
+            fileName: "attachment.txt",
+            size: 17,
+          },
+        },
+      });
+      expect(uploadedPath).toMatch(/^\.paseo-uploads\/[a-f0-9]{64}$/);
+      if (!uploadedPath) throw new Error("expected canonical upload path");
+      expect(await readFile(path.join(workspaceRoot, ...uploadedPath.split("/")), "utf8")).toBe(
+        "enterprise-upload",
+      );
       const replay = new TestHttpResponse();
       await expect(
         provider.httpHandler.handle({
@@ -285,6 +324,24 @@ function createProvider(workspaceRoot: string): EnterpriseWorkspaceFilesProducti
   });
   if (!provider?.releaseReady) throw new Error("expected production workspace files provider");
   return provider;
+}
+
+function uploadFrame(opcode: FileTransferOpcode, payload = new Uint8Array()): FileTransferFrame {
+  if (opcode === FileTransferOpcode.FileBegin) {
+    return {
+      opcode,
+      requestId: "upload-1",
+      metadata: {
+        mime: "text/plain",
+        size: 17,
+        encoding: "binary",
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        fileName: "attachment.txt",
+      },
+      payload,
+    };
+  }
+  return { opcode, requestId: "upload-1", payload };
 }
 
 async function createAuthorizationFixture(name: string) {

@@ -909,7 +909,9 @@ type OperationOutcome<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: unknown };
 
-export function loadDarwinWorkspaceBinding(addonPath: string): DarwinWorkspaceBinding | null {
+export function loadDarwinWorkspaceBinding(
+  addonPath: string = DEFAULT_BINDING_PATH,
+): DarwinWorkspaceBinding | null {
   if (process.platform !== "darwin" || !addonPath.endsWith(".node")) return null;
   const napiVersion = Number(process.versions.napi);
   if (!Number.isSafeInteger(napiVersion) || napiVersion < 10) return null;

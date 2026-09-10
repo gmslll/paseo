@@ -16,6 +16,7 @@ import {
 } from "../access/production-authorization-runtime.js";
 import type { EnterpriseSessionContext } from "../identity/session-context.js";
 import { DarwinWorkspaceFileSystem } from "./darwin-workspace-fs.js";
+import { DarwinEnterpriseUploadFileSystem } from "./darwin-upload-fs.js";
 import {
   ENTERPRISE_UPLOAD_CAPACITY_HARD_MAX,
   EnterpriseUploadPolicy,
@@ -184,6 +185,7 @@ export function createProductionEnterpriseWorkspaceFilesProvider(
 class ProductionWorkspaceFilesProvider {
   public readonly publicPort: EnterpriseWorkspaceFilesProductionProvider;
   private readonly safeFs: SafeWorkspaceFsPort;
+  private readonly uploadSafeFs: EnterpriseUploadSafeFsPort;
   private readonly getWorkspaceRoot: EnterpriseWorkspaceRootRegistry["get"];
   private readonly options: CapturedOptions;
   private readonly routes = new Map<string, DownloadRoute>();
@@ -193,12 +195,20 @@ class ProductionWorkspaceFilesProvider {
     this.options = options;
     this.safeFs = safeFs;
     this.getWorkspaceRoot = options.getWorkspaceRoot;
+    this.uploadSafeFs = new DarwinEnterpriseUploadFileSystem({
+      ...(options.nativeAddonPath === undefined ? {} : { addonPath: options.nativeAddonPath }),
+      capacity: options.uploadCapacity,
+      resolveCanonicalRoot: (workspace) => this.resolveCanonicalRoot(workspace),
+    });
     const httpConsumer = Object.freeze({
       consume: (input: unknown) => this.consumeDownload(input),
     });
     this.publicPort = Object.freeze({
       releaseReady:
-        safeFs.releaseReady === true && safeFs.supportsDirectoryRelativeOperations === true,
+        safeFs.releaseReady === true &&
+        safeFs.supportsDirectoryRelativeOperations === true &&
+        this.uploadSafeFs.releaseReady === true &&
+        this.uploadSafeFs.supportsDirectoryRelativeOperations === true,
       httpHandler: createDownloadHttpHandler(httpConsumer),
       createSessionRuntime: (runtime: ProductionAuthorizationRuntime) =>
         this.createSessionRuntime(runtime),
@@ -216,7 +226,7 @@ class ProductionWorkspaceFilesProvider {
       ttlMs: this.options.uploadTtlMs,
       capacity: this.options.uploadCapacity,
       authorization: resourceAuthorization,
-      safeFs: UNAVAILABLE_UPLOAD_SAFE_FS,
+      safeFs: this.uploadSafeFs,
     });
     const host = new EnterpriseWorkspaceFilesHost({
       authorization: resourceAuthorization,
@@ -437,15 +447,6 @@ class RoutedWorkspaceFilesRuntime implements EnterpriseWorkspaceFilesRuntime {
     return this.cleanupPromise;
   }
 }
-
-const UNAVAILABLE_UPLOAD_SAFE_FS: EnterpriseUploadSafeFsPort = Object.freeze({
-  releaseReady: false,
-  supportsDirectoryRelativeOperations: false,
-  prepare: async () => Promise.reject(new Error("Enterprise upload safe-FS is unavailable.")),
-  append: async () => Promise.reject(new Error("Enterprise upload safe-FS is unavailable.")),
-  finalize: async () => Promise.reject(new Error("Enterprise upload safe-FS is unavailable.")),
-  abort: async () => Promise.reject(new Error("Enterprise upload safe-FS is unavailable.")),
-});
 
 function captureOptions(input: unknown): CapturedOptions | null {
   const values = captureExactRecord(input, PROVIDER_OPTION_KEYS, REQUIRED_PROVIDER_OPTION_KEYS);

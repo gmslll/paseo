@@ -162,6 +162,12 @@ export interface EnterpriseUploadSafeFsPort extends Pick<
     options: { readonly signal: AbortSignal },
   ): Promise<EnterpriseUploadFinalizedTarget>;
 
+  /**
+   * Irreversibly publish a finalized target and release its descriptors. This call is deliberately
+   * synchronous so no authority invalidation can interleave with the policy's final current check.
+   */
+  commit(capability: EnterpriseUploadCapability): true;
+
   abort(capability: EnterpriseUploadCapability): Promise<void>;
 }
 
@@ -289,6 +295,7 @@ type AssertWorkspace = ResourceAuthorization["assertWorkspace"];
 type PrepareCapability = EnterpriseUploadSafeFsPort["prepare"];
 type AppendCapability = EnterpriseUploadSafeFsPort["append"];
 type FinalizeCapability = EnterpriseUploadSafeFsPort["finalize"];
+type CommitCapability = EnterpriseUploadSafeFsPort["commit"];
 type AbortCapability = EnterpriseUploadSafeFsPort["abort"];
 
 const SYSTEM_CLOCK: EnterpriseUploadClock = Object.freeze({
@@ -312,6 +319,7 @@ export class EnterpriseUploadPolicy {
   private readonly prepareCapability: PrepareCapability;
   private readonly appendCapability: AppendCapability;
   private readonly finalizeCapability: FinalizeCapability;
+  private readonly commitCapability: CommitCapability;
   private readonly abortCapability: AbortCapability;
   private readonly now: EnterpriseUploadClock["now"];
   private readonly randomBytes: EnterpriseUploadRandomSource["randomBytes"];
@@ -346,16 +354,18 @@ export class EnterpriseUploadPolicy {
     }
     const clock = options.clock ?? SYSTEM_CLOCK;
     const randomSource = options.randomSource ?? SECURE_RANDOM_SOURCE;
+    const authorization = options.authorization;
+    const safeFs = options.safeFs;
     this.ttlMs = options.ttlMs;
     this.capacity = options.capacity;
-    this.releaseReady = options.safeFs.releaseReady === true;
-    this.supportsDirectoryRelativeOperations =
-      options.safeFs.supportsDirectoryRelativeOperations === true;
-    this.assertWorkspace = options.authorization.assertWorkspace.bind(options.authorization);
-    this.prepareCapability = options.safeFs.prepare.bind(options.safeFs);
-    this.appendCapability = options.safeFs.append.bind(options.safeFs);
-    this.finalizeCapability = options.safeFs.finalize.bind(options.safeFs);
-    this.abortCapability = options.safeFs.abort.bind(options.safeFs);
+    this.releaseReady = safeFs.releaseReady === true;
+    this.supportsDirectoryRelativeOperations = safeFs.supportsDirectoryRelativeOperations === true;
+    this.assertWorkspace = authorization.assertWorkspace.bind(authorization);
+    this.prepareCapability = safeFs.prepare.bind(safeFs);
+    this.appendCapability = safeFs.append.bind(safeFs);
+    this.finalizeCapability = safeFs.finalize.bind(safeFs);
+    this.commitCapability = safeFs.commit.bind(safeFs);
+    this.abortCapability = safeFs.abort.bind(safeFs);
     this.now = clock.now.bind(clock);
     this.randomBytes = randomSource.randomBytes.bind(randomSource);
   }
@@ -647,6 +657,14 @@ export class EnterpriseUploadPolicy {
         return null;
       }
       if (!this.inFlightIsCurrent(operation)) {
+        await this.releaseOrQuarantine(operation.record);
+        return null;
+      }
+      try {
+        if (this.commitCapability(cloneCapability(operation.record.capability)) !== true) {
+          throw new Error("Enterprise upload commit failed");
+        }
+      } catch {
         await this.releaseOrQuarantine(operation.record);
         return null;
       }

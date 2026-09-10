@@ -155,6 +155,10 @@ class BlockingPrepareSafeFs implements EnterpriseUploadSafeFsPort {
     return { ...capability, fileIdentity: { dev: 1, ino: 2, size: 5, mtimeMs: 3 } };
   }
 
+  public commit(): true {
+    return true;
+  }
+
   public async abort(): Promise<void> {
     this.abortCalls += 1;
   }
@@ -188,11 +192,16 @@ describe("EnterpriseUploadStore", () => {
       size: 5,
       modifiedAt: "2026-09-10T00:00:00.000Z",
     });
-    await expect(store.receiveFrame(frame(FileTransferOpcode.FileBegin))).resolves.toBeNull();
     await expect(
-      store.receiveFrame(frame(FileTransferOpcode.FileChunk, new TextEncoder().encode("hello"))),
+      store.receiveEnterpriseFrame(frame(FileTransferOpcode.FileBegin)),
     ).resolves.toBeNull();
-    const result = await store.receiveFrame(frame(FileTransferOpcode.FileEnd));
+    await expect(
+      store.receiveEnterpriseFrame(
+        frame(FileTransferOpcode.FileChunk, new TextEncoder().encode("hello")),
+      ),
+    ).resolves.toBeNull();
+    const frameResult = await store.receiveEnterpriseFrame(frame(FileTransferOpcode.FileEnd));
+    const result = frameResult?.response;
 
     expect(policy.issued[0]).toEqual({
       principal: principal(),
@@ -225,6 +234,7 @@ describe("EnterpriseUploadStore", () => {
       workspaceId: WORKSPACE_ID,
       path: RELATIVE_PATH,
     });
+    expect(frameResult?.workspaceId).toBe(WORKSPACE_ID);
     expect(Object.hasOwn(result?.payload.file ?? {}, "absolutePath")).toBe(false);
     expect(existsSync(join(paseoHome, "uploads"))).toBe(false);
   });

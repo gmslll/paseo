@@ -199,10 +199,12 @@ class TestSafeFs implements EnterpriseUploadSafeFsPort {
   }> = [];
   public readonly finalizeCalls: EnterpriseUploadCapability[] = [];
   public readonly finalizeSignals: AbortSignal[] = [];
+  public readonly commitCalls: EnterpriseUploadCapability[] = [];
   public readonly abortCalls: EnterpriseUploadCapability[] = [];
   public prepareError: unknown;
   public appendError: unknown;
   public finalizeError: unknown;
+  public commitError: unknown;
   public abortError: unknown;
   public prepareResult: EnterpriseUploadCapability | undefined;
   public finalizeResult: EnterpriseUploadFinalizedTarget | undefined;
@@ -251,6 +253,12 @@ class TestSafeFs implements EnterpriseUploadSafeFsPort {
     await this.finalizeGate;
     if (this.finalizeError !== undefined) throw this.finalizeError;
     return this.finalizeResult ?? finalizedTarget(input);
+  }
+
+  public commit(input: EnterpriseUploadCapability): true {
+    this.commitCalls.push(input);
+    if (this.commitError !== undefined) throw this.commitError;
+    return true;
   }
 
   public async abort(input: EnterpriseUploadCapability): Promise<void> {
@@ -348,6 +356,20 @@ describe("EnterpriseUploadPolicy", () => {
     expect(safeFs.appendCalls[0]?.bytes).toEqual(new Uint8Array([1, 2, 3]));
     expect(safeFs.appendCalls[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(safeFs.finalizeCalls).toHaveLength(1);
+    expect(safeFs.commitCalls).toHaveLength(1);
+    expect(safeFs.abortCalls).toHaveLength(0);
+  });
+
+  it("denies and aborts when the adapter cannot commit its finalized target", async () => {
+    const safeFs = new TestSafeFs();
+    safeFs.commitError = new Error("close failed");
+    const policy = createPolicy({ safeFs });
+    const issued = await policy.issue(issueInput());
+
+    await expect(policy.finalize(finalizeInput(issued.uploadId))).resolves.toBeNull();
+
+    expect(safeFs.commitCalls).toHaveLength(1);
+    expect(safeFs.abortCalls).toHaveLength(1);
   });
 
   it("burns before append when session generation is wrong", async () => {
@@ -1235,6 +1257,7 @@ describe("EnterpriseUploadPolicy", () => {
 
     await expectPolicyError(pending, "upload_access_denied");
     await expect(cleanup).resolves.toEqual({ cleaned: 1 });
+    expect(safeFs.commitCalls).toHaveLength(0);
     expect(safeFs.abortCalls).toHaveLength(1);
   });
 
@@ -1644,6 +1667,7 @@ describe("EnterpriseUploadPolicy", () => {
 
     await expect(finalize).resolves.toBeNull();
     await expect(cleanup).resolves.toEqual({ cleaned: 1 });
+    expect(safeFs.commitCalls).toHaveLength(0);
     expect(safeFs.abortCalls).toHaveLength(1);
     await expect(policy.finalize(finalizeInput(issued.uploadId))).resolves.toBeNull();
   });
@@ -1681,10 +1705,14 @@ describe("EnterpriseUploadPolicy", () => {
     safeFs.prepare = async () => {
       throw new Error("replaced prepare");
     };
+    safeFs.commit = () => {
+      throw new Error("replaced commit");
+    };
     clock.now = () => Number.NaN;
     randomSource.randomBytes = () => new Uint8Array(1);
 
-    await expect(policy.issue(issueInput())).resolves.toMatchObject({ expiresAt: 61_000 });
+    const issued = await policy.issue(issueInput());
+    await expect(policy.finalize(finalizeInput(issued.uploadId))).resolves.not.toBeNull();
   });
 
   it("a new policy instance has no access to another instance's upload IDs", async () => {
