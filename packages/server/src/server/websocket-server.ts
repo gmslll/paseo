@@ -736,6 +736,7 @@ interface SocketSessionOptions {
   sessionAuthorization?: SessionAuthorization;
   enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
   enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
+  admissionInvalidationSink?: SessionOptions["admissionInvalidationSink"];
   admissionAuthorizationIssuer?: EnterpriseAdmissionRuntime["admission"]["authorizationIssuer"];
   admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
 }
@@ -1951,6 +1952,7 @@ export class VoiceAssistantWebSocketServer {
             authorityReceiptState: options.enterprise.runtime.authorityReceiptState,
             principalGrantVersionGuard: options.enterprise.runtime.grantVersionGuard,
             resourceAuthorization: options.enterprise.runtime.resourceAuthorization,
+            admissionInvalidationSink: options.enterprise.runtime.admissionInvalidationSink,
           }
         : {}),
       ...(options.enterpriseWorkspaceFilesRuntime
