@@ -31,6 +31,7 @@ import {
 } from "./session/enterprise-agent-session-context-registry.js";
 import { MemoryAuthorityReceiptState } from "./session/enterprise-authority-receipt-state.js";
 import { StrictOutboundAuthorityVerifier } from "./enterprise/access/authority-receipt-verifier.js";
+import type { FileBinaryOutboundAuthorizer } from "./enterprise/access/file-binary-outbound-authorizer.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
@@ -338,6 +339,7 @@ interface SessionForTestOptions {
   targetedMessages?: Array<{ source: object; message: SessionOutboundMessage }>;
   binaryMessages?: Uint8Array[];
   targetedBinaryMessages?: Array<{ source: object; frame: Uint8Array }>;
+  onBinaryMessageToSource?: SessionOptions["onBinaryMessageToSource"];
   pluginRuntime?: SessionOptions["pluginRuntime"];
   orchestrationSkills?: SessionOptions["orchestrationSkills"];
   workspaceLabelService?: WorkspaceLabelService;
@@ -349,6 +351,7 @@ interface SessionForTestOptions {
   autoPrincipalGrantVersionGuard?: boolean;
   resourceAuthorization?: SessionOptions["resourceAuthorization"];
   enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
+  fileBinaryOutboundAuthorizer?: SessionOptions["fileBinaryOutboundAuthorizer"];
 }
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
@@ -383,6 +386,12 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     ...options.workspaceGitService,
   };
   const messages = options.messages ?? [];
+  const onBinaryMessageToSource =
+    options.onBinaryMessageToSource ??
+    (options.targetedBinaryMessages
+      ? async (source: object, frame: Uint8Array) =>
+          options.targetedBinaryMessages?.push({ source, frame })
+      : undefined);
 
   const sessionOptions: SessionOptions = {
     agentRequests: createAgentRequestsStub(),
@@ -395,12 +404,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
         }
       : {}),
     onBinaryMessage: createBinaryMessageHandler(options.binaryMessages),
-    ...(options.targetedBinaryMessages
-      ? {
-          onBinaryMessageToSource: async (source: object, frame: Uint8Array) =>
-            options.targetedBinaryMessages?.push({ source, frame }),
-        }
-      : {}),
+    ...(onBinaryMessageToSource ? { onBinaryMessageToSource } : {}),
     logger,
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
@@ -478,6 +482,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       options.resourceAuthorization ??
       (options.enterpriseContext ? ({ canEmit: vi.fn(async () => true) } as never) : undefined),
     enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime,
+    fileBinaryOutboundAuthorizer: options.fileBinaryOutboundAuthorizer,
   };
   return new Session(sessionOptions);
 }
@@ -1110,10 +1115,43 @@ test("enterprise runtime construction failure rolls back registered authority bi
   expect(registryRelease).toHaveBeenCalledTimes(1);
 });
 
-test("enterprise binary workspace emission fails closed until verifier is available", async () => {
+test("enterprise binary workspace emission is authorized and consumed per frame", async () => {
   const binaryMessages: Uint8Array[] = [];
   const targetedBinaryMessages: Array<{ source: object; frame: Uint8Array }> = [];
+  const deliveryOrder: string[] = [];
   const close = vi.fn(async () => {});
+  const frameBytes = new WeakMap<object, Uint8Array>();
+  const emissionBytes = new WeakMap<object, Uint8Array>();
+  const stream = Object.freeze(Object.create(null));
+  const canonicalizeFrame = vi.fn((frame: Uint8Array) => {
+    const canonical = Object.freeze(Object.create(null));
+    frameBytes.set(canonical, new Uint8Array(frame));
+    return canonical;
+  });
+  const open = vi.fn(async ({ frame }: { frame: object }) => {
+    const emission = Object.freeze(Object.create(null));
+    emissionBytes.set(emission, frameBytes.get(frame)!);
+    return { stream, emission };
+  });
+  const authorizeNext = vi.fn(async ({ frame }: { frame: object }) => {
+    const emission = Object.freeze(Object.create(null));
+    emissionBytes.set(emission, frameBytes.get(frame)!);
+    return emission;
+  });
+  const consumeForDelivery = vi.fn((_stream: object, emission: object) => {
+    deliveryOrder.push("consume");
+    return emissionBytes.get(emission);
+  });
+  const closeStream = vi.fn(() => true);
+  const closeAll = vi.fn();
+  const fileBinaryOutboundAuthorizer = {
+    canonicalizeFrame,
+    open,
+    authorizeNext,
+    consumeForDelivery,
+    close: closeStream,
+    closeAll,
+  } as unknown as FileBinaryOutboundAuthorizer;
   const runtime = {
     stat: vi.fn(),
     list: vi.fn(),
@@ -1148,6 +1186,11 @@ test("enterprise binary workspace emission fails closed until verifier is availa
     enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
     authorityReceiptState: new MemoryAuthorityReceiptState(),
     enterpriseWorkspaceFilesRuntime: runtime,
+    fileBinaryOutboundAuthorizer,
+    onBinaryMessageToSource: async (source, frame) => {
+      deliveryOrder.push("send");
+      targetedBinaryMessages.push({ source, frame });
+    },
   });
   await session.handleMessage(
     {
@@ -1162,9 +1205,18 @@ test("enterprise binary workspace emission fails closed until verifier is availa
     {},
   );
   expect(binaryMessages).toHaveLength(0);
-  expect(targetedBinaryMessages).toHaveLength(0);
+  expect(targetedBinaryMessages).toHaveLength(3);
+  expect(targetedBinaryMessages.map(({ frame }) => decodeFileTransferFrame(frame)?.opcode)).toEqual(
+    [FileTransferOpcode.FileBegin, FileTransferOpcode.FileChunk, FileTransferOpcode.FileEnd],
+  );
+  expect(canonicalizeFrame).toHaveBeenCalledTimes(3);
+  expect(open).toHaveBeenCalledTimes(1);
+  expect(authorizeNext).toHaveBeenCalledTimes(2);
+  expect(consumeForDelivery).toHaveBeenCalledTimes(3);
+  expect(deliveryOrder).toEqual(["consume", "send", "consume", "send", "consume", "send"]);
   expect(close).toHaveBeenCalledTimes(1);
   await session.cleanup();
+  expect(closeAll).toHaveBeenCalledWith("session_release");
 });
 
 function makeEnterpriseRuntime(cleanup: () => Promise<void>) {
