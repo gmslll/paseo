@@ -117,7 +117,10 @@ interface EnterpriseBrowserLeaseHandlerRuntime {
 
 type BrowserResourceRequestType =
   | "enterprise.browser.list_profiles.request"
-  | "enterprise.browser.bind_profile.request";
+  | "enterprise.browser.bind_profile.request"
+  | "enterprise.resource.acquire_lease.request"
+  | "enterprise.resource.renew_lease.request"
+  | "enterprise.resource.release_lease.request";
 
 interface BrowserResourceResult {
   readonly response: SessionOutboundMessage;
@@ -170,6 +173,24 @@ const StrictBindProfileResponseSchema = EnterpriseBrowserBindProfileResponseSche
   payload: EnterpriseBrowserBindProfileResponseSchema.shape.payload.strict(),
 }).strict();
 
+const StrictListProfilesRequestSchema = EnterpriseBrowserListProfilesRequestSchema.strict();
+const StrictBindProfileRequestSchema = EnterpriseBrowserBindProfileRequestSchema.strict();
+const StrictAcquireLeaseRequestSchema = EnterpriseResourceAcquireLeaseRequestSchema.strict();
+const StrictRenewLeaseRequestSchema = EnterpriseResourceRenewLeaseRequestSchema.strict();
+const StrictReleaseLeaseRequestSchema = EnterpriseResourceReleaseLeaseRequestSchema.strict();
+
+const StrictAcquireLeaseResponseSchema = EnterpriseResourceAcquireLeaseResponseSchema.extend({
+  payload: EnterpriseResourceAcquireLeaseResponseSchema.shape.payload.strict(),
+}).strict();
+
+const StrictRenewLeaseResponseSchema = EnterpriseResourceRenewLeaseResponseSchema.extend({
+  payload: EnterpriseResourceRenewLeaseResponseSchema.shape.payload.strict(),
+}).strict();
+
+const StrictReleaseLeaseResponseSchema = EnterpriseResourceReleaseLeaseResponseSchema.extend({
+  payload: EnterpriseResourceReleaseLeaseResponseSchema.shape.payload.strict(),
+}).strict();
+
 const W4_REQUEST_TYPES = new Set<string>([
   "enterprise.browser.list_profiles.request",
   "enterprise.browser.bind_profile.request",
@@ -189,10 +210,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   private closePromise: Promise<void> | null = null;
 
   public requestPolicyForType(type: string): "resources" | null {
-    return type === "enterprise.browser.list_profiles.request" ||
-      type === "enterprise.browser.bind_profile.request"
-      ? "resources"
-      : null;
+    return W4_REQUEST_TYPES.has(type) ? "resources" : null;
   }
 
   public constructor(options: EnterpriseBrowserLeaseHandlerOptions) {
@@ -275,11 +293,23 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
           type,
         );
       case "enterprise.resource.acquire_lease.request":
-        return this.handleAcquireLease(sessionContext, message, type);
+        return this.handleAcquireLease(
+          { originalContext, originalMessage, sessionContext },
+          message,
+          type,
+        );
       case "enterprise.resource.renew_lease.request":
-        return this.handleRenewLease(sessionContext, message, type);
+        return this.handleRenewLease(
+          { originalContext, originalMessage, sessionContext },
+          message,
+          type,
+        );
       case "enterprise.resource.release_lease.request":
-        return this.handleReleaseLease(sessionContext, message, type);
+        return this.handleReleaseLease(
+          { originalContext, originalMessage, sessionContext },
+          message,
+          type,
+        );
       default:
         return false;
     }
@@ -299,45 +329,23 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     if (!issued) return null;
     this.issued.delete(response);
     this.pending.delete(issued);
-    try {
-      if (
-        issued.context !== sessionContext ||
-        issued.message !== message ||
-        issued.response !== response ||
-        !this.isCurrentSession(sessionContext)
-      ) {
-        return null;
-      }
-      if (issued.requestType === "enterprise.browser.list_profiles.request") {
-        const request = EnterpriseBrowserListProfilesRequestSchema.parse(message);
-        const parsedResponse = StrictListProfilesResponseSchema.parse(response);
-        if (
-          request.requestId !== issued.requestId ||
-          parsedResponse.payload.requestId !== issued.requestId
-        ) {
-          return null;
-        }
-      } else {
-        const request = EnterpriseBrowserBindProfileRequestSchema.parse(message);
-        const parsedResponse = StrictBindProfileResponseSchema.parse(response);
-        if (
-          request.requestId !== issued.requestId ||
-          parsedResponse.payload.requestId !== issued.requestId
-        ) {
-          return null;
-        }
-      }
-      return deepFreeze({
-        response: issued.response,
-        authorizationContext: {
-          kind: "resources",
-          resources: issued.resources,
-        },
-        receiptClassification: "resources",
-      });
-    } catch {
+    if (
+      issued.context !== sessionContext ||
+      issued.message !== message ||
+      issued.response !== response ||
+      !this.isCurrentSession(sessionContext) ||
+      !matchesPendingBrowserResponseSchema(issued, message, response)
+    ) {
       return null;
     }
+    return deepFreeze({
+      response: issued.response,
+      authorizationContext: {
+        kind: "resources",
+        resources: issued.resources,
+      },
+      receiptClassification: "resources",
+    });
   }
 
   public close(): Promise<void> {
@@ -404,7 +412,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   }
 
   private async handleAcquireLease(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     message: SessionInboundMessage,
     type: "enterprise.resource.acquire_lease.request",
   ): Promise<EnterpriseDispatchResult> {
@@ -418,15 +426,15 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     let held: HeldBrowserLease | null = null;
     try {
       const handle = await this.runtime.resolveAgentHandle({
-        sessionContext: sessionContext.enterpriseContext,
+        sessionContext: input.sessionContext.enterpriseContext,
         agentId: request.agentId,
       });
-      this.assertCurrentSessionHandle(handle, sessionContext.enterpriseContext);
+      this.assertCurrentSessionHandle(handle, input.sessionContext.enterpriseContext);
       if (handle.agentId !== request.agentId) {
         throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       }
       const authorization = await this.resolveCurrentAuthorization(handle);
-      this.assertCurrentSessionHandle(handle, sessionContext.enterpriseContext);
+      this.assertCurrentSessionHandle(handle, input.sessionContext.enterpriseContext);
       assertAuthorizationMatchesAcquire(handle, authorization, request);
       const acquired = snapshotLease(
         await this.runtime.acquireLease({
@@ -437,9 +445,9 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         }),
       );
       held = { handle, authorization, lease: acquired, released: false };
-      this.assertCurrentSessionHandle(handle, sessionContext.enterpriseContext);
+      this.assertCurrentSessionHandle(handle, input.sessionContext.enterpriseContext);
       const currentAuthorization = await this.resolveCurrentAuthorization(handle);
-      this.assertCurrentSessionHandle(handle, sessionContext.enterpriseContext);
+      this.assertCurrentSessionHandle(handle, input.sessionContext.enterpriseContext);
       if (!sameAuthorization(authorization, currentAuthorization)) {
         throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       }
@@ -450,10 +458,18 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       }
       this.heldLeases.set(acquired.leaseId, held);
-      return EnterpriseResourceAcquireLeaseResponseSchema.parse({
-        type: "enterprise.resource.acquire_lease.response",
-        payload: { requestId: request.requestId, lease: acquired, waiting: false },
+      const result = leaseResourceResult({
+        response: StrictAcquireLeaseResponseSchema.parse({
+          type: "enterprise.resource.acquire_lease.response",
+          payload: { requestId: request.requestId, lease: acquired, waiting: false },
+        }),
+        requestType: request.type,
+        requestId: request.requestId,
+        authorization: currentAuthorization,
       });
+      const response = this.issuePending(input, result);
+      if (response === false) await this.releaseHeldLease(held);
+      return response;
     } catch {
       if (held) await this.releaseHeldLease(held);
       return denied(request.type, request.requestId);
@@ -461,7 +477,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   }
 
   private async handleRenewLease(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     message: SessionInboundMessage,
     type: "enterprise.resource.renew_lease.request",
   ): Promise<EnterpriseDispatchResult> {
@@ -476,7 +492,11 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     const expectedMode = held.lease.mode;
     let didRenew = false;
     try {
-      this.assertHeldLeaseRequest(held, sessionContext.enterpriseContext, request.fencingToken);
+      this.assertHeldLeaseRequest(
+        held,
+        input.sessionContext.enterpriseContext,
+        request.fencingToken,
+      );
       const renewed = snapshotLease(
         await this.runtime.renewLease({
           handle: held.handle,
@@ -486,18 +506,26 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       );
       held.lease = renewed;
       didRenew = true;
-      this.assertCurrentSessionHandle(held.handle, sessionContext.enterpriseContext);
+      this.assertCurrentSessionHandle(held.handle, input.sessionContext.enterpriseContext);
       const authorization = await this.resolveCurrentAuthorization(held.handle);
-      this.assertCurrentSessionHandle(held.handle, sessionContext.enterpriseContext);
+      this.assertCurrentSessionHandle(held.handle, input.sessionContext.enterpriseContext);
       if (!sameAuthorization(held.authorization, authorization)) {
         throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
       }
       assertLeaseMatchesAuthorization(renewed, held.handle, authorization, expectedMode);
       held.authorization = authorization;
-      return EnterpriseResourceRenewLeaseResponseSchema.parse({
-        type: "enterprise.resource.renew_lease.response",
-        payload: { requestId: request.requestId, lease: renewed },
+      const result = leaseResourceResult({
+        response: StrictRenewLeaseResponseSchema.parse({
+          type: "enterprise.resource.renew_lease.response",
+          payload: { requestId: request.requestId, lease: renewed },
+        }),
+        requestType: request.type,
+        requestId: request.requestId,
+        authorization,
       });
+      const response = this.issuePending(input, result);
+      if (response === false) await this.releaseHeldLease(held);
+      return response;
     } catch {
       if (didRenew) await this.releaseHeldLease(held);
       return denied(request.type, request.requestId);
@@ -505,7 +533,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   }
 
   private async handleReleaseLease(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     message: SessionInboundMessage,
     type: "enterprise.resource.release_lease.request",
   ): Promise<EnterpriseDispatchResult> {
@@ -518,14 +546,32 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     const held = this.heldLeases.get(request.leaseId);
     if (!held) return false;
     try {
-      this.assertHeldLeaseRequest(held, sessionContext.enterpriseContext, request.fencingToken);
+      this.assertHeldLeaseRequest(
+        held,
+        input.sessionContext.enterpriseContext,
+        request.fencingToken,
+      );
+      const authorization = await this.resolveCurrentAuthorization(held.handle);
+      this.assertCurrentSessionHandle(held.handle, input.sessionContext.enterpriseContext);
+      if (!sameAuthorization(held.authorization, authorization)) {
+        throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
+      }
+      assertLeaseMatchesAuthorization(held.lease, held.handle, authorization, held.lease.mode);
       held.released = true;
       this.heldLeases.delete(held.lease.leaseId);
       await this.runtime.releaseLease({ handle: held.handle, lease: held.lease });
-      return EnterpriseResourceReleaseLeaseResponseSchema.parse({
-        type: "enterprise.resource.release_lease.response",
-        payload: { requestId: request.requestId, released: true },
-      });
+      return this.issuePending(
+        input,
+        leaseResourceResult({
+          response: StrictReleaseLeaseResponseSchema.parse({
+            type: "enterprise.resource.release_lease.response",
+            payload: { requestId: request.requestId, released: true },
+          }),
+          requestType: request.type,
+          requestId: request.requestId,
+          authorization,
+        }),
+      );
     } catch {
       return denied(request.type, request.requestId);
     }
@@ -1044,6 +1090,66 @@ function assertLeaseMatchesAuthorization(
   }
 }
 
+function matchesPendingBrowserResponseSchema(
+  issued: PendingBrowserResponse,
+  message: SessionInboundMessage,
+  response: SessionOutboundMessage,
+): boolean {
+  try {
+    switch (issued.requestType) {
+      case "enterprise.browser.list_profiles.request":
+        return (
+          StrictListProfilesRequestSchema.parse(message).requestId === issued.requestId &&
+          StrictListProfilesResponseSchema.parse(response).payload.requestId === issued.requestId
+        );
+      case "enterprise.browser.bind_profile.request":
+        return (
+          StrictBindProfileRequestSchema.parse(message).requestId === issued.requestId &&
+          StrictBindProfileResponseSchema.parse(response).payload.requestId === issued.requestId
+        );
+      case "enterprise.resource.acquire_lease.request":
+        return (
+          StrictAcquireLeaseRequestSchema.parse(message).requestId === issued.requestId &&
+          StrictAcquireLeaseResponseSchema.parse(response).payload.requestId === issued.requestId
+        );
+      case "enterprise.resource.renew_lease.request":
+        return (
+          StrictRenewLeaseRequestSchema.parse(message).requestId === issued.requestId &&
+          StrictRenewLeaseResponseSchema.parse(response).payload.requestId === issued.requestId
+        );
+      case "enterprise.resource.release_lease.request":
+        return (
+          StrictReleaseLeaseRequestSchema.parse(message).requestId === issued.requestId &&
+          StrictReleaseLeaseResponseSchema.parse(response).payload.requestId === issued.requestId
+        );
+    }
+  } catch {
+    return false;
+  }
+}
+
+function leaseResourceResult(input: {
+  response: SessionOutboundMessage;
+  requestType:
+    | "enterprise.resource.acquire_lease.request"
+    | "enterprise.resource.renew_lease.request"
+    | "enterprise.resource.release_lease.request";
+  requestId: string;
+  authorization: BrowserProfileLeaseAuthorization;
+}): BrowserResourceResult {
+  const resources = deepFreeze([
+    workspaceResourceRef(input.authorization.workspace),
+    agentResourceRef(input.authorization.agent),
+    browserProfileResourceRef(input.authorization.profile),
+  ]);
+  return deepFreeze({
+    response: deepFreeze(input.response),
+    requestType: input.requestType,
+    requestId: input.requestId,
+    resources,
+  });
+}
+
 const GLOBAL_RESOURCE_REF_KEYS = new Set([
   "organizationId",
   "nodeId",
@@ -1057,6 +1163,15 @@ function workspaceResourceRef(workspace: AuthorizedWorkspace): GlobalResourceRef
     nodeId: workspace.nodeId,
     resourceKind: "workspace",
     localResourceId: workspace.workspaceId,
+  });
+}
+
+function agentResourceRef(agent: AuthorizedAgent): GlobalResourceRef {
+  return strictResourceRef({
+    organizationId: agent.organizationId,
+    nodeId: agent.nodeId,
+    resourceKind: "agent",
+    localResourceId: agent.agentId,
   });
 }
 
