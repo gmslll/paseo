@@ -50,6 +50,7 @@ type GrantProjectionWithoutType = Omit<PrincipalGrantProjection, "principalType"
 export interface ProductionPrincipalGrantSource extends PrincipalGrantSource {
   ready(): Promise<void>;
   validateCurrent(): Promise<boolean>;
+  isCurrent(): boolean;
   listPrincipalRecords(
     organizationId: OrganizationId,
   ): Promise<readonly EnterprisePrincipalRecord[]>;
@@ -119,6 +120,7 @@ export function createProductionPrincipalGrantSource(input: {
   }
   const grantStore = input.grantStore;
   const fs = input.fs ?? nodeIdentityRegistryFs;
+  let ready = false;
   const validateAll = async () => {
     productionAuditCapabilityIssuer.requireCurrent(audit);
     const document = readIdentityDocument(input.filePath, fs);
@@ -152,12 +154,22 @@ export function createProductionPrincipalGrantSource(input: {
   return Object.freeze({
     ...source,
     async ready() {
+      ready = false;
       await validateAll();
+      ready = true;
     },
     async validateCurrent() {
       try {
         await validateAll();
         return true;
+      } catch {
+        return false;
+      }
+    },
+    isCurrent() {
+      try {
+        productionAuditCapabilityIssuer.requireCurrent(audit);
+        return ready;
       } catch {
         return false;
       }

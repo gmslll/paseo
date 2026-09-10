@@ -98,23 +98,40 @@ export function createProductionEnterpriseIdentityDispatcherRegistration(input: 
     },
     open({ context: _context }) {
       productionAuditCapabilityIssuer.requireCurrent(input.audit);
+      if (input.admission.audit !== input.audit || !input.source.isCurrent())
+        throw new Error("enterprise identity registration is not current");
+      let active = true;
       const dispatcher = createEnterpriseIdentityDispatcher({
         listPrincipals: async ({ enterpriseContext }) => {
+          if (!active) throw new Error("enterprise identity lease is closed");
           productionAuditCapabilityIssuer.requireCurrent(input.audit);
-          return input.source.listPrincipalRecords(enterpriseContext.principal.organizationId);
+          const result = await input.source.listPrincipalRecords(
+            enterpriseContext.principal.organizationId,
+          );
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          if (!active) throw new Error("enterprise identity lease is closed");
+          return result;
         },
         logoutAll: async ({ enterpriseContext }) => {
+          if (!active) throw new Error("enterprise identity lease is closed");
           productionAuditCapabilityIssuer.requireCurrent(input.audit);
-          return (
+          const result =
             (await input.admission.registry.logoutAll(
               enterpriseContext.principal,
               enterpriseContext.principal.principalId,
               enterpriseContext.principal.organizationId,
-            )) > 0
-          );
+            )) > 0;
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          if (!active) throw new Error("enterprise identity lease is closed");
+          return result;
         },
       });
-      return { dispatcher, close: () => undefined };
+      return {
+        dispatcher,
+        close: () => {
+          active = false;
+        },
+      };
     },
   };
 }
