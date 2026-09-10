@@ -1958,6 +1958,9 @@ export class VoiceAssistantWebSocketServer {
       ...(options.enterpriseWorkspaceFilesRuntime
         ? { enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime }
         : {}),
+      ...(options.enterpriseAuthorizationRuntime
+        ? { enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime }
+        : {}),
       ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
       ...(this.enterpriseIdentitySelfAuthorization
         ? { enterpriseIdentitySelfAuthorization: this.enterpriseIdentitySelfAuthorization }
