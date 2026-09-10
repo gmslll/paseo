@@ -15,6 +15,7 @@ import type {
 } from "@getpaseo/protocol/messages";
 import pino from "pino";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import { extractHttpBearerToken } from "../../auth.js";
 import { OWNER_PERMISSIONS, SessionAuthorization } from "../../authorization/index.js";
 import { Session, type SessionOptions } from "../../session.js";
 import { createEnterpriseAgentSessionContextRegistry } from "../../session/enterprise-agent-session-context-registry.js";
@@ -50,7 +51,6 @@ import {
 } from "../access/production-authorization-runtime.js";
 import {
   bindEnterpriseAdmissionSession,
-  bindOrReplaceEnterpriseAdmissionSession,
   createEnterpriseAdmissionAuthorizationIssuer,
   issueEnterpriseAdmissionEvidence,
   releaseEnterpriseAdmissionSession,
@@ -58,8 +58,13 @@ import {
   type EnterpriseAdmissionAuthorizationHandle,
   type EnterpriseAdmissionAuthorizationIssuer,
 } from "../identity/admission-authorization.js";
+import { EnterpriseAdmission } from "../identity/admission.js";
 import { createEnterpriseSessionBindingKey } from "@getpaseo/protocol/messages";
-import { createProductionEnterpriseWorkspaceFilesProvider } from "../runtime/production-workspace-files-runtime-provider.js";
+import {
+  createProductionEnterpriseWorkspaceFilesProvider,
+  type EnterpriseDownloadHttpResponsePort,
+  type EnterpriseWorkspaceFilesProductionProvider,
+} from "../runtime/production-workspace-files-runtime-provider.js";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import {
   createProductionAuditRuntime,
@@ -80,7 +85,7 @@ const principal: PrincipalContext = Object.freeze({
   principalType: "human",
   principalId: "usr_0123456789abcdef",
   organizationId: "org_0123456789abcdef",
-  credentialId: "cred_crossflow",
+  credentialId: "cred_0123456789abcdef01234567",
   grantVersion: "grv_crossflow_1",
   grants: Object.freeze([
     {
@@ -218,6 +223,8 @@ async function createAuthority(
 ): Promise<
   SessionAuthority & {
     readonly provider: NonNullable<ReturnType<typeof createProductionAuthorizationRuntimeProvider>>;
+    readonly admission: EnterpriseAdmission;
+    readonly personalAccessToken: string;
   }
 > {
   const grant: GrantRecord = {
@@ -236,17 +243,42 @@ async function createAuthority(
     ownerPrincipalId: principal.principalId,
     createdByPrincipalId: principal.principalId,
   });
-  const mintSecret = Object.freeze(Object.create(null)) as object;
-  const issuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret, () =>
-    productionAuditCapabilityIssuer.current(audit),
-  );
-  const evidence = issueEnterpriseAdmissionEvidence(issuer, mintSecret, principal, node, {
+  const admission = new EnterpriseAdmission({
+    filePath: `${grantFilePath}.identities.json`,
+    principalSource: {
+      async resolvePrincipal(principalId, organizationId) {
+        if (principalId !== principal.principalId || organizationId !== principal.organizationId) {
+          return null;
+        }
+        return {
+          principalType: principal.principalType,
+          principalId: principal.principalId,
+          organizationId: principal.organizationId,
+          grantVersion: principal.grantVersion,
+          grants: principal.grants,
+        };
+      },
+    },
+    node,
+    audit,
+    organizationId: principal.organizationId,
+    invalidation: { publish: async () => undefined },
+    credentialIds: { next: () => principal.credentialId },
+    secrets: { next: () => Buffer.alloc(32, 7).toString("base64url") },
+  });
+  const issued = await admission.registry.issueToken({
+    actor: principal,
+    principalId: principal.principalId,
+    organizationId: principal.organizationId,
+  });
+  const evidence = await admission.authenticateEvidence(issued.token, {
     node,
     transport: "direct",
     peer: "loopback",
   });
   if (!evidence) throw new Error("expected enterprise admission evidence");
-  const handle = bindOrReplaceEnterpriseAdmissionSession(issuer, evidence, clientId);
+  const issuer = admission.authorizationIssuer;
+  const handle = admission.bindSession(evidence, clientId);
   if (!handle) throw new Error("expected enterprise admission handle");
   const resolved = resolveCurrentEnterpriseAdmissionAuthorization(issuer, handle);
   if (!resolved) throw new Error("expected current enterprise admission handle");
@@ -267,6 +299,8 @@ async function createAuthority(
   });
   return {
     provider,
+    admission,
+    personalAccessToken: issued.token,
     issuer,
     handle,
     authorization,
@@ -275,6 +309,64 @@ async function createAuthority(
     context,
     sessionBindingKey: resolved.sessionBindingKey,
   };
+}
+
+class TestHttpResponse implements EnterpriseDownloadHttpResponsePort {
+  readonly rejections: Array<400 | 403> = [];
+  readonly chunks: Buffer[] = [];
+  metadata: { fileName: string; mimeType: string; size: number } | null = null;
+  ended = false;
+  aborted = false;
+
+  async reject(status: 400 | 403): Promise<void> {
+    this.rejections.push(status);
+  }
+
+  async begin(metadata: { fileName: string; mimeType: string; size: number }): Promise<void> {
+    this.metadata = { ...metadata };
+  }
+
+  async write(bytes: Uint8Array): Promise<void> {
+    this.chunks.push(Buffer.from(bytes));
+  }
+
+  async end(): Promise<void> {
+    this.ended = true;
+  }
+
+  async abort(): Promise<void> {
+    this.aborted = true;
+  }
+}
+
+async function handleAuthenticatedHttpDownload(input: {
+  readonly admission: EnterpriseAdmission;
+  readonly provider: EnterpriseWorkspaceFilesProductionProvider;
+  readonly authorization: string | undefined;
+  readonly query: unknown;
+  readonly response: EnterpriseDownloadHttpResponsePort;
+}): Promise<void> {
+  const token = extractHttpBearerToken(input.authorization);
+  if (!token) {
+    await input.response.reject(403);
+    return;
+  }
+  const authenticated = await input.admission.authenticate(token, {
+    node: input.admission.node,
+    transport: "direct",
+    peer: "external",
+    remoteAddress: "127.0.0.1",
+  });
+  if (!authenticated) {
+    await input.response.reject(403);
+    return;
+  }
+  await input.provider.httpHandler.handle({
+    principal: authenticated,
+    node: input.admission.node,
+    query: input.query,
+    response: input.response,
+  });
 }
 
 describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership cross-flow", () => {
@@ -483,7 +575,168 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       journal
         .split("\n")
         .filter(Boolean)
-        .map((row) => JSON.parse(row).eventId),
-    ).toEqual([auditEvent.eventId]);
+        .map((row) => JSON.parse(row)),
+    ).toEqual([
+      expect.objectContaining({
+        eventId: auditEvent.eventId,
+        action: "workspace.content.read",
+      }),
+      expect.objectContaining({ action: "identity.credential.issue" }),
+      expect.objectContaining({ action: "identity.credential.use" }),
+    ]);
+  });
+
+  test("streams a one-use Session token only for the same real PAT principal and node", async () => {
+    const caseRoot = path.join(suiteRoot, "http-same-source");
+    const auditRoot = path.join(caseRoot, "audit");
+    const workspaceInput = path.join(caseRoot, "workspace");
+    await mkdir(workspaceInput, { recursive: true });
+    const workspaceRoot = await realpath(workspaceInput);
+    const content = "same-source-enterprise-http-file";
+    await writeFile(path.join(workspaceRoot, "download.txt"), content);
+
+    const audit = await createProductionAuditRuntime({
+      node,
+      auditRoot,
+      nativeAddonPath: auditAddonPath,
+    });
+    const authority = await createAuthority(audit, path.join(caseRoot, "grants.json"));
+    let workspaceRootReads = 0;
+    const filesProvider = createProductionEnterpriseWorkspaceFilesProvider({
+      workspaceRoots: {
+        async get(requestedWorkspaceId) {
+          workspaceRootReads += 1;
+          if (requestedWorkspaceId !== workspaceId) return null;
+          return {
+            workspaceId,
+            organizationId: principal.organizationId,
+            nodeId: node.nodeId,
+            ownerPrincipalId: principal.principalId,
+            createdByPrincipalId: principal.principalId,
+            cwd: workspaceRoot,
+            archivedAt: null,
+          };
+        },
+      },
+      nativeAddonPath: workspaceAddonPath,
+    });
+    if (!filesProvider?.releaseReady) throw new Error("expected Darwin workspace provider");
+    const filesRuntime = filesProvider.createSessionRuntime(authority.runtime);
+    if (!filesRuntime) throw new Error("expected production workspace files runtime");
+    const issued = await filesRuntime.issueDownloadToken({
+      workspaceId,
+      relativePath: "download.txt",
+      requestId: "http-download",
+    });
+    const readsAfterIssue = workspaceRootReads;
+    expect(readsAfterIssue).toBeGreaterThan(0);
+
+    for (const authorization of [undefined, "Bearer not-a-personal-access-token"]) {
+      const response = new TestHttpResponse();
+      await handleAuthenticatedHttpDownload({
+        admission: authority.admission,
+        provider: filesProvider,
+        authorization,
+        query: {
+          workspaceId: issued.workspaceId,
+          relativePath: issued.relativePath,
+          token: issued.token,
+        },
+        response,
+      });
+      expect(response.rejections).toEqual([403]);
+      expect(response.chunks).toEqual([]);
+      expect(workspaceRootReads).toBe(readsAfterIssue);
+    }
+
+    const success = new TestHttpResponse();
+    await handleAuthenticatedHttpDownload({
+      admission: authority.admission,
+      provider: filesProvider,
+      authorization: `Bearer ${authority.personalAccessToken}`,
+      query: {
+        workspaceId: issued.workspaceId,
+        relativePath: issued.relativePath,
+        token: issued.token,
+      },
+      response: success,
+    });
+    expect(success.rejections).toEqual([]);
+    expect(success.metadata).toEqual({
+      fileName: "download.txt",
+      mimeType: "text/plain",
+      size: Buffer.byteLength(content),
+    });
+    expect(Buffer.concat(success.chunks).toString("utf8")).toBe(content);
+    expect(success.ended).toBe(true);
+    expect(success.aborted).toBe(false);
+    const readsAfterSuccess = workspaceRootReads;
+    expect(readsAfterSuccess).toBeGreaterThan(readsAfterIssue);
+
+    for (const query of [
+      {
+        workspaceId: issued.workspaceId,
+        relativePath: issued.relativePath,
+        token: issued.token,
+      },
+      {
+        workspaceId: issued.workspaceId,
+        relativePath: issued.relativePath,
+        token: "not-an-issued-download-token",
+      },
+    ]) {
+      const rejected = new TestHttpResponse();
+      await handleAuthenticatedHttpDownload({
+        admission: authority.admission,
+        provider: filesProvider,
+        authorization: `Bearer ${authority.personalAccessToken}`,
+        query,
+        response: rejected,
+      });
+      expect(rejected.rejections).toEqual([403]);
+      expect(rejected.chunks).toEqual([]);
+      expect(workspaceRootReads).toBe(readsAfterSuccess);
+    }
+
+    const missingDownloadToken = new TestHttpResponse();
+    await handleAuthenticatedHttpDownload({
+      admission: authority.admission,
+      provider: filesProvider,
+      authorization: `Bearer ${authority.personalAccessToken}`,
+      query: {
+        workspaceId: issued.workspaceId,
+        relativePath: issued.relativePath,
+      },
+      response: missingDownloadToken,
+    });
+    expect(missingDownloadToken.rejections).toEqual([400]);
+    expect(workspaceRootReads).toBe(readsAfterSuccess);
+
+    const closedIssued = await filesRuntime.issueDownloadToken({
+      workspaceId,
+      relativePath: "download.txt",
+      requestId: "http-download-closed",
+    });
+    await filesRuntime.cleanup("session-closed");
+    const readsAfterClose = workspaceRootReads;
+    const closed = new TestHttpResponse();
+    await handleAuthenticatedHttpDownload({
+      admission: authority.admission,
+      provider: filesProvider,
+      authorization: `Bearer ${authority.personalAccessToken}`,
+      query: {
+        workspaceId: closedIssued.workspaceId,
+        relativePath: closedIssued.relativePath,
+        token: closedIssued.token,
+      },
+      response: closed,
+    });
+    expect(closed.rejections).toEqual([403]);
+    expect(closed.chunks).toEqual([]);
+    expect(workspaceRootReads).toBe(readsAfterClose);
+
+    await authority.runtime.release();
+    expect(authority.admission.releaseSession(authority.handle)).toBe(true);
+    await audit.close();
   });
 });
