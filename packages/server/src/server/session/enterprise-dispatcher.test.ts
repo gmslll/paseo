@@ -3,6 +3,8 @@ import type { SessionInboundMessage } from "../messages.js";
 import type { EnterpriseSessionContext } from "../enterprise/identity/session-context.js";
 import {
   dispatchEnterpriseRequest,
+  ENTERPRISE_IDENTITY_SELF_POLICY,
+  registerEnterpriseIdentitySelfPolicy,
   type EnterpriseSessionDispatcher,
 } from "./enterprise-dispatcher.js";
 
@@ -19,6 +21,19 @@ const message = {
 } as SessionInboundMessage;
 
 describe("enterprise session dispatcher seam", () => {
+  test("exports the identity-self request/response policy contract", () => {
+    expect(ENTERPRISE_IDENTITY_SELF_POLICY.requiresCurrentSessionBinding).toBe(true);
+    expect(ENTERPRISE_IDENTITY_SELF_POLICY.requestTypes).toEqual([
+      "enterprise.identity.get_current.request",
+      "enterprise.identity.logout_all.request",
+    ]);
+    expect(ENTERPRISE_IDENTITY_SELF_POLICY.responseTypes).toEqual([
+      "enterprise.identity.get_current.response",
+      "enterprise.identity.logout_all.response",
+    ]);
+    const dispatcher: EnterpriseSessionDispatcher = { handle: vi.fn(() => false) };
+    expect(registerEnterpriseIdentitySelfPolicy(dispatcher)).toBe(dispatcher);
+  });
   test("passes the server-bound context to the registered dispatcher", async () => {
     const handle = vi.fn(() => message);
     const dispatcher: EnterpriseSessionDispatcher = { handle };

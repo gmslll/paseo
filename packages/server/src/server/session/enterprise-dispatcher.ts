@@ -15,6 +15,43 @@ export type EnterpriseDispatchResult = SessionOutboundMessage | false;
 export type EnterpriseIdentityRequestType =
   | "enterprise.identity.get_current.request"
   | "enterprise.identity.logout_all.request";
+export type EnterpriseIdentityResponseType =
+  | "enterprise.identity.get_current.response"
+  | "enterprise.identity.logout_all.response";
+export interface EnterpriseIdentitySelfPolicyDescriptor {
+  readonly requestTypes: readonly EnterpriseIdentityRequestType[];
+  readonly responseTypes: readonly EnterpriseIdentityResponseType[];
+  readonly requiresCurrentSessionBinding: true;
+}
+export const ENTERPRISE_IDENTITY_SELF_POLICY: EnterpriseIdentitySelfPolicyDescriptor =
+  Object.freeze({
+    requestTypes: Object.freeze([
+      "enterprise.identity.get_current.request",
+      "enterprise.identity.logout_all.request",
+    ] as const),
+    responseTypes: Object.freeze([
+      "enterprise.identity.get_current.response",
+      "enterprise.identity.logout_all.response",
+    ] as const),
+    requiresCurrentSessionBinding: true,
+  });
+export function registerEnterpriseIdentitySelfPolicy(
+  dispatcher: EnterpriseSessionDispatcher,
+): EnterpriseSessionDispatcher {
+  return dispatcher;
+}
+export function isIdentitySelfRequest(message: SessionInboundMessage): boolean {
+  return (
+    message.type === "enterprise.identity.get_current.request" ||
+    message.type === "enterprise.identity.logout_all.request"
+  );
+}
+export function isIdentitySelfResponse(message: SessionOutboundMessage): boolean {
+  return (
+    message.type === "enterprise.identity.get_current.response" ||
+    message.type === "enterprise.identity.logout_all.response"
+  );
+}
 
 /** W3 routing seam; domain policy and handlers remain owned by their workstreams. */
 export interface EnterpriseSessionDispatcher {
