@@ -28,3 +28,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0015: Register enterprise RPCs in the operation permission gate](decisions/0015-enterprise-operation-permission-registration.md)
 - [ADR 0016: Audit Sink authority and durability](decisions/0016-audit-sink-authority-and-durability.md)
 - [ADR 0017: Browser Profile runtime authorization](decisions/0017-browser-profile-runtime-authorization.md)
+- [ADR 0026: Provider history and search resource contract](decisions/0026-provider-history-and-search-resource-contract.md)
