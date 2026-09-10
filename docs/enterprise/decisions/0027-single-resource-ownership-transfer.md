@@ -1,6 +1,6 @@
 # ADR-0027: Single-resource ownership transfer contract
 
-- Status: DECISION_REQUIRED
+- Status: Accepted (contract; implementation pending)
 - Date: 2026-09-11
 - Decision owner: Enterprise integration owner
 
@@ -12,7 +12,7 @@ production tree contain no callable Workspace/Agent owner-transfer API, transfer
 receipt. Existing `expectedRevision` fields belong to file/config mutation and cannot authorize an
 ownership change.
 
-## Minimum P0 contract for decision
+## Decision
 
 Add one typed, single-resource ownership-transfer operation for the existing Workspace and Agent
 resource kinds. The request contains exactly the existing canonical `GlobalResourceRef`,
