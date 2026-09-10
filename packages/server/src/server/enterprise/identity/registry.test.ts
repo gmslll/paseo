@@ -109,7 +109,7 @@ class FaultFs implements IdentityRegistryFsPort {
 
   constructor(options?: { noFollowFlag?: number; delegate?: IdentityRegistryFsPort }) {
     this.delegate = options?.delegate ?? nodeIdentityRegistryFs;
-    this.noFollowFlag = options?.noFollowFlag ?? this.delegate.noFollowFlag;
+    this.noFollowFlag = options?.noFollowFlag ?? (this.delegate.noFollowFlag || 0x40000000);
   }
 
   fail(
