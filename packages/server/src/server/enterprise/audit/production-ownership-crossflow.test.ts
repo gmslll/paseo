@@ -1253,6 +1253,10 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       ]);
       expect(a.info.message.payload.features.enterpriseAuditV1).toBe(true);
       expect(b.info.message.payload.features.enterpriseAuditV1).toBe(true);
+      const allowedPromise = next(
+        a.socket,
+        (v) => v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response",
+      );
       a.socket.send(
         JSON.stringify({
           type: "session",
@@ -1264,11 +1268,14 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           },
         }),
       );
-      const allowed = await next(
-        a.socket,
-        (v) => v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response",
-      );
+      const allowed = await allowedPromise;
       expect(allowed.message?.payload?.events).toHaveLength(1);
+      const deniedPromise = next(
+        b.socket,
+        (v) =>
+          v?.type === "rpc_error" ||
+          (v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response"),
+      );
       b.socket.send(
         JSON.stringify({
           type: "session",
@@ -1280,16 +1287,45 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           },
         }),
       );
-      const denied = await next(
-        b.socket,
-        (v) =>
-          v?.type === "rpc_error" ||
-          (v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response"),
-      );
+      const denied = await deniedPromise;
       const deniedEvents = denied.message?.payload?.events;
       expect(
         denied.type === "rpc_error" || (Array.isArray(deniedEvents) && deniedEvents.length === 0),
       ).toBe(true);
+      const identityPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" && v.message?.type === "enterprise.identity.get_current.response",
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: { type: "enterprise.identity.get_current.request", requestId: "identity-a" },
+        }),
+      );
+      expect((await identityPromise).message?.payload?.requestId).toBe("identity-a");
+      for (const [type, requestId] of [
+        ["daemon.get_status.request", "deny-status"],
+        ["get_daemon_config_request", "deny-config"],
+        ["plugin.list.request", "deny-plugin"],
+        ["list_available_providers_request", "deny-provider"],
+      ] as const) {
+        const responsePromise = next(
+          a.socket,
+          (v) =>
+            (v?.type === "rpc_error" && v.payload?.requestId === requestId) ||
+            (v?.type === "session" &&
+              v.message?.type === "rpc_error" &&
+              v.message?.payload?.requestId === requestId),
+        );
+        a.socket.send(JSON.stringify({ type: "session", message: { type, requestId } }));
+        const response = await responsePromise;
+        expect(response.payload ?? response.message?.payload).toMatchObject({
+          requestId,
+          requestType: type,
+          code: "access_denied",
+        });
+      }
     } finally {
       for (const socket of sockets) socket.close();
       await daemon.stop().catch(() => undefined);
