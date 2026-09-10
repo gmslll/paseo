@@ -152,6 +152,14 @@ describe("ResourceAuthorizationService", () => {
       workspaceId: "wks_a",
       ...owner,
     });
+    await expect(authorization.assertAgent(ctx, "browser.use", "agent_a")).resolves.toEqual({
+      agentId: "agent_a",
+      workspaceId: "wks_a",
+      ...owner,
+    });
+    await expect(authorization.assertAgent(ctx, "app.use", "agent_a")).rejects.toBeInstanceOf(
+      ResourceAuthorizationError,
+    );
     expect(
       authorization.filterWorkspaces(ctx, [workspaceRecord, { id: "wks_a" }, { id: "wks_b" }]),
     ).toEqual([workspaceRecord]);

@@ -82,6 +82,11 @@ const WORKSPACE_ACTIONS = [
   "workspace.editor.open",
 ] as const satisfies readonly EnterpriseAction[];
 
+const AGENT_ACTIONS = [
+  ...WORKSPACE_ACTIONS,
+  "browser.use",
+] as const satisfies readonly EnterpriseAction[];
+
 export class ResourceAuthorizationService implements ResourceAuthorizationContract {
   private readonly owners: OwnerAuthorizationRegistry;
   private readonly browserProfiles?: BrowserProfileRegistry;
@@ -147,7 +152,7 @@ export class ResourceAuthorizationService implements ResourceAuthorizationContra
     if (
       !agent ||
       agent.nodeId !== this.nodeId ||
-      !WORKSPACE_ACTIONS.includes(action as (typeof WORKSPACE_ACTIONS)[number]) ||
+      !AGENT_ACTIONS.includes(action as (typeof AGENT_ACTIONS)[number]) ||
       !grantAllows(ctx, action, agent, agent.workspaceId)
     )
       throw new ResourceAuthorizationError();
