@@ -1519,8 +1519,9 @@ describe("IdentityRegistry", () => {
     ).toHaveLength(1);
   });
   test("initial credential rejects foreign and unknown principals", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-initial-foreign-"));
     const { registry } = createTestRegistry({
-      filePath: path.join(os.tmpdir(), "paseo-initial-foreign.json"),
+      filePath: path.join(root, "credentials.json"),
     });
     await registry.load();
     await expect(
