@@ -17,22 +17,26 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
         getTimelineRows: async () => [],
       };
       let cleanupCount = 0;
+      let listCount = 0;
       const unused = async (..._args: never[]): Promise<never> => {
         throw new Error("unused");
       };
       const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
         stat: unused,
-        list: async () => [
-          {
-            kind: "file" as const,
-            relativePath: "README.md",
-            name: "README.md",
-            dev: 1,
-            ino: 2,
-            size: 12,
-            mtimeMs: 1_000,
-          },
-        ],
+        list: async () => {
+          listCount += 1;
+          return [
+            {
+              kind: "file" as const,
+              relativePath: "README.md",
+              name: "README.md",
+              dev: 1,
+              ino: 2,
+              size: 12,
+              mtimeMs: 1_000,
+            },
+          ];
+        },
         openRead: unused,
         write: unused,
         create: unused,
@@ -136,6 +140,38 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
           response: response2,
         }),
       ).toBeNull();
+      const successListCount = listCount;
+      const successAuditCount = (await fixture.audit.snapshotEvents()).filter(
+        (event) => event.action === "workspace.content.read",
+      ).length;
+      const foreignOrgMessage = {
+        ...message,
+        requestId: "r-foreign-org",
+        resource: { ...message.resource, organizationId: "org_ffffffffffffffff" },
+      };
+      expect(
+        await lease.dispatcher.handle({
+          sessionContext: fixture.context,
+          message: foreignOrgMessage,
+        }),
+      ).toBe(false);
+      const missingWorkspaceMessage = {
+        ...message,
+        requestId: "r-missing-workspace",
+        resource: { ...message.resource, localResourceId: "wks_ffffffffffffffff" },
+      };
+      expect(
+        await lease.dispatcher.handle({
+          sessionContext: fixture.context,
+          message: missingWorkspaceMessage,
+        }),
+      ).toBe(false);
+      expect(listCount).toBe(successListCount);
+      expect(
+        (await fixture.audit.snapshotEvents()).filter(
+          (event) => event.action === "workspace.content.read",
+        ),
+      ).toHaveLength(successAuditCount);
       await lease.close();
       await lease.close();
       expect(cleanupCount).toBe(1);
