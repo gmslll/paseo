@@ -1,6 +1,15 @@
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
-import { MemoryEnterpriseIdentityLifecycle } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import {
+  createEnterpriseIdentityLifecycle,
+  type EnterpriseIdentityLifecycle,
+  type ProcessCredentialVault,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
@@ -190,24 +199,96 @@ function expectResidueAbsent(keys: ReturnType<typeof residueKeys>): void {
   );
 }
 
+function fingerprint(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+function containsSecretOrFingerprint(value: string, secrets: readonly string[]): boolean {
+  for (const secret of secrets) {
+    if (value.includes(secret) || value.includes(fingerprint(secret))) return true;
+  }
+  return false;
+}
+
+async function expectClientSurfacesExcludeSecrets(
+  input: {
+    readonly controller: HostRuntimeController;
+    readonly lifecycle: EnterpriseIdentityLifecycle;
+    readonly vault: ProcessCredentialVault;
+    readonly logs: readonly unknown[];
+    readonly localStorageValues: ReadonlyMap<string, string>;
+  },
+  secrets: readonly string[],
+): Promise<void> {
+  await flushDraftPersistStorage();
+  const storageKeys = await AsyncStorage.getAllKeys();
+  const persistedStorage = await AsyncStorage.multiGet(storageKeys);
+  const serialized = JSON.stringify({
+    hostSnapshot: input.controller.getSnapshot(),
+    identitySnapshot: input.lifecycle.readSnapshot(),
+    vault: input.vault,
+    vaultKeys: Reflect.ownKeys(input.vault),
+    layout: useWorkspaceLayoutStore.getState(),
+    drafts: useDraftStore.getState(),
+    submissions: useWorkspaceDraftSubmissionStore.getState(),
+    attachments: useWorkspaceAttachmentsStore.getState(),
+    persistedStorage,
+    localStorage: [...input.localStorageValues.entries()],
+    logs: input.logs,
+  });
+  for (const secret of secrets) {
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain(fingerprint(secret));
+  }
+}
+
 describe("production enterprise app residue lifecycle", () => {
-  it("clears A stores before browser and network teardown, then isolates B from late A events", async () => {
+  it("keeps PATs out of snapshots and caches across A revoke and B login", async () => {
+    const tokenA = "pso_u_credA.A1Wz4zvsvS5l1mbqLh9jR3F0dT8uY2xK6pN7cQeV9Mo";
+    const tokenB = "pso_u_credB.B7Xm2qL8vC4sN9kH1rT6wP3dF5yJ0uGzE8aM4iQn2Rs";
+    const wrongToken = "pso_u_wrong.C9Vn5xK2mD7qR1tF8wH4sL6jP0yB3uGzE5aM9iQn7Ro";
+    const secrets = [tokenA, tokenB, wrongToken] as const;
+    const localStorageValues = new Map<string, string>();
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
         localStorage: {
-          getItem: () => null,
-          setItem: () => {},
-          removeItem: () => {},
+          get length() {
+            return localStorageValues.size;
+          },
+          clear: () => localStorageValues.clear(),
+          getItem: (key: string) => localStorageValues.get(key) ?? null,
+          key: (index: number) => [...localStorageValues.keys()][index] ?? null,
+          removeItem: (key: string) => localStorageValues.delete(key),
+          setItem: (key: string, value: string) => localStorageValues.set(key, value),
         },
       },
     });
     resetResidueStores();
     const serverId = "server-case8";
+    let fileRequestCount = 0;
+    let transportMetadataSafe = true;
+    const fileServer = createServer((request, response) => {
+      const requestMetadata = JSON.stringify({ method: request.method, url: request.url });
+      transportMetadataSafe &&= !containsSecretOrFingerprint(requestMetadata, secrets);
+      const authorization = request.headers.authorization;
+      let principal: "a" | "b" | null = null;
+      if (authorization === `Bearer ${tokenA}`) principal = "a";
+      else if (authorization === `Bearer ${tokenB}`) principal = "b";
+      if (!principal) {
+        response.writeHead(401).end();
+        return;
+      }
+      fileRequestCount += 1;
+      response.writeHead(200, { "content-type": "text/plain" }).end(`ok-${principal}`);
+    });
+    fileServer.listen(0, "127.0.0.1");
+    await once(fileServer, "listening");
+    const fileAddress = fileServer.address() as AddressInfo;
     const connection: HostConnection = {
-      id: "direct:127.0.0.1:1",
+      id: `direct:127.0.0.1:${fileAddress.port}`,
       type: "directTcp",
-      endpoint: "127.0.0.1:1",
+      endpoint: `127.0.0.1:${fileAddress.port}`,
     };
     const host: HostProfile = {
       serverId,
@@ -220,10 +301,18 @@ describe("production enterprise app residue lifecycle", () => {
       updatedAt: new Date(0).toISOString(),
     };
     const events: string[] = [];
+    const logs: unknown[] = [];
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation((...args) => logs.push({ level: "warn", args }));
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args) => logs.push({ level: "error", args }));
     const keysA = residueKeys(serverId, "a");
     const keysB = residueKeys(serverId, "b");
-    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
-    let generationA: ReturnType<MemoryEnterpriseIdentityLifecycle["readSnapshot"]>["generation"];
+    let lifecycle!: EnterpriseIdentityLifecycle;
+    let vault!: ProcessCredentialVault;
+    let generationA: ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]>["generation"];
     const bridge: BrowserProfileRuntimeBridge = {
       hydrateBrowserProfileAuthorizations: async ({ lifecycleGeneration }) => {
         events.push(`hydrate:${lifecycleGeneration}`);
@@ -237,32 +326,33 @@ describe("production enterprise app residue lifecycle", () => {
       host,
       deps: {
         browserProfileRuntimeBridge: bridge,
-        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
-          lifecycle = new MemoryEnterpriseIdentityLifecycle(
-            vault,
-            ports.authenticate,
-            ports.teardown,
-            ports.remoteLogout,
-          );
+        createEnterpriseIdentityLifecycle: ({ vault: inputVault, ports }) => {
+          vault = inputVault;
+          lifecycle = createEnterpriseIdentityLifecycle({ vault, ports });
           return lifecycle;
         },
         createEnterpriseIdentityLifecyclePorts: () => ({
-          authenticate: async ({ token }) => ({
-            projection: {
-              principalType: "human",
-              principalId:
-                token === "local-token-a" ? "usr_aaaaaaaaaaaaaaaa" : "usr_bbbbbbbbbbbbbbbb",
-              organizationId: "org_aaaaaaaaaaaaaaaa",
-              nodeId: "nod_aaaaaaaaaaaaaaaa",
-              paseoServerId: serverId,
-              displayName: token === "local-token-a" ? "Employee A" : "Employee B",
-              grantVersion: token === "local-token-a" ? "grant-a" : "grant-b",
-              navigation: [],
-              allowedOperations: [],
-            },
-            sessionBindingKey: token === "local-token-a" ? "binding-a" : "binding-b",
-            teardownAttempt: async () => {},
-          }),
+          authenticate: async ({ token }) => {
+            let owner: "a" | "b" | null = null;
+            if (token === tokenA) owner = "a";
+            else if (token === tokenB) owner = "b";
+            if (!owner) throw new Error("Enterprise credential rejected");
+            return {
+              projection: {
+                principalType: "human",
+                principalId: owner === "a" ? "usr_aaaaaaaaaaaaaaaa" : "usr_bbbbbbbbbbbbbbbb",
+                organizationId: "org_aaaaaaaaaaaaaaaa",
+                nodeId: "nod_aaaaaaaaaaaaaaaa",
+                paseoServerId: serverId,
+                displayName: owner === "a" ? "Employee A" : "Employee B",
+                grantVersion: owner === "a" ? "grant-a" : "grant-b",
+                navigation: [],
+                allowedOperations: [],
+              },
+              sessionBindingKey: owner === "a" ? "binding-a" : "binding-b",
+              teardownAttempt: async () => {},
+            };
+          },
           teardown: {
             stopNetworkAndSubscriptions: async () => {
               events.push("stop-network");
@@ -292,15 +382,24 @@ describe("production enterprise app residue lifecycle", () => {
         getClientId: async () => "cid_case8",
       },
     });
-    const fileTransport = vi.fn(async () => new Response("ok", { status: 200 }));
     const enterpriseFileRequest = createEnterpriseFileRequestFactory({
       lifecycle,
-      fetch: fileTransport,
     })({ host, connection, clientId: "cid_case8", runtimeGeneration: 1 });
     expect(enterpriseFileRequest).toBeTypeOf("function");
+    expect(Object.isFrozen(vault)).toBe(true);
+    expect(Object.keys(vault)).toEqual([]);
+    expect(JSON.stringify(vault)).toBe("{}");
 
     try {
-      await lifecycle.authenticateEnterpriseHost({ serverId, token: "local-token-a" });
+      await expect(
+        lifecycle.authenticateEnterpriseHost({ serverId, token: wrongToken }),
+      ).rejects.toThrow("rejected");
+      await expectClientSurfacesExcludeSecrets(
+        { controller, lifecycle, vault, logs, localStorageValues },
+        secrets,
+      );
+
+      await lifecycle.authenticateEnterpriseHost({ serverId, token: tokenA });
       generationA = lifecycle.readSnapshot().generation;
       expect(generationA).toEqual(expect.any(String));
       expect(controller.getEnterpriseScopeGeneration()).toBe(generationA);
@@ -328,8 +427,18 @@ describe("production enterprise app residue lifecycle", () => {
           scopeGeneration: generationA!,
         }),
       ).resolves.toMatchObject({ status: 200 });
+      expect(fileRequestCount).toBe(1);
+      expect(transportMetadataSafe).toBe(true);
+      await expectClientSurfacesExcludeSecrets(
+        { controller, lifecycle, vault, logs, localStorageValues },
+        secrets,
+      );
 
-      await lifecycle.logoutCurrent(serverId);
+      await lifecycle.credentialRevoked({
+        serverId,
+        generation: generationA!,
+        sessionBindingKey: "binding-a",
+      });
       expectResidueAbsent(keysA);
       expect(events.indexOf(`revoke:${generationA}`)).toBeGreaterThanOrEqual(0);
       expect(events.indexOf(`revoke:${generationA}`)).toBeLessThan(events.indexOf("stop-network"));
@@ -342,7 +451,7 @@ describe("production enterprise app residue lifecycle", () => {
         }),
       ).rejects.toThrow("no longer current");
 
-      await lifecycle.authenticateEnterpriseHost({ serverId, token: "local-token-b" });
+      await lifecycle.authenticateEnterpriseHost({ serverId, token: tokenB });
       const generationB = lifecycle.readSnapshot().generation;
       expect(generationB).toEqual(expect.any(String));
       expect(controller.getEnterpriseScopeGeneration()).toBe(generationB);
@@ -357,6 +466,8 @@ describe("production enterprise app residue lifecycle", () => {
           scopeGeneration: generationB!,
         }),
       ).resolves.toMatchObject({ status: 200 });
+      expect(fileRequestCount).toBe(2);
+      expect(transportMetadataSafe).toBe(true);
 
       await lifecycle.credentialRevoked({
         serverId,
@@ -382,11 +493,39 @@ describe("production enterprise app residue lifecycle", () => {
       expectResiduePresent(keysB, "private-b");
       expect(JSON.stringify(useDraftStore.getState().drafts)).not.toContain("private-a");
       expect(JSON.stringify(useDraftStore.getState().drafts)).toContain("private-b");
-      expect(fileTransport).toHaveBeenCalledTimes(2);
+      await expectClientSurfacesExcludeSecrets(
+        { controller, lifecycle, vault, logs, localStorageValues },
+        secrets,
+      );
+      await lifecycle.logoutCurrent(serverId);
+      await expect(
+        enterpriseFileRequest!({
+          serverId,
+          workspaceId: keysB.workspaceId,
+          relativePath: "late-b.txt",
+          scopeGeneration: generationB!,
+        }),
+      ).rejects.toThrow("no longer current");
+      expect(fileRequestCount).toBe(2);
+      await expectClientSurfacesExcludeSecrets(
+        { controller, lifecycle, vault, logs, localStorageValues },
+        secrets,
+      );
     } finally {
       if (lifecycle.readSnapshot().state === "signed_in") {
         await lifecycle.logoutCurrent(serverId);
       }
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+      await new Promise<void>((resolve, reject) => {
+        fileServer.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
     }
   });
 });
