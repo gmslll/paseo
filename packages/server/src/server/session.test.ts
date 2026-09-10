@@ -1259,7 +1259,6 @@ test("enterprise authorized request registers active handle before handler and c
     authorityReceiptState: state,
   });
   const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
-  const terminalDispatch = vi.spyOn(asSessionInternals(session).terminalController, "dispatch");
   await session.handleMessage({ type: "daemon.get_status.request", requestId: "authority-1" });
   expect(register).toHaveBeenCalledTimes(1);
   expect(register.mock.calls[0]?.[0].binding).toEqual(
@@ -1275,7 +1274,6 @@ test("enterprise authorized request registers active handle before handler and c
   );
   expect(end).toHaveBeenCalledTimes(1);
   expect(dispatch).toHaveBeenCalledTimes(1);
-  expect(terminalDispatch).not.toHaveBeenCalled();
   expect(register.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]!);
   expect(end.mock.calls[0]?.[0]).toEqual({
     sessionId: session.getSessionId(),
@@ -2369,6 +2367,7 @@ test("enterprise global list terminals is denied before terminal enumeration", a
     authorityReceiptState,
   });
   const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  const terminalDispatch = vi.spyOn(asSessionInternals(session).terminalController, "dispatch");
 
   await session.handleMessage({
     type: "list_terminals_request",
@@ -2377,6 +2376,7 @@ test("enterprise global list terminals is denied before terminal enumeration", a
   });
 
   expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(terminalDispatch).not.toHaveBeenCalled();
   expect(register).not.toHaveBeenCalled();
   expect(messages).toEqual([
     {
