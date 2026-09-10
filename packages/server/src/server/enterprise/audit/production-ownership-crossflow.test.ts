@@ -20,6 +20,7 @@ import type {
 import pino from "pino";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { extractHttpBearerToken } from "../../auth.js";
+import { MockLoadTestAgentClient } from "../../agent/providers/mock-load-test-agent.js";
 import { OWNER_PERMISSIONS, SessionAuthorization } from "../../authorization/index.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../../bootstrap.js";
 import { Session, type SessionOptions } from "../../session.js";
@@ -1024,11 +1025,63 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     const root = path.join(suiteRoot, "default-ws");
     const paseoHome = path.join(root, ".paseo");
     const staticDir = path.join(root, "static");
+    const workspaceInput = path.join(root, "workspace-content");
     const serverId = "srv_0123456789ab";
     const principalA = "usr_aaaaaaaaaaaaaaaa";
     const principalB = "usr_bbbbbbbbbbbbbbbb";
     await mkdir(path.join(paseoHome, "enterprise"), { recursive: true, mode: 0o700 });
     await mkdir(staticDir, { recursive: true, mode: 0o700 });
+    await mkdir(path.join(paseoHome, "projects"), { recursive: true, mode: 0o700 });
+    await mkdir(path.join(paseoHome, "agents"), { recursive: true, mode: 0o700 });
+    await mkdir(workspaceInput, { recursive: true, mode: 0o700 });
+    const workspaceRoot = await realpath(workspaceInput);
+    await writeFile(path.join(workspaceRoot, "canonical.txt"), "workspace-content-canonical\n", {
+      mode: 0o600,
+    });
+    await writeFile(
+      path.join(paseoHome, "projects", "workspaces.json"),
+      JSON.stringify([
+        {
+          workspaceId,
+          organizationId: principal.organizationId,
+          nodeId: node.nodeId,
+          ownerPrincipalId: principalA,
+          createdByPrincipalId: principalA,
+          projectId: "project-crossflow",
+          cwd: workspaceRoot,
+          kind: "directory",
+          displayName: "Crossflow workspace",
+          title: null,
+          branch: null,
+          worktreeRoot: null,
+          baseBranch: null,
+          isPaseoOwnedWorktree: false,
+          mainRepoRoot: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          archivedAt: null,
+        },
+      ]),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      path.join(paseoHome, "projects", "projects.json"),
+      JSON.stringify([
+        {
+          projectId: "project-crossflow",
+          rootPath: workspaceRoot,
+          kind: "non_git",
+          displayName: "Crossflow",
+          projectKey: null,
+          customName: null,
+          customIconRevision: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          archivedAt: null,
+        },
+      ]),
+      { mode: 0o600 },
+    );
     await writeFile(path.join(paseoHome, "server-id"), `${serverId}\n`, { mode: 0o600 });
     await writeFile(
       path.join(paseoHome, "enterprise", "principals.json"),
@@ -1066,6 +1119,14 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
               action: "audit.read",
               selector: { kind: "organization", organizationId: principal.organizationId },
             },
+            {
+              action: "workspace.content.read",
+              selector: { kind: "workspace", workspaceIds: [workspaceId] },
+            },
+            {
+              action: "workspace.metadata.read",
+              selector: { kind: "workspace", workspaceIds: [workspaceId] },
+            },
           ],
           grantVersion: "grv_a",
         },
@@ -1076,6 +1137,10 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             {
               action: "audit.read",
               selector: { kind: "organization", organizationId: principal.organizationId },
+            },
+            {
+              action: "workspace.metadata.read",
+              selector: { kind: "workspace", workspaceIds: [workspaceId] },
             },
           ],
           grantVersion: "grv_b",
@@ -1174,7 +1239,7 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         mcpEnabled: false,
         staticDir,
         mcpDebug: false,
-        agentClients: {},
+        agentClients: { mock: new MockLoadTestAgentClient() },
         agentStoragePath: path.join(paseoHome, "agents"),
         relayEnabled: false,
         appBaseUrl: "https://app.paseo.sh",
@@ -1202,13 +1267,17 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       },
     );
     const sockets: WebSocket[] = [];
+    let phase = "startup";
     interface WsEnvelope {
       type?: string;
       message?: { type?: string; payload?: Record<string, unknown> };
     }
     const next = (socket: WebSocket, predicate: (value: unknown) => boolean) =>
       new Promise<WsEnvelope>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("WebSocket response timeout")), 10_000);
+        const timer = setTimeout(
+          () => reject(new Error(`WebSocket response timeout (${phase})`)),
+          10_000,
+        );
         const onMessage = (data: RawData) => {
           let value: unknown;
           try {
@@ -1252,6 +1321,24 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         connect("default-a", issuedA.token),
         connect("default-b", issuedB.token),
       ]);
+      const liveAgent = await daemon.agentManager.createAgent(
+        { provider: "mock", cwd: workspaceRoot, model: "ten-second-stream" },
+        "00000000-0000-4000-8000-000000000777",
+        {
+          workspaceId,
+          enterpriseOwnership: {
+            workspaceId,
+            organizationId: principal.organizationId,
+            nodeId: node.nodeId,
+            ownerPrincipalId: principalA,
+            createdByPrincipalId: principalA,
+          },
+        },
+      );
+      await daemon.agentManager.appendTimelineItem(liveAgent.id, {
+        type: "assistant_message",
+        text: "live-agent-content",
+      });
       expect(a.info.message.payload.features.enterpriseAuditV1).toBe(true);
       expect(b.info.message.payload.features.enterpriseAuditV1).toBe(true);
       const allowedPromise = next(
@@ -1372,6 +1459,192 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         code: "access_denied",
       });
       expect(JSON.stringify(terminals)).not.toContain(paseoHome);
+      const contentRequest = (
+        type: string,
+        requestId: string,
+        resourceKind: "workspace" | "agent",
+        localResourceId: string,
+        selector: { kind: "workspace" | "agent"; view: "files" | "timeline" | "transcript" },
+      ) => ({
+        type,
+        requestId,
+        resource: {
+          organizationId: principal.organizationId,
+          nodeId: node.nodeId,
+          resourceKind,
+          localResourceId,
+        },
+        selector,
+        page: { limit: 20 },
+      });
+      const workspaceContentPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.workspace.content.read.response" &&
+          v.message?.payload?.requestId === "content-workspace-a",
+      );
+      phase = "content-workspace-a";
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: contentRequest(
+            "enterprise.workspace.content.read.request",
+            "content-workspace-a",
+            "workspace",
+            workspaceId,
+            { kind: "workspace", view: "timeline" },
+          ),
+        }),
+      );
+      const workspaceContent = await workspaceContentPromise;
+      expect(workspaceContent.message?.payload?.resource?.localResourceId).toBe(workspaceId);
+      expect(workspaceContent.message?.payload?.page?.items).toEqual(
+        expect.arrayContaining([expect.objectContaining({ text: "live-agent-content" })]),
+      );
+      const agentContentPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.agent.content.read.response" &&
+          v.message?.payload?.requestId === "content-agent-a",
+      );
+      phase = "content-agent-a";
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: contentRequest(
+            "enterprise.agent.content.read.request",
+            "content-agent-a",
+            "agent",
+            liveAgent.id,
+            { kind: "agent", view: "transcript" },
+          ),
+        }),
+      );
+      const agentContent = await agentContentPromise;
+      expect(agentContent.message?.payload?.resource?.localResourceId).toBe(liveAgent.id);
+      const foreignContentPromise = next(
+        b.socket,
+        (v) =>
+          (v?.type === "rpc_error" && v.payload?.requestId === "content-workspace-b") ||
+          (v?.type === "session" &&
+            v.message?.type === "rpc_error" &&
+            v.message?.payload?.requestId === "content-workspace-b"),
+      );
+      phase = "content-workspace-b";
+      b.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: contentRequest(
+            "enterprise.workspace.content.read.request",
+            "content-workspace-b",
+            "workspace",
+            workspaceId,
+            { kind: "workspace", view: "files" },
+          ),
+        }),
+      );
+      const foreignContent = await foreignContentPromise;
+      expect(foreignContent.payload ?? foreignContent.message?.payload).toMatchObject({
+        requestId: "content-workspace-b",
+        code: expect.stringMatching(/^(access_denied|unavailable)$/),
+      });
+      const resourcesPromise = next(
+        b.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.organization.list_resources.response" &&
+          v.message?.payload?.requestId === "resources-b",
+      );
+      b.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.organization.list_resources.request",
+            requestId: "resources-b",
+            resourceKinds: ["workspace", "agent"],
+            limit: 20,
+          },
+        }),
+      );
+      const resources = await resourcesPromise;
+      const resourceRows = resources.message?.payload?.resources;
+      expect(resourceRows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ resourceKind: "workspace", workspaceId }),
+          expect.objectContaining({ resourceKind: "agent", agentId: liveAgent.id }),
+        ]),
+      );
+      expect(JSON.stringify(resources)).not.toContain(paseoHome);
+      const foreignAgentPromise = next(
+        b.socket,
+        (v) =>
+          (v?.type === "rpc_error" && v.payload?.requestId === "content-agent-b") ||
+          (v?.type === "session" &&
+            v.message?.type === "rpc_error" &&
+            v.message?.payload?.requestId === "content-agent-b"),
+      );
+      phase = "content-agent-b";
+      b.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: contentRequest(
+            "enterprise.agent.content.read.request",
+            "content-agent-b",
+            "agent",
+            liveAgent.id,
+            { kind: "agent", view: "transcript" },
+          ),
+        }),
+      );
+      const foreignAgent = await foreignAgentPromise;
+      expect(foreignAgent.payload ?? foreignAgent.message?.payload).toMatchObject({
+        requestId: "content-agent-b",
+        code: expect.stringMatching(/^(access_denied|unavailable)$/),
+      });
+      const contentAuditPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.audit.list_events.response" &&
+          v.message?.payload?.requestId === "audit-content-a",
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.audit.list_events.request",
+            requestId: "audit-content-a",
+            workspaceId,
+            limit: 50,
+          },
+        }),
+      );
+      const contentAudit = await contentAuditPromise;
+      const contentEvents = contentAudit.message?.payload?.events;
+      expect(contentEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "workspace.content.read",
+            actorPrincipalId: principalA,
+            sessionId: expect.any(String),
+            resource: expect.objectContaining({ kind: "workspace", id: workspaceId }),
+          }),
+          expect.objectContaining({
+            action: "workspace.content.read",
+            actorPrincipalId: principalA,
+            sessionId: expect.any(String),
+            resource: expect.objectContaining({ kind: "agent", id: liveAgent.id }),
+          }),
+        ]),
+      );
+      expect(contentEvents).toHaveLength(3);
+      expect(contentEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ actorPrincipalId: principalA, outcome: "allowed" }),
+        ]),
+      );
     } finally {
       for (const socket of sockets) socket.close();
       await daemon.stop().catch(() => undefined);
