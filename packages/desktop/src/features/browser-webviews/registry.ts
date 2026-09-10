@@ -11,6 +11,8 @@ export interface BrowserWorkspaceRegistration {
 export interface BrowserWebContentsRegistration {
   browserId: string;
   hostWebContentsId: number;
+  /** Desktop-owned revision of the concrete guest registration. Never sourced from renderer IPC. */
+  registrationRevision: number;
   workspaceId?: string;
   profileAuthorization?: BrowserProfileRuntimeAuthorization;
 }
@@ -20,6 +22,11 @@ export class PaseoBrowserWebviewRegistry {
   private readonly webContentsIdsByHostAndBrowserId = new Map<string, number>();
   private readonly workspaceIdsByBrowserId = new Map<string, string>();
   private readonly activeBrowserIdsByHostWindow = new Map<number, Map<string, string>>();
+  private registrationSequence = 0;
+
+  public constructor() {
+    browserWebviewRegistries.add(this);
+  }
 
   public registerWebContents(input: {
     webContentsId: number;
@@ -62,7 +69,10 @@ export class PaseoBrowserWebviewRegistry {
       this.removeWebContents(snapshot.webContentsId);
     }
 
-    const registration = freezeBrowserWebContentsRegistration(snapshot);
+    const registration = freezeBrowserWebContentsRegistration({
+      ...snapshot,
+      registrationRevision: ++this.registrationSequence,
+    });
     this.registrationsByWebContentsId.set(snapshot.webContentsId, registration);
     this.webContentsIdsByHostAndBrowserId.set(hostBrowserKey, snapshot.webContentsId);
     if (snapshot.workspaceId) {
@@ -427,6 +437,7 @@ function freezeBrowserWebContentsRegistration(
   return Object.freeze({
     browserId: input.browserId,
     hostWebContentsId: input.hostWebContentsId,
+    registrationRevision: input.registrationRevision,
     ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
     ...(input.profileAuthorization
       ? {
@@ -434,6 +445,14 @@ function freezeBrowserWebContentsRegistration(
         }
       : {}),
   });
+}
+
+const browserWebviewRegistries = new WeakSet<object>();
+
+export function isPaseoBrowserWebviewRegistry(
+  value: unknown,
+): value is PaseoBrowserWebviewRegistry {
+  return typeof value === "object" && value !== null && browserWebviewRegistries.has(value);
 }
 
 function readStableRecord(

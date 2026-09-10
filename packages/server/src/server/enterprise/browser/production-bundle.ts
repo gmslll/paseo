@@ -24,6 +24,16 @@ import {
 import { readSecureJsonFile, writeSecureJsonFile } from "./secure-json-file.js";
 import type { EnterpriseAgentContextHandle } from "../../session/enterprise-agent-session-context-registry.js";
 import type { BrowserProfileLeaseAuthorization } from "./lease-manager.js";
+import {
+  BrowserPageIdentityRegistry,
+  createBrowserPageIdentityVerifier,
+  type BrowserPageIdentityVerifier,
+} from "../../browser-tools/page-identity-registry.js";
+import {
+  createBrowserPageIdentityInvalidationDispatcherRegistration,
+  createBrowserPageIdentityObservationDispatcherRegistration,
+} from "./page-identity-observation.js";
+import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 
 export class JsonFileBrowserProfileLeaseGenerationStorage implements BrowserProfileLeaseGenerationStorage {
   public constructor(private readonly filePath: string) {}
@@ -181,6 +191,11 @@ export interface ProductionBrowserLeaseBundle {
   }) => () => void;
   readonly runtimeForSession: (generation: string) => ProductionBrowserLeaseRuntime;
   readonly browserToolsRuntime: ProductionBrowserToolsRuntime;
+  /** W4 seams; root computes both flags from the actual manifests and complete W1/W2/Desktop chain. */
+  readonly pageIdentity: BrowserPageIdentityRegistry;
+  readonly pageIdentityVerifier: BrowserPageIdentityVerifier;
+  readonly pageIdentityObservationRegistration: EnterpriseSessionDispatcherFactoryRegistration;
+  readonly pageIdentityInvalidationRegistration: EnterpriseSessionDispatcherFactoryRegistration;
 }
 
 export interface ProductionBrowserToolsRuntime {
@@ -236,6 +251,15 @@ export function createProductionBrowserLeaseBundle(
     profiles,
     quarantine: options.quarantine,
   });
+  const pageIdentity = new BrowserPageIdentityRegistry({ profiles });
+  const pageIdentityVerifier = createBrowserPageIdentityVerifier(pageIdentity);
+  const pageIdentityObservationRegistration =
+    createBrowserPageIdentityObservationDispatcherRegistration({ registry: pageIdentity });
+  const pageIdentityInvalidationRegistration =
+    createBrowserPageIdentityInvalidationDispatcherRegistration({ registry: pageIdentity });
+  if (!pageIdentityObservationRegistration || !pageIdentityInvalidationRegistration) {
+    throw new Error("Production Browser page identity registrations are unavailable.");
+  }
   const authorities = new Map<string, SessionAuthority>();
   const current = (handle: EnterpriseAgentContextHandle): boolean =>
     [...authorities.values()].some((authority) => authority.isCurrentHandle(handle));
@@ -305,8 +329,18 @@ export function createProductionBrowserLeaseBundle(
     profiles,
     bindings,
     leases,
-    invalidateHost: (hostClientId) => leases.invalidateHost(hostClientId),
-    invalidateSession: (generation) => leases.invalidateSession(generation),
+    pageIdentity,
+    pageIdentityVerifier,
+    pageIdentityObservationRegistration,
+    pageIdentityInvalidationRegistration,
+    invalidateHost: (hostClientId) => {
+      pageIdentity.invalidateHost(hostClientId);
+      return leases.invalidateHost(hostClientId);
+    },
+    invalidateSession: (generation) => {
+      pageIdentity.invalidateSession(generation);
+      return leases.invalidateSession(generation);
+    },
     bindSessionAuthority: (input) => {
       if (
         input.waitingContext !== undefined &&
@@ -325,6 +359,7 @@ export function createProductionBrowserLeaseBundle(
       return () => {
         if (!active) return;
         active = false;
+        pageIdentity.invalidateSession(input.generation);
         if (authorities.get(input.generation) === authority) authorities.delete(input.generation);
       };
     },
@@ -334,6 +369,7 @@ export function createProductionBrowserLeaseBundle(
       if (closed) return;
       closed = true;
       authorities.clear();
+      pageIdentity.close();
       await leases.close();
     },
   };

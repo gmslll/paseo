@@ -26,6 +26,14 @@ import type {
   BrowserProfileLeaseAuthorization,
 } from "../enterprise/browser/lease-manager.js";
 import { browserToolsFailure, type BrowserToolsResponsePayload } from "./errors.js";
+import {
+  isAuthenticatedBrowserHostSession,
+  isBrowserPageIdentityRegistry,
+  isBrowserPageIdentityVerification,
+  type AuthenticatedBrowserHostSession,
+  type BrowserPageIdentityRegistry,
+  type BrowserPageIdentityVerification,
+} from "./page-identity-registry.js";
 
 export interface BrowserHostClient {
   /** Opaque server-assigned registration identity. Never sourced from a host payload. */
@@ -35,6 +43,8 @@ export interface BrowserHostClient {
   enterpriseProfiles?: { version: 1 };
   /** Trusted execution node from the authenticated Session context. */
   homeNodeId?: string;
+  /** Nominal W1 Session identity required by the page-observation capability. */
+  authenticatedSession?: AuthenticatedBrowserHostSession;
   sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void | Promise<void>;
 }
 
@@ -50,6 +60,8 @@ export interface BrowserToolsExecuteInput {
 export interface EnterpriseBrowserToolsExecuteInput {
   handle: EnterpriseAgentContextHandle;
   command: BrowserAutomationCommand;
+  /** W2 preauthorization proof. Agents and browser hosts cannot construct this value. */
+  pageIdentityVerification?: BrowserPageIdentityVerification;
 }
 
 export interface EnterpriseBrowserProfileHostBindingInput {
@@ -89,6 +101,7 @@ interface RegisteredBrowserHost {
   sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void | Promise<void>;
   enterpriseProfiles?: Readonly<{ version: 1 }>;
   homeNodeId?: string;
+  authenticatedSession?: AuthenticatedBrowserHostSession;
   registeredAt: number;
   supportedCommands: ReadonlySet<BrowserAutomationCommandName>;
   ready: Promise<boolean>;
@@ -98,6 +111,7 @@ export interface BrowserToolsBrokerOptions {
   defaultTimeoutMs?: number;
   createRequestId?: () => string;
   enterprise?: EnterpriseBrowserToolsRuntime;
+  pageIdentity?: BrowserPageIdentityRegistry;
   onHostTeardownError?: (error: Error, hostClientId: string) => void;
 }
 
@@ -117,6 +131,11 @@ interface EnterpriseHandleAuthoritySnapshot {
   readonly organizationId: string;
   readonly nodeId: string;
   readonly principalId: string;
+}
+
+interface EnterprisePageIdentityExecution {
+  readonly verification: BrowserPageIdentityVerification;
+  readonly browserId: string;
 }
 
 const DEFAULT_BROWSER_TOOLS_TIMEOUT_MS = 15_000;
@@ -145,6 +164,7 @@ export class BrowserToolsBroker {
   private readonly defaultTimeoutMs: number;
   private readonly createRequestId: () => string;
   private readonly enterpriseRuntime: EnterpriseRuntimeSnapshot | null;
+  private readonly pageIdentity: BrowserPageIdentityRegistry | null;
   private readonly onHostTeardownError: (error: Error, hostClientId: string) => void;
   private readonly clients = new Map<string, RegisteredBrowserHost>();
   private readonly pending = new Map<string, PendingBrowserToolsRequest>();
@@ -155,16 +175,22 @@ export class BrowserToolsBroker {
   private readonly liveRequestIds = new Set<string>();
   private readonly hostTeardownBarriers = new Map<string, Promise<void>>();
   private readonly readyHosts = new WeakSet<RegisteredBrowserHost>();
+  private readonly failedPageIdentitySessions = new WeakSet<AuthenticatedBrowserHostSession>();
   private registrationSequence = 0;
 
   public constructor(options: BrowserToolsBrokerOptions) {
     const defaultTimeoutMs = options.defaultTimeoutMs;
     const createRequestId = options.createRequestId ?? (() => `browser_${randomUUID()}`);
     const enterprise = options.enterprise;
+    const pageIdentity = options.pageIdentity;
     const onHostTeardownError = options.onHostTeardownError;
     this.defaultTimeoutMs = defaultTimeoutMs ?? DEFAULT_BROWSER_TOOLS_TIMEOUT_MS;
     this.createRequestId = () => createRequestId();
     this.onHostTeardownError = onHostTeardownError ?? (() => {});
+    if (pageIdentity !== undefined && !isBrowserPageIdentityRegistry(pageIdentity)) {
+      throw new Error("Enterprise Browser page identity registry is invalid.");
+    }
+    this.pageIdentity = pageIdentity ?? null;
     const enterpriseLeaseTtlMs = enterprise?.leaseTtlMs;
     if (enterprise && (!Number.isSafeInteger(enterpriseLeaseTtlMs) || enterpriseLeaseTtlMs! <= 0)) {
       throw new Error("Enterprise Browser Profile lease TTL must be a positive safe integer.");
@@ -248,6 +274,7 @@ export class BrowserToolsBroker {
       this.clients.delete(clientId);
     }
     this.readyHosts.delete(current);
+    this.pageIdentity?.invalidateHost(clientId);
 
     for (const [browserId, ownerClientId] of this.browserHostByBrowserId) {
       if (ownerClientId !== clientId) {
@@ -420,53 +447,59 @@ export class BrowserToolsBroker {
         });
       }
       const handleAuthority = this.snapshotCurrentHandle(runtime, snapshot.handle);
+      const pageIdentity = await this.preparePageIdentityExecution(
+        snapshot,
+        handleAuthority.nodeId,
+      );
       const authorization = await this.resolveCurrentAuthorization(
         runtime,
         snapshot.handle,
         handleAuthority,
       );
 
-      lease = await runtime.acquire({
-        handle: snapshot.handle,
-        resourceId: authorization.profile.browserProfileId,
-        mode: leaseModeForCommand(snapshot.command),
-        ttlMs: runtime.leaseTtlMs,
-      });
-      await this.assertAuthorizationStillCurrent(
-        runtime,
-        snapshot.handle,
-        handleAuthority,
-        authorization,
-      );
-      const enterpriseContext = enterpriseContextFromLease(lease);
-      const request = deepFreezeClone(
-        BrowserAutomationExecuteRequestSchema.parse({
-          type: "browser.automation.execute.request",
-          requestId,
-          agentId: authorization.agent.agentId,
-          workspaceId: authorization.workspace.workspaceId,
-          enterpriseContext,
+      await this.recheckPageIdentityExecution(pageIdentity, authorization);
+      const selected = this.selectEnterpriseHostForCommand(
+        {
           command: snapshot.command,
-        }),
-      );
-      await this.assertAuthorizationStillCurrent(
-        runtime,
-        snapshot.handle,
-        handleAuthority,
+          requestId,
+        },
         authorization,
       );
-      const selected = this.selectHostForRequest(request, authorization);
       if (!selected.ok) {
         result = selected.payload;
       } else {
+        await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value.id);
         const unsupported = this.unsupportedCommandFailure({
           host: selected.value,
-          commandName: request.command.command,
+          commandName: snapshot.command.command,
           requestId,
         });
         if (unsupported) {
           result = unsupported;
         } else {
+          lease = await runtime.acquire({
+            handle: snapshot.handle,
+            resourceId: authorization.profile.browserProfileId,
+            mode: leaseModeForCommand(snapshot.command),
+            ttlMs: runtime.leaseTtlMs,
+          });
+          await this.assertAuthorizationStillCurrent(
+            runtime,
+            snapshot.handle,
+            handleAuthority,
+            authorization,
+          );
+          const enterpriseContext = enterpriseContextFromLease(lease);
+          const request = deepFreezeClone(
+            BrowserAutomationExecuteRequestSchema.parse({
+              type: "browser.automation.execute.request",
+              requestId,
+              agentId: authorization.agent.agentId,
+              workspaceId: authorization.workspace.workspaceId,
+              enterpriseContext,
+              command: snapshot.command,
+            }),
+          );
           await runtime.attachHost({
             handle: snapshot.handle,
             lease,
@@ -478,6 +511,7 @@ export class BrowserToolsBroker {
             handleAuthority,
             authorization,
           );
+          await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value.id);
           result = await this.sendRequest({
             host: selected.value,
             request,
@@ -626,6 +660,47 @@ export class BrowserToolsBroker {
         }
       }
     }
+  }
+
+  private async preparePageIdentityExecution(
+    input: ReturnType<typeof snapshotEnterpriseExecuteInput>,
+    homeNodeId: string,
+  ): Promise<EnterprisePageIdentityExecution | null> {
+    if (!this.pageIdentity) {
+      throw new Error("Enterprise Browser page identity is unavailable.");
+    }
+    // These Profile-filtered bootstrap operations create the server-owned Browser registration
+    // that atomically combines with authenticated provisional page evidence. Neither operation
+    // grants page proof by itself.
+    if (input.command.command === "list_tabs" || input.command.command === "new_tab") {
+      if (this.listEnterpriseHostsForNode(homeNodeId).length === 0) {
+        throw new Error("An authenticated Enterprise Browser host Session is required.");
+      }
+      return null;
+    }
+    const verification = input.pageIdentityVerification;
+    if (!verification) {
+      throw new Error("Current Browser page identity proof is required.");
+    }
+    await this.pageIdentity.recheck(verification);
+    return Object.freeze({
+      verification,
+      browserId: getBrowserIdForCommand(input.command) ?? verification.browserId,
+    });
+  }
+
+  private async recheckPageIdentityExecution(
+    input: EnterprisePageIdentityExecution | null,
+    authorization: BrowserProfileLeaseAuthorization,
+    hostClientId?: string,
+  ): Promise<void> {
+    if (!input || !this.pageIdentity) return;
+    await this.pageIdentity.recheck(input.verification, {
+      browserId: input.browserId,
+      browserProfileId: authorization.profile.browserProfileId,
+      bindingRevision: authorization.bindingRevision,
+      ...(hostClientId ? { hostClientId } : {}),
+    });
   }
 
   private assertCurrentHandle(
@@ -966,6 +1041,19 @@ export class BrowserToolsBroker {
         }),
       };
     }
+    return this.selectEnterpriseHostForCommand({ command, requestId }, authorization);
+  }
+
+  private selectEnterpriseHostForCommand(
+    input: {
+      readonly command: BrowserAutomationCommand;
+      readonly requestId: string;
+    },
+    authorization: BrowserProfileLeaseAuthorization,
+  ):
+    | { ok: true; value: RegisteredBrowserHost }
+    | { ok: false; payload: BrowserToolsResponsePayload } {
+    const { command, requestId } = input;
 
     const homeNodeId = authorization.profile.homeNodeId;
     const eligibleHosts = this.listEnterpriseHostsForNode(homeNodeId);
@@ -1050,7 +1138,10 @@ export class BrowserToolsBroker {
     return (
       this.readyHosts.has(host) &&
       host.enterpriseProfiles?.version === 1 &&
-      host.homeNodeId === nodeId
+      host.homeNodeId === nodeId &&
+      (!this.pageIdentity ||
+        (host.authenticatedSession !== undefined &&
+          !this.failedPageIdentitySessions.has(host.authenticatedSession)))
     );
   }
 
@@ -1133,12 +1224,46 @@ export class BrowserToolsBroker {
     payload: Extract<BrowserToolsResponsePayload, { ok: true }>,
     authorization: BrowserProfileLeaseAuthorization,
   ): void {
+    const affinityKey = (browserId: string): string =>
+      getEnterpriseBrowserAffinityKey({ authorization, browserId });
+
+    const host = this.clients.get(clientId);
+    const pageIdentity = this.pageIdentity;
+    const authenticatedSession = host?.authenticatedSession;
+    if (
+      !host ||
+      !pageIdentity ||
+      !authenticatedSession ||
+      this.failedPageIdentitySessions.has(authenticatedSession)
+    ) {
+      if (host) this.failPageIdentityHost(host);
+      throw new Error("Enterprise Browser host Session is unavailable.");
+    }
+
+    let browserIds: readonly string[] = [];
+    if (payload.result.command === "list_tabs") {
+      browserIds = payload.result.tabs.map((tab) => tab.browserId);
+    } else if ("browserId" in payload.result) {
+      browserIds = [payload.result.browserId];
+    }
+    try {
+      for (const browserId of browserIds) {
+        pageIdentity.registerBrowser({
+          host: authenticatedSession,
+          browserId,
+          browserProfileId: authorization.profile.browserProfileId,
+          bindingRevision: authorization.bindingRevision,
+        });
+      }
+    } catch (error) {
+      this.failPageIdentityHost(host);
+      throw error;
+    }
+
     this.enterpriseBrowserHostByProfile.set(
       getEnterpriseBrowserProfileKey({ authorization }),
       clientId,
     );
-    const affinityKey = (browserId: string): string =>
-      getEnterpriseBrowserAffinityKey({ authorization, browserId });
 
     if (payload.result.command === "list_tabs") {
       for (const tab of payload.result.tabs) {
@@ -1148,11 +1273,20 @@ export class BrowserToolsBroker {
     }
     if (payload.result.command === "close_tab") {
       this.enterpriseBrowserHostByAffinity.delete(affinityKey(payload.result.browserId));
+      pageIdentity.invalidateBrowser(authenticatedSession, payload.result.browserId);
       return;
     }
     if ("browserId" in payload.result) {
       this.enterpriseBrowserHostByAffinity.set(affinityKey(payload.result.browserId), clientId);
     }
+  }
+
+  private failPageIdentityHost(host: RegisteredBrowserHost): void {
+    if (host.authenticatedSession) {
+      this.failedPageIdentitySessions.add(host.authenticatedSession);
+    }
+    this.detachRegisteredClient(host);
+    this.beginHostTeardown(host.id);
   }
 
   private responseSenderMatches(
@@ -1332,15 +1466,34 @@ function snapshotBrowserToolsExecuteInput(input: BrowserToolsExecuteInput): {
 function snapshotEnterpriseExecuteInput(input: EnterpriseBrowserToolsExecuteInput): {
   handle: EnterpriseAgentContextHandle;
   command: BrowserAutomationCommand;
+  pageIdentityVerification?: BrowserPageIdentityVerification;
 } {
-  const values = readExactOwnDataRecord(
+  const values = readSelectedOwnDataProperties(
     input,
+    ["command", "handle", "pageIdentityVerification"],
     ["command", "handle"],
     "Enterprise Browser execution input",
   );
+  if (
+    Reflect.ownKeys(input).some(
+      (key) => key !== "command" && key !== "handle" && key !== "pageIdentityVerification",
+    )
+  ) {
+    throw new Error("Enterprise Browser execution input has invalid fields.");
+  }
+  if (
+    values.pageIdentityVerification !== undefined &&
+    !isBrowserPageIdentityVerification(values.pageIdentityVerification)
+  ) {
+    throw new Error("Enterprise Browser page identity proof is invalid.");
+  }
+  const pageIdentityVerification = values.pageIdentityVerification;
   return {
     handle: values.handle as EnterpriseAgentContextHandle,
     command: snapshotBrowserAutomationCommand(values.command),
+    ...(isBrowserPageIdentityVerification(pageIdentityVerification)
+      ? { pageIdentityVerification }
+      : {}),
   };
 }
 
@@ -1574,6 +1727,7 @@ function snapshotBrowserHostClient(
   const values = readSelectedOwnDataProperties(
     input,
     [
+      "authenticatedSession",
       "enterpriseProfiles",
       "homeNodeId",
       "hostKind",
@@ -1588,6 +1742,7 @@ function snapshotBrowserHostClient(
     id,
     hostKind,
     supportedCommands,
+    authenticatedSession,
     enterpriseProfiles,
     homeNodeId,
     sendBrowserAutomationRequest,
@@ -1618,23 +1773,13 @@ function snapshotBrowserHostClient(
     throw new Error("Invalid Browser host send method.");
   }
 
-  let enterpriseCapability: Readonly<{ version: 1 }> | undefined;
-  if (enterpriseProfiles !== undefined) {
-    const capability = readExactOwnDataRecord(
+  const { enterpriseCapability, trustedHomeNodeId, trustedSession } =
+    snapshotEnterpriseBrowserHostIdentity({
+      id,
       enterpriseProfiles,
-      ["version"],
-      "Enterprise Browser host capability",
-    );
-    if (capability.version !== 1) {
-      throw new Error("Invalid Enterprise Browser host capability version.");
-    }
-    enterpriseCapability = Object.freeze({ version: 1 });
-    if (typeof homeNodeId !== "string" || !NODE_ID_PATTERN.test(homeNodeId)) {
-      throw new Error("Enterprise Browser host requires a valid trusted home node ID.");
-    }
-  } else if (homeNodeId !== undefined) {
-    throw new Error("A legacy Browser host cannot claim an Enterprise home node.");
-  }
+      homeNodeId,
+      authenticatedSession,
+    });
   const send = sendBrowserAutomationRequest as (
     request: BrowserAutomationExecuteRequest,
   ) => void | Promise<void>;
@@ -1643,7 +1788,10 @@ function snapshotBrowserHostClient(
     hostKind: hostKind.trim(),
     supportedCommands: Object.freeze([...commands]),
     sendBrowserAutomationRequest: send,
-    ...(enterpriseCapability ? { enterpriseProfiles: enterpriseCapability, homeNodeId } : {}),
+    ...(enterpriseCapability
+      ? { enterpriseProfiles: enterpriseCapability, homeNodeId: trustedHomeNodeId }
+      : {}),
+    ...(trustedSession ? { authenticatedSession: trustedSession } : {}),
   });
   return Object.freeze({
     id,
@@ -1651,8 +1799,52 @@ function snapshotBrowserHostClient(
     supportedCommands: new Set(commands),
     sendBrowserAutomationRequest: (request: BrowserAutomationExecuteRequest) =>
       Reflect.apply(send, receiver, [request]),
-    ...(enterpriseCapability ? { enterpriseProfiles: enterpriseCapability, homeNodeId } : {}),
+    ...(enterpriseCapability
+      ? { enterpriseProfiles: enterpriseCapability, homeNodeId: trustedHomeNodeId }
+      : {}),
+    ...(trustedSession ? { authenticatedSession: trustedSession } : {}),
   });
+}
+
+function snapshotEnterpriseBrowserHostIdentity(input: {
+  id: string;
+  enterpriseProfiles: unknown;
+  homeNodeId: unknown;
+  authenticatedSession: unknown;
+}): {
+  enterpriseCapability?: Readonly<{ version: 1 }>;
+  trustedHomeNodeId?: string;
+  trustedSession?: AuthenticatedBrowserHostSession;
+} {
+  const { id, enterpriseProfiles, homeNodeId, authenticatedSession } = input;
+  if (enterpriseProfiles === undefined) {
+    if (homeNodeId !== undefined || authenticatedSession !== undefined) {
+      throw new Error("A legacy Browser host cannot claim Enterprise authority.");
+    }
+    return {};
+  }
+  const capability = readExactOwnDataRecord(
+    enterpriseProfiles,
+    ["version"],
+    "Enterprise Browser host capability",
+  );
+  if (capability.version !== 1) {
+    throw new Error("Invalid Enterprise Browser host capability version.");
+  }
+  if (typeof homeNodeId !== "string" || !NODE_ID_PATTERN.test(homeNodeId)) {
+    throw new Error("Enterprise Browser host requires a valid trusted home node ID.");
+  }
+  const enterpriseCapability = Object.freeze({ version: 1 as const });
+  const trustedHomeNodeId = homeNodeId;
+  if (authenticatedSession === undefined) return { enterpriseCapability, trustedHomeNodeId };
+  if (
+    !isAuthenticatedBrowserHostSession(authenticatedSession) ||
+    authenticatedSession.clientId !== id ||
+    authenticatedSession.homeNodeId !== homeNodeId
+  ) {
+    throw new Error("Enterprise Browser host Session does not match its registration.");
+  }
+  return { enterpriseCapability, trustedHomeNodeId, trustedSession: authenticatedSession };
 }
 
 function readSelectedOwnDataProperties(

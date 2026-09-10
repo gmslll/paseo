@@ -25,6 +25,11 @@ import {
   type EnterpriseBrowserProfileLeasePort,
   type EnterpriseBrowserToolsRuntime,
 } from "./broker.js";
+import {
+  BrowserPageIdentityRegistry,
+  createAuthenticatedBrowserHostSession,
+  type AuthenticatedBrowserHostSession,
+} from "./page-identity-registry.js";
 
 const ORGANIZATION_ID = "org_1111111111111111";
 const SECOND_ORGANIZATION_ID = "org_2222222222222222";
@@ -36,6 +41,28 @@ const PROFILE_A = "brp_1111111111111111";
 const PROFILE_B = "brp_2222222222222222";
 const BROWSER_A = "11111111-1111-4111-8111-111111111111";
 
+function pageIdentityProfile(): AuthorizedBrowserProfile {
+  return {
+    browserProfileId: PROFILE_A,
+    organizationId: ORGANIZATION_ID,
+    homeNodeId: NODE_ID,
+    businessIdentityId: "bid_1111111111111111",
+    ownerPrincipalId: PRINCIPAL_ID,
+    platform: "generic",
+    businessAccountKey: PROFILE_A,
+    label: PROFILE_A,
+    partitionKey: `persist:paseo-enterprise-${PROFILE_A}`,
+    downloadRoot: `/profiles/${PROFILE_A}/downloads`,
+    expectedIdentity: {
+      hostnames: ["shop.example"],
+      accountLabelHash: "sha256:account-a",
+    },
+    status: "ready",
+    createdAt: "2026-09-10T00:00:00.000Z",
+    updatedAt: "2026-09-10T00:00:00.000Z",
+  };
+}
+
 class EnterpriseHost implements BrowserHostClient {
   public readonly hostKind = "desktop app";
   public readonly supportedCommands: readonly BrowserAutomationCommandName[] = [
@@ -43,15 +70,29 @@ class EnterpriseHost implements BrowserHostClient {
   ];
   public readonly enterpriseProfiles?: { version: 1 };
   public readonly homeNodeId?: string;
+  public readonly authenticatedSession?: AuthenticatedBrowserHostSession;
   public readonly receivedRequests: BrowserAutomationExecuteRequest[] = [];
 
   public constructor(
     public readonly id: string,
-    options: { enterprise?: boolean; homeNodeId?: string } = {},
+    options: {
+      enterprise?: boolean;
+      homeNodeId?: string;
+      authenticatedSession?: AuthenticatedBrowserHostSession | null;
+    } = {},
   ) {
     if (options.enterprise !== false) {
       this.enterpriseProfiles = { version: 1 };
       this.homeNodeId = options.homeNodeId ?? NODE_ID;
+      this.authenticatedSession =
+        options.authenticatedSession === null
+          ? undefined
+          : (options.authenticatedSession ??
+            createAuthenticatedBrowserHostSession({
+              clientId: id,
+              homeNodeId: this.homeNodeId,
+              sessionBindingGeneration: "session-a",
+            }));
     }
   }
 
@@ -78,6 +119,7 @@ class EnterpriseHost implements BrowserHostClient {
 
 interface EnterpriseFixture {
   broker: BrowserToolsBroker;
+  pageIdentity: BrowserPageIdentityRegistry | null;
   handles: Record<"a" | "b" | "c", EnterpriseAgentContextHandle>;
   workspaces: Record<"a" | "b" | "c", AuthorizedWorkspace>;
   manager: BrowserProfileLeaseManager;
@@ -96,6 +138,7 @@ async function createEnterpriseFixture(
     createRequestId?: () => string;
     invalidateHost?: (hostClientId: string) => Promise<void>;
     onHostTeardownError?: (error: Error, hostClientId: string) => void;
+    pageIdentity?: BrowserPageIdentityRegistry | null;
   } = {},
 ): Promise<EnterpriseFixture> {
   const registry = createEnterpriseAgentSessionContextRegistry();
@@ -159,6 +202,10 @@ async function createEnterpriseFixture(
       label: browserProfileId,
       partitionKey: `persist:paseo-enterprise-${browserProfileId}`,
       downloadRoot: `/profiles/${browserProfileId}/downloads`,
+      expectedIdentity: {
+        hostnames: ["shop.example"],
+        accountLabelHash: "sha256:account-a",
+      },
       status: "ready",
       createdAt: "2026-09-10T00:00:00.000Z",
       updatedAt: "2026-09-10T00:00:00.000Z",
@@ -205,6 +252,18 @@ async function createEnterpriseFixture(
   };
   let resolverCalls = 0;
   let requestSequence = 0;
+  const pageIdentity =
+    options.pageIdentity === null
+      ? null
+      : (options.pageIdentity ??
+        new BrowserPageIdentityRegistry({
+          profiles: {
+            get: async (browserProfileId) =>
+              [...authorizations.values()].find(
+                (authorization) => authorization.profile.browserProfileId === browserProfileId,
+              )?.profile ?? null,
+          },
+        }));
   const enterpriseRuntime = {
     isCurrentHandle: (handle: EnterpriseAgentContextHandle) => registry.isCurrentHandle(handle),
     resolveAuthorization: (handle: EnterpriseAgentContextHandle) => {
@@ -222,10 +281,12 @@ async function createEnterpriseFixture(
     defaultTimeoutMs: 1_000,
     createRequestId: options.createRequestId ?? (() => `enterprise-${++requestSequence}`),
     enterprise: enterpriseRuntime,
+    ...(pageIdentity ? { pageIdentity } : {}),
     ...(options.onHostTeardownError ? { onHostTeardownError: options.onHostTeardownError } : {}),
   });
   return {
     broker,
+    pageIdentity,
     handles,
     workspaces,
     manager,
@@ -268,11 +329,12 @@ async function registerProfileHost(
   fixture: EnterpriseFixture,
   host: EnterpriseHost,
   handle: EnterpriseAgentContextHandle = fixture.handles.a,
-): Promise<void> {
-  fixture.broker.registerClient(host);
+): Promise<() => void> {
+  const unregister = fixture.broker.registerClient(host);
   await expect(
     fixture.broker.bindEnterpriseProfileHost({ handle, hostClientId: host.id }),
   ).resolves.toBe(true);
+  return unregister;
 }
 
 function deferred<T>() {
@@ -302,6 +364,44 @@ function newTabSuccess(request: BrowserAutomationExecuteRequest, browserId = BRO
 }
 
 describe("BrowserToolsBroker enterprise Profile execution", () => {
+  test("denies every enterprise command before authorization when page identity is absent", async () => {
+    const fixture = await createEnterpriseFixture({ pageIdentity: null });
+    const resolverCalls = fixture.getResolverCalls();
+
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(resolverCalls);
+    expect(fixture.acquired).toEqual([]);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
+  });
+
+  test.each(["list_tabs", "new_tab"] as const)(
+    "denies %s before authorization when the Enterprise host has no authenticated Session",
+    async (command) => {
+      const fixture = await createEnterpriseFixture();
+      const host = new EnterpriseHost("desktop-client-untrusted", {
+        authenticatedSession: null,
+      });
+      fixture.broker.registerClient(host);
+      const resolverCalls = fixture.getResolverCalls();
+
+      await expect(
+        fixture.broker.executeEnterprise({
+          handle: fixture.handles.a,
+          command: { command, args: {} },
+        }),
+      ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+      expect(fixture.getResolverCalls()).toBe(resolverCalls);
+      expect(fixture.acquired).toEqual([]);
+      expect(host.receivedRequests).toEqual([]);
+      expect(fixture.broker.getPendingRequestCount()).toBe(0);
+    },
+  );
+
   test("rejects structural handles and caller-owned Profile, partition, lease, or process authority before resolution", async () => {
     const fixture = await createEnterpriseFixture();
     const fakeHandle = { ...fixture.handles.a } as EnterpriseAgentContextHandle;
@@ -445,6 +545,11 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       supportedCommands: [...BROWSER_AUTOMATION_COMMAND_NAMES],
       enterpriseProfiles: { version: 1 as const },
       homeNodeId: NODE_ID,
+      authenticatedSession: createAuthenticatedBrowserHostSession({
+        clientId: "host-snapshot",
+        homeNodeId: NODE_ID,
+        sessionBindingGeneration: "session-a",
+      }),
       sendBrowserAutomationRequest: (request: BrowserAutomationExecuteRequest) => {
         receivedRequests.push(request);
       },
@@ -894,7 +999,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "browser_tab_not_found" },
+      error: { code: "browser_denied" },
     });
     expect(host.receivedRequests).toHaveLength(1);
   });
@@ -928,7 +1033,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "browser_tab_not_found" },
+      error: { code: "browser_denied" },
     });
     expect(host.receivedRequests).toHaveLength(1);
   });
@@ -974,7 +1079,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "browser_tab_not_found" },
+      error: { code: "browser_denied" },
     });
     expect(host.receivedRequests).toEqual([]);
   });
@@ -1000,7 +1105,14 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     unregister();
     await fixture.manager.waitForIdle();
 
-    const reconnectedHost = new EnterpriseHost("profile-host");
+    const reconnectedSession = createAuthenticatedBrowserHostSession({
+      clientId: "profile-host",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-reconnected",
+    });
+    const reconnectedHost = new EnterpriseHost("profile-host", {
+      authenticatedSession: reconnectedSession,
+    });
     fixture.broker.registerClient(reconnectedHost);
     await expect(
       fixture.broker.bindEnterpriseProfileHost({
@@ -1013,7 +1125,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
         handle: fixture.handles.a,
         command: { command: "snapshot", args: { browserId: BROWSER_A } },
       }),
-    ).resolves.toMatchObject({ ok: false, error: { code: "browser_tab_not_found" } });
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
     expect(reconnectedHost.receivedRequests).toEqual([]);
 
     const listTabs = fixture.broker.executeEnterprise({
@@ -1043,9 +1155,26 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     });
     await expect(listTabs).resolves.toMatchObject({ ok: true });
 
+    await fixture.pageIdentity!.observe(reconnectedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-reconnected",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-reconnected",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "session-reconnected",
+    });
+    const pageIdentityVerification = await fixture.pageIdentity!.verify({
+      browserId: BROWSER_A,
+      browserProfileId: PROFILE_A,
+      bindingRevision: "binding-workspace-a",
+    });
+
     const snapshot = fixture.broker.executeEnterprise({
       handle: fixture.handles.a,
       command: { command: "snapshot", args: { browserId: BROWSER_A } },
+      pageIdentityVerification,
     });
     await vi.waitFor(() => expect(reconnectedHost.receivedRequests).toHaveLength(2));
     const snapshotRequest = reconnectedHost.receivedRequests[1];
@@ -1152,5 +1281,362 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       ok: true,
       result: { command: "list_tabs", tabs: [] },
     });
+  });
+
+  test("requires and rechecks same-host nominal page evidence before authorization, lease, attach, or send", async () => {
+    let throwProfileRead = false;
+    const pageIdentity = new BrowserPageIdentityRegistry({
+      profiles: {
+        get: async () => {
+          if (throwProfileRead) throw new Error("profile store failed");
+          return pageIdentityProfile();
+        },
+      },
+    });
+    const fixture = await createEnterpriseFixture({ pageIdentity });
+    const authenticatedSession = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-1",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-a",
+    });
+    const host = new EnterpriseHost("desktop-client-1", { authenticatedSession });
+    const unregisterHost = await registerProfileHost(fixture, host);
+
+    await pageIdentity.observe(authenticatedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-1",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-1",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "session-a",
+    });
+    await expect(
+      pageIdentity.verify({
+        browserId: BROWSER_A,
+        browserProfileId: PROFILE_A,
+        bindingRevision: "binding-workspace-a",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "observation_unavailable" });
+    const preRegistrationResolverCalls = fixture.getResolverCalls();
+    const preRegistrationAcquireCount = fixture.acquired.length;
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(preRegistrationResolverCalls);
+    expect(fixture.acquired).toHaveLength(preRegistrationAcquireCount);
+    expect(host.receivedRequests).toHaveLength(0);
+
+    const listTabs = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "list_tabs", args: {} },
+    });
+    await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(1));
+    const listRequest = host.receivedRequests[0];
+    if (!listRequest.enterpriseContext || !listRequest.workspaceId) {
+      throw new Error("Expected enterprise list-tabs context.");
+    }
+    host.respond(fixture.broker, listRequest, {
+      ok: true,
+      enterpriseContext: listRequest.enterpriseContext,
+      result: {
+        command: "list_tabs",
+        tabs: [
+          {
+            browserId: BROWSER_A,
+            workspaceId: listRequest.workspaceId,
+            enterpriseContext: listRequest.enterpriseContext,
+            url: "https://shop.example",
+            title: "Shop",
+          },
+        ],
+      },
+    });
+    await expect(listTabs).resolves.toMatchObject({ ok: true });
+    const proof = await pageIdentity.verify({
+      browserId: BROWSER_A,
+      browserProfileId: PROFILE_A,
+      bindingRevision: "binding-workspace-a",
+    });
+    const resolverCalls = fixture.getResolverCalls();
+    const acquiredCount = fixture.acquired.length;
+    const sentCount = host.receivedRequests.length;
+
+    await pageIdentity.observe(authenticatedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-2",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "wrong.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-2",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "session-a",
+    });
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+        pageIdentityVerification: proof,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(resolverCalls);
+    expect(fixture.acquired).toHaveLength(acquiredCount);
+    expect(host.receivedRequests).toHaveLength(sentCount);
+
+    await pageIdentity.observe(authenticatedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-3",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-3",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "session-a",
+    });
+    const currentProof = await pageIdentity.verify({
+      browserId: BROWSER_A,
+      browserProfileId: PROFILE_A,
+      bindingRevision: "binding-workspace-a",
+    });
+    const snapshot = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "snapshot", args: { browserId: BROWSER_A } },
+      pageIdentityVerification: currentProof,
+    });
+    await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(sentCount + 1));
+    const snapshotRequest = host.receivedRequests.at(-1)!;
+    host.respond(fixture.broker, snapshotRequest, {
+      ok: true,
+      enterpriseContext: snapshotRequest.enterpriseContext,
+      result: {
+        command: "snapshot",
+        browserId: BROWSER_A,
+        workspaceId: snapshotRequest.workspaceId,
+        url: "https://shop.example",
+        title: "Shop",
+        format: "aria-yaml",
+        snapshot: "- document",
+        truncated: false,
+        stats: { nodeCount: 1, refCount: 0, textLength: 10 },
+      },
+    });
+    await expect(snapshot).resolves.toMatchObject({ ok: true });
+
+    const foreignSession = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-2",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-b",
+    });
+    pageIdentity.registerBrowser({
+      host: foreignSession,
+      browserId: BROWSER_A,
+      browserProfileId: PROFILE_A,
+      bindingRevision: "binding-workspace-a",
+    });
+    await pageIdentity.observe(foreignSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-foreign",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-foreign",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "session-b",
+    });
+    const foreignProof = await pageIdentity.verify({
+      browserId: BROWSER_A,
+      browserProfileId: PROFILE_A,
+      bindingRevision: "binding-workspace-a",
+    });
+    const preForeignAcquiredCount = fixture.acquired.length;
+    const preForeignSentCount = host.receivedRequests.length;
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+        pageIdentityVerification: foreignProof,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.acquired).toHaveLength(preForeignAcquiredCount);
+    expect(host.receivedRequests).toHaveLength(preForeignSentCount);
+
+    const postSuccessResolverCalls = fixture.getResolverCalls();
+    const postSuccessAcquiredCount = fixture.acquired.length;
+    const postSuccessSentCount = host.receivedRequests.length;
+    throwProfileRead = true;
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+        pageIdentityVerification: currentProof,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(postSuccessResolverCalls);
+    expect(fixture.acquired).toHaveLength(postSuccessAcquiredCount);
+    expect(host.receivedRequests).toHaveLength(postSuccessSentCount);
+
+    throwProfileRead = false;
+    unregisterHost();
+    await expect(pageIdentity.recheck(currentProof)).rejects.toMatchObject({
+      reasonCode: "observation_stale",
+    });
+  });
+
+  test("atomically combines provisional page evidence with a new_tab Browser registration", async () => {
+    const pageIdentity = new BrowserPageIdentityRegistry({
+      profiles: { get: async () => pageIdentityProfile() },
+    });
+    const fixture = await createEnterpriseFixture({ pageIdentity });
+    const authenticatedSession = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-1",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-a",
+    });
+    const host = new EnterpriseHost("desktop-client-1", { authenticatedSession });
+    await registerProfileHost(fixture, host);
+    await pageIdentity.observe(authenticatedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-before-new-tab",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-before-new-tab",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "session-a",
+    });
+
+    const execution = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "new_tab", args: {} },
+    });
+    await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(1));
+    const request = host.receivedRequests[0];
+    expect(host.respond(fixture.broker, request, newTabSuccess(request))).toBe(true);
+    await expect(execution).resolves.toMatchObject({ ok: true });
+    await expect(
+      pageIdentity.verify({
+        browserId: BROWSER_A,
+        browserProfileId: PROFILE_A,
+        bindingRevision: "binding-workspace-a",
+        hostClientId: host.id,
+      }),
+    ).resolves.toMatchObject({ observationRevision: "observation-before-new-tab" });
+  });
+
+  test("revokes a host before affinity mutation when provisional evidence mismatches registration", async () => {
+    const fixture = await createEnterpriseFixture();
+    const pageIdentity = fixture.pageIdentity;
+    if (!pageIdentity) throw new Error("Expected Browser page identity registry.");
+    const authenticatedSession = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-mismatch",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-a",
+    });
+    const host = new EnterpriseHost("desktop-client-mismatch", { authenticatedSession });
+    await registerProfileHost(fixture, host);
+    await pageIdentity.observe(authenticatedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-mismatched-binding",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-mismatched-binding",
+      bindingRevision: "binding-rebound",
+      lifecycleGeneration: "session-a",
+    });
+
+    const bootstrap = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "list_tabs", args: {} },
+    });
+    await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(1));
+    const request = host.receivedRequests[0];
+    if (!request.enterpriseContext || !request.workspaceId) {
+      throw new Error("Expected enterprise list-tabs context.");
+    }
+    expect(
+      host.respond(fixture.broker, request, {
+        ok: true,
+        enterpriseContext: request.enterpriseContext,
+        result: {
+          command: "list_tabs",
+          tabs: [
+            {
+              browserId: BROWSER_A,
+              workspaceId: request.workspaceId,
+              enterpriseContext: request.enterpriseContext,
+              url: "https://shop.example",
+              title: "Shop",
+            },
+          ],
+        },
+      }),
+    ).toBe(true);
+    await expect(bootstrap).resolves.toMatchObject({
+      ok: false,
+      error: { code: "browser_denied" },
+    });
+    expect(fixture.broker.getRegisteredClientCount()).toBe(0);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
+
+    const postFailureResolverCalls = fixture.getResolverCalls();
+    const postFailureAcquireCount = fixture.acquired.length;
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(postFailureResolverCalls);
+    expect(fixture.acquired).toHaveLength(postFailureAcquireCount);
+    expect(host.receivedRequests).toHaveLength(1);
+
+    const unregisterFailedSession = fixture.broker.registerClient(host);
+    await fixture.manager.waitForIdle();
+    await expect(
+      fixture.broker.bindEnterpriseProfileHost({
+        handle: fixture.handles.a,
+        hostClientId: host.id,
+      }),
+    ).resolves.toBe(false);
+    const failedSessionResolverCalls = fixture.getResolverCalls();
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "new_tab", args: {} },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(failedSessionResolverCalls);
+    expect(host.receivedRequests).toHaveLength(1);
+    unregisterFailedSession();
+
+    const replacement = new EnterpriseHost("desktop-client-mismatch", {
+      authenticatedSession: createAuthenticatedBrowserHostSession({
+        clientId: "desktop-client-mismatch",
+        homeNodeId: NODE_ID,
+        sessionBindingGeneration: "session-b",
+      }),
+    });
+    fixture.broker.registerClient(replacement);
+    await fixture.manager.waitForIdle();
+    const beforeReplacementAcquireCount = fixture.acquired.length;
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.acquired).toHaveLength(beforeReplacementAcquireCount);
+    expect(replacement.receivedRequests).toEqual([]);
   });
 });

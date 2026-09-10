@@ -19,6 +19,7 @@ import {
   createEnterpriseAgentSessionContextRegistry,
   type EnterpriseAgentContextHandle,
 } from "../../session/enterprise-agent-session-context-registry.js";
+import { createAuthenticatedBrowserHostSession } from "../../browser-tools/page-identity-registry.js";
 
 const ORGANIZATION_ID = "org_1111111111111111";
 const NODE_ID = "nod_1111111111111111";
@@ -179,6 +180,65 @@ describe("production browser lease bundle", () => {
     await expect(
       readFile(path.join(home, "enterprise", "browser", "lease-generation.json"), "utf8"),
     ).resolves.toContain('"generation"');
+  });
+
+  test("exposes nominal verification and both production registrations without advertising them", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paseo-browser-bundle-"));
+    const bundle = createBundle(home);
+    try {
+      const created = await bundle.profiles.create({
+        organizationId: ORGANIZATION_ID,
+        homeNodeId: NODE_ID,
+        businessIdentityId: "bid_1111111111111111",
+        ownerPrincipalId: OWNER_ID,
+        platform: "generic",
+        businessAccountKey: "account-a",
+        label: "Account A",
+        expectedIdentity: { hostnames: ["shop.example"] },
+        status: "ready",
+      });
+      const host = createAuthenticatedBrowserHostSession({
+        clientId: "desktop-client-1",
+        homeNodeId: NODE_ID,
+        sessionBindingGeneration: "session-1",
+      });
+      bundle.pageIdentity.registerBrowser({
+        host,
+        browserId: "11111111-1111-4111-8111-111111111111",
+        browserProfileId: created.browserProfileId,
+        bindingRevision: "binding-1",
+      });
+      await bundle.pageIdentity.observe(host, {
+        type: "enterprise.browser.page_identity.observe.request",
+        requestId: "observe-1",
+        browser: {
+          browserId: "11111111-1111-4111-8111-111111111111",
+          browserProfileId: created.browserProfileId,
+        },
+        hostname: "shop.example",
+        observationRevision: "observation-1",
+        bindingRevision: "binding-1",
+        lifecycleGeneration: "session-1",
+      });
+
+      await expect(
+        bundle.pageIdentity.verify({
+          browserId: "11111111-1111-4111-8111-111111111111",
+          browserProfileId: created.browserProfileId,
+          bindingRevision: "binding-1",
+        }),
+      ).resolves.toMatchObject({ observationRevision: "observation-1" });
+      expect(bundle.pageIdentityObservationRegistration.manifest.operations).toEqual([
+        "enterprise.browser.page_identity.observe.request",
+      ]);
+      expect(bundle.pageIdentityInvalidationRegistration.manifest.operations).toEqual([
+        "enterprise.browser.page_identity.invalidate.request",
+      ]);
+      expect("enterpriseBrowserPageIdentityObservationV1" in bundle).toBe(false);
+      expect("enterpriseBrowserPageIdentityInvalidationV1" in bundle).toBe(false);
+    } finally {
+      await bundle.close();
+    }
   });
 
   test("routes same-Profile FIFO waiting to each exact server Session context", async () => {

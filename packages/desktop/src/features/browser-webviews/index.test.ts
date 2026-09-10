@@ -1,4 +1,8 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+
+const fromWebContentsId = vi.hoisted(() => vi.fn());
+vi.mock("electron", () => ({ webContents: { fromId: fromWebContentsId } }));
+
 import {
   getEnterpriseBrowserProfilePartition,
   PASEO_BROWSER_PROFILE_PARTITION,
@@ -6,13 +10,22 @@ import {
 } from "../browser-profile.js";
 import {
   getPaseoBrowserIdForWebContents,
+  getPaseoBrowserWebContentsForBootstrapDiscovery,
+  getPaseoBrowserWebContentsForHostWindow,
+  getPaseoBrowserWebviewRegistry,
   getPaseoBrowserWorkspaceId,
+  installPaseoBrowserPageIdentityPublisher,
   isPaseoBrowserWebviewAttach,
   preparePaseoBrowserWebContents,
   registerAttachedPaseoBrowser,
+  registerAttachedPaseoBrowserAfterPageIdentityBarrier,
   unregisterPaseoBrowser,
   unregisterPaseoBrowserFromHost,
 } from "./index.js";
+import {
+  createBrowserPageIdentityAuthorityTeardownPort,
+  createBrowserPageIdentityPublisher,
+} from "./page-identity-publisher.js";
 
 class FakeRenderer {
   public constructor(public readonly id: number) {}
@@ -33,8 +46,20 @@ const enterpriseAuthorization: BrowserProfileRuntimeAuthorization = {
 
 class FakeBrowserGuest {
   public readonly backgroundThrottlingCalls: boolean[] = [];
+  public readonly debugCommands: string[] = [];
+  public readonly executedScripts: string[] = [];
+  public readonly inputEvents: unknown[] = [];
+  public readonly debugger = {
+    isAttached: () => true,
+    attach: () => {},
+    sendCommand: async (command: string) => {
+      this.debugCommands.push(command);
+      return undefined;
+    },
+  };
   private destroyedListener: (() => void) | null = null;
   private destroyed = false;
+  private readonly listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
   public constructor(
     public readonly id: number,
@@ -44,6 +69,29 @@ class FakeBrowserGuest {
 
   public isDestroyed(): boolean {
     return this.destroyed;
+  }
+
+  public getURL(): string {
+    return "https://shop.example/orders";
+  }
+
+  public async executeJavaScript(code: string): Promise<unknown> {
+    this.executedScripts.push(code);
+    return undefined;
+  }
+
+  public sendInputEvent(event: unknown): void {
+    this.inputEvents.push(event);
+  }
+
+  public on(event: string, listener: (...args: unknown[]) => void): void {
+    const listeners = this.listeners.get(event) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(event, listeners);
+  }
+
+  public removeListener(event: string, listener: (...args: unknown[]) => void): void {
+    this.listeners.get(event)?.delete(listener);
   }
 
   public setBackgroundThrottling(allowed: boolean): void {
@@ -57,8 +105,21 @@ class FakeBrowserGuest {
 
   public destroy(): void {
     this.destroyed = true;
+    for (const listener of this.listeners.get("destroyed") ?? []) listener();
     this.destroyedListener?.();
   }
+
+  public emit(event: string, ...args: unknown[]): void {
+    for (const listener of this.listeners.get(event) ?? []) listener(...args);
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 describe("browser webview attachment", () => {
@@ -271,5 +332,156 @@ describe("browser webview attachment", () => {
 
     expect(getPaseoBrowserIdForWebContents(guest)).toBeNull();
     expect(guest.backgroundThrottlingCalls).toEqual([false]);
+  });
+
+  test("exposes an observed guest for bootstrap discovery and revokes guarded action primitives on navigation", async () => {
+    const profileSession = {};
+    const renderer = new FakeRenderer(35);
+    const browserId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const guest = new FakeBrowserGuest(635, renderer, profileSession);
+    fromWebContentsId.mockImplementation((webContentsId) =>
+      webContentsId === guest.id ? guest : null,
+    );
+    const observationAck = deferred<void>();
+    const publisher = createBrowserPageIdentityPublisher({
+      registry: getPaseoBrowserWebviewRegistry(),
+      authorityTeardown: createBrowserPageIdentityAuthorityTeardownPort({
+        teardownAfterAuthorityTransportFailure: async () => {},
+      }),
+      publish: async () => observationAck.promise,
+      invalidate: async () => undefined,
+    });
+    const dispose = await installPaseoBrowserPageIdentityPublisher(publisher);
+    try {
+      preparePaseoBrowserWebContents(guest);
+      const attach = registerAttachedPaseoBrowserAfterPageIdentityBarrier({
+        browserId,
+        workspaceId: enterpriseAuthorization.workspaceId,
+        webContentsId: guest.id,
+        sender: renderer,
+        profileSession,
+        profileAuthorization: enterpriseAuthorization,
+        findWebContents: () => guest,
+      });
+      await vi.waitFor(() => expect(getPaseoBrowserIdForWebContents(guest)).toBe(browserId));
+      expect(getPaseoBrowserWebContentsForBootstrapDiscovery(browserId, renderer.id)).toBeNull();
+      expect(getPaseoBrowserWebContentsForHostWindow(browserId, renderer.id)).toBeNull();
+
+      observationAck.resolve();
+      await expect(attach).resolves.toBe(true);
+      expect(getPaseoBrowserWebContentsForBootstrapDiscovery(browserId, renderer.id)).toBe(guest);
+      const guarded = getPaseoBrowserWebContentsForHostWindow(browserId, renderer.id);
+      expect(guarded).not.toBeNull();
+      expect(guarded).not.toBe(guest);
+      if (!guarded) throw new Error("Expected guarded Browser WebContents.");
+
+      const actionReady = deferred<void>();
+      const fill = actionReady.promise.then(() => guarded.executeJavaScript("fill()"));
+      const click = actionReady.promise.then(() =>
+        guarded.debugger.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed" }),
+      );
+      const input = actionReady.promise.then(() =>
+        guarded.sendInputEvent({ type: "keyDown", keyCode: "Enter" }),
+      );
+      guest.emit("did-start-navigation", {}, "https://other.example", false, true);
+      actionReady.resolve();
+
+      await expect(fill).rejects.toThrow(/no longer current/u);
+      await expect(click).rejects.toThrow(/no longer current/u);
+      await expect(input).rejects.toThrow(/no longer current/u);
+      expect(guest.executedScripts).toEqual([]);
+      expect(guest.debugCommands).toEqual([]);
+      expect(guest.inputEvents).toEqual([]);
+    } finally {
+      await dispose();
+      await unregisterPaseoBrowser(browserId);
+      fromWebContentsId.mockReset();
+    }
+  });
+
+  test("holds replacement and release behind remote invalidation while the local gate closes immediately", async () => {
+    const profileSession = {};
+    const renderer = new FakeRenderer(41);
+    const browserId = "11111111-1111-4111-8111-111111111111";
+    const oldGuest = new FakeBrowserGuest(701, renderer, profileSession);
+    const newGuest = new FakeBrowserGuest(702, renderer, profileSession);
+    const guests = new Map([
+      [oldGuest.id, oldGuest],
+      [newGuest.id, newGuest],
+    ]);
+    expect(
+      registerAttachedPaseoBrowser({
+        browserId,
+        workspaceId: enterpriseAuthorization.workspaceId,
+        webContentsId: oldGuest.id,
+        sender: renderer,
+        profileSession,
+        profileAuthorization: enterpriseAuthorization,
+        findWebContents: (id) => guests.get(id) ?? null,
+      }),
+    ).toBe(true);
+    const invalidations: Array<ReturnType<typeof deferred<void>>> = [];
+    let revision = 0;
+    const publisher = createBrowserPageIdentityPublisher({
+      registry: getPaseoBrowserWebviewRegistry(),
+      authorityTeardown: createBrowserPageIdentityAuthorityTeardownPort({
+        teardownAfterAuthorityTransportFailure: async () => {},
+      }),
+      publish: async () => {},
+      invalidate: async () => {
+        const barrier = deferred<void>();
+        invalidations.push(barrier);
+        await barrier.promise;
+      },
+      createObservationRevision: () => `observation-${++revision}`,
+    });
+    const dispose = await installPaseoBrowserPageIdentityPublisher(publisher);
+    try {
+      publisher.track(oldGuest);
+      await publisher.publishCurrent(oldGuest);
+      expect(publisher.isExecutionAllowed(oldGuest.id)).toBe(true);
+      preparePaseoBrowserWebContents(newGuest);
+
+      expect(() =>
+        registerAttachedPaseoBrowser({
+          browserId,
+          workspaceId: enterpriseAuthorization.workspaceId,
+          webContentsId: newGuest.id,
+          sender: renderer,
+          profileSession,
+          profileAuthorization: enterpriseAuthorization,
+          findWebContents: (id) => guests.get(id) ?? null,
+        }),
+      ).toThrow(/awaitable page-identity barrier/u);
+      const replacement = registerAttachedPaseoBrowserAfterPageIdentityBarrier({
+        browserId,
+        workspaceId: enterpriseAuthorization.workspaceId,
+        webContentsId: newGuest.id,
+        sender: renderer,
+        profileSession,
+        profileAuthorization: enterpriseAuthorization,
+        findWebContents: (id) => guests.get(id) ?? null,
+      });
+      expect(publisher.isExecutionAllowed(oldGuest.id)).toBe(false);
+      expect(getPaseoBrowserIdForWebContents(oldGuest)).toBe(browserId);
+      expect(getPaseoBrowserIdForWebContents(newGuest)).toBeNull();
+      await vi.waitFor(() => expect(invalidations).toHaveLength(1));
+      invalidations[0].resolve();
+      await expect(replacement).resolves.toBe(true);
+      expect(getPaseoBrowserIdForWebContents(oldGuest)).toBeNull();
+      expect(getPaseoBrowserIdForWebContents(newGuest)).toBe(browserId);
+      expect(publisher.isExecutionAllowed(newGuest.id)).toBe(true);
+
+      const release = unregisterPaseoBrowserFromHost(renderer.id, browserId);
+      expect(publisher.isExecutionAllowed(newGuest.id)).toBe(false);
+      expect(getPaseoBrowserIdForWebContents(newGuest)).toBe(browserId);
+      await vi.waitFor(() => expect(invalidations).toHaveLength(2));
+      invalidations[1].resolve();
+      await release;
+      expect(getPaseoBrowserIdForWebContents(newGuest)).toBeNull();
+    } finally {
+      for (const invalidation of invalidations) invalidation.resolve();
+      await dispose();
+    }
   });
 });

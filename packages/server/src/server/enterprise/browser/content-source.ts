@@ -7,6 +7,10 @@ import {
 } from "@getpaseo/protocol/messages";
 import { DarwinWorkspaceFileSystem } from "../runtime/darwin-workspace-fs.js";
 import { randomBytes } from "node:crypto";
+import {
+  isBrowserPageIdentityVerifier,
+  type BrowserPageIdentityVerifier,
+} from "../../browser-tools/page-identity-registry.js";
 const sourceBrand = Symbol("EnterpriseBrowserProfileContentReadSource");
 const sources = new WeakSet<object>();
 
@@ -48,28 +52,39 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
     readonly limit: number;
   }) => Promise<EnterpriseBrowserProfileContentPage>;
   readonly onClose?: () => void;
+  readonly pageIdentity?: BrowserPageIdentityVerifier;
 }): EnterpriseBrowserProfileContentReadSource {
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null)
     throw new Error("Invalid source options.");
-  if (Reflect.ownKeys(input).some((key) => key !== "readProfile" && key !== "onClose"))
+  if (
+    Reflect.ownKeys(input).some(
+      (key) => key !== "readProfile" && key !== "onClose" && key !== "pageIdentity",
+    )
+  )
     throw new Error("Invalid source options.");
   const readProfile = captureDataFunction(input, "readProfile");
   const onClose = captureDataOptionalFunction(input, "onClose");
+  const pageIdentity = capturePageIdentity(input);
   let closed = false;
   const source = Object.freeze({
     [sourceBrand]: true as const,
     read: async ({ profile, selector, cursor, limit }: BrowserContentReadInput) => {
       if (closed) throw new Error("Browser profile content source is closed.");
       const parsedSelector = EnterpriseBrowserProfileContentSelectorSchema.parse(selector);
+      const verified = pageIdentity
+        ? await pageIdentity.resolveVerifiedProfile(profile)
+        : { profile, verification: null };
+      if (verified.verification) await pageIdentity!.recheck(verified.verification);
       const page = await readProfile({
-        profile,
-        browserProfileId: profile.browserProfileId,
+        profile: verified.profile,
+        browserProfileId: verified.profile.browserProfileId,
         view: parsedSelector.view,
         cursor,
         limit,
       });
       if (closed) throw new Error("Browser profile content source is closed.");
+      if (verified.verification) await pageIdentity!.recheck(verified.verification);
       return {
         items: page.items.map((item) => EnterpriseBrowserProfileContentItemSchema.parse(item)),
         nextCursor: page.nextCursor,
@@ -107,31 +122,30 @@ function captureDataOptionalFunction(input: object, key: string): (() => void) |
   return descriptor.value;
 }
 
+function capturePageIdentity(input: object): BrowserPageIdentityVerifier | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(input, "pageIdentity");
+  if (!descriptor) return undefined;
+  if (
+    !descriptor.enumerable ||
+    descriptor.get ||
+    descriptor.set ||
+    !("value" in descriptor) ||
+    (descriptor.value !== undefined && !isBrowserPageIdentityVerifier(descriptor.value))
+  ) {
+    throw new Error("Invalid pageIdentity.");
+  }
+  return descriptor.value;
+}
+
 export function createProductionEnterpriseBrowserProfileContentReadSource(input: {
   readonly workspaceFs?: DarwinWorkspaceFileSystem;
   readonly addonPath?: string;
+  readonly pageIdentity?: BrowserPageIdentityVerifier;
 }): EnterpriseBrowserProfileContentReadSource | null {
-  const proto = Object.getPrototypeOf(input);
-  if (proto !== Object.prototype && proto !== null)
-    throw new Error("Invalid production source options.");
-  if (Reflect.ownKeys(input).some((key) => key !== "workspaceFs" && key !== "addonPath"))
-    throw new Error("Invalid production source options.");
-  const workspaceDescriptor = Object.getOwnPropertyDescriptor(input, "workspaceFs");
-  const addonDescriptor = Object.getOwnPropertyDescriptor(input, "addonPath");
-  if (workspaceDescriptor && !("value" in workspaceDescriptor))
-    throw new Error("Invalid workspaceFs.");
-  if (addonDescriptor && !("value" in addonDescriptor)) throw new Error("Invalid addonPath.");
-  if (workspaceDescriptor?.value && addonDescriptor?.value)
-    throw new Error("Choose workspaceFs or addonPath.");
-  if (
-    addonDescriptor?.value !== undefined &&
-    (typeof addonDescriptor.value !== "string" || addonDescriptor.value.length === 0)
-  )
-    throw new Error("Invalid addonPath.");
+  const options = snapshotProductionSourceOptions(input);
+  if (!options.pageIdentity) return null;
   const workspaceFs =
-    input.workspaceFs ?? new DarwinWorkspaceFileSystem({ addonPath: input.addonPath });
-  if (input.workspaceFs && !(input.workspaceFs instanceof DarwinWorkspaceFileSystem))
-    throw new Error("Invalid workspaceFs.");
+    options.workspaceFs ?? new DarwinWorkspaceFileSystem({ addonPath: options.addonPath });
   if (!workspaceFs.releaseReady) return null;
   const cursorRecords = new Map<
     string,
@@ -179,7 +193,49 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
       }
     },
     onClose: () => cursorRecords.clear(),
+    pageIdentity: options.pageIdentity,
   });
+}
+
+function snapshotProductionSourceOptions(input: unknown): {
+  workspaceFs?: DarwinWorkspaceFileSystem;
+  addonPath?: string;
+  pageIdentity?: BrowserPageIdentityVerifier;
+} {
+  const proto = input && typeof input === "object" ? Object.getPrototypeOf(input) : undefined;
+  if (proto !== Object.prototype && proto !== null)
+    throw new Error("Invalid production source options.");
+  const record = input as object;
+  if (
+    Reflect.ownKeys(record).some(
+      (key) => key !== "workspaceFs" && key !== "addonPath" && key !== "pageIdentity",
+    )
+  )
+    throw new Error("Invalid production source options.");
+  const workspaceFs = stableOptionValue(record, "workspaceFs");
+  const addonPath = stableOptionValue(record, "addonPath");
+  const pageIdentity = stableOptionValue(record, "pageIdentity");
+  if (workspaceFs && addonPath) throw new Error("Choose workspaceFs or addonPath.");
+  if (workspaceFs !== undefined && !(workspaceFs instanceof DarwinWorkspaceFileSystem))
+    throw new Error("Invalid workspaceFs.");
+  if (addonPath !== undefined && (typeof addonPath !== "string" || addonPath.length === 0))
+    throw new Error("Invalid addonPath.");
+  if (pageIdentity !== undefined && !isBrowserPageIdentityVerifier(pageIdentity))
+    throw new Error("Invalid pageIdentity.");
+  return {
+    ...(workspaceFs ? { workspaceFs } : {}),
+    ...(typeof addonPath === "string" ? { addonPath } : {}),
+    ...(isBrowserPageIdentityVerifier(pageIdentity) ? { pageIdentity } : {}),
+  };
+}
+
+function stableOptionValue(input: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  if (!descriptor) return undefined;
+  if (descriptor.get || descriptor.set || !("value" in descriptor)) {
+    throw new Error(`Invalid ${key}.`);
+  }
+  return descriptor.value;
 }
 
 function statePage(profile: AuthorizedBrowserProfile): EnterpriseBrowserProfileContentPage {

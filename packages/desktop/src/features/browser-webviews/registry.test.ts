@@ -160,6 +160,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
     expect(registry.getRegistrationForWebContents(2)).toEqual({
       browserId: "browser-a",
       hostWebContentsId: 101,
+      registrationRevision: 2,
     });
     expect(registry.getWebContentsIdForBrowserInHostWindow(101, "browser-a")).toBe(2);
     expect(registry.getWorkspaceId("browser-a")).toBe("workspace-a");
@@ -334,6 +335,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
     expect(registry.getRegistrationForWebContents(22)).toEqual({
       browserId: "browser-a",
       hostWebContentsId: 202,
+      registrationRevision: 2,
     });
     expect(registry.getWebContentsIdForBrowserInHostWindow(202, "browser-a")).toBe(22);
   });
