@@ -221,6 +221,7 @@ import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
+  extractHttpBearerToken,
   isAgentMcpRequestAuthorized,
   type DaemonAuthConfig,
 } from "./auth.js";
@@ -975,6 +976,54 @@ export async function createPaseoDaemon(
       req: express.Request,
       res: express.Response,
     ): Promise<void> => {
+      if (enterpriseRuntime && enterpriseWorkspaceFilesProvider) {
+        const token = extractHttpBearerToken(req.header("authorization"));
+        if (!token) {
+          res.status(403).json({ error: "Enterprise authentication required" });
+          return;
+        }
+        const principal = await enterpriseRuntime.admission.authenticate(token, {
+          node: enterpriseRuntime.node,
+          transport: "direct",
+          peer: "external",
+          remoteAddress: req.ip || req.socket.remoteAddress || "http",
+          ...(typeof req.headers.origin === "string" && req.headers.origin.length > 0
+            ? { origin: req.headers.origin }
+            : {}),
+          ...(typeof req.headers["user-agent"] === "string" && req.headers["user-agent"].length > 0
+            ? { userAgent: req.headers["user-agent"] }
+            : {}),
+        });
+        if (!principal) {
+          res.status(403).json({ error: "Enterprise authentication failed" });
+          return;
+        }
+        await enterpriseWorkspaceFilesProvider.httpHandler.handle({
+          principal,
+          node: enterpriseRuntime.node,
+          query: req.query,
+          response: {
+            reject: async (status) => {
+              res.status(status).json({ error: status === 400 ? "Invalid request" : "Forbidden" });
+            },
+            begin: async (metadata) => {
+              res.setHeader("Content-Type", metadata.mimeType);
+              res.setHeader("Content-Disposition", `attachment; filename="${metadata.fileName}"`);
+              res.setHeader("Content-Length", metadata.size.toString());
+            },
+            write: async (bytes) => {
+              res.write(bytes);
+            },
+            end: async () => {
+              res.end();
+            },
+            abort: async () => {
+              res.destroy();
+            },
+          },
+        });
+        return;
+      }
       const token =
         typeof req.query.token === "string" && req.query.token.trim().length > 0
           ? req.query.token.trim()
@@ -1055,7 +1104,7 @@ export async function createPaseoDaemon(
       enterpriseWorkspaceFilesProvider = createProductionEnterpriseWorkspaceFilesProvider({
         workspaceRoots: workspaceRegistry,
       });
-      if (!enterpriseWorkspaceFilesProvider) {
+      if (!enterpriseWorkspaceFilesProvider || !enterpriseWorkspaceFilesProvider.releaseReady) {
         throw new Error("enterprise workspace files provider unavailable");
       }
     }
