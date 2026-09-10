@@ -60,8 +60,10 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
 
 export function createProductionEnterpriseBrowserProfileContentReadSource(input: {
   readonly workspaceFs?: DarwinWorkspaceFileSystem;
+  readonly addonPath?: string;
 }): EnterpriseBrowserProfileContentReadSource | null {
-  const workspaceFs = input.workspaceFs ?? new DarwinWorkspaceFileSystem();
+  const workspaceFs =
+    input.workspaceFs ?? new DarwinWorkspaceFileSystem({ addonPath: input.addonPath });
   if (!workspaceFs.releaseReady) return null;
   return createEnterpriseBrowserProfileContentReadSource({
     readProfile: async ({ profile, view, cursor, limit }) => {
