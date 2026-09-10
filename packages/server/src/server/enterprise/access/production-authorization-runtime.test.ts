@@ -32,6 +32,11 @@ import {
   type ProductionAuthorizationRuntimeOptions,
   type ProductionAuthorizationStatePort,
 } from "./production-authorization-runtime.js";
+import {
+  createProductionAuthorizationRuntimeForSession,
+  createProductionAuthorizationRuntimeProvider,
+  isProductionAuthorizationRuntimeProvider,
+} from "./production-authorization-runtime-provider.js";
 
 const executeFile = promisify(execFile);
 const node: NodeContext = {
@@ -187,6 +192,119 @@ afterAll(async () => {
 });
 
 describe("production enterprise authorization runtime", () => {
+  test("rejects accessor-backed provider options without invoking the getter", () => {
+    let auditGetterCalls = 0;
+    const input = Object.defineProperties(
+      {},
+      {
+        audit: {
+          enumerable: true,
+          get() {
+            auditGetterCalls += 1;
+            return { releaseReady: true };
+          },
+        },
+        grantFilePath: { enumerable: true, value: "/tmp/grants.json" },
+      },
+    );
+
+    expect(createProductionAuthorizationRuntimeProvider(input)).toBeNull();
+    expect(auditGetterCalls).toBe(0);
+  });
+
+  test("rejects structural production dependency providers without touching session input", async () => {
+    let sessionGetterCalls = 0;
+    const sessionInput = Object.defineProperty({}, "authorityState", {
+      enumerable: true,
+      get() {
+        sessionGetterCalls += 1;
+        return new EmptyAuthorityState();
+      },
+    });
+
+    expect(isProductionAuthorizationRuntimeProvider({ grantStore: {}, owners: {} })).toBe(false);
+    await expect(
+      createProductionAuthorizationRuntimeForSession({ grantStore: {}, owners: {} }, sessionInput),
+    ).resolves.toBeNull();
+    expect(sessionGetterCalls).toBe(0);
+  });
+
+  test.runIf(process.platform === "darwin")(
+    "creates every Session runtime from one audit-bound GrantStore and OwnerRegistry",
+    async () => {
+      const fixture = await createFixture("provider");
+      const grantFilePath = path.join(parent, "provider-grants.json");
+      await new FileBackedGrantStorage(grantFilePath).put(grantRecord);
+      const provider = createProductionAuthorizationRuntimeProvider({
+        audit: fixture.audit,
+        grantFilePath,
+      });
+
+      expect(provider).not.toBeNull();
+      if (!provider) throw new Error("expected production authorization provider");
+      expect(isProductionAuthorizationRuntimeProvider(provider)).toBe(true);
+      expect(Object.isFrozen(provider)).toBe(true);
+      expect(Reflect.ownKeys(provider)).toEqual(["grantStore", "owners"]);
+      provider.owners.registerWorkspace({
+        id: "wks_a",
+        organizationId: principal.organizationId,
+        nodeId: node.nodeId,
+        ownerPrincipalId: principal.principalId,
+        createdByPrincipalId: principal.principalId,
+      });
+
+      const runtime = await createProductionAuthorizationRuntimeForSession(provider, {
+        admissionAuthorizationIssuer: fixture.issuer,
+        admissionAuthorizationHandle: fixture.handle,
+        sessionAuthorization: fixture.sessionAuthorization,
+        sessionId: "session-provider",
+        authorityState: new EmptyAuthorityState(),
+      });
+
+      expect(runtime).not.toBeNull();
+      expect(runtime?.binding).toMatchObject({
+        sessionId: "session-provider",
+        clientId: "client-a",
+        principalId: principal.principalId,
+      });
+      await expect(
+        runtime?.resourceAuthorization.assertWorkspace(
+          runtime.principal,
+          "workspace.content.read",
+          "wks_a",
+        ),
+      ).resolves.toMatchObject({ workspaceId: "wks_a" });
+      await runtime?.release();
+      await fixture.audit.close();
+    },
+  );
+
+  test.runIf(process.platform === "darwin")(
+    "rejects Session construction after the provider audit closes without touching input",
+    async () => {
+      const fixture = await createFixture("provider-closed");
+      const provider = createProductionAuthorizationRuntimeProvider({
+        audit: fixture.audit,
+        grantFilePath: path.join(parent, "provider-closed-grants.json"),
+      });
+      expect(provider).not.toBeNull();
+      await fixture.audit.close();
+      let getterCalls = 0;
+      const input = Object.defineProperty({}, "authorityState", {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return new EmptyAuthorityState();
+        },
+      });
+
+      await expect(
+        createProductionAuthorizationRuntimeForSession(provider, input),
+      ).resolves.toBeNull();
+      expect(getterCalls).toBe(0);
+    },
+  );
+
   test("rejects a structural factory input without touching authority-shaped getters", async () => {
     let getterCalls = 0;
     const input = Object.defineProperty({}, "audit", {
