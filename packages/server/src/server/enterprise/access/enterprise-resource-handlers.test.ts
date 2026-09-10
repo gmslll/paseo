@@ -697,6 +697,26 @@ describe.runIf(process.platform === "darwin")("enterprise resource handler core"
     });
   });
 
+  test("accepts the same canonical Principal grants in a different wire order", async () => {
+    const fixture = await createFixture();
+    const context: EnterpriseDispatchContext = {
+      ...fixture.context,
+      enterpriseContext: {
+        ...fixture.context.enterpriseContext,
+        principal: {
+          ...fixture.context.enterpriseContext.principal,
+          grants: fixture.context.enterpriseContext.principal.grants.toReversed(),
+        },
+      },
+    };
+    const message = placementRequest("place-reordered-grants");
+
+    await expect(fixture.handler.handle({ sessionContext: context, message })).resolves.toEqual({
+      type: "enterprise.placement.resolve_workspace.response",
+      payload: { requestId: "place-reordered-grants", resource: workspaceRef() },
+    });
+  });
+
   test("filters organization rows and principals through authoritative ownership", async () => {
     const foreignRow = {
       ...workspaceRow,

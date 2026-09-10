@@ -10,9 +10,11 @@ import {
   GlobalResourceRefSchema,
   NodeContextSchema,
   PrincipalContextSchema,
+  normalizeResourceGrants,
   type EnterpriseOrganizationResourceProjection,
   type EnterprisePrincipalSummaryProjection,
   type GlobalResourceRef,
+  type NodeContext,
   type OutboundAuthorizationContext,
   type PlacementResolver,
   type PrincipalContext,
@@ -652,8 +654,8 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
         this.runtime.binding.sessionBindingGeneration === context.sessionBindingGeneration &&
         this.runtime.binding.sessionBindingGeneration ===
           context.enterpriseContext.sessionBindingGeneration &&
-        sameCanonical(this.runtime.principal, context.enterpriseContext.principal) &&
-        sameCanonical(this.runtime.node, context.enterpriseContext.node)
+        samePrincipalAuthority(this.runtime.principal, context.enterpriseContext.principal) &&
+        sameNodeAuthority(this.runtime.node, context.enterpriseContext.node)
       );
     } catch {
       return false;
@@ -855,6 +857,26 @@ function isObject(value: unknown): value is object {
 
 function sameCanonical(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function samePrincipalAuthority(left: PrincipalContext, right: PrincipalContext): boolean {
+  return (
+    left.organizationId === right.organizationId &&
+    left.principalId === right.principalId &&
+    left.principalType === right.principalType &&
+    left.credentialId === right.credentialId &&
+    left.grantVersion === right.grantVersion &&
+    JSON.stringify(normalizeResourceGrants(left.grants)) ===
+      JSON.stringify(normalizeResourceGrants(right.grants))
+  );
+}
+
+function sameNodeAuthority(left: NodeContext, right: NodeContext): boolean {
+  return (
+    left.nodeId === right.nodeId &&
+    left.paseoServerId === right.paseoServerId &&
+    left.mode === right.mode
+  );
 }
 
 function sameWorkspaceAuthority(
