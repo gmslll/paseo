@@ -18,35 +18,6 @@ export type EnterpriseReceiptClassification =
   | "resources"
   | "identity_self"
   | "transport_control";
-export interface EnterpriseFileDownloadRequest {
-  readonly workspaceId: string;
-  readonly relativePath: string;
-  readonly bearer: string;
-}
-export function buildEnterpriseFileDownloadRequest(input: {
-  readonly workspaceId: string;
-  readonly relativePath: string;
-  readonly bearer: string;
-}): EnterpriseFileDownloadRequest {
-  if (!input.workspaceId || !input.relativePath || !input.bearer) {
-    throw new Error("Invalid enterprise file download request");
-  }
-  return Object.freeze({
-    workspaceId: input.workspaceId,
-    relativePath: input.relativePath,
-    bearer: input.bearer,
-  });
-}
-export function buildEnterpriseFileDownloadUrl(
-  baseUrl: string,
-  request: EnterpriseFileDownloadRequest,
-): string {
-  const url = new URL("/enterprise/files/download", baseUrl);
-  url.searchParams.set("workspaceId", request.workspaceId);
-  url.searchParams.set("relativePath", request.relativePath);
-  url.searchParams.set("bearer", request.bearer);
-  return url.toString();
-}
 export interface EnterpriseDispatchResponse {
   readonly response: SessionOutboundMessage;
   readonly authorizationContext?: OutboundAuthorizationContext;
