@@ -1,5 +1,10 @@
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
-import { DAEMON_PERMISSIONS, type DaemonPermission } from "@getpaseo/protocol/messages";
+import {
+  DAEMON_PERMISSIONS,
+  type DaemonPermission,
+  type EnterpriseAction,
+  type PrincipalContext,
+} from "@getpaseo/protocol/messages";
 import {
   INBOUND_PERMISSION,
   type PermissionRequirement,
@@ -22,6 +27,42 @@ export function parseDaemonPermissions(values: readonly string[]): DaemonPermiss
 }
 
 export const OWNER_PERMISSIONS: readonly DaemonPermission[] = DAEMON_PERMISSIONS;
+
+/** Derive only enterprise coarse permissions from a canonical principal grant snapshot. */
+export function deriveEnterpriseSessionPermissions(
+  principal: PrincipalContext,
+): readonly DaemonPermission[] {
+  if (principal.principalType === "break_glass_owner") return OWNER_PERMISSIONS;
+  const actions = new Set(principal.grants.map((grant) => grant.action));
+  const permissions = new Set<DaemonPermission>();
+  const readActions: readonly EnterpriseAction[] = [
+    "workspace.metadata.read",
+    "workspace.content.read",
+    "provider.history.read",
+    "audit.read",
+  ];
+  if (readActions.some((a) => actions.has(a))) permissions.add("workspace.read");
+  const writeActions: readonly EnterpriseAction[] = [
+    "workspace.write",
+    "provider.history.import",
+    "workspace.script.execute",
+    "browser.profile.manage",
+  ];
+  if (writeActions.some((a) => actions.has(a))) permissions.add("workspace.write");
+  if (actions.has("workspace.manage")) permissions.add("workspace.manage");
+  const pairedActions: readonly EnterpriseAction[] = [
+    "browser.use",
+    "app.use",
+    "terminal.use",
+    "workspace.script.configure",
+    "workspace.editor.open",
+  ];
+  if (pairedActions.some((a) => actions.has(a))) {
+    permissions.add("workspace.read");
+    permissions.add("workspace.write");
+  }
+  return Object.freeze([...permissions]);
+}
 
 declare const inboundDaemonAuthorizationDecisionBrand: unique symbol;
 declare const consumedInboundDaemonAuthorizationDecisionBrand: unique symbol;
