@@ -21,7 +21,11 @@ import type { PatLoginFormModel } from "@/stores/enterprise/pat-login-form-model
 import type { BrowserBindingFormModel } from "./forms/browser-binding-form-model";
 import type { GrantEditorFormModel } from "./forms/grant-editor-form-model";
 import type { EnterpriseUiPort } from "./enterprise-ui-port";
-import { createEnterpriseUiBundle, type EnterpriseContentReaders } from "./enterprise-ui-port";
+import {
+  createEnterpriseUiBundle,
+  type EnterpriseBrowserAuthorizationHydrator,
+  type EnterpriseContentReaders,
+} from "./enterprise-ui-port";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { EnterpriseIdentityLifecycle } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import { getIdentityDisplayPolicyFromParsed } from "@/stores/enterprise/display-policy";
@@ -67,6 +71,8 @@ export interface EnterpriseWorkbenchContainerProps<
   readonly lifecycle: EnterpriseIdentityLifecycle;
   readonly daemonClient: DaemonClient;
   readonly contentReaders: EnterpriseContentReaders<TGeneration, TContent>;
+  readonly browserProfilesEnabled?: () => boolean;
+  readonly hydrateBrowserProfileAuthorizations?: EnterpriseBrowserAuthorizationHydrator<TGeneration>;
 }
 
 export function EnterpriseWorkbenchContainer<TGeneration extends string, TContent>(
@@ -84,8 +90,17 @@ export function EnterpriseWorkbenchContainer<TGeneration extends string, TConten
         daemonClient: props.daemonClient,
         serverId: props.serverId,
         contentReaders: props.contentReaders,
+        browserProfilesEnabled: props.browserProfilesEnabled,
+        hydrateBrowserProfileAuthorizations: props.hydrateBrowserProfileAuthorizations,
       }),
-    [props.lifecycle, props.daemonClient, props.serverId, props.contentReaders],
+    [
+      props.lifecycle,
+      props.daemonClient,
+      props.serverId,
+      props.contentReaders,
+      props.browserProfilesEnabled,
+      props.hydrateBrowserProfileAuthorizations,
+    ],
   );
   const identity = React.useMemo(
     () => ({

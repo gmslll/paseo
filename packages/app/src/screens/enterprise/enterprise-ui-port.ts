@@ -13,6 +13,10 @@ import type {
 } from "./forms/browser-binding-form-model";
 import {
   EnterpriseIdentityGetCurrentResponseSchema,
+  EnterpriseBrowserBindProfileResponseSchema,
+  EnterpriseBrowserListProfilesResponseSchema,
+  type BrowserProfileBindingProjection,
+  type BrowserProfileSummary,
   type CurrentIdentityProjection,
 } from "@getpaseo/protocol/messages";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -72,7 +76,16 @@ export interface EnterpriseUiBundleOptions<TGeneration extends string, TContent>
   readonly daemonClient: DaemonClient;
   readonly serverId: string;
   readonly contentReaders: EnterpriseContentReaders<TGeneration, TContent>;
+  readonly browserProfilesEnabled?: () => boolean;
+  readonly hydrateBrowserProfileAuthorizations?: EnterpriseBrowserAuthorizationHydrator<TGeneration>;
 }
+
+export type EnterpriseBrowserAuthorizationHydrator<TGeneration extends string> = (input: {
+  readonly serverId: string;
+  readonly profiles: readonly BrowserProfileSummary[];
+  readonly bindings: readonly BrowserProfileBindingProjection[];
+  readonly lifecycleGeneration: TGeneration;
+}) => Promise<void>;
 
 function abortError(): Error {
   return new Error("The enterprise request was aborted");
@@ -129,6 +142,8 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
   options: EnterpriseUiBundleOptions<TGeneration, TContent>,
 ): EnterpriseUiBundle<TGeneration, TContent> {
   const { lifecycle, daemonClient, serverId, contentReaders } = options;
+  let hydratedProfiles: readonly BrowserProfileSummary[] = [];
+  let hydratedBindings: readonly BrowserProfileBindingProjection[] = [];
   const request = <T>(
     type: string,
     payload: Readonly<Record<string, unknown>>,
@@ -283,7 +298,22 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         requestId,
         signal,
         sessionGeneration,
-      );
+      ).then(async (response) => {
+        const parsed = EnterpriseBrowserListProfilesResponseSchema.safeParse(response);
+        if (parsed.success) {
+          hydratedProfiles = parsed.data.payload.profiles;
+          hydratedBindings = parsed.data.payload.bindings;
+          if (options.browserProfilesEnabled?.() !== false) {
+            await options.hydrateBrowserProfileAuthorizations?.({
+              serverId,
+              profiles: hydratedProfiles,
+              bindings: hydratedBindings,
+              lifecycleGeneration: sessionGeneration,
+            });
+          }
+        }
+        return response;
+      });
     },
     bindProfile: ({
       workspaceId,
@@ -300,7 +330,27 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         requestId,
         signal,
         sessionGeneration,
-      );
+      ).then(async (response) => {
+        const parsed = EnterpriseBrowserBindProfileResponseSchema.safeParse(response);
+        if (parsed.success && options.browserProfilesEnabled?.() !== false) {
+          const binding = parsed.data.payload.binding;
+          hydratedBindings = [
+            ...hydratedBindings.filter(
+              (candidate) =>
+                candidate.workspaceId !== binding.workspaceId ||
+                candidate.browserProfileId !== binding.browserProfileId,
+            ),
+            binding,
+          ];
+          await options.hydrateBrowserProfileAuthorizations?.({
+            serverId,
+            profiles: hydratedProfiles,
+            bindings: hydratedBindings,
+            lifecycleGeneration: sessionGeneration,
+          });
+        }
+        return response;
+      });
     },
   };
 
