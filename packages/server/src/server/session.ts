@@ -1593,6 +1593,34 @@ export class Session {
     this.rebuildViewedTimelineAgentIds();
   }
 
+  private async handleAgentTimelineSubscriptionRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.set_subscription.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const agentIds = [...new Set(msg.agentIds)].sort();
+    if (this.enterpriseContext) {
+      for (const agentId of agentIds) {
+        if (!(await this.assertLegacyAgentResource("workspace.content.read", agentId))) {
+          this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+          return;
+        }
+      }
+    }
+    if (
+      source
+        ? this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source)
+        : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
+    ) {
+      this.replaceAgentTimelineSubscription(source, agentIds);
+    }
+    const response: SessionOutboundMessage = {
+      type: "agent.timeline.set_subscription.response",
+      payload: { agentIds, requestId: msg.requestId },
+    };
+    if (source && this.onMessageToSource) this.onMessageToSource(source, response);
+    else this.emit(response);
+  }
+
   private rebuildViewedTimelineAgentIds(): void {
     const viewedAgentIds = new Set<string>();
     for (const agentIds of this.viewedTimelineAgentIdsBySource.values()) {
@@ -3168,21 +3196,7 @@ export class Session {
         return undefined;
       }
       case "agent.timeline.set_subscription.request": {
-        const agentIds = [...new Set(msg.agentIds)].sort();
-        if (
-          source
-            ? this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source)
-            : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
-        ) {
-          this.replaceAgentTimelineSubscription(source, agentIds);
-        }
-        const response: SessionOutboundMessage = {
-          type: "agent.timeline.set_subscription.response",
-          payload: { agentIds, requestId: msg.requestId },
-        };
-        if (source && this.onMessageToSource) this.onMessageToSource(source, response);
-        else this.emit(response);
-        return undefined;
+        return this.handleAgentTimelineSubscriptionRequest(msg, source);
       }
       case "agent.fork_context.request":
         return this.handleAgentForkContextRequest(msg);
@@ -8233,6 +8247,10 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+        return;
+      }
       const agentPayload = await this.buildAgentPayload(snapshot);
 
       const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
@@ -8357,12 +8375,20 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.timeline.list_prompts.request" }>,
     source?: object,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+      return;
+    }
     try {
       await ensureAgentLoaded(msg.agentId, {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+        return;
+      }
       const rows = await this.agentManager.getTimelineRows(msg.agentId);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
@@ -8415,6 +8441,10 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type);
+        return;
+      }
       this.emit({
         type: "agent.provider_subagents.list.response",
         payload: {
@@ -8452,6 +8482,10 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+        return;
+      }
       const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
       if (!descriptor) {
         throw new Error("Provider subagent not found");

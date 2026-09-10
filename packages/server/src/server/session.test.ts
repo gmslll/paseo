@@ -8234,6 +8234,74 @@ describe("enterprise dispatcher integration seam", () => {
     });
   });
 
+  test("enterprise timeline subscription and prompt tail deny before manager access", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+    const getTimelineRows = vi.fn();
+    const fetchTimeline = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-timeline-subscription-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentManager: {
+        subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+          agentEventListeners.push(listener);
+          return () => {};
+        }),
+        getTimelineRows,
+        fetchTimeline,
+      },
+    });
+    session.updateClientCapabilities({ selective_agent_timeline: true });
+
+    await session.handleMessage({
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agt_aaaaaaaaaaaaaaaa"],
+      requestId: "timeline-subscription-denied",
+    });
+    await session.handleMessage({
+      type: "agent.timeline.list_prompts.request",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      requestId: "timeline-prompts-denied",
+    });
+
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "timeline-subscription-denied",
+          requestType: "agent.timeline.set_subscription.request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "timeline-prompts-denied",
+          requestType: "agent.timeline.list_prompts.request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+    expect(getTimelineRows).not.toHaveBeenCalled();
+    expect(fetchTimeline).not.toHaveBeenCalled();
+    expect(agentEventListeners).toHaveLength(1);
+    messages.length = 0;
+    agentEventListeners[0]({
+      type: "agent_stream",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      event: {
+        type: "timeline",
+        provider: "mock",
+        item: { type: "assistant_message", messageId: "denied-tail", text: "hidden" },
+      },
+    });
+    expect(messages).toEqual([]);
+    await session.cleanup();
+  });
+
   test("enterprise provider and forge searches deny before provider side effects", async () => {
     const messages: SessionOutboundMessage[] = [];
     const listAgents = vi.fn().mockResolvedValue([]);
