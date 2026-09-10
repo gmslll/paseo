@@ -29,3 +29,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0016: Audit Sink authority and durability](decisions/0016-audit-sink-authority-and-durability.md)
 - [ADR 0017: Browser Profile runtime authorization](decisions/0017-browser-profile-runtime-authorization.md)
 - [ADR 0026: Provider history and search resource contract](decisions/0026-provider-history-and-search-resource-contract.md)
+- [ADR 0027: Single-resource ownership transfer contract](decisions/0027-single-resource-ownership-transfer.md)
