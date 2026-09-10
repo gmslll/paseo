@@ -26,7 +26,9 @@ export function parseDaemonPermissions(values: readonly string[]): DaemonPermiss
   return permissions;
 }
 
-export const OWNER_PERMISSIONS: readonly DaemonPermission[] = DAEMON_PERMISSIONS;
+export const OWNER_PERMISSIONS: readonly DaemonPermission[] = Object.freeze([
+  ...DAEMON_PERMISSIONS,
+]);
 
 /** Derive only enterprise coarse permissions from a canonical principal grant snapshot. */
 export function deriveEnterpriseSessionPermissions(

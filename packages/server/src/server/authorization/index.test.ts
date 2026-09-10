@@ -69,14 +69,15 @@ describe("SessionAuthorization", () => {
     expect(permissions).not.toContain("daemon.read");
     const none = deriveEnterpriseSessionPermissions({ ...human, grants: [] });
     expect(none).toEqual([]);
-    expect(
-      deriveEnterpriseSessionPermissions({
-        ...base,
-        principalType: "break_glass_owner",
-        principalId: "owner",
-        grants: [],
-      }),
-    ).toEqual(OWNER_PERMISSIONS);
+    const owner = deriveEnterpriseSessionPermissions({
+      ...base,
+      principalType: "break_glass_owner",
+      principalId: "owner",
+      grants: [],
+    });
+    expect(Object.isFrozen(OWNER_PERMISSIONS)).toBe(true);
+    expect(Object.isFrozen(owner)).toBe(true);
+    expect(owner).toEqual(OWNER_PERMISSIONS);
   });
   test("enterprise operations have explicit coarse permission requirements", () => {
     const inboundRequirements = {
