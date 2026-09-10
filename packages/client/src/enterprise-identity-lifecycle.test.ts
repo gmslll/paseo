@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { type PrincipalScopeKey } from "./daemon-client.js";
 import {
   MemoryCredentialVault,
@@ -82,6 +82,94 @@ describe("enterprise identity lifecycle", () => {
     expect(JSON.stringify(snapshot)).not.toContain("pat");
     expect(Object.isFrozen(snapshot.projection)).toBe(true);
     expect(Object.isFrozen(snapshot.projection?.navigation)).toBe(true);
+  });
+
+  it("owns authenticated file requests and rejects revoke or generation races", async () => {
+    const p = ports();
+    const vault = new MemoryCredentialVault();
+    const lifecycle = new MemoryEnterpriseIdentityLifecycle(
+      vault,
+      async () => result(),
+      p.teardown,
+      p.remoteLogout,
+    );
+    await lifecycle.bootstrap({ target: "enterprise_host", enterpriseIdentityV1: true });
+    const signedIn = await lifecycle.authenticateEnterpriseHost({
+      serverId: "server-a",
+      token: "pat",
+    });
+    const transport = {
+      request: vi.fn(
+        async (input: { authorization: string }) =>
+          new Response(input.authorization, { status: 200 }),
+      ),
+    };
+    const request = lifecycle.createEnterpriseFileRequest({
+      serverId: "server-a",
+      transport,
+    });
+    const response = await request({
+      serverId: "server-a",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      relativePath: "src/main.ts",
+      scopeGeneration: signedIn.generation!,
+    });
+    expect(await response.text()).toBe("Bearer pat");
+    expect(transport.request).toHaveBeenCalledTimes(1);
+
+    await lifecycle.credentialRevoked({
+      serverId: "server-a",
+      generation: signedIn.generation!,
+      sessionBindingKey: signedIn.sessionBindingKey!,
+    });
+    await expect(
+      request({
+        serverId: "server-a",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "src/main.ts",
+        scopeGeneration: signedIn.generation!,
+      }),
+    ).rejects.toThrow("no longer current");
+    expect(transport.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a response that arrives after the lifecycle generation changes", async () => {
+    const p = ports();
+    const lifecycle = new MemoryEnterpriseIdentityLifecycle(
+      new MemoryCredentialVault(),
+      async () => result(),
+      p.teardown,
+      p.remoteLogout,
+    );
+    await lifecycle.bootstrap({ target: "enterprise_host", enterpriseIdentityV1: true });
+    const signedIn = await lifecycle.authenticateEnterpriseHost({
+      serverId: "server-a",
+      token: "pat",
+    });
+    let resolveTransport!: (response: Response) => void;
+    const transport = {
+      request: vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveTransport = resolve;
+          }),
+      ),
+    };
+    const request = lifecycle.createEnterpriseFileRequest({ serverId: "server-a", transport });
+    const pending = request({
+      serverId: "server-a",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      relativePath: "src/main.ts",
+      scopeGeneration: signedIn.generation!,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await lifecycle.credentialRevoked({
+      serverId: "server-a",
+      generation: signedIn.generation!,
+      sessionBindingKey: signedIn.sessionBindingKey!,
+    });
+    resolveTransport(new Response("late", { status: 200 }));
+    await expect(pending).rejects.toThrow("no longer current");
   });
 
   it("runs replacement teardown before auth and compensates late abort exactly once", async () => {

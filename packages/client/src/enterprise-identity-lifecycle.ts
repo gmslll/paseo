@@ -9,6 +9,7 @@ import {
   type LifecycleGeneration,
   type PrincipalScopeKey,
 } from "./daemon-client.js";
+import type { EnterpriseFileRequest, EnterpriseFileRequestInput } from "./daemon-client.js";
 
 export type { CurrentIdentityProjection };
 declare const credentialHandleBrand: unique symbol;
@@ -95,6 +96,22 @@ export interface EnterpriseIdentityLifecycle {
   scopeRefreshed(
     input: CorrelatedIdentityEvent & { projection: CurrentIdentityProjection },
   ): Promise<void>;
+  createEnterpriseFileRequest(input: {
+    serverId: string;
+    transport: EnterpriseFileRequestTransport;
+  }): EnterpriseFileRequest;
+}
+
+/** Host-runtime transport; Authorization is assembled inside the lifecycle owner. */
+export interface EnterpriseFileRequestTransport {
+  request(input: {
+    readonly serverId: string;
+    readonly workspaceId: string;
+    readonly relativePath: string;
+    readonly scopeGeneration: string;
+    readonly authorization: string;
+    readonly signal: AbortSignal;
+  }): Promise<Response>;
 }
 export interface CorrelatedIdentityEvent {
   readonly serverId: string;
@@ -127,6 +144,67 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
 
   readSnapshot(): EnterpriseIdentitySnapshot {
     return freezeSnapshot(this.snapshot);
+  }
+  createEnterpriseFileRequest(input: {
+    serverId: string;
+    transport: EnterpriseFileRequestTransport;
+  }): EnterpriseFileRequest {
+    const serverId = input.serverId;
+    const transport = input.transport;
+    if (!serverId || !transport || typeof transport.request !== "function")
+      throw new Error("Invalid enterprise file request owner");
+    // oxlint-disable-next-line complexity -- request scope, credential, and late-response fences.
+    return async (request: EnterpriseFileRequestInput) => {
+      if (
+        request.serverId !== serverId ||
+        !request.workspaceId ||
+        !request.relativePath ||
+        request.relativePath.includes("\0") ||
+        request.relativePath.startsWith("/") ||
+        !request.scopeGeneration
+      )
+        throw new Error("Invalid enterprise file request scope");
+      const snapshot = this.readSnapshot();
+      const handle = this.handle;
+      const handleServerId = this.handleServerId;
+      if (
+        snapshot.state !== "signed_in" ||
+        snapshot.scope?.paseoServerId !== serverId ||
+        snapshot.generation !== request.scopeGeneration ||
+        !handle ||
+        handleServerId !== serverId
+      )
+        throw new Error("Enterprise file request scope is no longer current");
+      const token = this.vault.read(serverId, handle);
+      if (!token) throw new Error("Enterprise credential unavailable");
+      const controller = new AbortController();
+      const onAbort = () => controller.abort();
+      if (request.signal?.aborted) controller.abort();
+      else request.signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const response = await transport.request({
+          serverId,
+          workspaceId: request.workspaceId,
+          relativePath: request.relativePath,
+          scopeGeneration: request.scopeGeneration,
+          authorization: `Bearer ${token}`,
+          signal: controller.signal,
+        });
+        const current = this.readSnapshot();
+        if (
+          current.state !== "signed_in" ||
+          current.scope?.paseoServerId !== serverId ||
+          current.generation !== request.scopeGeneration ||
+          this.handle !== handle ||
+          this.handleServerId !== handleServerId
+        )
+          throw new Error("Enterprise file request scope is no longer current");
+        return response;
+      } finally {
+        request.signal?.removeEventListener("abort", onAbort);
+      }
+    };
   }
   subscribe(listener: (snapshot: EnterpriseIdentitySnapshot) => void): () => void {
     this.listeners.add(listener);
