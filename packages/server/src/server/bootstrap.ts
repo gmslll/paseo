@@ -1082,6 +1082,9 @@ export async function createPaseoDaemon(
     app.get("/api/files/download", (req, res) => {
       void handleFileDownload(req, res).catch((error: unknown) => {
         logger.error({ err: error }, "Unhandled file download request failure");
+        if (res.destroyed) {
+          return;
+        }
         if (!res.headersSent) {
           res.status(enterpriseRuntime ? 403 : 500).json({ error: "File download failed" });
         } else if (!res.writableEnded) {
