@@ -236,6 +236,7 @@ export const OUTBOUND_PERMISSION = {
   "enterprise.browser.page_identity.observe.response": "workspace.read",
   "enterprise.browser.page_identity.invalidate.response": "workspace.read",
   "enterprise.resource.ownership.transfer.response": "workspace.manage",
+  "enterprise.workspace.ownership.transfer.tombstone": null,
   "agent.config.apply.response": ["workspace.write", "hub.execute"],
   "agent.detach.response": "workspace.write",
   "agent.fork_context.response": "workspace.read",

@@ -5,6 +5,7 @@ import type {
   EnterpriseSessionDispatcherFactoryRegistration,
 } from "../../session/enterprise-dispatcher.js";
 import {
+  createLeasedEnterpriseResourceDispatcher,
   createEnterpriseResourceDispatcher,
   ENTERPRISE_RESOURCE_HANDLER_REQUEST_TYPES,
   type EnterpriseOrganizationResourceSource,
@@ -150,27 +151,8 @@ export function openEnterpriseResourceDispatcher(
 
 function createLease(delegate: EnterpriseResourceDispatcher): EnterpriseDispatcherLease {
   const state: LeaseState = { active: true, delegate };
-  const dispatcher: EnterpriseResourceDispatcher = Object.freeze({
-    requestPolicyForType: (requestType: string) =>
-      state.active ? state.delegate.requestPolicyForType(requestType) : null,
-    handle: async (input: Parameters<EnterpriseResourceDispatcher["handle"]>[0]) => {
-      if (!state.active) return false;
-      try {
-        const response = await state.delegate.handle(input);
-        return state.active ? response : false;
-      } catch {
-        return false;
-      }
-    },
-    consumeResponse: (input: Parameters<EnterpriseResourceDispatcher["consumeResponse"]>[0]) => {
-      if (!state.active) return null;
-      try {
-        return state.delegate.consumeResponse(input);
-      } catch {
-        return null;
-      }
-    },
-  });
+  const dispatcher = createLeasedEnterpriseResourceDispatcher(state.delegate, () => state.active);
+  if (!dispatcher) throw new EnterpriseResourceDispatcherOpenError();
   return Object.freeze({
     dispatcher,
     close: () => {

@@ -30,11 +30,14 @@ import {
 } from "../identity/admission-authorization.js";
 import {
   consumeEnterpriseResourceHandlerResult,
+  consumeWorkspaceOwnershipTransferTombstoneContext,
   createEnterpriseResourceDispatcher,
+  createLeasedEnterpriseResourceDispatcher,
   ENTERPRISE_RESOURCE_HANDLER_REQUEST_TYPES,
   EnterpriseResourceAuthorizationHandlers,
   enterpriseResourceHandlerPolicyForRequestType,
   enterpriseResourceRequestPolicyForType,
+  isWorkspaceOwnershipTransferTombstoneContext,
   type EnterpriseOrganizationResourcePage,
   type EnterpriseOrganizationResourceSource,
 } from "./enterprise-resource-handlers.js";
@@ -279,6 +282,7 @@ describe.runIf(process.platform === "darwin")("enterprise resource handler core"
       receiptClassification: "authority",
     });
     expect(Object.isFrozen(contextual)).toBe(true);
+    expect(consumeWorkspaceOwnershipTransferTombstoneContext(dispatcher, contextual)).toBeNull();
 
     const burnMessage = listRequest("adapter-burn");
     const burnInput = { sessionContext: fixture.context, message: burnMessage };
@@ -560,6 +564,143 @@ describe.runIf(process.platform === "darwin")("enterprise resource handler core"
       authorization: "authority_receipt",
     });
     expect(consumeEnterpriseResourceHandlerResult(fixture.handler, input, response)).toBeNull();
+  });
+
+  test("issues one nominal current-generation tombstone only from the committed authority sidecar", async () => {
+    const transfer = await createTransferDispatcherFixture("tombstone-success");
+    const input = { sessionContext: transfer.fixture.context, message: transfer.message };
+    const response = await transfer.dispatcher.handle(input);
+    if (response === false) throw new Error("expected transfer response");
+    const contextual = transfer.dispatcher.consumeResponse({ ...input, response });
+    if (!contextual) throw new Error("expected contextual transfer response");
+
+    expect(consumeWorkspaceOwnershipTransferTombstoneContext(transfer.dispatcher, null)).toBeNull();
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(transfer.dispatcher, {
+        ...contextual,
+      }),
+    ).toBeNull();
+    const tombstone = consumeWorkspaceOwnershipTransferTombstoneContext(
+      transfer.dispatcher,
+      contextual,
+    );
+    expect(tombstone).toMatchObject({
+      message: {
+        type: "enterprise.workspace.ownership.transfer.tombstone",
+        payload: {
+          eventId: expect.any(String),
+          resource: workspaceRef(),
+          oldPrincipalId: principalFields.principalId,
+          newRevision: "1",
+          transferReceiptId:
+            response.type === "enterprise.resource.ownership.transfer.response"
+              ? response.payload.receiptId
+              : "wrong-response",
+        },
+      },
+      issuerBinding: transfer.fixture.runtime.binding,
+    });
+    expect(isWorkspaceOwnershipTransferTombstoneContext(tombstone)).toBe(true);
+    expect(
+      isWorkspaceOwnershipTransferTombstoneContext({
+        message: tombstone?.message,
+        issuerBinding: tombstone?.issuerBinding,
+      }),
+    ).toBe(false);
+    expect(Object.isFrozen(tombstone)).toBe(true);
+    expect(Object.isFrozen(tombstone?.message)).toBe(true);
+    expect(Object.isFrozen(tombstone?.issuerBinding)).toBe(true);
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(transfer.dispatcher, contextual),
+    ).toBeNull();
+  });
+
+  test("burns mismatched, stale, closed, Agent, and failed-transfer tombstone claims", async () => {
+    const mismatch = await createTransferDispatcherFixture("tombstone-mismatch");
+    const mismatchInput = { sessionContext: mismatch.fixture.context, message: mismatch.message };
+    const mismatchResponse = await mismatch.dispatcher.handle(mismatchInput);
+    if (mismatchResponse === false) throw new Error("expected transfer response");
+    const mismatchContextual = mismatch.dispatcher.consumeResponse({
+      ...mismatchInput,
+      response: mismatchResponse,
+    });
+    if (!mismatchContextual) throw new Error("expected contextual transfer response");
+    const foreignFixture = await createFixture();
+    const foreignDispatcher = createEnterpriseResourceDispatcher({
+      runtime: foreignFixture.runtime,
+      grantStore: foreignFixture.store,
+      owners: foreignFixture.owners,
+      placement: { resolveWorkspace: async () => workspaceRef() },
+      organizationResources: { list: async () => defaultPage() },
+    });
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(foreignDispatcher, mismatchContextual),
+    ).toBeNull();
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(mismatch.dispatcher, mismatchContextual),
+    ).toBeNull();
+
+    const stale = await createTransferDispatcherFixture("tombstone-stale");
+    const staleInput = { sessionContext: stale.fixture.context, message: stale.message };
+    const staleResponse = await stale.dispatcher.handle(staleInput);
+    if (staleResponse === false) throw new Error("expected transfer response");
+    const staleContextual = stale.dispatcher.consumeResponse({
+      ...staleInput,
+      response: staleResponse,
+    });
+    if (!staleContextual) throw new Error("expected contextual transfer response");
+    await stale.fixture.runtime.release();
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(stale.dispatcher, staleContextual),
+    ).toBeNull();
+
+    const closed = await createTransferDispatcherFixture("tombstone-close");
+    let active = true;
+    const leased = createLeasedEnterpriseResourceDispatcher(closed.dispatcher, () => active);
+    if (!leased) throw new Error("expected leased dispatcher");
+    const closedInput = { sessionContext: closed.fixture.context, message: closed.message };
+    const closedResponse = await leased.handle(closedInput);
+    if (closedResponse === false) throw new Error("expected transfer response");
+    const closedContextual = leased.consumeResponse({ ...closedInput, response: closedResponse });
+    if (!closedContextual) throw new Error("expected contextual transfer response");
+    active = false;
+    expect(consumeWorkspaceOwnershipTransferTombstoneContext(leased, closedContextual)).toBeNull();
+
+    const failed = await createTransferDispatcherFixture("tombstone-failed");
+    const failedResponse = await failed.dispatcher.handle({
+      sessionContext: failed.fixture.context,
+      message: { ...failed.message, expectedRevision: "99" },
+    });
+    expect(failedResponse).toBe(false);
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(failed.dispatcher, failedResponse),
+    ).toBeNull();
+    const agentResponse = await failed.dispatcher.handle({
+      sessionContext: failed.fixture.context,
+      message: {
+        ...failed.message,
+        requestId: "tombstone-agent",
+        resource: {
+          ...workspaceRef(),
+          resourceKind: "agent",
+          localResourceId: "agent_a",
+        },
+      },
+    });
+    expect(agentResponse).toBe(false);
+    expect(
+      consumeWorkspaceOwnershipTransferTombstoneContext(failed.dispatcher, agentResponse),
+    ).toBeNull();
+    expect(
+      createLeasedEnterpriseResourceDispatcher(
+        {
+          requestPolicyForType: () => "authority",
+          handle: async () => false,
+          consumeResponse: () => null,
+        },
+        () => true,
+      ),
+    ).toBeNull();
   });
 
   test("persists intent and storage-failure metadata through the real audit sink", async () => {
@@ -1103,6 +1244,68 @@ async function createFixture(
     },
   };
   return { runtime, store, storage, owners, handler, context };
+}
+
+async function createTransferDispatcherFixture(label: string) {
+  const registry = new FileBackedWorkspaceRegistry(
+    path.join(parent, `${label}-${fixtureNumber + 1}.json`),
+    createTestLogger(),
+  );
+  await registry.initialize();
+  await registry.upsert({
+    ...createPersistedWorkspaceRecord({
+      workspaceId: "wks_a",
+      projectId: `prj_${label}`,
+      cwd: path.join(parent, label),
+      kind: "directory",
+      displayName: label,
+      createdAt: "2026-09-11T00:00:00.000Z",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+    }),
+    organizationId,
+    nodeId: node.nodeId,
+    ownerPrincipalId: principalFields.principalId,
+    createdByPrincipalId: principalFields.principalId,
+  });
+  const workspaceTransfers = createLocalWorkspaceTransfer({
+    workspaceRegistry: registry,
+    audit,
+    principalSource: {
+      isCurrent: () => true,
+      resolvePrincipal: async (principalId: string, requestedOrganizationId: string) =>
+        principalId === targetRecord.principalId
+          ? {
+              principalType: "service" as const,
+              principalId,
+              organizationId: requestedOrganizationId,
+              grants: targetRecord.grants,
+              grantVersion: targetRecord.grantVersion,
+            }
+          : null,
+    },
+  });
+  if (!workspaceTransfers) throw new Error("expected WorkspaceTransfer");
+  const fixture = await createFixture({
+    grants: [workspaceMetadata, workspaceManage],
+    workspaceTransfers,
+  });
+  const dispatcher = createEnterpriseResourceDispatcher({
+    runtime: fixture.runtime,
+    grantStore: fixture.store,
+    owners: fixture.owners,
+    placement: { resolveWorkspace: async () => workspaceRef() },
+    organizationResources: { list: async () => defaultPage() },
+    workspaceTransfers,
+  });
+  const message = {
+    type: "enterprise.resource.ownership.transfer.request",
+    requestId: label,
+    resource: workspaceRef(),
+    expectedOwnerPrincipalId: principalFields.principalId,
+    expectedRevision: "0",
+    newPrincipalId: targetRecord.principalId,
+  } as const satisfies SessionInboundMessage;
+  return { fixture, dispatcher, message, registry };
 }
 
 function defaultPage(): EnterpriseOrganizationResourcePage {

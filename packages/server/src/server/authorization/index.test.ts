@@ -117,6 +117,7 @@ describe("SessionAuthorization", () => {
       "enterprise.resource.release_lease.response": "workspace.write",
       "enterprise.resource.renew_lease.response": "workspace.write",
       "enterprise.resource.ownership.transfer.response": "workspace.manage",
+      "enterprise.workspace.ownership.transfer.tombstone": null,
       "enterprise.resource.status": "workspace.read",
       "enterprise.resource.waiting": "workspace.read",
     } as const satisfies Partial<Record<SessionOutboundMessage["type"], PermissionRequirement>>;
@@ -154,6 +155,21 @@ describe("SessionAuthorization", () => {
     expect(
       authorization.allowsOutbound(outboundMessage("enterprise.identity.credential_revoked")),
     ).toBe(true);
+  });
+
+  test("does not coarse-filter Workspace transfer tombstones from read-only old Sessions", () => {
+    const authorization = new SessionAuthorization(["workspace.read"]);
+
+    expect(
+      authorization.allowsOutbound(
+        outboundMessage("enterprise.workspace.ownership.transfer.tombstone"),
+      ),
+    ).toBe(true);
+    expect(
+      requiredPermissionForOutbound(
+        outboundMessage("enterprise.workspace.ownership.transfer.tombstone"),
+      ),
+    ).toBeNull();
   });
 
   test("owner authority covers every session operation", () => {

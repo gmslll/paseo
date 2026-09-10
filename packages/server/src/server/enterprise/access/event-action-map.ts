@@ -416,6 +416,14 @@ export const OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS = [
   "status",
 ] as const satisfies readonly SessionOutboundMessage["type"][];
 
+/**
+ * A post-CAS transfer tombstone is authorized by W2's nominal transfer sidecar,
+ * never by the ordinary resource policy for the Workspace's new owner.
+ */
+export const OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS = Object.freeze([
+  "enterprise.workspace.ownership.transfer.tombstone",
+] as const satisfies readonly SessionOutboundMessage["type"][]);
+
 export const OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS = [
   "pong",
 ] as const satisfies readonly SessionOutboundMessage["type"][];

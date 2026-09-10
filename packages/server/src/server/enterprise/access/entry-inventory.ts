@@ -13,6 +13,7 @@ import {
   OUTBOUND_AUTHORITY_RECEIPT_POLICIES,
   OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS,
   OUTBOUND_INHERITED_CONTEXT_EVENTS,
+  OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS,
   OUTBOUND_RESOURCE_ACTION_MAP,
   OUTBOUND_SELF_LIFECYCLE_EVENTS,
   OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS,
@@ -33,7 +34,8 @@ export type EnterpriseEntryAuthorizationLayer =
   | "operation_permission"
   | "resource_authorization"
   | "transport_control"
-  | "authority_receipt";
+  | "authority_receipt"
+  | "ownership_transfer_tombstone";
 
 export type EnterpriseEntryAuthoritySource =
   | "request_workspace_id"
@@ -42,6 +44,7 @@ export type EnterpriseEntryAuthoritySource =
   | "outbound_resource_context"
   | "transport_control"
   | "authority_receipt"
+  | "ownership_transfer_receipt"
   | "upload_id"
   | "download_token";
 
@@ -455,6 +458,7 @@ function inboundInventoryItem(entry: InboundEntry): EnterpriseEntryInventoryItem
 }
 
 function outboundActions(entry: OutboundEntry): readonly EnterpriseAction[] {
+  if (isOwnershipTransferTombstone(entry)) return ["workspace.manage"];
   const receipt = authorityReceiptPolicyByEvent.get(entry);
   if (receipt) return receipt.enterpriseActions;
   if (OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS.includes(entry as "status"))
@@ -464,6 +468,7 @@ function outboundActions(entry: OutboundEntry): readonly EnterpriseAction[] {
 }
 
 function outboundResourceKinds(entry: OutboundEntry): readonly GlobalResourceRef["resourceKind"][] {
+  if (isOwnershipTransferTombstone(entry)) return ["workspace"];
   const policy = OUTBOUND_RESOURCE_ACTION_MAP.get(entry);
   if (policy)
     return Object.entries(policy)
@@ -475,6 +480,7 @@ function outboundResourceKinds(entry: OutboundEntry): readonly GlobalResourceRef
 }
 
 function outboundAuthoritySource(entry: OutboundEntry): EnterpriseEntryAuthoritySource {
+  if (isOwnershipTransferTombstone(entry)) return "ownership_transfer_receipt";
   if (authorityReceiptPolicyByEvent.has(entry)) return "authority_receipt";
   if (OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS.includes(entry as "status"))
     return "authority_receipt";
@@ -491,6 +497,7 @@ function outboundAuthoritySource(entry: OutboundEntry): EnterpriseEntryAuthority
 function outboundAuthorizationLayers(
   entry: OutboundEntry,
 ): readonly EnterpriseEntryAuthorizationLayer[] {
+  if (isOwnershipTransferTombstone(entry)) return ["ownership_transfer_tombstone"];
   if (authorityReceiptPolicyByEvent.has(entry))
     return ["operation_permission", "authority_receipt"];
   if (
@@ -530,6 +537,7 @@ function outboundWiringGap(entry: OutboundEntry): EnterpriseEntryInventoryItem["
 function outboundInventoryItem(entry: OutboundEntry): EnterpriseEntryInventoryItem {
   const policy = OUTBOUND_RESOURCE_ACTION_MAP.get(entry);
   const dynamic = OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS.includes(entry as "status");
+  const transferTombstone = isOwnershipTransferTombstone(entry);
   const selfLifecycle = OUTBOUND_SELF_LIFECYCLE_EVENTS.includes(
     entry as (typeof OUTBOUND_SELF_LIFECYCLE_EVENTS)[number],
   );
@@ -542,7 +550,8 @@ function outboundInventoryItem(entry: OutboundEntry): EnterpriseEntryInventoryIt
     enterpriseActions: outboundActions(entry),
     resourceKinds: outboundResourceKinds(entry),
     authoritySource: outboundAuthoritySource(entry),
-    workspaceIdPolicy: policy || dynamic ? "server_resolved" : "not_applicable",
+    workspaceIdPolicy:
+      policy || dynamic || transferTombstone ? "server_resolved" : "not_applicable",
     authorizationLayers: outboundAuthorizationLayers(entry),
     wiringOwner: selfLifecycle ? "W1" : "W3",
     wiringGap: outboundWiringGap(entry),
@@ -552,11 +561,18 @@ function outboundInventoryItem(entry: OutboundEntry): EnterpriseEntryInventoryIt
 const reviewedOutboundEntries: readonly OutboundEntry[] = [
   ...OUTBOUND_RESOURCE_ACTION_MAP.keys(),
   ...OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS,
+  ...OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS,
   ...OUTBOUND_AUTHORITY_RECEIPT_POLICIES.map((policy) => policy.event),
   ...OUTBOUND_SELF_LIFECYCLE_EVENTS,
   ...OUTBOUND_INHERITED_CONTEXT_EVENTS,
   ...OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS,
 ];
+
+function isOwnershipTransferTombstone(entry: OutboundEntry): boolean {
+  return OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS.includes(
+    entry as (typeof OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS)[number],
+  );
+}
 
 const nonUnionEntries: readonly EnterpriseEntryInventoryItem[] = [
   inventoryItem({

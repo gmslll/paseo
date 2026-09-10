@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   EnterpriseAccessListGrantsResponseSchema,
@@ -7,12 +8,14 @@ import {
   EnterprisePlacementResolveWorkspaceResponseSchema,
   EnterprisePrincipalSummaryProjectionSchema,
   EnterpriseResourceOwnershipTransferResponseSchema,
+  EnterpriseWorkspaceOwnershipTransferTombstoneSchema,
   GlobalResourceRefSchema,
   NodeContextSchema,
   PrincipalContextSchema,
   normalizeResourceGrants,
   type EnterpriseOrganizationResourceProjection,
   type EnterprisePrincipalSummaryProjection,
+  type EnterpriseWorkspaceOwnershipTransferTombstone,
   type GlobalResourceRef,
   type NodeContext,
   type OutboundAuthorizationContext,
@@ -28,6 +31,7 @@ import type {
   EnterpriseResponseContextConsumer,
   EnterpriseSessionDispatcher,
 } from "../../session/enterprise-dispatcher.js";
+import type { AuthoritySessionBindingRecord } from "./authority-receipt-verifier.js";
 import {
   isAuthoritativeGrantStore,
   readAuthoritativeGrantRecord,
@@ -162,6 +166,15 @@ export interface EnterpriseResourceDispatcher extends EnterpriseSessionDispatche
   readonly consumeResponse: EnterpriseResponseContextConsumer["consumeResponse"];
 }
 
+declare const workspaceOwnershipTransferTombstoneContextBrand: unique symbol;
+
+/** Opaque W2 authority for W3 to fan out one committed Workspace-transfer tombstone. */
+export interface WorkspaceOwnershipTransferTombstoneContext {
+  readonly [workspaceOwnershipTransferTombstoneContextBrand]: never;
+  readonly message: EnterpriseWorkspaceOwnershipTransferTombstone;
+  readonly issuerBinding: AuthoritySessionBindingRecord;
+}
+
 type ResourceContext = Extract<OutboundAuthorizationContext, { kind: "resources" }>;
 
 export type ConsumedEnterpriseResourceHandlerResult = Readonly<
@@ -191,7 +204,26 @@ interface IssuedResultState {
   readonly output: ConsumedEnterpriseResourceHandlerResult;
 }
 
+interface WorkspaceOwnershipTransferTombstoneSeed {
+  readonly handler: EnterpriseResourceAuthorizationHandlers;
+  readonly sessionContext: EnterpriseDispatchContext;
+  readonly resource: Extract<GlobalResourceRef, { resourceKind: "workspace" }>;
+  readonly oldPrincipalId: string;
+  readonly newRevision: string;
+  readonly transferReceiptId: string;
+  readonly binding: AuthoritySessionBindingRecord;
+}
+
+interface EnterpriseResourceDispatcherState {
+  readonly handler: EnterpriseResourceAuthorizationHandlers;
+  readonly isActive: () => boolean;
+}
+
 const issuedHandlerResults = new WeakMap<object, IssuedResultState>();
+const transferTombstoneSeeds = new WeakMap<object, WorkspaceOwnershipTransferTombstoneSeed>();
+const issuedTransferTombstones = new WeakMap<object, WorkspaceOwnershipTransferTombstoneSeed>();
+const enterpriseResourceDispatchers = new WeakMap<object, EnterpriseResourceDispatcherState>();
+const workspaceOwnershipTransferTombstoneContexts = new WeakSet<object>();
 const enterpriseResourceHandlers = new WeakSet<object>();
 
 const OrganizationResourcePageSchema = z
@@ -491,6 +523,18 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
         },
       }),
     );
+    transferTombstoneSeeds.set(
+      response,
+      Object.freeze({
+        handler: this,
+        sessionContext: input.sessionContext,
+        resource,
+        oldPrincipalId: principal.principalId,
+        newRevision: response.payload.revision,
+        transferReceiptId: committed.receiptId,
+        binding: deepFreeze(structuredClone(this.runtime.binding)),
+      }),
+    );
     return deepFreeze({ response, authorization: "authority_receipt" as const });
   }
 
@@ -661,6 +705,14 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
       return false;
     }
   }
+
+  /** @internal Revalidates the exact issuing Session generation before W3 claims a tombstone. */
+  isCurrentForIssuedTombstone(
+    context: EnterpriseDispatchContext,
+    binding: AuthoritySessionBindingRecord,
+  ): boolean {
+    return this.isCurrent(context) && sameAuthorityBinding(this.runtime.binding, binding);
+  }
 }
 
 export function consumeEnterpriseResourceHandlerResult(
@@ -676,12 +728,120 @@ export function createEnterpriseResourceDispatcher(
   dependencies: EnterpriseResourceHandlerDependencies,
 ): EnterpriseResourceDispatcher {
   const handlers = new EnterpriseResourceAuthorizationHandlers(dependencies);
-  return Object.freeze({
+  const dispatcher = Object.freeze({
     requestPolicyForType: enterpriseResourceRequestPolicyForType,
     handle: handlers.handle.bind(handlers),
     consumeResponse: (input: Parameters<EnterpriseResponseContextConsumer["consumeResponse"]>[0]) =>
       consumeResponse(handlers, input),
   });
+  enterpriseResourceDispatchers.set(dispatcher, {
+    handler: handlers,
+    isActive: () => true,
+  });
+  return dispatcher;
+}
+
+/** Builds the only lease facade that preserves W2's nominal tombstone issuer. */
+export function createLeasedEnterpriseResourceDispatcher(
+  delegate: EnterpriseResourceDispatcher,
+  isActive: () => boolean,
+): EnterpriseResourceDispatcher | null {
+  try {
+    const delegateState = enterpriseResourceDispatchers.get(delegate);
+    if (!delegateState || typeof isActive !== "function") return null;
+    const active = () => {
+      try {
+        return isActive() && delegateState.isActive();
+      } catch {
+        return false;
+      }
+    };
+    const dispatcher: EnterpriseResourceDispatcher = Object.freeze({
+      requestPolicyForType: (requestType: string) =>
+        active() ? delegate.requestPolicyForType(requestType) : null,
+      handle: async (input: Parameters<EnterpriseResourceDispatcher["handle"]>[0]) => {
+        if (!active()) return false;
+        try {
+          const response = await delegate.handle(input);
+          return active() ? response : false;
+        } catch {
+          return false;
+        }
+      },
+      consumeResponse: (input: Parameters<EnterpriseResourceDispatcher["consumeResponse"]>[0]) => {
+        if (!active()) return null;
+        try {
+          return delegate.consumeResponse(input);
+        } catch {
+          return null;
+        }
+      },
+    });
+    enterpriseResourceDispatchers.set(dispatcher, {
+      handler: delegateState.handler,
+      isActive: active,
+    });
+    return dispatcher;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Burns the authority-response sidecar before validation and returns one nominal,
+ * current-generation tombstone context only for a committed Workspace transfer.
+ */
+export function consumeWorkspaceOwnershipTransferTombstoneContext(
+  dispatcher: unknown,
+  contextualResponse: unknown,
+): WorkspaceOwnershipTransferTombstoneContext | null {
+  try {
+    if (!isObject(contextualResponse)) return null;
+    const seed = issuedTransferTombstones.get(contextualResponse);
+    if (!seed) return null;
+    issuedTransferTombstones.delete(contextualResponse);
+    if (!isObject(dispatcher)) return null;
+    const dispatcherState = enterpriseResourceDispatchers.get(dispatcher);
+    if (
+      !dispatcherState ||
+      dispatcherState.handler !== seed.handler ||
+      !dispatcherState.isActive() ||
+      !seed.handler.isCurrentForIssuedTombstone(seed.sessionContext, seed.binding) ||
+      seed.sessionContext.sessionBindingGeneration !==
+        seed.sessionContext.enterpriseContext.sessionBindingGeneration ||
+      seed.binding.organizationId !== seed.resource.organizationId ||
+      seed.binding.nodeId !== seed.resource.nodeId ||
+      seed.binding.principalId !== seed.oldPrincipalId
+    ) {
+      return null;
+    }
+    const message = deepFreeze(
+      EnterpriseWorkspaceOwnershipTransferTombstoneSchema.parse({
+        type: "enterprise.workspace.ownership.transfer.tombstone",
+        payload: {
+          eventId: randomUUID(),
+          resource: seed.resource,
+          oldPrincipalId: seed.oldPrincipalId,
+          newRevision: seed.newRevision,
+          transferReceiptId: seed.transferReceiptId,
+        },
+      }),
+    );
+    const context = deepFreeze({
+      message,
+      issuerBinding: seed.binding,
+    }) as WorkspaceOwnershipTransferTombstoneContext;
+    workspaceOwnershipTransferTombstoneContexts.add(context);
+    return context;
+  } catch {
+    return null;
+  }
+}
+
+export function isWorkspaceOwnershipTransferTombstoneContext(
+  value: unknown,
+): value is WorkspaceOwnershipTransferTombstoneContext {
+  return isObject(value) && workspaceOwnershipTransferTombstoneContexts.has(value);
 }
 
 function consumeResponse(
@@ -698,6 +858,8 @@ function consumeResponse(
     ) {
       return null;
     }
+    const tombstoneSeed = transferTombstoneSeeds.get(responseDescriptor.value);
+    transferTombstoneSeeds.delete(responseDescriptor.value);
     const captured = strictOwnData(input, ["sessionContext", "message", "response"]);
     const consumed = consumeEnterpriseResourceHandlerResult(
       handlers,
@@ -710,13 +872,18 @@ function consumeResponse(
       responseDescriptor.value as SessionOutboundMessage,
     );
     if (!consumed) return null;
-    return consumed.authorization === "authority_receipt"
-      ? deepFreeze({ response: consumed.response, receiptClassification: "authority" as const })
-      : deepFreeze({
-          response: consumed.response,
-          authorizationContext: consumed.context,
-          receiptClassification: "resources" as const,
-        });
+    const contextual =
+      consumed.authorization === "authority_receipt"
+        ? deepFreeze({ response: consumed.response, receiptClassification: "authority" as const })
+        : deepFreeze({
+            response: consumed.response,
+            authorizationContext: consumed.context,
+            receiptClassification: "resources" as const,
+          });
+    if (tombstoneSeed && tombstoneSeed.handler === handlers) {
+      issuedTransferTombstones.set(contextual, tombstoneSeed);
+    }
+    return contextual;
   } catch {
     return null;
   }
@@ -901,6 +1068,24 @@ function sameWorkspaceAuthority(
     left.nodeId === right.nodeId &&
     left.ownerPrincipalId === right.ownerPrincipalId &&
     left.createdByPrincipalId === right.createdByPrincipalId
+  );
+}
+
+function sameAuthorityBinding(
+  left: AuthoritySessionBindingRecord,
+  right: AuthoritySessionBindingRecord,
+): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.sessionBindingKey === right.sessionBindingKey &&
+    left.sessionBindingGeneration === right.sessionBindingGeneration &&
+    left.organizationId === right.organizationId &&
+    left.principalId === right.principalId &&
+    left.principalType === right.principalType &&
+    left.credentialId === right.credentialId &&
+    left.grantVersion === right.grantVersion &&
+    left.nodeId === right.nodeId &&
+    left.clientId === right.clientId
   );
 }
 

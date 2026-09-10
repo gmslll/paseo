@@ -77,6 +77,27 @@ describe("enterprise entry inventory", () => {
     ).toMatchObject({ authoritySource: "authority_receipt", wiringGap: "runtime_call_site" });
   });
 
+  test("classifies the Workspace transfer tombstone by its nominal receipt authority", () => {
+    expect(
+      entriesForSurface("session_outbound").find(
+        (item) => item.entry === "enterprise.workspace.ownership.transfer.tombstone",
+      ),
+    ).toEqual({
+      surface: "session_outbound",
+      entry: "enterprise.workspace.ownership.transfer.tombstone",
+      direction: "outbound",
+      transport: "session_json",
+      daemonPermissions: [],
+      enterpriseActions: ["workspace.manage"],
+      resourceKinds: ["workspace"],
+      authoritySource: "ownership_transfer_receipt",
+      workspaceIdPolicy: "server_resolved",
+      authorizationLayers: ["ownership_transfer_tombstone"],
+      wiringOwner: "W3",
+      wiringGap: "runtime_call_site",
+    });
+  });
+
   test("contains only frozen actions and marks uncorrelated resource entries fail closed", () => {
     const actions = new Set(ENTERPRISE_ACTIONS);
     for (const item of ENTERPRISE_ENTRY_INVENTORY) {

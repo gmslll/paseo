@@ -6,6 +6,7 @@ import {
   ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES,
   OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS,
   OUTBOUND_EVENTS_WITHOUT_RESOURCE_POLICY,
+  OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS,
   OUTBOUND_RESOURCE_ACTION_MAP,
   OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS,
   authorityReceiptPolicyForEvent,
@@ -29,16 +30,39 @@ describe("outbound enterprise event-action map", () => {
     const resourceEvents = [...OUTBOUND_RESOURCE_ACTION_MAP.keys()];
     const dynamicResourceEvents = [...OUTBOUND_DYNAMIC_RESOURCE_POLICY_EVENTS];
     const operationOnlyEvents = [...OUTBOUND_EVENTS_WITHOUT_RESOURCE_POLICY];
+    const transferTombstoneEvents = [...OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS];
     const transportEvents = [...OUTBOUND_TRANSPORT_CONTROL_ONLY_EVENTS];
     const classified = [
       ...resourceEvents,
       ...dynamicResourceEvents,
       ...operationOnlyEvents,
+      ...transferTombstoneEvents,
       ...transportEvents,
     ];
 
     expect(new Set(classified).size).toBe(classified.length);
     expect(classified.sort()).toEqual(outboundTypes());
+  });
+
+  test("keeps transfer tombstones outside ordinary post-CAS resource policy", () => {
+    expect(OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS).toEqual([
+      "enterprise.workspace.ownership.transfer.tombstone",
+    ]);
+    expect(Object.isFrozen(OUTBOUND_OWNERSHIP_TRANSFER_TOMBSTONE_EVENTS)).toBe(true);
+    expect(
+      OUTBOUND_RESOURCE_ACTION_MAP.has("enterprise.workspace.ownership.transfer.tombstone"),
+    ).toBe(false);
+    expect(
+      OUTBOUND_EVENTS_WITHOUT_RESOURCE_POLICY.includes(
+        "enterprise.workspace.ownership.transfer.tombstone" as never,
+      ),
+    ).toBe(false);
+    expect(
+      outboundActionsFor(
+        outbound("enterprise.workspace.ownership.transfer.tombstone"),
+        "workspace",
+      ),
+    ).toEqual([]);
   });
 
   test("contains only frozen EnterpriseAction V1 values", () => {
