@@ -762,6 +762,10 @@ export class HostRuntimeController {
     return this.enterpriseIdentityLifecycle?.readSnapshot() ?? null;
   }
 
+  getEnterpriseIdentityLifecycle(): EnterpriseIdentityLifecycle | null {
+    return this.enterpriseIdentityLifecycle;
+  }
+
   subscribeEnterpriseIdentity(
     listener: Parameters<EnterpriseIdentityLifecycle["subscribe"]>[0],
   ): () => void {
@@ -2434,6 +2438,10 @@ export class HostRuntimeStore {
     return this.controllers.get(serverId)?.getEnterpriseIdentitySnapshot() ?? null;
   }
 
+  getEnterpriseIdentityLifecycle(serverId: string): EnterpriseIdentityLifecycle | null {
+    return this.controllers.get(serverId)?.getEnterpriseIdentityLifecycle() ?? null;
+  }
+
   subscribeEnterpriseIdentity(
     serverId: string,
     listener: (snapshot: EnterpriseIdentitySnapshot) => void,
@@ -2734,6 +2742,17 @@ export function useHostEnterpriseIdentitySnapshot(
     (onStoreChange) => store.subscribeEnterpriseIdentity(serverId, () => onStoreChange()),
     () => store.getEnterpriseIdentitySnapshot(serverId),
     () => store.getEnterpriseIdentitySnapshot(serverId),
+  );
+}
+
+export function useHostEnterpriseIdentityLifecycle(
+  serverId: string,
+): EnterpriseIdentityLifecycle | null {
+  const store = getHostRuntimeStore();
+  return useSyncExternalStore(
+    (onStoreChange) => store.subscribeEnterpriseIdentity(serverId, () => onStoreChange()),
+    () => store.getEnterpriseIdentityLifecycle(serverId),
+    () => store.getEnterpriseIdentityLifecycle(serverId),
   );
 }
 
