@@ -11,6 +11,13 @@ import type {
   EnterpriseResponseContextConsumer,
 } from "../../session/enterprise-dispatcher.js";
 import { isIdentitySelfResponse } from "../../session/enterprise-dispatcher.js";
+import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
+import type { EnterpriseAdmission } from "./admission.js";
+import type { ProductionPrincipalGrantSource } from "./principal-source.js";
+import {
+  productionAuditCapabilityIssuer,
+  type ProductionAuditCapability,
+} from "../audit/production-audit-runtime.js";
 
 export interface EnterpriseIdentityHandlerDeps {
   readonly listPrincipals: (
@@ -67,5 +74,41 @@ export function createEnterpriseIdentityDispatcher(
             receiptClassification: "identity_self",
           } satisfies EnterpriseDispatchResponse)
         : null) satisfies EnterpriseResponseContextConsumer["consumeResponse"],
+  };
+}
+
+export function createProductionEnterpriseIdentityDispatcherRegistration(input: {
+  readonly admission: EnterpriseAdmission;
+  readonly source: ProductionPrincipalGrantSource;
+  readonly audit: ProductionAuditCapability;
+}): EnterpriseSessionDispatcherFactoryRegistration {
+  return {
+    manifest: {
+      operations: [
+        "enterprise.identity.get_current.request",
+        "enterprise.identity.list_principals.request",
+        "enterprise.identity.logout_all.request",
+      ],
+    },
+    open({ context: _context }) {
+      productionAuditCapabilityIssuer.requireCurrent(input.audit);
+      const dispatcher = createEnterpriseIdentityDispatcher({
+        listPrincipals: async ({ enterpriseContext }) => {
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          return input.source.listPrincipalRecords(enterpriseContext.principal.organizationId);
+        },
+        logoutAll: async ({ enterpriseContext }) => {
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          return (
+            (await input.admission.registry.logoutAll(
+              enterpriseContext.principal,
+              enterpriseContext.principal.principalId,
+              enterpriseContext.principal.organizationId,
+            )) > 0
+          );
+        },
+      });
+      return { dispatcher, close: () => undefined };
+    },
   };
 }
