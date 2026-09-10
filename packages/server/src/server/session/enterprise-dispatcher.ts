@@ -71,6 +71,12 @@ export function isIdentitySelfRequest(message: SessionInboundMessage): boolean {
     message.type === "enterprise.identity.logout_all.request"
   );
 }
+export function isEnterpriseResourceRequest(message: SessionInboundMessage): boolean {
+  return (
+    message.type === "enterprise.organization.list_resources.request" ||
+    message.type === "enterprise.placement.resolve_workspace.request"
+  );
+}
 export function isIdentitySelfResponse(message: SessionOutboundMessage): boolean {
   return (
     message.type === "enterprise.identity.get_current.response" ||

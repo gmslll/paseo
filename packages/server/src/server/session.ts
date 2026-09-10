@@ -38,6 +38,7 @@ import {
   isIdentitySelfRequest,
   resolveEnterpriseReceiptPolicy,
   isEnterpriseRequest,
+  isEnterpriseResourceRequest,
   type EnterpriseSessionDispatcher,
 } from "./session/enterprise-dispatcher.js";
 import type {
@@ -2290,6 +2291,41 @@ export class Session {
             });
           }
           return;
+        }
+        return;
+      }
+      if (isEnterpriseResourceRequest(msg) && this.enterpriseDispatcher && this.enterpriseContext) {
+        const requestId = sessionRequestId(msg);
+        if (!requestId || this.reservedAuthorityRequestIds.has(requestId)) return;
+        this.reservedAuthorityRequestIds.add(requestId);
+        try {
+          const response = await dispatchEnterpriseRequest(
+            this.enterpriseDispatcher,
+            {
+              sessionId: this.sessionId,
+              clientId: this.clientId,
+              credentialId: this.enterpriseContext.principal.credentialId,
+              sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+              enterpriseContext: this.enterpriseContext,
+            },
+            msg,
+          );
+          if (response === false) return;
+          const contextual = this.enterpriseDispatcher.consumeResponse?.({
+            sessionContext: {
+              sessionId: this.sessionId,
+              clientId: this.clientId,
+              credentialId: this.enterpriseContext.principal.credentialId,
+              sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+              enterpriseContext: this.enterpriseContext,
+            },
+            message: msg,
+            response,
+          });
+          if (!contextual || contextual.receiptClassification !== "resources") return;
+          this.emit(contextual.response, contextual.authorizationContext);
+        } finally {
+          this.reservedAuthorityRequestIds.delete(requestId);
         }
         return;
       }
