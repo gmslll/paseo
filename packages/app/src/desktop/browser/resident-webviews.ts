@@ -10,6 +10,8 @@ const RESIDENT_BROWSER_HOST_ID = "paseo-browser-resident-webviews";
 const BROWSER_ID_ATTRIBUTE = "data-paseo-browser-id";
 const BROWSER_SURFACE_ATTRIBUTE = "data-paseo-browser-surface";
 const PROFILE_WORKSPACE_ATTRIBUTE = "data-paseo-workspace-id";
+const PROFILE_ORGANIZATION_ATTRIBUTE = "data-paseo-organization-id";
+const PROFILE_HOME_NODE_ATTRIBUTE = "data-paseo-home-node-id";
 const PROFILE_ID_ATTRIBUTE = "data-paseo-browser-profile-id";
 const PROFILE_BINDING_ATTRIBUTE = "data-paseo-binding-revision";
 const PROFILE_LIFECYCLE_ATTRIBUTE = "data-paseo-lifecycle-generation";
@@ -390,6 +392,8 @@ export function prepareBrowserWebview(
   webview.setAttribute(BROWSER_ID_ATTRIBUTE, input.browserId);
   webview.setAttribute("partition", profile?.partition ?? browser.profilePartition);
   if (profile) {
+    webview.setAttribute(PROFILE_ORGANIZATION_ATTRIBUTE, profile.authorization.organizationId);
+    webview.setAttribute(PROFILE_HOME_NODE_ATTRIBUTE, profile.authorization.homeNodeId);
     webview.setAttribute(PROFILE_WORKSPACE_ATTRIBUTE, profile.authorization.workspaceId);
     webview.setAttribute(PROFILE_ID_ATTRIBUTE, profile.authorization.browserProfileId);
     webview.setAttribute(PROFILE_BINDING_ATTRIBUTE, profile.authorization.bindingRevision);

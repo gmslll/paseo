@@ -22,9 +22,7 @@ import {
 } from "../../utils/command-center-focus-restore";
 
 const RESIDENT_HOST_ID = "paseo-browser-resident-webviews";
-const attachedBrowsers: Array<
-  DesktopAttachedBrowserRegistration & { profile?: Record<string, string> }
-> = [];
+const attachedBrowsers: DesktopAttachedBrowserRegistration[] = [];
 const enterpriseProfile: BrowserProfileAuthorizationResult = {
   authorization: {
     organizationId: "org_1111111111111111",
@@ -277,6 +275,8 @@ describe("resident browser webviews", () => {
     webview.dispatchEvent(new Event("did-attach"));
 
     expect(webview.getAttribute("partition")).toBe(enterpriseProfile.partition);
+    expect(webview.getAttribute("data-paseo-organization-id")).toBe("org_1111111111111111");
+    expect(webview.getAttribute("data-paseo-home-node-id")).toBe("nod_1111111111111111");
     expect(webview.getAttribute("data-paseo-workspace-id")).toBe("workspace-enterprise");
     expect(webview.getAttribute("data-paseo-browser-profile-id")).toBe("brp_1111111111111111");
     expect(attachedBrowsers).toEqual([

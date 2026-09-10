@@ -58,27 +58,40 @@ import {
   BROWSER_NEW_TAB_REQUEST_EVENT,
   decideBrowserWindowOpenRequest,
   getPaseoBrowserIdForWebContents,
+  getPaseoBrowserWebContentsForProfile,
   getPaseoBrowserWebContentsForHostWindow,
   getPaseoBrowserWebviewRegistry,
   listRegisteredPaseoBrowserIds,
+  listRegisteredPaseoBrowserIdsForProfile,
   isPaseoBrowserWebviewAttach,
   preparePaseoBrowserWebContents,
   PendingBrowserWindowOpenRequests,
   registerBrowserWebviewNavigationGuards,
   unregisterPaseoBrowserFromHost,
+  unregisterPaseoBrowserProfile,
   registerAttachedPaseoBrowser,
   setWorkspaceActivePaseoBrowserId,
   unregisterPaseoBrowserHost,
 } from "./features/browser-webviews/index.js";
 import {
+  BrowserProfileRuntimeAuthorizationRegistry,
   clearPaseoBrowserProfile,
+  getEnterpriseBrowserProfilePartition,
   getLegacyPaseoBrowserProfileSession,
   PASEO_BROWSER_PROFILE_PARTITION,
   getPaseoBrowserProfileSession,
   getPaseoBrowserProfileSessions,
   listPaseoBrowserProfileGuests,
+  parseBrowserProfileRuntimeSelector,
   readLegacyPaseoBrowserIds,
+  type BrowserProfileRuntimeAuthorization,
+  type BrowserProfileRuntimeSelector,
 } from "./features/browser-profile.js";
+import {
+  HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL,
+  REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL,
+} from "./features/browser-webviews/profile-authorizations.js";
+import { createBrowserProfileAuthorizationHandler } from "./features/browser-webviews/profile-authorizations-handler.js";
 import { parseOpenProjectPathFromArgv } from "./open-project-routing.js";
 import {
   createDesktopWindowOwner,
@@ -106,6 +119,7 @@ import {
   type AgentDeepLinkTarget,
 } from "@getpaseo/protocol/agent-deep-link";
 import { AgentNavigationInbox, parseAgentDeepLinkFromArgv } from "./agent-navigation.js";
+import { loadPersistedConfig, resolvePaseoHome } from "@getpaseo/server";
 
 const DEV_SERVER_URL = process.env.EXPO_DEV_URL ?? "http://localhost:8081";
 const APP_SCHEME = "paseo";
@@ -142,13 +156,21 @@ interface AttachedBrowserInput {
   browserId: string;
   workspaceId: string;
   webContentsId: number;
+  profile?: BrowserProfileRuntimeSelector;
 }
 
 function readAttachedBrowserInput(input: unknown): AttachedBrowserInput | null {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+  let record: Record<string, unknown>;
+  try {
+    record = readStableIpcRecord(
+      input,
+      ["browserId", "profile", "webContentsId", "workspaceId"],
+      ["browserId", "webContentsId", "workspaceId"],
+      "attached browser registration",
+    );
+  } catch {
     return null;
   }
-  const record = input as Record<string, unknown>;
   if (typeof record.browserId !== "string" || record.browserId.trim().length === 0) {
     return null;
   }
@@ -166,7 +188,46 @@ function readAttachedBrowserInput(input: unknown): AttachedBrowserInput | null {
     browserId: record.browserId.trim(),
     workspaceId: record.workspaceId.trim(),
     webContentsId: record.webContentsId,
+    ...(record.profile === undefined
+      ? {}
+      : { profile: parseBrowserProfileRuntimeSelector(record.profile) }),
   };
+}
+
+function readStableIpcRecord(
+  input: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const keys = Object.keys(descriptors);
+  if (
+    Object.getOwnPropertySymbols(input).length > 0 ||
+    keys.some((key) => !allowedKeys.includes(key)) ||
+    requiredKeys.some((key) => !keys.includes(key))
+  ) {
+    throw new Error(`Invalid ${label} fields.`);
+  }
+  const record: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || descriptor.get || descriptor.set || !("value" in descriptor)) {
+      throw new Error(`Invalid ${label} field.`);
+    }
+    record[key] = descriptor.value;
+  }
+  return record;
+}
+
+function readNonEmptyIpcString(input: unknown, label: string): string {
+  if (typeof input !== "string" || input.length === 0 || input.trim() !== input) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return input;
 }
 
 function readActiveBrowserInput(
@@ -185,6 +246,179 @@ function readActiveBrowserInput(
 
 const browserKeyboard = new BrowserKeyboard(getPaseoBrowserWebviewRegistry());
 browserKeyboard.registerIpc();
+
+const PROFILE_ORGANIZATION_ATTRIBUTE = "data-paseo-organization-id";
+const PROFILE_HOME_NODE_ATTRIBUTE = "data-paseo-home-node-id";
+const PROFILE_WORKSPACE_ATTRIBUTE = "data-paseo-workspace-id";
+const PROFILE_ID_ATTRIBUTE = "data-paseo-browser-profile-id";
+const PROFILE_BINDING_ATTRIBUTE = "data-paseo-binding-revision";
+const PROFILE_LIFECYCLE_ATTRIBUTE = "data-paseo-lifecycle-generation";
+const PROFILE_SELECTOR_ATTRIBUTES = [
+  PROFILE_ORGANIZATION_ATTRIBUTE,
+  PROFILE_HOME_NODE_ATTRIBUTE,
+  PROFILE_WORKSPACE_ATTRIBUTE,
+  PROFILE_ID_ATTRIBUTE,
+  PROFILE_BINDING_ATTRIBUTE,
+  PROFILE_LIFECYCLE_ATTRIBUTE,
+] as const;
+
+let browserProfileAuthorizationRegistry: BrowserProfileRuntimeAuthorizationRegistry | null = null;
+const browserProfileLifecycleGenerationByHost = new Map<number, string>();
+
+function readBrowserProfileSelectorFromWebviewParams(
+  params: Record<string, string>,
+): BrowserProfileRuntimeSelector | null {
+  const present = PROFILE_SELECTOR_ATTRIBUTES.filter((attribute) => attribute in params);
+  if (present.length === 0) return null;
+  if (present.length !== PROFILE_SELECTOR_ATTRIBUTES.length) {
+    throw new Error("Incomplete Browser Profile authorization attributes.");
+  }
+  return parseBrowserProfileRuntimeSelector({
+    organizationId: params[PROFILE_ORGANIZATION_ATTRIBUTE],
+    homeNodeId: params[PROFILE_HOME_NODE_ATTRIBUTE],
+    workspaceId: params[PROFILE_WORKSPACE_ATTRIBUTE],
+    browserProfileId: params[PROFILE_ID_ATTRIBUTE],
+    bindingRevision: params[PROFILE_BINDING_ATTRIBUTE],
+    lifecycleGeneration: params[PROFILE_LIFECYCLE_ATTRIBUTE],
+  });
+}
+
+function resolveBrowserProfileAuthorization(
+  hostWebContentsId: number,
+  selector: BrowserProfileRuntimeSelector,
+): BrowserProfileRuntimeAuthorization {
+  const authorization = browserProfileAuthorizationRegistry?.resolveExact(
+    hostWebContentsId,
+    selector,
+  );
+  if (!authorization) {
+    throw new Error("Browser Profile authorization is unavailable or stale.");
+  }
+  return authorization;
+}
+
+function createBrowserProfileAuthorizationCleanup(hostWebContentsId: number) {
+  const guestIdsByProfile = new Map<string, readonly number[]>();
+  return {
+    unregisterProfile(authorization: BrowserProfileRuntimeAuthorization): void {
+      const browserIds = listRegisteredPaseoBrowserIdsForProfile({
+        hostWebContentsId,
+        authorization,
+      });
+      const registeredGuestIds = browserIds.flatMap((browserId) => {
+        const contents = getPaseoBrowserWebContentsForProfile({
+          browserId,
+          hostWebContentsId,
+          authorization,
+        });
+        return contents ? [contents.id] : [];
+      });
+      const profileSession = session.fromPartition(
+        getEnterpriseBrowserProfilePartition(authorization.browserProfileId),
+      );
+      const profileGuestIds = listPaseoBrowserProfileGuests({
+        profileSession,
+        webContents: webContents.getAllWebContents(),
+      }).map((contents) => contents.id);
+      guestIdsByProfile.set(
+        authorization.browserProfileId,
+        Object.freeze([...new Set([...registeredGuestIds, ...profileGuestIds])]),
+      );
+      unregisterPaseoBrowserProfile({ hostWebContentsId, authorization });
+    },
+    findGuests(profileId: string): readonly unknown[] {
+      const guestIds = guestIdsByProfile.get(profileId) ?? [];
+      guestIdsByProfile.delete(profileId);
+      return guestIds;
+    },
+    destroyGuest(guest: unknown): void {
+      if (typeof guest !== "number" || !Number.isSafeInteger(guest) || guest <= 0) {
+        throw new Error("Invalid Browser Profile guest ID.");
+      }
+      const contents = webContents.fromId(guest);
+      if (contents && !contents.isDestroyed()) contents.close({ waitForBeforeUnload: false });
+    },
+    cleanupGuest(guest: unknown): void {
+      if (typeof guest !== "number" || !Number.isSafeInteger(guest) || guest <= 0) {
+        throw new Error("Invalid Browser Profile guest ID.");
+      }
+      pendingBrowserWindowOpenRequests.delete(guest);
+    },
+  };
+}
+
+function createBrowserProfileHandler(hostWebContentsId: number) {
+  if (!browserProfileAuthorizationRegistry) {
+    throw new Error("Browser Profile authorization is unavailable.");
+  }
+  return createBrowserProfileAuthorizationHandler({
+    registry: browserProfileAuthorizationRegistry,
+    hostWebContentsId,
+    cleanup: createBrowserProfileAuthorizationCleanup(hostWebContentsId),
+  });
+}
+
+function registerBrowserProfileAuthorizationIpc(): void {
+  const enterprise = loadPersistedConfig(resolvePaseoHome(process.env)).features
+    ?.enterpriseMultiUser;
+  if (!enterprise?.enabled) return;
+  browserProfileAuthorizationRegistry = new BrowserProfileRuntimeAuthorizationRegistry(
+    enterprise.nodeId,
+  );
+  ipcMain.handle(
+    HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL,
+    async (event, rawInput: unknown) => {
+      const input = readStableIpcRecord(
+        rawInput,
+        ["authorizations", "lifecycleGeneration"],
+        ["authorizations", "lifecycleGeneration"],
+        "Browser Profile authorization hydration",
+      );
+      if (!Array.isArray(input.authorizations)) {
+        throw new Error("Invalid Browser Profile authorizations.");
+      }
+      const lifecycleGeneration = readNonEmptyIpcString(
+        input.lifecycleGeneration,
+        "Browser Profile lifecycle generation",
+      );
+      const handler = createBrowserProfileHandler(event.sender.id);
+      const pending = handler.hydrate(input.authorizations, lifecycleGeneration);
+      browserProfileLifecycleGenerationByHost.set(event.sender.id, lifecycleGeneration);
+      return pending;
+    },
+  );
+  ipcMain.handle(REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL, async (event, rawInput: unknown) => {
+    const input = readStableIpcRecord(
+      rawInput,
+      ["lifecycleGeneration"],
+      ["lifecycleGeneration"],
+      "Browser Profile generation revocation",
+    );
+    const lifecycleGeneration = readNonEmptyIpcString(
+      input.lifecycleGeneration,
+      "Browser Profile lifecycle generation",
+    );
+    const pending = createBrowserProfileHandler(event.sender.id).revoke(lifecycleGeneration);
+    if (browserProfileLifecycleGenerationByHost.get(event.sender.id) === lifecycleGeneration) {
+      browserProfileLifecycleGenerationByHost.delete(event.sender.id);
+    }
+    return pending;
+  });
+}
+
+function revokeBrowserProfileHost(hostWebContentsId: number): void {
+  const generation = browserProfileLifecycleGenerationByHost.get(hostWebContentsId);
+  browserProfileLifecycleGenerationByHost.delete(hostWebContentsId);
+  if (!generation || !browserProfileAuthorizationRegistry) return;
+  void createBrowserProfileHandler(hostWebContentsId)
+    .revoke(generation)
+    .catch((error) => {
+      log.error("[browser-profile] failed to cleanup closed host", {
+        hostWebContentsId,
+        error,
+      });
+    });
+}
 
 function showBrowserWebviewContextMenu(
   win: BrowserWindow,
@@ -388,10 +622,24 @@ ipcMain.handle("paseo:browser:register-attached", (event, rawInput: unknown) => 
   if (!input) {
     throw new Error("Invalid attached browser registration");
   }
+  const profileAuthorization = input.profile
+    ? resolveBrowserProfileAuthorization(event.sender.id, input.profile)
+    : null;
+  if (profileAuthorization && profileAuthorization.workspaceId !== input.workspaceId) {
+    throw new Error("Browser Profile authorization does not match the Browser Workspace.");
+  }
+  const profileSession = profileAuthorization
+    ? session.fromPartition(
+        getEnterpriseBrowserProfilePartition(profileAuthorization.browserProfileId),
+      )
+    : getPaseoBrowserProfileSession(session);
   const registered = registerAttachedPaseoBrowser({
-    ...input,
+    browserId: input.browserId,
+    workspaceId: input.workspaceId,
+    webContentsId: input.webContentsId,
+    ...(profileAuthorization ? { profileAuthorization } : {}),
     sender: event.sender,
-    profileSession: getPaseoBrowserProfileSession(session),
+    profileSession,
     findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
   });
   if (!registered) {
@@ -714,6 +962,7 @@ async function createWindow(
   mainWindow.on("closed", () => {
     options.onClosed?.(webContentsId);
     agentNavigationInbox.removeWindow(webContentsId);
+    revokeBrowserProfileHost(webContentsId);
     unregisterPaseoBrowserHost(webContentsId);
     browserKeyboard.detachHost(webContentsId);
   });
@@ -734,7 +983,22 @@ async function createWindow(
   setupDefaultContextMenu(mainWindow);
   setupDragDropPrevention(mainWindow);
   mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
-    if (!isPaseoBrowserWebviewAttach(params)) {
+    let profileAuthorization: BrowserProfileRuntimeAuthorization | null = null;
+    try {
+      const selector = readBrowserProfileSelectorFromWebviewParams(params);
+      profileAuthorization = selector
+        ? resolveBrowserProfileAuthorization(mainWindow.webContents.id, selector)
+        : null;
+    } catch {
+      event.preventDefault();
+      return;
+    }
+    if (
+      !isPaseoBrowserWebviewAttach({
+        ...params,
+        ...(profileAuthorization ? { profileAuthorization } : {}),
+      })
+    ) {
       event.preventDefault();
       return;
     }
@@ -966,6 +1230,7 @@ async function bootstrap(): Promise<void> {
   ipcMain.handle("paseo:opener:openUrl", (_event, value: unknown) => openExternalUrl(value));
   registerEditorTargetHandlers();
   registerBrowserAutomationIpc();
+  registerBrowserProfileAuthorizationIpc();
 
   // In-app "Open in new window": opens a window that lands on the given project
   // via the same open-project flow as a CLI launch (no move, no ownership).

@@ -597,8 +597,20 @@ function probeIntervalForConnection(
 }
 
 function createDefaultDeps(): HostRuntimeControllerDeps {
-  const browserHostAvailable =
-    typeof getDesktopHost()?.browser?.executeAutomationCommand === "function";
+  const desktopBrowser = getDesktopHost()?.browser;
+  const browserHostAvailable = typeof desktopBrowser?.executeAutomationCommand === "function";
+  const browserProfileRuntimeBridge =
+    typeof desktopBrowser?.hydrateBrowserProfileAuthorizations === "function" &&
+    typeof desktopBrowser.revokeBrowserProfileGeneration === "function"
+      ? {
+          hydrateBrowserProfileAuthorizations: (input: {
+            readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
+            readonly lifecycleGeneration: string;
+          }) => desktopBrowser.hydrateBrowserProfileAuthorizations!(input),
+          revokeBrowserProfileGeneration: (input: { readonly lifecycleGeneration: string }) =>
+            desktopBrowser.revokeBrowserProfileGeneration!(input),
+        }
+      : undefined;
   const browserAutomationCapabilities = browserHostAvailable
     ? {
         [CLIENT_CAPS.browserHost]: {
@@ -612,6 +624,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
   };
 
   return {
+    ...(browserProfileRuntimeBridge ? { browserProfileRuntimeBridge } : {}),
     createEnterpriseIdentityLifecyclePorts: ({ serverId }) =>
       createUnavailableEnterpriseIdentityLifecyclePorts(serverId),
     createEnterpriseIdentityLifecycle: ({ vault, ports }) =>

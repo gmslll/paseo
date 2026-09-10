@@ -30,6 +30,14 @@ interface AttachedBrowserRegistration {
   browserId: string;
   workspaceId: string;
   webContentsId: number;
+  profile?: {
+    organizationId: string;
+    homeNodeId: string;
+    workspaceId: string;
+    browserProfileId: string;
+    bindingRevision: string;
+    lifecycleGeneration: string;
+  };
 }
 
 contextBridge.exposeInMainWorld("paseoDesktop", {
