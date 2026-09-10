@@ -121,6 +121,18 @@ export function isProductionAuthorizationRuntimeProvider(
   return isObject(value) && providerRecords.has(value);
 }
 
+export function isCurrentProductionAuthorizationRuntimeProvider(
+  value: unknown,
+): value is ProductionAuthorizationRuntimeProvider {
+  try {
+    if (!isObject(value)) return false;
+    const shared = providerRecords.get(value);
+    return Boolean(shared && productionAuditCapabilityIssuer.current(shared.audit));
+  } catch {
+    return false;
+  }
+}
+
 export async function createProductionAuthorizationRuntimeForSession(
   provider: unknown,
   input: unknown,
