@@ -117,6 +117,7 @@ import {
   sendBoundedPhysicalFrameAndWait,
 } from "./websocket/physical-socket.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
+import type { EnterpriseWorkspaceFilesRuntime } from "./enterprise/runtime/workspace-files-runtime.js";
 import { createProductionAuthorizationRuntimeForSession } from "./enterprise/access/production-authorization-runtime-provider.js";
 import type { ProductionAuthorizationRuntime } from "./enterprise/access/production-authorization-runtime.js";
 import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
@@ -1787,6 +1788,9 @@ export class VoiceAssistantWebSocketServer {
     sessionId?: string;
     sessionAuthorization?: SessionAuthorization;
     enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+    onEnterpriseWorkspaceRuntimeConstructionFailure?: (
+      runtime: EnterpriseWorkspaceFilesRuntime,
+    ) => void;
   }): SessionConnection {
     const {
       ws,
@@ -1799,6 +1803,7 @@ export class VoiceAssistantWebSocketServer {
       sessionId,
       sessionAuthorization,
       enterpriseAuthorizationRuntime,
+      onEnterpriseWorkspaceRuntimeConstructionFailure,
     } = params;
     let connection: SessionConnection | null = null;
     const enterpriseWorkspaceFilesRuntime =
@@ -1813,69 +1818,77 @@ export class VoiceAssistantWebSocketServer {
       throw new Error("Enterprise workspace files runtime unavailable");
     }
 
-    const session = this.createSocketSession({
-      clientId,
-      appVersion,
-      clientCapabilities,
-      permissions: Object.freeze([...admission.permissions]),
-      connectionLogger,
-      onMessage: (msg) => {
-        if (!connection) {
-          return;
-        }
-        this.sendToConnection(connection, wrapSessionMessage(msg));
-      },
-      onMessageToSource: (source, msg) => {
-        if (!connection || !connection.sockets.has(source as WebSocketLike)) {
-          return;
-        }
-        this.sendToClient(source as WebSocketLike, wrapSessionMessage(msg));
-      },
-      onBinaryMessage: (frame) => {
-        if (!connection) {
-          return;
-        }
-        this.sendBinaryToConnection(connection, frame);
-      },
-      onBinaryMessageToSource: async (source, frame) => {
-        if (!connection || !connection.sockets.has(source as WebSocketLike)) {
-          throw new Error("File transfer source socket is no longer attached");
-        }
-        await this.sendBinaryToClientAndWait(source as WebSocketLike, frame);
-      },
-      getTransportBufferedAmount: () => {
-        if (!connection) {
-          return null;
-        }
-        // Relay-attached sockets are a WebSocketLike that doesn't expose
-        // bufferedAmount. Return null when no socket gives a signal so the
-        // terminal fallback can't mistake "no signal" for "client keeping up";
-        // a direct ws reports its real buffered bytes (0 when drained).
-        let maxBuffered: number | null = null;
-        for (const socket of connection.sockets) {
-          if (typeof socket.bufferedAmount === "number") {
-            maxBuffered = Math.max(maxBuffered ?? 0, socket.bufferedAmount);
+    let session: Session;
+    try {
+      session = this.createSocketSession({
+        clientId,
+        appVersion,
+        clientCapabilities,
+        permissions: Object.freeze([...admission.permissions]),
+        connectionLogger,
+        onMessage: (msg) => {
+          if (!connection) {
+            return;
           }
-        }
-        return maxBuffered;
-      },
-      onLifecycleIntent: (intent) => {
-        this.onLifecycleIntent?.(intent);
-      },
-      hubExecutionAgents: admission.hubExecutionAgents,
-      hubRelationships: this.hubRelationships ?? undefined,
-      enterprise: admission.enterprise,
-      ...(enterpriseWorkspaceFilesRuntime ? { enterpriseWorkspaceFilesRuntime } : {}),
-      ...(sessionId ? { sessionId } : {}),
-      ...(sessionAuthorization ? { sessionAuthorization } : {}),
-      ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
-      ...(this.enterpriseRuntime && params.enterpriseAuthorizationHandle
-        ? { admissionAuthorizationIssuer: this.enterpriseRuntime.admission.authorizationIssuer }
-        : {}),
-      ...(params.enterpriseAuthorizationHandle
-        ? { admissionAuthorizationHandle: params.enterpriseAuthorizationHandle }
-        : {}),
-    });
+          this.sendToConnection(connection, wrapSessionMessage(msg));
+        },
+        onMessageToSource: (source, msg) => {
+          if (!connection || !connection.sockets.has(source as WebSocketLike)) {
+            return;
+          }
+          this.sendToClient(source as WebSocketLike, wrapSessionMessage(msg));
+        },
+        onBinaryMessage: (frame) => {
+          if (!connection) {
+            return;
+          }
+          this.sendBinaryToConnection(connection, frame);
+        },
+        onBinaryMessageToSource: async (source, frame) => {
+          if (!connection || !connection.sockets.has(source as WebSocketLike)) {
+            throw new Error("File transfer source socket is no longer attached");
+          }
+          await this.sendBinaryToClientAndWait(source as WebSocketLike, frame);
+        },
+        getTransportBufferedAmount: () => {
+          if (!connection) {
+            return null;
+          }
+          // Relay-attached sockets are a WebSocketLike that doesn't expose
+          // bufferedAmount. Return null when no socket gives a signal so the
+          // terminal fallback can't mistake "no signal" for "client keeping up";
+          // a direct ws reports its real buffered bytes (0 when drained).
+          let maxBuffered: number | null = null;
+          for (const socket of connection.sockets) {
+            if (typeof socket.bufferedAmount === "number") {
+              maxBuffered = Math.max(maxBuffered ?? 0, socket.bufferedAmount);
+            }
+          }
+          return maxBuffered;
+        },
+        onLifecycleIntent: (intent) => {
+          this.onLifecycleIntent?.(intent);
+        },
+        hubExecutionAgents: admission.hubExecutionAgents,
+        hubRelationships: this.hubRelationships ?? undefined,
+        enterprise: admission.enterprise,
+        ...(enterpriseWorkspaceFilesRuntime ? { enterpriseWorkspaceFilesRuntime } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(sessionAuthorization ? { sessionAuthorization } : {}),
+        ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+        ...(this.enterpriseRuntime && params.enterpriseAuthorizationHandle
+          ? { admissionAuthorizationIssuer: this.enterpriseRuntime.admission.authorizationIssuer }
+          : {}),
+        ...(params.enterpriseAuthorizationHandle
+          ? { admissionAuthorizationHandle: params.enterpriseAuthorizationHandle }
+          : {}),
+      });
+    } catch (error) {
+      if (enterpriseWorkspaceFilesRuntime) {
+        onEnterpriseWorkspaceRuntimeConstructionFailure?.(enterpriseWorkspaceFilesRuntime);
+      }
+      throw error;
+    }
 
     const base: SessionConnectionBase = {
       session,
@@ -2295,6 +2308,7 @@ export class VoiceAssistantWebSocketServer {
     this.incrementRuntimeCounter("helloNew");
     let connection: SessionConnection | undefined;
     let cleanupStarted = false;
+    let workspaceCleanupPromise: Promise<void> | null = null;
     try {
       connection = this.createSessionConnection({
         ws,
@@ -2308,6 +2322,9 @@ export class VoiceAssistantWebSocketServer {
         ...(sessionId ? { sessionId } : {}),
         ...(sessionAuthorization ? { sessionAuthorization } : {}),
         ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+        onEnterpriseWorkspaceRuntimeConstructionFailure: (runtime) => {
+          workspaceCleanupPromise ??= runtime.cleanup("session-closed");
+        },
       });
       const initialInfo = this.sendServerInfoToClient(
         ws,
@@ -2353,6 +2370,16 @@ export class VoiceAssistantWebSocketServer {
       );
       this.handshakeConnections.delete(ws);
     } catch (primary) {
+      if (workspaceCleanupPromise) {
+        try {
+          await workspaceCleanupPromise;
+        } catch (workspaceCleanup) {
+          // oxlint-disable-next-line preserve-caught-error
+          throw new AggregateError([primary, workspaceCleanup], "enterprise hello failed", {
+            cause: primary,
+          });
+        }
+      }
       this.handshakeConnections.delete(ws);
       if (connection) {
         this.releaseEnterpriseAuthorization(connection);
