@@ -3077,7 +3077,7 @@ export class VoiceAssistantWebSocketServer {
 
     let routeId: string;
     if (authenticatedSession) {
-      routeId = `${registrationKey}:${randomUUID()}`;
+      routeId = `browser-host:${randomUUID()}`;
     } else if (connection.principalId === "owner") {
       routeId = connection.clientId;
     } else {
