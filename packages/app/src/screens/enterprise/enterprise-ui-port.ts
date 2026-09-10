@@ -142,6 +142,8 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
   options: EnterpriseUiBundleOptions<TGeneration, TContent>,
 ): EnterpriseUiBundle<TGeneration, TContent> {
   const { lifecycle, daemonClient, serverId, contentReaders } = options;
+  const browserProfilesEnabled = options.browserProfilesEnabled;
+  const hydrateBrowserProfileAuthorizations = options.hydrateBrowserProfileAuthorizations;
   let hydratedProfiles: readonly BrowserProfileSummary[] = [];
   let hydratedBindings: readonly BrowserProfileBindingProjection[] = [];
   const request = <T>(
@@ -292,6 +294,8 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
     }: BrowserBindingPortInput<TGeneration>) => {
       if (!generationMatches(lifecycle, sessionGeneration))
         return Promise.reject(new Error("identity.generation_changed"));
+      if (browserProfilesEnabled?.() !== true || !hydrateBrowserProfileAuthorizations)
+        return Promise.reject(new Error("enterprise.browser.feature_unavailable"));
       return request(
         "enterprise.browser.list_profiles.request",
         { requestId, workspaceId },
@@ -301,16 +305,16 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
       ).then(async (response) => {
         const parsed = EnterpriseBrowserListProfilesResponseSchema.safeParse(response);
         if (parsed.success) {
-          hydratedProfiles = parsed.data.payload.profiles;
-          hydratedBindings = parsed.data.payload.bindings;
-          if (options.browserProfilesEnabled?.() !== false) {
-            await options.hydrateBrowserProfileAuthorizations?.({
-              serverId,
-              profiles: hydratedProfiles,
-              bindings: hydratedBindings,
-              lifecycleGeneration: sessionGeneration,
-            });
-          }
+          const nextProfiles = parsed.data.payload.profiles;
+          const nextBindings = parsed.data.payload.bindings;
+          await hydrateBrowserProfileAuthorizations({
+            serverId,
+            profiles: nextProfiles,
+            bindings: nextBindings,
+            lifecycleGeneration: sessionGeneration,
+          });
+          hydratedProfiles = nextProfiles;
+          hydratedBindings = nextBindings;
         }
         return response;
       });
@@ -324,6 +328,8 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
     }: BrowserBindingPortBindInput<TGeneration>) => {
       if (!generationMatches(lifecycle, sessionGeneration))
         return Promise.reject(new Error("identity.generation_changed"));
+      if (browserProfilesEnabled?.() !== true || !hydrateBrowserProfileAuthorizations)
+        return Promise.reject(new Error("enterprise.browser.feature_unavailable"));
       return request(
         "enterprise.browser.bind_profile.request",
         { requestId, workspaceId, browserProfileId },
@@ -332,22 +338,21 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         sessionGeneration,
       ).then(async (response) => {
         const parsed = EnterpriseBrowserBindProfileResponseSchema.safeParse(response);
-        if (parsed.success && options.browserProfilesEnabled?.() !== false) {
+        if (parsed.success) {
           const binding = parsed.data.payload.binding;
-          hydratedBindings = [
+          const nextBindings = [
             ...hydratedBindings.filter(
-              (candidate) =>
-                candidate.workspaceId !== binding.workspaceId ||
-                candidate.browserProfileId !== binding.browserProfileId,
+              (candidate) => candidate.workspaceId !== binding.workspaceId,
             ),
             binding,
           ];
-          await options.hydrateBrowserProfileAuthorizations?.({
+          await hydrateBrowserProfileAuthorizations({
             serverId,
             profiles: hydratedProfiles,
-            bindings: hydratedBindings,
+            bindings: nextBindings,
             lifecycleGeneration: sessionGeneration,
           });
+          hydratedBindings = nextBindings;
         }
         return response;
       });

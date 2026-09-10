@@ -154,4 +154,30 @@ describe("createEnterpriseUiBundle", () => {
       }),
     ).rejects.toThrow("identity.generation_changed");
   });
+
+  it("fails closed when browser capability or hydration seam is absent", async () => {
+    const { lifecycle } = makeLifecycle();
+    const calls: unknown[] = [];
+    const bundle = createEnterpriseUiBundle({
+      ...makeOptions(lifecycle, async (...args) => {
+        calls.push(args);
+        return {};
+      }),
+      browserProfilesEnabled: (() => undefined) as unknown as () => boolean,
+    });
+    await bundle.uiPort.authenticatePat({
+      serverId: "server-a",
+      token: "opaque",
+      signal: new AbortController().signal,
+    });
+    await expect(
+      bundle.browserPort.listProfiles({
+        workspaceId: "workspace-1",
+        requestId: "request-3",
+        sessionGeneration: generation,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("feature_unavailable");
+    expect(calls).toHaveLength(0);
+  });
 });
