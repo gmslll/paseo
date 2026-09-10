@@ -31,6 +31,7 @@ import {
 } from "./identity/admission-authorization.js";
 import { createSessionBindingGeneration } from "./identity/authenticator.js";
 import { createProductionPrincipalGrantSource } from "./identity/principal-source.js";
+import { createProductionEnterpriseIdentityDispatcherRegistration } from "./identity/handlers.js";
 import type { CredentialInvalidation, CredentialInvalidationSink } from "./identity/registry.js";
 import type { EnterpriseAdmissionRuntime } from "./identity/runtime.js";
 import type {
@@ -54,6 +55,15 @@ export type ProductionEnterpriseRuntimeFactory = (
 ) => Promise<EnterpriseAdmissionRuntime>;
 
 const AUDIT_OPERATIONS = Object.freeze(["enterprise.audit.list_events.request"]);
+const productionIdentityRecords = new WeakMap<
+  object,
+  {
+    readonly admission: ReturnType<typeof createEnterpriseAdmission>;
+    readonly source: ReturnType<typeof createProductionPrincipalGrantSource>;
+    readonly audit: ProductionAuditCapability;
+    readonly provider: ProductionAuthorizationRuntimeProvider;
+  }
+>();
 
 /** Root-owned composition of the W1/W2/W3 production authority objects. */
 export function createProductionEnterpriseRuntimeFactory(
@@ -125,7 +135,7 @@ export function createProductionEnterpriseRuntimeFactory(
       authorityVerifier: new StrictOutboundAuthorityVerifier(node.nodeId, authorityReceiptState),
     });
     productionAuditCapabilityIssuer.requireCurrent(currentAudit);
-    return Object.freeze({
+    const runtime = Object.freeze({
       audit: currentAudit,
       admission,
       node,
@@ -137,7 +147,44 @@ export function createProductionEnterpriseRuntimeFactory(
       admissionInvalidationSink,
       nextSessionBindingGeneration: createSessionBindingGeneration,
     });
+    productionIdentityRecords.set(
+      admission,
+      Object.freeze({
+        admission,
+        source: principalSource,
+        audit: currentAudit,
+        provider: authorizationRuntimeProvider,
+      }),
+    );
+    return runtime;
   };
+}
+
+export function createProductionIdentityDispatcherRegistration(input: {
+  readonly admission: EnterpriseAdmissionRuntime["admission"];
+  readonly audit: ProductionAuditCapability;
+  readonly provider: ProductionAuthorizationRuntimeProvider;
+}): EnterpriseSessionDispatcherFactoryRegistration | null {
+  try {
+    const record = productionIdentityRecords.get(input.admission);
+    if (
+      !record ||
+      record.admission !== input.admission ||
+      record.audit !== input.audit ||
+      record.provider !== input.provider ||
+      !record.source.isCurrent() ||
+      !isAuthoritativeGrantStoreForAudit(input.provider.grantStore, input.audit)
+    ) {
+      return null;
+    }
+    return createProductionEnterpriseIdentityDispatcherRegistration({
+      admission: record.admission,
+      source: record.source,
+      audit: record.audit,
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function createProductionAuditDispatcherRegistration(input: {

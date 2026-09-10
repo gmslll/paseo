@@ -219,7 +219,10 @@ import type {
 import { createEnterpriseDispatcherRegistry } from "./enterprise/dispatcher-registry.js";
 import { createEnterpriseSessionDispatcherRegistration } from "./enterprise/dispatcher-registry.js";
 import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
-import { createProductionAuditDispatcherRegistration } from "./enterprise/production-runtime-factory.js";
+import {
+  createProductionAuditDispatcherRegistration,
+  createProductionIdentityDispatcherRegistration,
+} from "./enterprise/production-runtime-factory.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -1189,11 +1192,17 @@ export async function createPaseoDaemon(
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
       });
-      if (!resourceBundle || !auditRegistration) {
+      const identityRegistration = createProductionIdentityDispatcherRegistration({
+        admission: enterpriseRuntime.admission,
+        audit: enterpriseRuntime.audit,
+        provider: authorizationRuntimeProvider,
+      });
+      if (!identityRegistration || !resourceBundle || !auditRegistration) {
         throw new Error("enterprise dispatcher production bundle unavailable");
       }
       productionEnterpriseDispatcherRegistration =
         createEnterpriseSessionDispatcherRegistration([
+          identityRegistration,
           resourceBundle.dispatcherFactory,
           auditRegistration,
         ]) ?? undefined;
@@ -1201,6 +1210,7 @@ export async function createPaseoDaemon(
         throw new Error("enterprise dispatcher production registration unavailable");
       }
       productionEnterpriseFeatureFlags = Object.freeze({
+        enterpriseIdentityV1: true,
         enterpriseResourceAuthorizationV1: true,
         enterpriseAuditV1: true,
       });

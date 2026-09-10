@@ -14,7 +14,10 @@ import {
   type ProductionAuditCapability,
 } from "./audit/production-audit-runtime.js";
 import { EnterpriseAdmission } from "./identity/admission.js";
-import { createProductionEnterpriseRuntimeFactory } from "./production-runtime-factory.js";
+import {
+  createProductionEnterpriseRuntimeFactory,
+  createProductionIdentityDispatcherRegistration,
+} from "./production-runtime-factory.js";
 
 const executeFile = promisify(execFile);
 const organizationId = "org_aaaaaaaaaaaaaaaa" as const;
@@ -66,6 +69,13 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
       expect(runtime.authorizationRuntimeProvider?.grantStore).toBeDefined();
       expect(runtime.admissionInvalidationSink).toBeDefined();
       expect(runtime.admission).toBeInstanceOf(EnterpriseAdmission);
+      expect(
+        createProductionIdentityDispatcherRegistration({
+          admission: runtime.admission,
+          audit,
+          provider: runtime.authorizationRuntimeProvider!,
+        }),
+      ).not.toBeNull();
       if (!(runtime.admission instanceof EnterpriseAdmission)) throw new Error("wrong admission");
       const owner = await runtime.admission.authenticate("break-glass", connection);
       expect(owner?.principalType).toBe("break_glass_owner");
