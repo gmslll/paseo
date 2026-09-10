@@ -6,9 +6,9 @@ does not mean the end-to-end case passes. `MISSING_CALL_SITE` means the producti
 yet proven to invoke the tested policy. `RED` is a known release blocker or missing mandatory real
 run. Do not replace these labels with `PASS` without attaching raw release-run evidence.
 
-Current blocking-state count, with every case counted once: `EVIDENCE` 11 (cases 6, 7, 8, 9, 11,
-12, 14, 16, 17, 18, and 19), `MISSING_CALL_SITE` 8, and `RED` 1 (case 20), leaving 9 cases not fully closed. Case
-15 remains a partial `MISSING_CALL_SITE`; case 10 also cites accepted static or
+Current blocking-state count, with every case counted once: `EVIDENCE` 12 (cases 6, 7, 8, 9, 11,
+12, 14, 15, 16, 17, 18, and 19), `MISSING_CALL_SITE` 7, and `RED` 1 (case 20), leaving 8 cases not fully closed. Case
+10 also cites accepted static or
 unit-level `EVIDENCE` but remain in the `MISSING_CALL_SITE` bucket and are not counted a second time.
 The `8dee12c94` cold-home provisioning/authentication run does not change
 this gate count: it proves startup and authority restoration, not the missing RPC-family call sites
@@ -34,18 +34,17 @@ remain separate release gates.
 - The real Darwin Browser lease lifecycle run at `6abb1f911` closes and reopens the production bundle
   against the same persisted home, rejects the pre-restart lease without invoking authorization,
   and proves monotonic fencing before allowing a new lease.
-- The real production direct-WebSocket secret-canary run at `e8de02d5c` covers direct transport
-  admission, snapshots, logs, audit inputs/events, and revoked-generation rejection. Relay transport
-  evidence is still pending, so case 15 remains partial and no relay claim is inferred.
+- The production secret-canary chain now covers direct WebSocket (`e8de02d5c`), relay
+  (`5c232e848`), and client cache/process lifecycle (`6af714dc9`): PAT/fingerprint absence is
+  verified across protocol/Admission, snapshots, logs, audit, credential persistence, AsyncStorage,
+  localStorage, console, and real HTTP fetch, with wrong/revoked/logout-old-generation network
+  rejection. This closes case 15 without extrapolation.
 - The real production case-18 run at `97705f923` proves manage-only C can list/bind, A can perform
   `browser.use` content reads, and C's real or guessed Profile receives the same redacted denial;
   capability state and required audit evidence are included.
 - The production HostRuntime residue run at `0690348d8` clears four Zustand residue families before
   network/browser teardown, isolates B from late A events, and verifies the enterprise file seam is
   generation-bound; this closes case 8.
-- Case 15 now has direct and relay production secret-canary evidence (`e8de02d5c` and
-  `5c232e848`) covering protocol/Admission, snapshots, logs, audit, and credential persistence.
-  A real client-cache boundary is still unproven, so the case remains partial.
 
 | Case | Required behavior                                                                                                 | Current state                    | Existing evidence or missing boundary                                                                                                                                                                                                                                                                                                                                                              |
 | ---: | ----------------------------------------------------------------------------------------------------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -63,7 +62,7 @@ remain separate release gates.
 |   12 | Browser Host/daemon restart does not revive an old lease.                                                         | `EVIDENCE` (closed)              | Real Darwin production lifecycle at `6abb1f911` closes the first bundle/runtime, reopens the same persisted home, rejects the old lease without an authorization resolution or audit side effect, then accepts a new lease with monotonic fencing token/revision.                                                                                                                                  |
 |   13 | A page-account/Profile mismatch stops high-risk actions.                                                          | `MISSING_CALL_SITE`              | Browser binding/profile contracts exist; no production risk-check call site plus real page-account test is recorded.                                                                                                                                                                                                                                                                               |
 |   14 | Employees cannot read daemon config, Grants, plugin/provider credentials, or global Terminal.                     | `EVIDENCE` (closed)              | Real default Darwin WS identity success followed by per-surface `access_denied` for daemon config/status, plugin/provider, `list_grants`, and global `list_terminals`; each response omits `paseoHome`.                                                                                                                                                                                            |
-|   15 | Company Codex/Claude tokens never enter protocol, snapshots, logs, audit, or client cache.                        | `MISSING_CALL_SITE` (partial)    | Direct and relay production secret canaries at `e8de02d5c` and `5c232e848` cover PAT/fingerprint absence across protocol/Admission, snapshots, logs, audit inputs/events, credential persistence, and revoked-generation rejection. A real client-cache boundary remains unproven, so this is not closed.                                                                                          |
+|   15 | Company Codex/Claude tokens never enter protocol, snapshots, logs, audit, or client cache.                        | `EVIDENCE` (closed)              | Direct WebSocket (`e8de02d5c`), relay (`5c232e848`), and client cache/process lifecycle (`6af714dc9`) production evidence verifies PAT/fingerprint absence across protocol/Admission, snapshots, logs, audit inputs/events, credential persistence, AsyncStorage, localStorage, console, and real HTTP fetch; wrong/revoked/logout-old-generation network attempts are rejected.                   |
 |   16 | Boss sees employee metadata but cannot read content without a content Grant.                                      | `EVIDENCE` (closed)              | Real Darwin two-Principal workspace/agent content flow at `3598dd23c`: B's metadata-only resources are redacted, B's workspace/agent body reads are denied with no allowed audit, and the foreign Principal remains non-enumerating.                                                                                                                                                               |
 |   17 | Boss with a content Grant reads content and creates an audit event.                                               | `EVIDENCE` (closed)              | The same production flow authorizes A's workspace timeline and live Agent transcript reads, with two `workspace.content.read` required audit events persisted; the integrated local audit/content evidence is recorded at `3598dd23c`.                                                                                                                                                             |
 |   18 | Platform admin manages bindings but cannot read content by default.                                               | `EVIDENCE` (closed)              | Real production run `97705f923`: manage-only C lists/binds successfully, A performs `browser.use` content reads, and C's real or guessed Profile receives the same redacted denial; capability state and required audit evidence are recorded.                                                                                                                                                     |
