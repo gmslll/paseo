@@ -1483,6 +1483,7 @@ export async function createPaseoDaemon(
       });
       browserToolsBroker = new BrowserToolsBroker({
         enterprise: browserBundle.browserToolsRuntime,
+        pageIdentity: browserBundle.pageIdentity,
         onHostTeardownError: (error, hostClientId) =>
           logger.error({ err: error, hostClientId }, "Enterprise browser host teardown failed"),
       });
