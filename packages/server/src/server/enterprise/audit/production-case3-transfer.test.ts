@@ -64,6 +64,7 @@ describe.runIf(process.platform === "darwin")("production Case3 workspace transf
         principalId: principalB,
         grantVersion: "grv_case3_b",
         grants: [
+          { action: "workspace.manage", selector: { kind: "self" as const } },
           grants("workspace.metadata.read"),
           grants("workspace.content.read"),
           grants("workspace.write"),
@@ -342,6 +343,44 @@ describe.runIf(process.platform === "darwin")("production Case3 workspace transf
         requestId: "case3-after-content",
         resource: { localResourceId: workspaceId },
       });
+      const aLateFrames: ProductionDirectWsEnvelope[] = [];
+      const onAFrame = (data: Buffer) => {
+        try {
+          aLateFrames.push(JSON.parse(data.toString()) as ProductionDirectWsEnvelope);
+        } catch {
+          // Ignore non-JSON frames.
+        }
+      };
+      a.socket.on("message", onAFrame);
+      const bTitle = waitFor(b.socket, (v) => v.message?.payload?.requestId === "case3-b-title");
+      b.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "workspace.title.set.request",
+            requestId: "case3-b-title",
+            workspaceId,
+            title: "Case3 transferred title",
+          },
+        }),
+      );
+      const bTitleResult = await bTitle;
+      expect(bTitleResult.message?.type).toBe("workspace.title.set.response");
+      expect(bTitleResult.message?.payload).toMatchObject({
+        requestId: "case3-b-title",
+        accepted: true,
+        title: "Case3 transferred title",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      a.socket.off("message", onAFrame);
+      expect(
+        aLateFrames.some(
+          (frame) =>
+            frame.message?.type === "workspace_update" &&
+            frame.message.payload?.kind === "upsert" &&
+            frame.message.payload.workspace?.id === workspaceId,
+        ),
+      ).toBe(false);
       const transferDenied = async (
         requestId: string,
         resource: Record<string, unknown>,
