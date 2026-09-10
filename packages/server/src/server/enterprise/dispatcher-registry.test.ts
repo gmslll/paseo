@@ -81,4 +81,53 @@ describe("enterprise dispatcher registry", () => {
       ]),
     ).toThrow();
   });
+
+  it("advertises exactly the complete registered families", () => {
+    const dispatcher = { handle: () => false };
+    const registrations = [
+      {
+        family: "identity" as const,
+        requestTypes: [
+          "enterprise.identity.get_current.request",
+          "enterprise.identity.list_principals.request",
+          "enterprise.identity.logout_all.request",
+        ],
+        dispatcher,
+      },
+      {
+        family: "resourceAuthorization" as const,
+        requestTypes: [
+          "enterprise.access.list_grants.request",
+          "enterprise.access.update_grants.request",
+          "enterprise.organization.list_resources.request",
+          "enterprise.placement.resolve_workspace.request",
+        ],
+        dispatcher,
+      },
+      {
+        family: "browserProfiles" as const,
+        requestTypes: [
+          "enterprise.browser.list_profiles.request",
+          "enterprise.browser.bind_profile.request",
+          "enterprise.resource.acquire_lease.request",
+          "enterprise.resource.renew_lease.request",
+          "enterprise.resource.release_lease.request",
+        ],
+        dispatcher,
+      },
+      {
+        family: "audit" as const,
+        requestTypes: ["enterprise.audit.list_events.request"],
+        dispatcher,
+      },
+    ] as const;
+    const registry = createEnterpriseDispatcherRegistry(registrations);
+    expect(registry.features).toEqual({
+      enterpriseIdentityV1: true,
+      enterpriseResourceAuthorizationV1: true,
+      enterpriseBrowserProfilesV1: true,
+      enterpriseAuditV1: true,
+    });
+    expect("enterpriseDistributedNodeV1" in registry.features).toBe(false);
+  });
 });
