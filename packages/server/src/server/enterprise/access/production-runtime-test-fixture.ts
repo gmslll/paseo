@@ -100,7 +100,7 @@ export async function createProductionRuntimeFixture(name: string) {
   const evidence = issueEnterpriseAdmissionEvidence(
     issuer,
     secret,
-    { ...principal, grantVersion: record.grantVersion },
+    { ...principal, grantVersion: record.grantVersion, grants: record.grants },
     node,
     { node, transport: "direct", peer: "loopback" },
   );
