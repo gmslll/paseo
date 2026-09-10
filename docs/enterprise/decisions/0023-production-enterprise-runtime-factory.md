@@ -82,14 +82,16 @@ empty required strings, invalid identifiers, and persisted `break_glass_owner`
 records are rejected.
 
 ```ts
-const EnterpriseIdentityPrincipalRecordSchema = z
-  .strictObject({
-    principalId: PrincipalIdSchema,
-    organizationId: OrganizationIdSchema,
-    principalType: z.enum(["human", "service"]),
-    displayName: z.string().min(1).optional(),
-    metadata: z.record(z.string(), z.string()).optional(),
-  });
+const EnterpriseIdentityPrincipalRecordSchema = z.strictObject({
+  principalId: PrincipalIdSchema,
+  organizationId: OrganizationIdSchema,
+  principalType: z.enum(["human", "service"]),
+  status: z.enum(["active", "disabled", "revoked"]),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+  displayName: z.string().min(1).optional(),
+  metadata: z.record(z.string(), z.string()).optional(),
+});
 
 const EnterpriseIdentityDocumentSchema = z
   .strictObject({
