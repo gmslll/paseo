@@ -105,6 +105,7 @@ class FaultFs implements IdentityRegistryFsPort {
   readonly noFollowFlag: number;
   private readonly delegate: IdentityRegistryFsPort;
   private readonly pathsByFd = new Map<number, string>();
+  private readonly modesByFd = new Map<number, number>();
   private readonly faults: FsFault[] = [];
 
   constructor(options?: { noFollowFlag?: number; delegate?: IdentityRegistryFsPort }) {
@@ -162,6 +163,7 @@ class FaultFs implements IdentityRegistryFsPort {
     this.visit({ operation: "close", fd, path: this.pathsByFd.get(fd) });
     this.delegate.close(fd);
     this.pathsByFd.delete(fd);
+    this.modesByFd.delete(fd);
   }
 
   read(fd: number): string {
@@ -176,12 +178,23 @@ class FaultFs implements IdentityRegistryFsPort {
 
   fstat(fd: number): IdentityRegistryFsStat {
     this.visit({ operation: "fstat", fd, path: this.pathsByFd.get(fd) });
-    return this.delegate.fstat(fd);
+    const statValue = this.delegate.fstat(fd);
+    const mode = this.modesByFd.get(fd);
+    if (mode === undefined) return statValue;
+    return Object.assign(Object.create(statValue), {
+      mode: (statValue.mode & ~0o777) | mode,
+    });
   }
 
   fchmod(fd: number, mode: number): void {
     this.visit({ operation: "fchmod", fd, path: this.pathsByFd.get(fd) });
-    this.delegate.fchmod(fd, mode);
+    this.modesByFd.set(fd, mode);
+    try {
+      this.delegate.fchmod(fd, mode);
+    } catch (error) {
+      if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM")
+        throw error;
+    }
   }
 
   fsync(fd: number): void {
