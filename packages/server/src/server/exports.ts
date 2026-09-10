@@ -10,6 +10,11 @@ export {
   type PersistedConfig,
 } from "./persisted-config.js";
 export { hashDaemonPassword, isBearerTokenValid } from "./auth.js";
+export {
+  provisionProductionEnterpriseInitialAdmin,
+  type ProductionEnterpriseProvisioningPorts,
+  type ProductionInitialCredential,
+} from "./enterprise/production-provisioning.js";
 export { generateLocalPairingOffer, type LocalPairingOffer } from "./pairing-offer.js";
 export {
   ConnectionOfferSchema,
