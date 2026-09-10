@@ -2295,6 +2295,7 @@ export class Session {
         return;
       }
       if (isEnterpriseResourceRequest(msg) && this.enterpriseDispatcher && this.enterpriseContext) {
+        if (this.enterpriseDispatcher.requestPolicyForType?.(msg.type) !== "resources") return;
         const requestId = sessionRequestId(msg);
         if (!requestId || this.reservedAuthorityRequestIds.has(requestId)) return;
         this.reservedAuthorityRequestIds.add(requestId);
