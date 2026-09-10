@@ -82,7 +82,7 @@ import {
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
-import type { AgentManagerEvent } from "./agent/agent-manager.js";
+import type { AgentManagerEvent, ManagedAgent } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
 import { createPersistedProjectRecord } from "./workspace-registry.js";
@@ -123,6 +123,10 @@ import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 
 interface SessionHandlerInternals {
   authorization: SessionAuthorization;
+  agentUpdates: {
+    flushBootstrapped(subscriptionId: string): Promise<void>;
+    hasSubscription(): boolean;
+  };
   listFetchAgentsEntries(params: SessionInboundMessage): Promise<unknown>;
   readAgentDirectorySync(params: SessionInboundMessage): Promise<unknown>;
   listFetchWorkspacesEntries(params: SessionInboundMessage): Promise<unknown>;
@@ -160,6 +164,7 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
+  emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void>;
   emitEnterpriseBrowserLeaseWaiting(
     notice: {
       requestId: string;
@@ -365,6 +370,7 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 });
 
 interface SessionForTestOptions {
+  logger?: pino.Logger;
   clientId?: string;
   permissions?: readonly DaemonPermission[];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
@@ -386,7 +392,7 @@ interface SessionForTestOptions {
     getWorkspaceGitMetadata?: ReturnType<typeof vi.fn>;
     getProjectSlug?: ReturnType<typeof vi.fn>;
   };
-  workspaceRegistry?: { get: ReturnType<typeof vi.fn> };
+  workspaceRegistry?: Partial<SessionOptions["workspaceRegistry"]>;
   projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
   terminalManager?: SessionOptions["terminalManager"];
   serviceProxy?: SessionOptions["serviceProxy"];
@@ -433,7 +439,7 @@ interface SessionForTestOptions {
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
-  const logger = pino({ level: "silent" });
+  const logger = options.logger ?? pino({ level: "silent" });
   const github = options.github ?? {
     invalidate: vi.fn(),
     searchIssuesAndPrs: vi.fn(),
@@ -9880,6 +9886,642 @@ describe("enterprise dispatcher integration seam", () => {
     releaseDescriptorLoad.resolve();
 
     await expect(loading).rejects.toMatchObject({ code: "access_denied" });
+    await session.cleanup();
+  });
+});
+
+type TestAgentEventListener = (event: AgentManagerEvent) => void | Promise<void>;
+
+const enterpriseEventAgentId = "agt_aaaaaaaaaaaaaaaa";
+const enterpriseEventForeignAgentId = "agt_bbbbbbbbbbbbbbbb";
+const enterpriseEventWorkspaceId = "workspace-1";
+
+function makeEnterpriseEventManagedAgent(
+  agentId = enterpriseEventAgentId,
+  workspaceId = enterpriseEventWorkspaceId,
+): ManagedAgent {
+  const timestamp = new Date("2026-09-10T12:00:00.000Z");
+  return {
+    id: agentId,
+    provider: "codex",
+    cwd: "/tmp/enterprise-agent-events",
+    workspaceId,
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: true,
+      supportsMcpServers: true,
+      supportsReasoningStream: true,
+      supportsToolInvocations: true,
+    },
+    config: { provider: "codex", cwd: "/tmp/enterprise-agent-events" },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    availableModes: [],
+    currentModeId: null,
+    pendingPermissions: new Map(),
+    persistence: null,
+    lastUserMessageAt: null,
+    activeTurnId: null,
+    activeTurnStartedAt: null,
+    attention: { requiresAttention: false },
+    labels: {},
+    lifecycle: "running",
+    activeForegroundTurnId: null,
+  } as unknown as ManagedAgent;
+}
+
+function enterpriseTimelineEvent(
+  text: string,
+  agentId = enterpriseEventAgentId,
+): AgentManagerEvent {
+  return {
+    type: "agent_stream",
+    agentId,
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: `message-${text}`, text },
+    },
+    timestamp: "2026-09-10T12:00:00.000Z",
+  };
+}
+
+async function createEnterpriseAgentEventHarness(
+  name: string,
+  options: {
+    logger?: pino.Logger;
+    agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
+    agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
+    workspaceRegistry?: Partial<SessionOptions["workspaceRegistry"]>;
+    projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
+  } = {},
+) {
+  const fixture = await createBinaryAuthorizationFixture(
+    name,
+    [
+      {
+        action: "workspace.content.read",
+        selector: { kind: "workspace", workspaceIds: [enterpriseEventWorkspaceId] },
+      },
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: [enterpriseEventWorkspaceId] },
+      },
+    ],
+    ["workspace.read", "hub.execute"],
+  );
+  fixture.owners.registerAgent({
+    id: enterpriseEventAgentId,
+    workspaceId: enterpriseEventWorkspaceId,
+  });
+  const workspace = {
+    workspaceId: enterpriseEventWorkspaceId,
+    organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+    nodeId: fixture.enterpriseSessionContext.node.nodeId,
+    ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    projectId: `project-${name}`,
+    cwd: "/tmp/enterprise-agent-events",
+    kind: "directory" as const,
+    displayName: "enterprise-agent-events",
+    title: null,
+    branch: null,
+    worktreeRoot: null,
+    baseBranch: null,
+    isPaseoOwnedWorktree: false,
+    mainRepoRoot: null,
+    createdAt: "2026-09-10T12:00:00.000Z",
+    updatedAt: "2026-09-10T12:00:00.000Z",
+    archivedAt: null,
+  };
+  const project = createPersistedProjectRecord({
+    projectId: workspace.projectId,
+    rootPath: workspace.cwd,
+    kind: "git",
+    displayName: "enterprise-agent-events",
+    createdAt: workspace.createdAt,
+    updatedAt: workspace.updatedAt,
+  });
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: TestAgentEventListener[] = [];
+  const unsubscribe = vi.fn();
+  const subscribe = vi.fn((listener: TestAgentEventListener) => {
+    listeners.push(listener);
+    return unsubscribe;
+  });
+  const session = createSessionForTest({
+    logger: options.logger,
+    messages,
+    clientId: "client-test",
+    enterpriseContext: fixture.enterpriseSessionContext,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: fixture.authorityState,
+    principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+    resourceAuthorization: fixture.runtime.resourceAuthorization,
+    sessionId: fixture.sessionId,
+    sessionAuthorization: fixture.sessionAuthorization,
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    enterpriseAuthorizationRuntime: fixture.runtime,
+    agentManager: { ...options.agentManager, subscribe },
+    agentStorage: options.agentStorage,
+    workspaceRegistry: {
+      get: vi.fn(async (workspaceId: string) =>
+        workspaceId === workspace.workspaceId ? workspace : undefined,
+      ),
+      list: vi.fn(async () => [workspace]),
+      ...options.workspaceRegistry,
+    },
+    projectRegistry: {
+      get: vi.fn(async (projectId: string) =>
+        projectId === project.projectId ? project : undefined,
+      ),
+      list: vi.fn(async () => [project]),
+      ...options.projectRegistry,
+    },
+  });
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+  return { fixture, listener, messages, project, session, subscribe, unsubscribe, workspace };
+}
+
+describe("enterprise agent event publication", () => {
+  test("serializes authorized stream delivery and uses the exact canonical workspace context", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-event-order");
+    const authorizeFirst = deferred<void>();
+    const firstAuthorizationStarted = deferred<void>();
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    let calls = 0;
+    const canEmit = vi
+      .spyOn(h.fixture.runtime.resourceAuthorization, "canEmit")
+      .mockImplementation(async (principal, event, context) => {
+        calls += 1;
+        if (calls === 1) {
+          firstAuthorizationStarted.resolve();
+          await authorizeFirst.promise;
+        }
+        return originalCanEmit(principal, event, context);
+      });
+
+    const first = h.listener(enterpriseTimelineEvent("first"));
+    const second = h.listener(enterpriseTimelineEvent("second"));
+    await firstAuthorizationStarted.promise;
+    expect(canEmit).toHaveBeenCalledTimes(1);
+    authorizeFirst.resolve();
+    await Promise.all([first, second]);
+
+    expect(
+      h.messages.flatMap((message) =>
+        message.type === "agent_stream" && message.payload.event.type === "timeline"
+          ? [message.payload.event.item]
+          : [],
+      ),
+    ).toEqual([
+      expect.objectContaining({ type: "assistant_message", text: "first" }),
+      expect.objectContaining({ type: "assistant_message", text: "second" }),
+    ]);
+    expect(canEmit).toHaveBeenCalledTimes(2);
+    for (const [, , context] of canEmit.mock.calls) {
+      expect(context).toEqual({
+        kind: "resources",
+        resources: [
+          {
+            resourceKind: "workspace",
+            organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+            localResourceId: enterpriseEventWorkspaceId,
+          },
+        ],
+      });
+      expect(Object.isFrozen(context)).toBe(true);
+      expect(context.kind === "resources" && Object.isFrozen(context.resources)).toBe(true);
+    }
+    await h.session.cleanup();
+  });
+
+  test("drops foreign and revoked stream events, including revocation at outbound authorization", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-event-revoke");
+
+    await h.listener(enterpriseTimelineEvent("foreign", enterpriseEventForeignAgentId));
+    expect(h.messages).toEqual([]);
+
+    const authorizeDelivery = deferred<void>();
+    const deliveryStarted = deferred<void>();
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        deliveryStarted.resolve();
+        await authorizeDelivery.promise;
+        return originalCanEmit(principal, event, context);
+      },
+    );
+    const publishing = h.listener(enterpriseTimelineEvent("revoked"));
+    await deliveryStarted.promise;
+    await h.fixture.runtime.release();
+    authorizeDelivery.resolve();
+    await publishing;
+
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("publishes agent updates only while content authorization remains current across enrichment", async () => {
+    if (process.platform !== "darwin") return;
+    const storageRead = deferred<StoredAgentRecord | undefined>();
+    const storageReadStarted = deferred<void>();
+    const h = await createEnterpriseAgentEventHarness("agent-update-enrichment", {
+      agentStorage: {
+        get: vi.fn(async () => {
+          storageReadStarted.resolve();
+          return storageRead.promise;
+        }),
+        list: vi.fn(async () => []),
+      },
+    });
+    await h.session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "agent-update-subscribe",
+      subscribe: { subscriptionId: "agent-update-subscription" },
+    });
+    h.messages.length = 0;
+
+    const publishing = h.listener({
+      type: "agent_state",
+      agent: makeEnterpriseEventManagedAgent(),
+    });
+    await storageReadStarted.promise;
+    await h.fixture.runtime.release();
+    storageRead.resolve(undefined);
+    await publishing;
+
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("publishes an authorized agent update through content and outbound resource gates", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-update-authorized");
+    const canEmit = vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit");
+    await h.session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "agent-update-authorized-subscribe",
+      subscribe: { subscriptionId: "agent-update-authorized-subscription" },
+    });
+    h.messages.length = 0;
+    canEmit.mockClear();
+
+    await h.listener({ type: "agent_state", agent: makeEnterpriseEventManagedAgent() });
+
+    expect(h.messages).toContainEqual(
+      expect.objectContaining({
+        type: "agent_update",
+        payload: expect.objectContaining({
+          kind: "upsert",
+          agent: expect.objectContaining({ id: enterpriseEventAgentId }),
+        }),
+      }),
+    );
+    expect(canEmit).toHaveBeenCalledWith(
+      h.fixture.enterpriseSessionContext.principal,
+      expect.objectContaining({ type: "agent_update" }),
+      {
+        kind: "resources",
+        resources: [
+          expect.objectContaining({
+            resourceKind: "workspace",
+            localResourceId: enterpriseEventWorkspaceId,
+          }),
+        ],
+      },
+    );
+    await h.session.cleanup();
+  });
+
+  test("awaits bootstrap flush and clears the subscription when its post-flush fence is stale", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-update-flush-fence");
+    const flushStarted = deferred<void>();
+    const releaseFlush = deferred<void>();
+    const internals = asSessionInternals(h.session);
+    vi.spyOn(internals.agentUpdates, "flushBootstrapped").mockImplementation(async () => {
+      flushStarted.resolve();
+      await releaseFlush.promise;
+    });
+
+    const request = h.session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "agent-update-flush-fence",
+      subscribe: { subscriptionId: "agent-update-flush-subscription" },
+    });
+    await flushStarted.promise;
+    expect(internals.agentUpdates.hasSubscription()).toBe(true);
+    await h.fixture.runtime.release();
+    releaseFlush.resolve();
+    await request;
+
+    expect(internals.agentUpdates.hasSubscription()).toBe(false);
+    await h.session.cleanup();
+  });
+
+  test("authorizes provider subagent update, timeline, and remove by canonical parent", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("provider-subagent-current");
+    h.session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true });
+    const subagent = {
+      id: "provider-child",
+      parentAgentId: enterpriseEventAgentId,
+      parentSubagentId: null,
+      provider: "codex" as const,
+      title: "child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-09-10T12:00:00.000Z",
+      updatedAt: "2026-09-10T12:00:01.000Z",
+      toolCallId: "tool-call-1",
+      cwd: "/tmp/enterprise-agent-events",
+      subtitle: null,
+    };
+    const events: AgentManagerEvent[] = [
+      { type: "provider_subagent", event: { type: "upsert", subagent } },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "timeline",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+          provider: "codex",
+          row: {
+            item: { type: "assistant_message", messageId: "provider-message", text: "child" },
+            timestamp: "2026-09-10T12:00:02.000Z",
+            seq: 1,
+          },
+          epoch: "provider-epoch",
+        },
+      },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "remove",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+        },
+      },
+    ];
+    for (const event of events) await h.listener(event);
+
+    expect(h.messages).toEqual([
+      {
+        type: "agent.provider_subagents.update",
+        payload: { kind: "upsert", subagent },
+      },
+      {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "timeline",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+          provider: "codex",
+          item: { type: "assistant_message", messageId: "provider-message", text: "child" },
+          timestamp: "2026-09-10T12:00:02.000Z",
+          seq: 1,
+          epoch: "provider-epoch",
+        },
+      },
+      {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "remove",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+        },
+      },
+    ]);
+
+    await h.listener({
+      type: "provider_subagent",
+      event: {
+        type: "upsert",
+        subagent: {
+          ...subagent,
+          id: enterpriseEventAgentId,
+          parentAgentId: enterpriseEventForeignAgentId,
+        },
+      },
+    });
+    expect(h.messages).toHaveLength(3);
+    await h.session.cleanup();
+  });
+
+  test("rechecks a provider subagent parent after its awaited workspace publication", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("provider-subagent-revoke");
+    h.session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true });
+    const workspaceUpdateStarted = deferred<void>();
+    const releaseWorkspaceUpdate = deferred<void>();
+    vi.spyOn(asSessionInternals(h.session), "emitWorkspaceUpdateForWorkspaceId").mockImplementation(
+      async () => {
+        workspaceUpdateStarted.resolve();
+        await releaseWorkspaceUpdate.promise;
+      },
+    );
+
+    const publishing = h.listener({
+      type: "provider_subagent",
+      event: {
+        type: "upsert",
+        subagent: {
+          id: "provider-child-revoked",
+          parentAgentId: enterpriseEventAgentId,
+          parentSubagentId: null,
+          provider: "codex",
+          title: null,
+          description: null,
+          status: "running",
+          createdAt: "2026-09-10T12:00:00.000Z",
+          updatedAt: "2026-09-10T12:00:00.000Z",
+          toolCallId: null,
+          cwd: null,
+          subtitle: null,
+        },
+      },
+    });
+    await workspaceUpdateStarted.promise;
+    await h.fixture.runtime.release();
+    releaseWorkspaceUpdate.resolve();
+    await publishing;
+
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("auto-allows voice speak only at an exact current agent gate", async () => {
+    if (process.platform !== "darwin") return;
+    const activeVoice = vi
+      .spyOn(VoiceSession.prototype, "isActiveForAgent")
+      .mockImplementation((agentId) => agentId === enterpriseEventAgentId);
+    const respondToPermission = vi.fn(async () => true);
+    const h = await createEnterpriseAgentEventHarness("voice-auto-allow-current", {
+      agentManager: { respondToPermission },
+    });
+    const permissionEvent: AgentManagerEvent = {
+      type: "agent_stream",
+      agentId: enterpriseEventAgentId,
+      event: {
+        type: "permission_requested",
+        provider: "codex",
+        request: {
+          id: "speak-current",
+          provider: "codex",
+          name: "paseo_voice.speak",
+          kind: "tool",
+        },
+      },
+    };
+
+    await h.listener(permissionEvent);
+    expect(respondToPermission).toHaveBeenCalledExactlyOnceWith(
+      enterpriseEventAgentId,
+      "speak-current",
+      { behavior: "allow" },
+    );
+    expect(h.messages.map((message) => message.type)).toEqual([
+      "agent_stream",
+      "agent_permission_request",
+    ]);
+
+    await h.fixture.runtime.release();
+    await h.listener({
+      ...permissionEvent,
+      event: {
+        ...permissionEvent.event,
+        request: { ...permissionEvent.event.request, id: "speak-revoked" },
+      },
+    });
+    expect(respondToPermission).toHaveBeenCalledTimes(1);
+    expect(h.messages).toHaveLength(2);
+    activeVoice.mockRestore();
+    await h.session.cleanup();
+  });
+
+  test("cleanup seals and unsubscribes before draining queued voice work", async () => {
+    if (process.platform !== "darwin") return;
+    const activeVoice = vi
+      .spyOn(VoiceSession.prototype, "isActiveForAgent")
+      .mockImplementation((agentId) => agentId === enterpriseEventAgentId);
+    const respondToPermission = vi.fn(async () => true);
+    const h = await createEnterpriseAgentEventHarness("agent-event-cleanup-drain", {
+      agentManager: { respondToPermission },
+    });
+    const authorizeDelivery = deferred<void>();
+    const deliveryStarted = deferred<void>();
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        deliveryStarted.resolve();
+        await authorizeDelivery.promise;
+        return originalCanEmit(principal, event, context);
+      },
+    );
+
+    const accepted = h.listener(enterpriseTimelineEvent("before-cleanup"));
+    const queuedVoice = h.listener({
+      type: "agent_stream",
+      agentId: enterpriseEventAgentId,
+      event: {
+        type: "permission_requested",
+        provider: "codex",
+        request: { id: "speak-cleanup", provider: "codex", name: "speak", kind: "tool" },
+      },
+    });
+    await deliveryStarted.promise;
+    const cleanup = h.session.cleanup();
+    expect(h.unsubscribe).toHaveBeenCalledTimes(1);
+    const late = h.listener(enterpriseTimelineEvent("after-cleanup"));
+    authorizeDelivery.resolve();
+    await Promise.all([accepted, queuedVoice, late, cleanup]);
+
+    expect(h.messages).toEqual([]);
+    expect(respondToPermission).not.toHaveBeenCalled();
+    expect(h.unsubscribe).toHaveBeenCalledTimes(1);
+    activeVoice.mockRestore();
+  });
+
+  test("records an outbound rejection and continues the Session tail without an unhandled rejection", async () => {
+    if (process.platform !== "darwin") return;
+    const logger = pino({ level: "silent" });
+    const logError = vi.spyOn(logger, "error");
+    const h = await createEnterpriseAgentEventHarness("agent-event-rejection", { logger });
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    let calls = 0;
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        calls += 1;
+        if (calls === 1) throw new Error("authorization transport rejected");
+        return originalCanEmit(principal, event, context);
+      },
+    );
+
+    await Promise.all([
+      h.listener(enterpriseTimelineEvent("rejected")),
+      h.listener(enterpriseTimelineEvent("continued")),
+    ]);
+
+    expect(h.messages).toHaveLength(1);
+    expect(h.messages[0]).toMatchObject({
+      type: "agent_stream",
+      payload: { event: { type: "timeline", item: { text: "continued" } } },
+    });
+    expect(logError).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error) }),
+      "Failed to authorize outbound message",
+    );
+    await h.session.cleanup();
+  });
+
+  test("keeps legacy stream and provider-subagent publication synchronous", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const listeners: TestAgentEventListener[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: {
+        getAgent: vi.fn(() => null),
+        subscribe: vi.fn((listener: TestAgentEventListener) => {
+          listeners.push(listener);
+          return () => {};
+        }),
+      },
+    });
+    session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true });
+    const listener = listeners[0];
+    if (!listener) throw new Error("Agent event listener was not installed");
+
+    const streamResult = listener(enterpriseTimelineEvent("legacy"));
+    expect(streamResult).toBeUndefined();
+    expect(messages).toHaveLength(1);
+    const providerResult = listener({
+      type: "provider_subagent",
+      event: {
+        type: "remove",
+        parentAgentId: enterpriseEventAgentId,
+        subagentId: "legacy-provider-child",
+      },
+    });
+    expect(providerResult).toBeUndefined();
+    expect(messages.map((message) => message.type)).toEqual([
+      "agent_stream",
+      "agent.provider_subagents.update",
+    ]);
     await session.cleanup();
   });
 });

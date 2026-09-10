@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
 import type pino from "pino";
-import { createAgentUpdatesService, matchesAgentUpdatesFilter } from "./agent-updates-service.js";
+import {
+  createAgentUpdatesService,
+  matchesAgentUpdatesFilter,
+  type AgentUpdatePublicationScope,
+} from "./agent-updates-service.js";
 import type {
   AgentSnapshotPayload,
   ProjectPlacementPayload,
@@ -17,12 +21,18 @@ import { DirectorySyncService } from "../../directory-sync/index.js";
 
 type AgentUpdatePayload = Extract<SessionOutboundMessage, { type: "agent_update" }>["payload"];
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function makeAgentPayload(input: {
@@ -91,12 +101,19 @@ function makeProject(overrides?: Partial<ProjectPlacementPayload>): ProjectPlace
   };
 }
 
-function buildHarness() {
+function buildHarness(options?: {
+  authorizeAgentId?: (
+    agentId: string,
+  ) => AgentUpdatePublicationScope | null | Promise<AgentUpdatePublicationScope | null>;
+}) {
   const emitted: SessionOutboundMessage[] = [];
+  const emittedScopes: Array<AgentUpdatePublicationScope | undefined> = [];
   const workspaceUpdates: string[] = [];
   const loggedErrors: unknown[][] = [];
   const payloadById = new Map<string, AgentSnapshotPayload>();
   const queuedPayloadBuilds: Promise<AgentSnapshotPayload>[] = [];
+  const queuedProjectBuilds: Array<Promise<ProjectPlacementPayload | null>> = [];
+  const queuedEmits: Array<Promise<unknown>> = [];
   const projectByWorkspaceId = new Map<string, ProjectPlacementPayload | null>();
   let providerVisible: (provider: string) => boolean = () => true;
   let buildAgentPayloadError: Error | null = null;
@@ -104,7 +121,15 @@ function buildHarness() {
   const directorySync = new DirectorySyncService("test-generation");
 
   const service = createAgentUpdatesService({
-    emit: (message) => emitted.push(message),
+    ...(options?.authorizeAgentId
+      ? { authorizeAgentId: async (agentId: string) => options.authorizeAgentId?.(agentId) ?? null }
+      : {}),
+    emit: async (message, scope) => {
+      const queuedEmit = queuedEmits.shift();
+      if (queuedEmit) await queuedEmit;
+      emitted.push(message);
+      emittedScopes.push(scope);
+    },
     enrichAgentPayload: async (payload) => {
       if (enrichProjectedPayload) {
         return payload;
@@ -130,8 +155,10 @@ function buildHarness() {
       return payload;
     },
     isProviderVisibleToClient: (provider) => providerVisible(provider),
-    buildProjectPlacementForWorkspaceId: async (workspaceId) =>
-      projectByWorkspaceId.get(workspaceId) ?? null,
+    buildProjectPlacementForWorkspaceId: async (workspaceId) => {
+      const queuedProject = queuedProjectBuilds.shift();
+      return queuedProject ? queuedProject : (projectByWorkspaceId.get(workspaceId) ?? null);
+    },
     emitWorkspaceUpdateForWorkspaceId: async (workspaceId) => {
       workspaceUpdates.push(workspaceId);
     },
@@ -148,6 +175,7 @@ function buildHarness() {
   return {
     service,
     emitted,
+    emittedScopes,
     workspaceUpdates,
     loggedErrors,
     // Register the payload a builder returns for an agent id, plus the project
@@ -173,6 +201,12 @@ function buildHarness() {
     },
     queuePayloadBuilds(...payloads: Promise<AgentSnapshotPayload>[]) {
       queuedPayloadBuilds.push(...payloads);
+    },
+    queueProjectBuilds(...projects: Array<Promise<ProjectPlacementPayload | null>>) {
+      queuedProjectBuilds.push(...projects);
+    },
+    queueEmits(...emits: Array<Promise<unknown>>) {
+      queuedEmits.push(...emits);
     },
     agentUpdates(): AgentUpdatePayload[] {
       return emitted
@@ -690,4 +724,165 @@ test("an idle session skips agent hydration while preserving workspace updates",
   expect(h.loggedErrors).toEqual([]);
   expect(h.agentUpdates()).toEqual([]);
   expect(h.workspaceUpdates).toEqual([agent.workspaceId]);
+});
+
+describe("enterprise publication fencing", () => {
+  const authorizedScope = (agentId: string): AgentUpdatePublicationScope => ({
+    agentId,
+    workspaceId: "ws-1",
+  });
+
+  test("preserves authorized publication order and carries the canonical workspace scope", async () => {
+    const h = buildHarness({ authorizeAgentId: async (agentId) => authorizedScope(agentId) });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    await h.service.flushBootstrapped("sub");
+    const idle = makeAgentPayload({ id: "a", workspaceId: "ws-1", status: "idle" });
+    const running = makeAgentPayload({ id: "a", workspaceId: "ws-1", status: "running" });
+    h.register(running);
+    const firstProjection = deferred<AgentSnapshotPayload>();
+    h.queuePayloadBuilds(firstProjection.promise, Promise.resolve(running));
+
+    const first = h.service.forwardLiveAgent(h.managed("a"));
+    const second = h.service.forwardLiveAgent(h.managed("a"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    firstProjection.resolve(idle);
+    await Promise.all([first, second]);
+
+    expect(
+      h.agentUpdates().map((update) => update.kind === "upsert" && update.agent.status),
+    ).toEqual(["idle", "running"]);
+    expect(h.emittedScopes).toEqual([authorizedScope("a"), authorizedScope("a")]);
+  });
+
+  test("drops foreign live, stored, and removal publications without workspace effects", async () => {
+    const h = buildHarness({ authorizeAgentId: async () => null });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    await h.service.flushBootstrapped("sub");
+    h.register(makeAgentPayload({ id: "foreign", workspaceId: "ws-foreign" }));
+
+    await h.service.forwardLiveAgent(h.managed("foreign"));
+    await h.service.emitStoredRecord(h.stored("foreign"));
+    await h.service.removeAgent("foreign");
+
+    expect(h.agentUpdates()).toEqual([]);
+    expect(h.workspaceUpdates).toEqual([]);
+    expect(h.emittedScopes).toEqual([]);
+  });
+
+  test("rechecks current authorization after agent enrichment", async () => {
+    let current = true;
+    const h = buildHarness({
+      authorizeAgentId: async (agentId) => (current ? authorizedScope(agentId) : null),
+    });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    await h.service.flushBootstrapped("sub");
+    const payload = h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    const projection = deferred<AgentSnapshotPayload>();
+    h.queuePayloadBuilds(projection.promise);
+
+    const forwarding = h.service.forwardLiveAgent(h.managed("a"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    current = false;
+    projection.resolve(payload);
+    await forwarding;
+
+    expect(h.agentUpdates()).toEqual([]);
+    expect(h.workspaceUpdates).toEqual([]);
+  });
+
+  test("rechecks current authorization after project placement", async () => {
+    let current = true;
+    const h = buildHarness({
+      authorizeAgentId: async (agentId) => (current ? authorizedScope(agentId) : null),
+    });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    await h.service.flushBootstrapped("sub");
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    const project = deferred<ProjectPlacementPayload | null>();
+    h.queueProjectBuilds(project.promise);
+
+    const forwarding = h.service.forwardLiveAgent(h.managed("a"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    current = false;
+    project.resolve(makeProject());
+    await forwarding;
+
+    expect(h.agentUpdates()).toEqual([]);
+    expect(h.workspaceUpdates).toEqual([]);
+  });
+
+  test("flushBootstrapped awaits its current fence and drops a revoked buffered update", async () => {
+    let current = true;
+    const h = buildHarness({
+      authorizeAgentId: async (agentId) => (current ? authorizedScope(agentId) : null),
+    });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    await h.service.forwardLiveAgent(h.managed("a"));
+    expect(h.agentUpdates()).toEqual([]);
+
+    current = false;
+    await h.service.flushBootstrapped("sub");
+
+    expect(h.agentUpdates()).toEqual([]);
+    expect(h.emittedScopes).toEqual([]);
+  });
+
+  test("sealAndDrain seals synchronously, drops in-flight work, and rejects later enqueue", async () => {
+    const h = buildHarness({ authorizeAgentId: async (agentId) => authorizedScope(agentId) });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    await h.service.flushBootstrapped("sub");
+    const payload = h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    const projection = deferred<AgentSnapshotPayload>();
+    h.queuePayloadBuilds(projection.promise);
+
+    const accepted = h.service.forwardLiveAgent(h.managed("a"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const draining = h.service.sealAndDrain();
+    const late = h.service.forwardLiveAgent(h.managed("a"));
+    projection.resolve(payload);
+    await Promise.all([accepted, draining, late]);
+
+    expect(h.agentUpdates()).toEqual([]);
+    expect(h.workspaceUpdates).toEqual([]);
+    expect(h.service.hasSubscription()).toBe(false);
+  });
+
+  test("handles an emit rejection and continues the same agent tail without an unhandled rejection", async () => {
+    const h = buildHarness({ authorizeAgentId: async (agentId) => authorizedScope(agentId) });
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    await h.service.flushBootstrapped("sub");
+    const firstPayload = makeAgentPayload({ id: "a", workspaceId: "ws-1", status: "idle" });
+    const secondPayload = makeAgentPayload({ id: "a", workspaceId: "ws-1", status: "running" });
+    h.register(secondPayload);
+    h.queuePayloadBuilds(Promise.resolve(firstPayload), Promise.resolve(secondPayload));
+    const firstEmit = deferred<unknown>();
+    h.queueEmits(firstEmit.promise);
+
+    const first = h.service.forwardLiveAgent(h.managed("a"));
+    const second = h.service.forwardLiveAgent(h.managed("a"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    firstEmit.reject(new Error("transport rejected"));
+    await Promise.all([first, second]);
+
+    expect(h.agentUpdates()).toEqual([
+      {
+        kind: "upsert",
+        agent: expect.objectContaining({ status: "running" }),
+        project: makeProject(),
+      },
+    ]);
+    expect(h.loggedErrors).toHaveLength(1);
+  });
+
+  test("keeps legacy bootstrap flush publication synchronous", async () => {
+    const h = buildHarness();
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    await h.service.forwardLiveAgent(h.managed("a"));
+
+    const flushing = h.service.flushBootstrapped("sub");
+    expect(h.agentUpdates()).toHaveLength(1);
+    await flushing;
+  });
 });

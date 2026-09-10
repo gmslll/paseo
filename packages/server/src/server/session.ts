@@ -285,6 +285,7 @@ import {
 import {
   createAgentUpdatesService,
   matchesAgentUpdatesFilter,
+  type AgentUpdatePublicationScope,
   type AgentUpdatesService,
 } from "./session/agent-updates/agent-updates-service.js";
 import { expandTilde } from "../utils/path.js";
@@ -879,6 +880,8 @@ export class Session {
   private readonly defaultTimelineSubscriptionSource = {};
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
   private readonly agentUpdates: AgentUpdatesService;
+  private enterpriseAgentEventIngressSealed = false;
+  private enterpriseAgentEventTail: Promise<void> = Promise.resolve();
   private workspaceUpdatesSubscription: WorkspaceUpdatesSubscriptionState | null = null;
   private readonly workspaceLabelService: WorkspaceLabelService | null;
   private workspaceLabelSubscription: {
@@ -1304,7 +1307,13 @@ export class Session {
       getClientBufferedAmount: () => this.getTransportBufferedAmount(),
     });
     this.agentUpdates = createAgentUpdatesService({
-      emit: (message) => this.emit(message),
+      emit: (message, scope) => this.emitAgentUpdatePublication(message, scope),
+      ...(this.enterpriseContext
+        ? {
+            authorizeAgentId: (agentId: string) =>
+              this.authorizeCurrentAgentEventPublication(agentId),
+          }
+        : {}),
       enrichAgentPayload: (payload) => this.enrichAgentPayload(payload),
       buildStoredAgentPayload: (record) => this.buildStoredAgentPayload(record),
       isProviderVisibleToClient: (provider) => this.isProviderVisibleToClient(provider),
@@ -1571,6 +1580,7 @@ export class Session {
       }
     };
     this.enterpriseBrowserLeaseWaitingCallbackActive = false;
+    this.enterpriseAgentEventIngressSealed = true;
     this.isCleanedUp = true;
     this.activeFileBinaryStreams.clear();
     const authorityState = this.authorityReceiptState;
@@ -1770,6 +1780,91 @@ export class Session {
         type: "agent_stream",
         payload: this.buildAgentStreamPayload(event, serializedEvent),
       });
+    }
+  }
+
+  // Enterprise delivery awaits the resource-authorized transport so the
+  // per-Session Agent event tail preserves manager publication order.
+  // oxlint-disable-next-line complexity -- mirrors the legacy capability fan-out above.
+  private async forwardEnterpriseAgentStream(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): Promise<void> {
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (serializedEvent.type === "timeline" && !this.supportsTimelineItem(serializedEvent.item))
+        return;
+      if (this.usesSelectiveTimelineDelivery() && serializedEvent.type === "attention_required") {
+        await this.emitCurrentAgentEvent(
+          {
+            type: "agent_attention_required",
+            payload: {
+              agentId: event.agentId,
+              reason: serializedEvent.reason,
+              timestamp: serializedEvent.timestamp,
+              shouldNotify: serializedEvent.shouldNotify,
+              ...(serializedEvent.notification
+                ? { notification: serializedEvent.notification }
+                : {}),
+            },
+          },
+          event.agentId,
+        );
+      } else if (
+        !this.usesSelectiveTimelineDelivery() ||
+        this.viewedTimelineAgentIds.has(event.agentId)
+      ) {
+        await this.emitCurrentAgentEvent(
+          {
+            type: "agent_stream",
+            payload: this.buildAgentStreamPayload(event, serializedEvent),
+          },
+          event.agentId,
+        );
+      }
+      return;
+    }
+
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      if (
+        serializedEvent.type === "timeline" &&
+        !this.supportsTimelineItem(serializedEvent.item, source)
+      )
+        continue;
+      const supportsSelectiveDelivery = capabilities.has(CLIENT_CAPS.selectiveAgentTimeline);
+      if (supportsSelectiveDelivery && serializedEvent.type === "attention_required") {
+        if (!this.wantsEvent("agent_attention_required", source)) continue;
+        await this.emitCurrentAgentEvent(
+          {
+            type: "agent_attention_required",
+            payload: {
+              agentId: event.agentId,
+              reason: serializedEvent.reason,
+              timestamp: serializedEvent.timestamp,
+              shouldNotify: serializedEvent.shouldNotify,
+              ...(serializedEvent.notification
+                ? { notification: serializedEvent.notification }
+                : {}),
+            },
+          },
+          event.agentId,
+          source,
+        );
+        continue;
+      }
+      if (
+        supportsSelectiveDelivery &&
+        !this.viewedTimelineAgentIdsBySource.get(source)?.has(event.agentId)
+      ) {
+        continue;
+      }
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_stream",
+          payload: this.buildAgentStreamPayload(event, serializedEvent),
+        },
+        event.agentId,
+        source,
+      );
     }
   }
 
@@ -2173,36 +2268,7 @@ export class Session {
   private forwardProviderSubagentUpdate(
     update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
   ): void {
-    let message: SessionOutboundMessage;
-    if (update.type === "upsert") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: update.subagent },
-      };
-    } else if (update.type === "timeline") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "timeline",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-          provider: update.provider,
-          item: update.row.item,
-          timestamp: update.row.timestamp,
-          seq: update.row.seq,
-          epoch: update.epoch,
-        },
-      };
-    } else {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "remove",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-        },
-      };
-    }
+    const message = this.buildProviderSubagentUpdateMessage(update);
 
     if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
       if (
@@ -2221,6 +2287,82 @@ export class Session {
     }
   }
 
+  private buildProviderSubagentUpdateMessage(
+    update: ProviderSubagentManagerEvent,
+  ): SessionOutboundMessage {
+    if (update.type === "upsert") {
+      return {
+        type: "agent.provider_subagents.update",
+        payload: { kind: "upsert", subagent: update.subagent },
+      };
+    }
+    if (update.type === "timeline") {
+      return {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "timeline",
+          parentAgentId: update.parentAgentId,
+          subagentId: update.subagentId,
+          provider: update.provider,
+          item: update.row.item,
+          timestamp: update.row.timestamp,
+          seq: update.row.seq,
+          epoch: update.epoch,
+        },
+      };
+    }
+    return {
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "remove",
+        parentAgentId: update.parentAgentId,
+        subagentId: update.subagentId,
+      },
+    };
+  }
+
+  private providerSubagentParentAgentId(update: ProviderSubagentManagerEvent): string {
+    return update.type === "upsert" ? update.subagent.parentAgentId : update.parentAgentId;
+  }
+
+  private async forwardEnterpriseProviderSubagentUpdate(
+    update: ProviderSubagentManagerEvent,
+  ): Promise<void> {
+    const parentAgentId = this.providerSubagentParentAgentId(update);
+    let current = await this.authorizeCurrentAgentEventPublication(parentAgentId);
+    if (!current) return;
+
+    if (update.type !== "timeline") {
+      try {
+        await this.emitWorkspaceUpdateForWorkspaceId(current.workspaceId);
+      } catch (error) {
+        this.sessionLogger.error(
+          { err: error, parentAgentId, workspaceId: current.workspaceId },
+          "Failed to emit provider subagent workspace update",
+        );
+      }
+      current = await this.authorizeCurrentAgentEventPublication(parentAgentId);
+      if (!current) return;
+    }
+
+    const message = this.buildProviderSubagentUpdateMessage(update);
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (
+        this.supports(CLIENT_CAPS.providerSubagents) &&
+        (update.type !== "timeline" || this.supportsTimelineItem(update.row.item))
+      ) {
+        await this.emitCurrentAgentEvent(message, parentAgentId);
+      }
+      return;
+    }
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      if (!capabilities.has(CLIENT_CAPS.providerSubagents)) continue;
+      if (update.type === "timeline" && !this.supportsTimelineItem(update.row.item, source))
+        continue;
+      await this.emitCurrentAgentEvent(message, parentAgentId, source);
+    }
+  }
+
   private subscribeToAgentEvents(): void {
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();
@@ -2228,95 +2370,190 @@ export class Session {
 
     this.unsubscribeAgentEvents = this.agentManager.subscribe(
       (event) => {
-        if (event.type === "timeline_replacement") {
-          this.deliverTimelineReplacement(event.agentId, this.rewindInitiators.get(event.agentId));
-          return;
-        }
-
-        if (event.type === "agent_state") {
-          this.sessionLogger.trace(
-            {
-              agentId: event.agent.id,
-              provider: event.agent.provider,
-              providerSessionId: event.agent.persistence?.sessionId ?? undefined,
-              turnId: event.agent.activeForegroundTurnId ?? undefined,
-              lifecycle: event.agent.lifecycle,
-            },
-            "agent.session.forward_update",
-          );
-          void this.agentUpdates.forwardLiveAgent(event.agent);
-          return;
-        }
-
-        if (event.type === "provider_subagent") {
-          this.emitProviderSubagentWorkspaceUpdate(event.event);
-          this.forwardProviderSubagentUpdate(event.event);
-          return;
-        }
-
-        if (
-          this.voiceSession.isActiveForAgent(event.agentId) &&
-          event.event.type === "permission_requested" &&
-          isVoicePermissionAllowed(event.event.request)
-        ) {
-          const requestId = event.event.request.id;
-          void this.agentManager
-            .respondToPermission(event.agentId, requestId, {
-              behavior: "allow",
-            })
-            .catch((error) => {
-              this.sessionLogger.warn(
-                {
-                  err: error,
-                  agentId: event.agentId,
-                  requestId,
-                },
-                "Failed to auto-allow speak tool permission in voice mode",
-              );
-            });
-        }
-
-        const serializedEvent = serializeAgentStreamEvent(event.event);
-        if (!serializedEvent) {
-          return;
-        }
-        this.sessionLogger.trace(
-          {
-            agentId: event.agentId,
-            provider: event.event.provider,
-            turnId: getAgentStreamEventTurnId(event.event),
-            seq: event.seq,
-            epoch: event.epoch,
-            event: event.event,
-          },
-          "agent.session.forward_stream",
-        );
-
-        this.forwardAgentStream(event, serializedEvent);
-
-        if (event.event.type === "permission_requested") {
-          this.emit({
-            type: "agent_permission_request",
-            payload: {
-              agentId: event.agentId,
-              request: event.event.request,
-            },
-          });
-        } else if (event.event.type === "permission_resolved") {
-          this.emit({
-            type: "agent_permission_resolved",
-            payload: {
-              agentId: event.agentId,
-              requestId: event.event.requestId,
-              resolution: event.event.resolution,
-            },
-          });
-        }
-
-        // Title updates may be applied asynchronously after agent creation.
+        if (this.enterpriseContext) return this.enqueueEnterpriseAgentEvent(event);
+        this.forwardLegacyAgentEvent(event);
       },
       { replayState: false },
     );
+  }
+
+  private enqueueEnterpriseAgentEvent(event: AgentManagerEvent): Promise<void> {
+    if (this.enterpriseAgentEventIngressSealed || this.isCleanedUp) return Promise.resolve();
+    const attempted = this.enterpriseAgentEventTail.then(() =>
+      this.enterpriseAgentEventIngressSealed || this.isCleanedUp
+        ? undefined
+        : this.forwardEnterpriseAgentEvent(event),
+    );
+    const handled = attempted.catch((error) => {
+      this.sessionLogger.error(
+        { err: error, eventType: event.type },
+        "Failed to publish enterprise agent event",
+      );
+    });
+    this.enterpriseAgentEventTail = handled;
+    return handled;
+  }
+
+  private forwardLegacyAgentEvent(event: AgentManagerEvent): void {
+    if (event.type === "timeline_replacement") {
+      this.deliverTimelineReplacement(event.agentId, this.rewindInitiators.get(event.agentId));
+      return;
+    }
+
+    if (event.type === "agent_state") {
+      this.traceAgentState(event.agent);
+      void this.agentUpdates.forwardLiveAgent(event.agent);
+      return;
+    }
+
+    if (event.type === "provider_subagent") {
+      this.emitProviderSubagentWorkspaceUpdate(event.event);
+      this.forwardProviderSubagentUpdate(event.event);
+      return;
+    }
+
+    if (
+      this.voiceSession.isActiveForAgent(event.agentId) &&
+      event.event.type === "permission_requested" &&
+      isVoicePermissionAllowed(event.event.request)
+    ) {
+      const requestId = event.event.request.id;
+      void this.agentManager
+        .respondToPermission(event.agentId, requestId, {
+          behavior: "allow",
+        })
+        .catch((error) => {
+          this.logVoiceAutoAllowFailure(error, event.agentId, requestId);
+        });
+    }
+
+    const serializedEvent = serializeAgentStreamEvent(event.event);
+    if (!serializedEvent) return;
+    this.traceAgentStream(event);
+    this.forwardAgentStream(event, serializedEvent);
+    this.forwardLegacyPermissionEvent(event);
+  }
+
+  private async forwardEnterpriseAgentEvent(event: AgentManagerEvent): Promise<void> {
+    if (event.type === "timeline_replacement") {
+      await this.deliverEnterpriseTimelineReplacement(
+        event.agentId,
+        this.rewindInitiators.get(event.agentId),
+      );
+      return;
+    }
+    if (event.type === "agent_state") {
+      this.traceAgentState(event.agent);
+      await this.agentUpdates.forwardLiveAgent(event.agent);
+      return;
+    }
+    if (event.type === "provider_subagent") {
+      await this.forwardEnterpriseProviderSubagentUpdate(event.event);
+      return;
+    }
+    await this.forwardEnterpriseAgentStreamEvent(event);
+  }
+
+  private traceAgentState(agent: ManagedAgent): void {
+    this.sessionLogger.trace(
+      {
+        agentId: agent.id,
+        provider: agent.provider,
+        providerSessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: agent.activeForegroundTurnId ?? undefined,
+        lifecycle: agent.lifecycle,
+      },
+      "agent.session.forward_update",
+    );
+  }
+
+  private traceAgentStream(event: Extract<AgentManagerEvent, { type: "agent_stream" }>): void {
+    this.sessionLogger.trace(
+      {
+        agentId: event.agentId,
+        provider: event.event.provider,
+        turnId: getAgentStreamEventTurnId(event.event),
+        seq: event.seq,
+        epoch: event.epoch,
+        event: event.event,
+      },
+      "agent.session.forward_stream",
+    );
+  }
+
+  private logVoiceAutoAllowFailure(error: unknown, agentId: string, requestId: string): void {
+    this.sessionLogger.warn(
+      { err: error, agentId, requestId },
+      "Failed to auto-allow speak tool permission in voice mode",
+    );
+  }
+
+  private forwardLegacyPermissionEvent(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+  ): void {
+    if (event.event.type === "permission_requested") {
+      this.emit({
+        type: "agent_permission_request",
+        payload: { agentId: event.agentId, request: event.event.request },
+      });
+    } else if (event.event.type === "permission_resolved") {
+      this.emit({
+        type: "agent_permission_resolved",
+        payload: {
+          agentId: event.agentId,
+          requestId: event.event.requestId,
+          resolution: event.event.resolution,
+        },
+      });
+    }
+  }
+
+  private async forwardEnterpriseAgentStreamEvent(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+  ): Promise<void> {
+    if (
+      this.voiceSession.isActiveForAgent(event.agentId) &&
+      event.event.type === "permission_requested" &&
+      isVoicePermissionAllowed(event.event.request)
+    ) {
+      const requestId = event.event.request.id;
+      const current = await this.authorizeCurrentAgentEventPublication(event.agentId);
+      if (!current) return;
+      try {
+        await this.agentManager.respondToPermission(event.agentId, requestId, {
+          behavior: "allow",
+        });
+      } catch (error) {
+        this.logVoiceAutoAllowFailure(error, event.agentId, requestId);
+      }
+    }
+
+    const serializedEvent = serializeAgentStreamEvent(event.event);
+    if (!serializedEvent) return;
+    this.traceAgentStream(event);
+    await this.forwardEnterpriseAgentStream(event, serializedEvent);
+
+    if (event.event.type === "permission_requested") {
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_permission_request",
+          payload: { agentId: event.agentId, request: event.event.request },
+        },
+        event.agentId,
+      );
+    } else if (event.event.type === "permission_resolved") {
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_permission_resolved",
+          payload: {
+            agentId: event.agentId,
+            requestId: event.event.requestId,
+            resolution: event.event.resolution,
+          },
+        },
+        event.agentId,
+      );
+    }
   }
 
   private emitProviderSubagentWorkspaceUpdate(event: ProviderSubagentManagerEvent): void {
@@ -3799,6 +4036,64 @@ export class Session {
     return (await authorization.assertAgent(action, agentId)) !== null;
   }
 
+  private async authorizeCurrentAgentEventPublication(
+    agentId: string,
+  ): Promise<AgentUpdatePublicationScope | null> {
+    if (!this.enterpriseContext || this.enterpriseAgentEventIngressSealed || this.isCleanedUp) {
+      return null;
+    }
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return null;
+    const canonical = await authorization.assertAgent("workspace.content.read", agentId);
+    if (
+      !canonical ||
+      canonical.agentId !== agentId ||
+      !authorization.isCurrent() ||
+      this.enterpriseAgentEventIngressSealed ||
+      this.isCleanedUp
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      agentId: canonical.agentId,
+      workspaceId: canonical.workspaceId,
+    });
+  }
+
+  private async emitCurrentAgentEvent(
+    message: SessionOutboundMessage,
+    agentId: string,
+    source?: object,
+  ): Promise<boolean> {
+    const current = await this.authorizeCurrentAgentEventPublication(agentId);
+    if (!current) return false;
+    const context = this.createWorkspaceOutboundContext(current.workspaceId);
+    if (!context || this.enterpriseAgentEventIngressSealed || this.isCleanedUp) return false;
+    return this.enqueueAuthorizedEmit(message, context, source);
+  }
+
+  private async emitAgentUpdatePublication(
+    message: SessionOutboundMessage,
+    scope?: AgentUpdatePublicationScope,
+  ): Promise<boolean | void> {
+    if (!this.enterpriseContext) {
+      this.emit(message);
+      return;
+    }
+    if (
+      !scope ||
+      this.enterpriseAgentEventIngressSealed ||
+      this.isCleanedUp ||
+      !this.isEnterpriseLegacyResourceCurrent()
+    ) {
+      return false;
+    }
+    const current = await this.authorizeCurrentAgentEventPublication(scope.agentId);
+    if (!current || current.workspaceId !== scope.workspaceId) return false;
+    const context = this.createWorkspaceOutboundContext(current.workspaceId);
+    return context ? this.enqueueAuthorizedEmit(message, context) : false;
+  }
+
   private async assertLegacyWorkspaceResource(
     action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
     workspaceId: string,
@@ -5199,6 +5494,83 @@ export class Session {
     }
   }
 
+  private async deliverEnterpriseTimelineReplacement(
+    agentId: string,
+    initiatingSource?: object,
+  ): Promise<void> {
+    if (!(await this.authorizeCurrentAgentEventPublication(agentId))) return;
+    const agent = this.agentManager.getAgent(agentId);
+    if (!agent) return;
+    const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });
+    const epoch = timeline.epoch;
+
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (!this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
+        await this.emitEnterpriseReconstructedTimelineRows(
+          agentId,
+          agent.provider,
+          timeline.rows,
+          epoch,
+        );
+      }
+      return;
+    }
+
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      const isInitiator = source === initiatingSource;
+      const supportsReplacement = capabilities.has(CLIENT_CAPS.timelineReplacementInvalidation);
+      const isSubscribed = this.viewedTimelineAgentIdsBySource.get(source)?.has(agentId) === true;
+      if (supportsReplacement) {
+        if (isSubscribed && !isInitiator) {
+          await this.emitCurrentAgentEvent(
+            {
+              type: "agent.timeline.replacement",
+              payload: { agentId, epoch },
+            },
+            agentId,
+            source,
+          );
+        }
+        continue;
+      }
+      await this.emitEnterpriseReconstructedTimelineRows(
+        agentId,
+        agent.provider,
+        timeline.rows,
+        epoch,
+        source,
+      );
+    }
+  }
+
+  private async emitEnterpriseReconstructedTimelineRows(
+    agentId: string,
+    provider: ManagedAgent["provider"],
+    rows: AgentTimelineFetchResult["rows"],
+    epoch: string,
+    source?: object,
+  ): Promise<void> {
+    for (const row of rows) {
+      if (!this.supportsTimelineItem(row.item, source)) continue;
+      const event = serializeAgentStreamEvent({
+        type: "timeline",
+        provider,
+        item: row.item,
+        ...(row.turnId ? { turnId: row.turnId } : {}),
+        timestamp: row.timestamp,
+      });
+      if (!event) continue;
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_stream",
+          payload: { agentId, event, timestamp: row.timestamp, seq: row.seq, epoch },
+        },
+        agentId,
+        source,
+      );
+    }
+  }
+
   private async buildAgentSessionConfig(
     config: AgentSessionConfig,
     gitOptions?: GitSetupOptions,
@@ -6242,10 +6614,13 @@ export class Session {
     }
     const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
     subscription.lastEmittedByWorkspaceId.set(workspaceId, payload);
-    this.emit({
-      type: "workspace_update",
-      payload,
-    });
+    this.emit(
+      {
+        type: "workspace_update",
+        payload,
+      },
+      this.createWorkspaceOutboundContext(workspaceId),
+    );
   }
 
   private flushBootstrappedWorkspaceUpdates(options?: {
@@ -6289,10 +6664,13 @@ export class Session {
       }
       const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
       subscription.lastEmittedByWorkspaceId.set(workspaceId, payload);
-      this.emit({
-        type: "workspace_update",
-        payload,
-      });
+      this.emit(
+        {
+          type: "workspace_update",
+          payload,
+        },
+        this.createWorkspaceOutboundContext(workspaceId),
+      );
     }
   }
 
@@ -6656,22 +7034,32 @@ export class Session {
         }
       }
 
-      this.emit(
-        {
-          type: "fetch_agents_response",
-          payload: {
-            requestId: request.requestId,
-            ...(subscriptionId ? { subscriptionId } : {}),
-            ...payload,
-          },
+      const response: SessionOutboundMessage = {
+        type: "fetch_agents_response",
+        payload: {
+          requestId: request.requestId,
+          ...(subscriptionId ? { subscriptionId } : {}),
+          ...payload,
         },
-        this.createWorkspaceOutboundContextForIds(
-          payload.entries.map((entry) => entry.agent.workspaceId),
-        ),
+      };
+      const responseContext = this.createWorkspaceOutboundContextForIds(
+        payload.entries.map((entry) => entry.agent.workspaceId),
       );
+      if (this.enterpriseContext) {
+        const delivered = await this.enqueueAuthorizedEmit(response, responseContext);
+        if (!delivered) {
+          if (subscriptionId) this.agentUpdates.clearSubscription(subscriptionId);
+          return;
+        }
+      } else {
+        this.emit(response, responseContext);
+      }
 
       if (subscriptionId) {
-        this.agentUpdates.flushBootstrapped(subscriptionId, { snapshotUpdatedAtByAgentId });
+        await this.agentUpdates.flushBootstrapped(subscriptionId, { snapshotUpdatedAtByAgentId });
+        if (this.enterpriseContext && !this.isEnterpriseLegacyResourceCurrent()) {
+          this.agentUpdates.clearSubscription(subscriptionId);
+        }
       }
     } catch (error) {
       if (subscriptionId) {
@@ -9404,8 +9792,19 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.enterpriseBrowserLeaseWaitingCallbackActive = false;
+    this.enterpriseAgentEventIngressSealed = true;
+    const agentUpdatesDrain = this.agentUpdates.sealAndDrain();
     this.isCleanedUp = true;
     const cleanupErrors: unknown[] = [];
+    const unsubscribeAgentEvents = this.unsubscribeAgentEvents;
+    this.unsubscribeAgentEvents = null;
+    if (unsubscribeAgentEvents) {
+      try {
+        unsubscribeAgentEvents();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     const admissionInvalidationUnsubscribe = this.admissionInvalidationUnsubscribe;
     this.admissionInvalidationUnsubscribe = null;
     if (admissionInvalidationUnsubscribe) {
@@ -9416,6 +9815,13 @@ export class Session {
       }
     }
     this.activeFileBinaryStreams.clear();
+    const agentEventDrains = await Promise.allSettled([
+      this.enterpriseAgentEventTail,
+      agentUpdatesDrain,
+    ]);
+    for (const result of agentEventDrains) {
+      if (result.status === "rejected") cleanupErrors.push(result.reason);
+    }
     // Seal the outbound ingress synchronously, then drain both existing and
     // racing tasks. Tasks queued after the seal observe isCleanedUp and cannot
     // deliver, but are still joined before authority binding release.
@@ -9523,14 +9929,6 @@ export class Session {
       }
     }
 
-    if (this.unsubscribeAgentEvents) {
-      try {
-        this.unsubscribeAgentEvents();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-      this.unsubscribeAgentEvents = null;
-    }
     try {
       this.unsubscribeProjectMutations?.();
     } catch (error) {
@@ -9555,11 +9953,6 @@ export class Session {
       cleanupErrors.push(error);
     }
     this.workspaceLabelSubscription = null;
-    try {
-      this.agentUpdates.dispose();
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
     try {
       await this.hubExecutionController?.cleanup();
     } catch (error) {
