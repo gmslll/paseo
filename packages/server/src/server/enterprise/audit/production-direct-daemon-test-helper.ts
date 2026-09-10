@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -210,7 +210,7 @@ export class ProductionDirectDaemonTestHarness {
     if (!PRODUCTION_DIRECT_DAEMON_TEST_SUPPORTED) {
       throw new Error("production direct daemon test harness requires Darwin");
     }
-    const root = await mkdtemp(path.join(os.tmpdir(), `paseo-${options.name}-`));
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), `paseo-${options.name}-`)));
     let preparatoryAudit: ProductionAuditCapability | undefined;
     let preparatoryRuntime: EnterpriseAdmissionRuntime | undefined;
     try {
@@ -382,9 +382,10 @@ export class ProductionDirectDaemonTestHarness {
               workspaceRoots,
               nativeAddonPath: this.nativeAddons.workspace,
             }),
-          createProductionBrowserProfileContentReadSource: () =>
+          createProductionBrowserProfileContentReadSource: (input) =>
             createProductionEnterpriseBrowserProfileContentReadSource({
               addonPath: this.nativeAddons.workspace,
+              pageIdentity: input.pageIdentity,
             }),
         },
       );
