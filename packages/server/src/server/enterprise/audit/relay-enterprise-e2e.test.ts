@@ -15,6 +15,7 @@ import {
   generateKeyPair,
   type Transport,
 } from "@getpaseo/relay/e2ee";
+import { EnterpriseAuditListEventsResponseSchema } from "@getpaseo/protocol/messages";
 import { startRelayTransport } from "../../relay-transport.js";
 import pino from "pino";
 import { hash } from "bcryptjs";
@@ -95,14 +96,31 @@ async function wsOpen(ws: WebSocket): Promise<void> {
   });
 }
 
-function hasSessionMessage(values: readonly unknown[]): boolean {
-  return values.some((value) => (value as { type?: string })?.type === "session");
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasAuditResponse(values: readonly unknown[]): boolean {
-  return values.some((value) =>
-    JSON.stringify(value).includes("enterprise.audit.list_events.response"),
-  );
+function hasEnterpriseAuditFeature(values: readonly unknown[]): boolean {
+  return values.some((value) => {
+    if (!isRecord(value) || value.type !== "session" || !isRecord(value.message)) return false;
+    const { message } = value;
+    return (
+      message.type === "status" &&
+      isRecord(message.payload) &&
+      message.payload.status === "server_info" &&
+      isRecord(message.payload.features) &&
+      message.payload.features.enterpriseAuditV1 === true
+    );
+  });
+}
+
+function findAuditResponse(values: readonly unknown[], requestId: string) {
+  for (const value of values) {
+    if (!isRecord(value) || value.type !== "session") continue;
+    const parsed = EnterpriseAuditListEventsResponseSchema.safeParse(value.message);
+    if (parsed.success && parsed.data.payload.requestId === requestId) return parsed.data;
+  }
+  return undefined;
 }
 
 function hasRelayDataLog(logs: readonly string[], connectionId: string): boolean {
@@ -298,7 +316,7 @@ describe.runIf(enabled && process.platform === "darwin")(
         auditRoot,
         nativeAddonPath: auditAddonPath,
       });
-      await seededAudit.append(
+      const seededEvent = await seededAudit.append(
         {
           organizationId,
           actorPrincipalId: principalId,
@@ -426,13 +444,12 @@ describe.runIf(enabled && process.platform === "darwin")(
             }),
           )
           .catch((error) => {
-            throw new Error(
-              `hello send failed: ${String(error)} errors=${clientErrors.join("|")} logs=${daemonLogs.join("")}`,
-            );
+            throw new Error(`hello send failed: ${String(error)} errors=${clientErrors.join("|")}`);
           });
-        await vi.waitFor(() => expect(hasSessionMessage(responses)).toBe(true), {
-          timeout: 10_000,
-        });
+        await vi.waitFor(
+          () => expect(hasEnterpriseAuditFeature(responses), JSON.stringify(responses)).toBe(true),
+          { timeout: 10_000 },
+        );
         await channel.send(
           JSON.stringify({
             type: "session",
@@ -443,7 +460,19 @@ describe.runIf(enabled && process.platform === "darwin")(
             },
           }),
         );
-        await vi.waitFor(() => expect(hasAuditResponse(responses)).toBe(true), { timeout: 10_000 });
+        await vi.waitFor(() => expect(findAuditResponse(responses, "relay-audit")).toBeDefined(), {
+          timeout: 10_000,
+        });
+        const auditResponse = findAuditResponse(responses, "relay-audit");
+        expect(
+          auditResponse?.payload.events.some(
+            (event) =>
+              event.eventId === seededEvent.eventId &&
+              event.resource.kind === "workspace" &&
+              event.resource.id === "wks_relay",
+          ),
+        ).toBe(true);
+        expect(clientErrors).toEqual([]);
       } finally {
         await daemon.stop().catch(() => undefined);
         for (const ws of sockets) ws.close();
