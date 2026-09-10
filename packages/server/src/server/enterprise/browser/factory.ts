@@ -113,6 +113,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
   bundle: ProductionBrowserLeaseBundle;
   runtime: EnterpriseBrowserLeaseSessionRuntime;
 }): EnterpriseSessionDispatcherFactoryRegistration | null {
+  const unbindByGeneration = new Map<string, { readonly unbind: () => void }>();
   const base = createEnterpriseBrowserLeaseDispatcherRegistration({
     runtime: input.runtime,
     authority: createUnavailableAuthority(),
@@ -150,15 +151,71 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
           return { workspace, agent, profile, bindingRevision: binding.boundAt };
         },
       };
-      input.bundle.bindSessionAuthority({
+      const unbind = input.bundle.bindSessionAuthority({
         generation: context.sessionBindingGeneration,
         isCurrentHandle: resolvedAuthority.isCurrentHandle,
         resolveAuthorization: resolvedAuthority.resolveLeaseAuthorization,
       });
+      unbindByGeneration.set(context.sessionBindingGeneration, { unbind });
       return resolvedAuthority;
     },
   });
-  return base;
+  if (!base) return null;
+  return Object.freeze({
+    manifest: base.manifest,
+    open(openInput) {
+      let lease: EnterpriseDispatcherLease;
+      try {
+        lease = base.open(openInput);
+      } catch (error) {
+        const failedEntry = unbindByGeneration.get(openInput.context.sessionBindingGeneration);
+        failedEntry?.unbind();
+        if (
+          failedEntry &&
+          unbindByGeneration.get(openInput.context.sessionBindingGeneration) === failedEntry
+        ) {
+          unbindByGeneration.delete(openInput.context.sessionBindingGeneration);
+        }
+        throw error;
+      }
+      const ownEntry = unbindByGeneration.get(openInput.context.sessionBindingGeneration);
+      let closePromise: Promise<void> | null = null;
+      return Object.freeze({
+        dispatcher: lease.dispatcher,
+        close: async () => {
+          closePromise ??= (async () => {
+            const generation = openInput.context.sessionBindingGeneration;
+            const errors: unknown[] = [];
+            try {
+              await lease.close();
+            } catch (error) {
+              errors.push(error);
+            }
+            if (ownEntry) {
+              try {
+                if (unbindByGeneration.get(generation) === ownEntry)
+                  unbindByGeneration.delete(generation);
+                ownEntry.unbind();
+              } catch (error) {
+                errors.push(error);
+              }
+            }
+            try {
+              await input.bundle.invalidateSession(generation);
+            } catch (error) {
+              errors.push(error);
+            }
+            if (errors.length > 0) {
+              throw new AggregateError(errors, "Enterprise browser lease close failed.", {
+                cause: errors[0],
+              });
+            }
+          })();
+          return closePromise;
+        },
+      });
+    },
+  });
 }
 
 function createUnavailableAuthority(): EnterpriseBrowserLeaseAuthorityPort {
