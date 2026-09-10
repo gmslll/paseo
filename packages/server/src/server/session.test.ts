@@ -111,6 +111,9 @@ import type { CheckDetails, ForgeService } from "../services/forge-service.js";
 import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 
 interface SessionHandlerInternals {
+  terminalController: {
+    dispatch(message: SessionInboundMessage): Promise<void> | undefined;
+  };
   interruptAgentIfRunning(agentId: string): Promise<void>;
   handleSendAgentMessage(
     agentId: string,
@@ -1256,6 +1259,7 @@ test("enterprise authorized request registers active handle before handler and c
     authorityReceiptState: state,
   });
   const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  const terminalDispatch = vi.spyOn(asSessionInternals(session).terminalController, "dispatch");
   await session.handleMessage({ type: "daemon.get_status.request", requestId: "authority-1" });
   expect(register).toHaveBeenCalledTimes(1);
   expect(register.mock.calls[0]?.[0].binding).toEqual(
@@ -1271,6 +1275,7 @@ test("enterprise authorized request registers active handle before handler and c
   );
   expect(end).toHaveBeenCalledTimes(1);
   expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(terminalDispatch).not.toHaveBeenCalled();
   expect(register.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]!);
   expect(end.mock.calls[0]?.[0]).toEqual({
     sessionId: session.getSessionId(),
@@ -2353,7 +2358,7 @@ test("coarse workspace access denies missing enterprise actions without receipt 
   await session.cleanup();
 });
 
-test("policy-null list terminals bypasses receipt lifecycle and reaches terminal handler", async () => {
+test("enterprise global list terminals is denied before terminal enumeration", async () => {
   const messages: SessionOutboundMessage[] = [];
   const authorityReceiptState = new MemoryAuthorityReceiptState();
   const register = vi.spyOn(authorityReceiptState, "register");
@@ -2373,6 +2378,17 @@ test("policy-null list terminals bypasses receipt lifecycle and reaches terminal
 
   expect(dispatch).toHaveBeenCalledTimes(1);
   expect(register).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: "terminal-policy-null",
+        requestType: "list_terminals_request",
+        error: "Session is not authorized for global terminal listing",
+        code: "access_denied",
+      },
+    },
+  ]);
   dispatch.mockRestore();
   await session.cleanup();
 });

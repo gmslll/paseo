@@ -3453,6 +3453,18 @@ export class Session {
   }
 
   private dispatchTerminalMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    if (msg.type === "list_terminals_request" && this.enterpriseContext && !msg.workspaceId) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: "Session is not authorized for global terminal listing",
+          code: "access_denied",
+        },
+      });
+      return undefined;
+    }
     switch (msg.type) {
       case "start_workspace_script_request":
         return this.handleStartWorkspaceScriptRequest(msg);
