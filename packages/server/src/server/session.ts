@@ -41,6 +41,8 @@ import {
   isEnterpriseResourceRequest,
   type EnterpriseSessionDispatcher,
   type EnterpriseSessionDispatcherFactory,
+  type EnterpriseSessionDispatcherFactoryRegistration,
+  type EnterpriseDispatcherLease,
 } from "./session/enterprise-dispatcher.js";
 import type {
   TerminalManager,
@@ -522,6 +524,7 @@ export interface SessionOptions {
   /** W3 routing seam; domain handlers are registered by integration/owning streams. */
   enterpriseDispatcher?: EnterpriseSessionDispatcher;
   enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
+  enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   /** Integration/W1 supplies the current-session decision for identity-self requests. */
   enterpriseIdentitySelfAuthorization?: SessionAuthorization["authorizeInbound"];
   permissions: readonly DaemonPermission[];
@@ -879,6 +882,7 @@ export class Session {
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private enterpriseDispatcher: EnterpriseSessionDispatcher | null;
   private readonly enterpriseDispatcherFactory: EnterpriseSessionDispatcherFactory | null;
+  private readonly enterpriseDispatcherLease: EnterpriseDispatcherLease | null;
   private readonly enterpriseIdentitySelfAuthorization:
     | SessionAuthorization["authorizeInbound"]
     | null;
@@ -900,6 +904,7 @@ export class Session {
       enterpriseAuthorizationRuntime,
       enterpriseDispatcher,
       enterpriseDispatcherFactory,
+      enterpriseDispatcherRegistration,
       enterpriseIdentitySelfAuthorization,
       permissions,
       appVersion,
@@ -957,6 +962,7 @@ export class Session {
     } = options;
     this.enterpriseDispatcher = enterpriseDispatcher ?? null;
     this.enterpriseDispatcherFactory = enterpriseDispatcherFactory ?? null;
+    this.enterpriseDispatcherLease = null;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization ?? null;
     const enterpriseConfigured = Boolean(
       enterpriseContext ||
@@ -1050,6 +1056,15 @@ export class Session {
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = sessionId ?? uuidv4();
+    if (!enterpriseDispatcher && enterpriseDispatcherRegistration && this.enterpriseContext) {
+      this.enterpriseDispatcherLease = enterpriseDispatcherRegistration.open({
+        sessionId: this.sessionId,
+        clientId,
+        context: this.enterpriseContext,
+        authorizationRuntime: enterpriseAuthorizationRuntime,
+      });
+      this.enterpriseDispatcher = this.enterpriseDispatcherLease.dispatcher;
+    }
     if (!this.enterpriseDispatcher && this.enterpriseDispatcherFactory && this.enterpriseContext) {
       this.enterpriseDispatcher = this.enterpriseDispatcherFactory.create({
         sessionId: this.sessionId,
@@ -9037,6 +9052,13 @@ export class Session {
     if (this.enterpriseDispatcher && this.enterpriseDispatcherFactory?.dispose) {
       try {
         await this.enterpriseDispatcherFactory.dispose(this.enterpriseDispatcher);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (this.enterpriseDispatcherLease) {
+      try {
+        await this.enterpriseDispatcherLease.close();
       } catch (error) {
         cleanupErrors.push(error);
       }

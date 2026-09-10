@@ -144,6 +144,23 @@ export interface EnterpriseSessionDispatcherFactory {
   }): EnterpriseSessionDispatcher;
   dispose?(dispatcher: EnterpriseSessionDispatcher): Promise<void> | void;
 }
+export interface EnterpriseDispatcherManifest {
+  readonly operations: readonly string[];
+}
+export interface EnterpriseDispatcherLease {
+  readonly dispatcher: EnterpriseSessionDispatcher;
+  readonly close: () => Promise<void> | void;
+}
+export interface EnterpriseSessionDispatcherFactoryRegistration {
+  readonly manifest: EnterpriseDispatcherManifest;
+  open(input: {
+    readonly sessionId: string;
+    readonly clientId: string;
+    readonly context: EnterpriseSessionContext;
+    readonly authorizationRuntime?: unknown;
+    readonly requestLifecycle?: unknown;
+  }): EnterpriseDispatcherLease;
+}
 
 export const ENTERPRISE_UNAVAILABLE_ERROR = "Enterprise operation unavailable";
 
