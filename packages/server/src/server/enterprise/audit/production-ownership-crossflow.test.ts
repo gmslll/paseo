@@ -1034,6 +1034,7 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     const principalA = "usr_aaaaaaaaaaaaaaaa";
     const principalB = "usr_bbbbbbbbbbbbbbbb";
     const principalC = "usr_cccccccccccccccc";
+    const principalD = "usr_dddddddddddddddd";
     const workspaceBId = "wks_bbbbbbbbbbbbbbbb";
     await mkdir(path.join(paseoHome, "enterprise"), { recursive: true, mode: 0o700 });
     await mkdir(staticDir, { recursive: true, mode: 0o700 });
@@ -1231,6 +1232,14 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
+          [principalD]: {
+            principalId: principalD,
+            organizationId: principal.organizationId,
+            principalType: "human",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
         },
       }),
       { mode: 0o600 },
@@ -1311,6 +1320,21 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           ],
           grantVersion: "grv_c",
         },
+        [principalD]: {
+          principalId: principalD,
+          organizationId: principal.organizationId,
+          grants: [
+            {
+              action: "workspace.metadata.read",
+              selector: { kind: "workspace", workspaceIds: [workspaceId] },
+            },
+            {
+              action: "browser.use",
+              selector: { kind: "organization", organizationId: principal.organizationId },
+            },
+          ],
+          grantVersion: "grv_d",
+        },
       }),
       { mode: 0o600 },
     );
@@ -1374,6 +1398,11 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     const issuedC = await preparatoryRuntime.admission.registry.issueToken({
       actor: breakGlass,
       principalId: principalC,
+      organizationId: principal.organizationId,
+    });
+    const issuedD = await preparatoryRuntime.admission.registry.issueToken({
+      actor: breakGlass,
+      principalId: principalD,
       organizationId: principal.organizationId,
     });
     await expect(
@@ -1586,6 +1615,20 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         type: "assistant_message",
         text: "live-agent-content",
       });
+      const liveAgentD = await daemon.agentManager.createAgent(
+        { provider: "mock", cwd: workspaceRoot, model: "ten-second-stream" },
+        "00000000-0000-4000-8000-000000000779",
+        {
+          workspaceId,
+          enterpriseOwnership: {
+            workspaceId,
+            organizationId: principal.organizationId,
+            nodeId: node.nodeId,
+            ownerPrincipalId: principalA,
+            createdByPrincipalId: principalA,
+          },
+        },
+      );
       const foreignAgent = await daemon.agentManager.createAgent(
         { provider: "mock", cwd: workspaceBRoot, model: "ten-second-stream" },
         "00000000-0000-4000-8000-000000000888",
@@ -1948,6 +1991,147 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         if (appDeniedShape === undefined) appDeniedShape = shape;
         else expect(shape).toEqual(appDeniedShape);
       }
+      await new Promise<void>((resolve) => {
+        if (b.socket.readyState === WebSocket.CLOSED) return resolve();
+        b.socket.once("close", () => resolve());
+        b.socket.close();
+      });
+      phase = "case10-d-connect";
+      const d = await connect("default-d", issuedD.token);
+      phase = "case10-a-holder";
+      const holderPromise = next(
+        a.socket,
+        (v) =>
+          (v?.type === "rpc_error" && v.payload?.requestId === "case10-a") ||
+          (v?.type === "session" && v.message?.payload?.requestId === "case10-a"),
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.resource.acquire_lease.request",
+            requestId: "case10-a",
+            workspaceId,
+            agentId: liveAgent.id,
+            resourceKind: "browser_profile",
+            mode: "write",
+          },
+        }),
+      );
+      const holder = await holderPromise;
+      const holderPayload = holder.payload ?? holder.message?.payload;
+      expect(holderPayload).toMatchObject({ requestId: "case10-a", waiting: false });
+      const holderLease = holderPayload.lease as {
+        leaseId: string;
+        fencingToken: number;
+      };
+      expect(holderLease).toMatchObject({
+        leaseId: expect.any(String),
+        fencingToken: expect.any(Number),
+      });
+      const waitingPromise = next(
+        d.socket,
+        (v) => v?.type === "session" && v.message?.type === "enterprise.resource.waiting",
+      );
+      d.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.resource.acquire_lease.request",
+            requestId: "case10-d",
+            workspaceId,
+            agentId: liveAgentD.id,
+            resourceKind: "browser_profile",
+            mode: "write",
+          },
+        }),
+      );
+      const waiting = await waitingPromise;
+      expect(waiting.message?.payload).toMatchObject({
+        status: "resource_waiting",
+        workspaceId,
+        agentId: liveAgentD.id,
+        nodeId: node.nodeId,
+        resourceKind: "browser_profile",
+        resourceId: browserProfileId,
+        mode: "write",
+        queuedAt: expect.any(String),
+        position: 1,
+      });
+      expect(waiting.message?.payload).not.toHaveProperty("requestId");
+      let waitingOnA = 0;
+      let waitingOnC = 0;
+      const countAWaiting = (value: RawData) => {
+        if (value.toString().includes('"enterprise.resource.waiting"')) waitingOnA += 1;
+      };
+      const countCWaiting = (value: RawData) => {
+        if (value.toString().includes('"enterprise.resource.waiting"')) waitingOnC += 1;
+      };
+      a.socket.on("message", countAWaiting);
+      c.socket.on("message", countCWaiting);
+      const releaseA = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.resource.release_lease.response" &&
+          v.message?.payload?.requestId === "case10-a-release",
+      );
+      const acquiredD = next(
+        d.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.resource.acquire_lease.response" &&
+          v.message?.payload?.requestId === "case10-d",
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.resource.release_lease.request",
+            requestId: "case10-a-release",
+            leaseId: holderLease.leaseId,
+            fencingToken: holderLease.fencingToken,
+          },
+        }),
+      );
+      await releaseA;
+      const acquiredDResult = await acquiredD;
+      a.socket.off("message", countAWaiting);
+      c.socket.off("message", countCWaiting);
+      expect(waitingOnA).toBe(0);
+      expect(waitingOnC).toBe(0);
+      const dLease = acquiredDResult.message?.payload?.lease as {
+        leaseId: string;
+        fencingToken: number;
+      };
+      expect(dLease).toMatchObject({
+        leaseId: expect.any(String),
+        fencingToken: expect.any(Number),
+      });
+      const releaseD = next(
+        d.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.resource.release_lease.response" &&
+          v.message?.payload?.requestId === "case10-d-release",
+      );
+      d.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.resource.release_lease.request",
+            requestId: "case10-d-release",
+            leaseId: dLease.leaseId,
+            fencingToken: dLease.fencingToken,
+          },
+        }),
+      );
+      await releaseD;
+      await new Promise<void>((resolve) => {
+        if (d.socket.readyState === WebSocket.CLOSED) return resolve();
+        d.socket.once("close", () => resolve());
+        d.socket.close();
+      });
       phase = "browser-list-c";
       const listPromise = next(
         c.socket,
@@ -2099,7 +2283,9 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           }),
         ]),
       );
-      expect(contentEvents).toHaveLength(3);
+      expect(
+        contentEvents?.filter((event) => event.action === "workspace.content.read"),
+      ).toHaveLength(3);
       expect(contentEvents).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ actorPrincipalId: principalA, outcome: "allowed" }),
@@ -2184,7 +2370,7 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             | Array<{ readonly agent?: { readonly id?: string } }>
             | undefined) ?? []
         ).map((entry) => entry.agent?.id),
-      ).toEqual([liveAgent.id]);
+      ).toEqual(expect.arrayContaining([liveAgent.id, liveAgentD.id]));
       expect(JSON.stringify(agentList)).not.toContain(foreignAgent.id);
       expect(JSON.stringify(agentList)).not.toContain("foreign-agent-secret-marker");
 
