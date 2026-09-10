@@ -22,6 +22,8 @@ interface RelayRuntimeOptions {
   serverId: string;
   daemonKeyPair: KeyPair;
   startTransport?: typeof startRelayTransport;
+  authenticateEnterprise?: (input: { token: string; challenge: string }) => Promise<boolean>;
+  requireEnterpriseAuth?: boolean;
 }
 
 export interface RelayRuntime {
@@ -37,6 +39,9 @@ export function createRelayRuntime(options: RelayRuntimeOptions): RelayRuntime {
 
   function start(): void {
     if (transport) return;
+    if (options.requireEnterpriseAuth && !options.authenticateEnterprise) {
+      throw new Error("enterprise relay authentication verifier required");
+    }
     transport = startTransport({
       logger: options.logger,
       attachSocket: options.attachSocket,
@@ -44,6 +49,7 @@ export function createRelayRuntime(options: RelayRuntimeOptions): RelayRuntime {
       relayUseTls: config.useTls,
       serverId: options.serverId,
       daemonKeyPair: options.daemonKeyPair,
+      authenticateEnterprise: options.authenticateEnterprise,
     });
   }
 

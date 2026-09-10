@@ -2302,6 +2302,25 @@ export async function createPaseoDaemon(
                 },
                 serverId,
                 daemonKeyPair: daemonKeyPair.keyPair,
+                requireEnterpriseAuth: enterpriseAudit !== undefined,
+                authenticateEnterprise: enterpriseRuntime
+                  ? async ({ token }) => {
+                      productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit);
+                      const evidence = await enterpriseRuntime.admission.authenticateEvidence(
+                        token,
+                        {
+                          node: enterpriseRuntime.node,
+                          transport: "relay",
+                          peer: "external",
+                          remoteAddress: "relay",
+                          origin: "relay",
+                          userAgent: "relay",
+                        },
+                      );
+                      productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit);
+                      return evidence !== null;
+                    }
+                  : undefined,
               });
               requireStartAudit();
               registerConfigUnsubscribe(
