@@ -545,6 +545,7 @@ export interface PaseoDaemonDependencies {
   createEnterpriseWorkspaceFilesProvider?: (input: {
     workspaceRoots: FileBackedWorkspaceRegistry;
   }) => EnterpriseWorkspaceFilesProductionProvider | null;
+  createProductionBrowserLeaseBundle?: typeof createProductionBrowserLeaseBundle;
   createEnterpriseAdmissionRuntime?: (input: {
     config: EnterpriseMultiUserConfig;
     audit: ProductionAuditCapability;
@@ -796,6 +797,8 @@ export async function createPaseoDaemon(
       : Object.freeze(EnterpriseMultiUserSchema.parse(structuredClone(rawEnterpriseMultiUser)));
   const capturedFactory = dependencies.createEnterpriseAdmissionRuntime;
   const capturedIssue = dependencies.issueProductionAuditCapability;
+  const capturedBrowserLeaseBundleFactory =
+    dependencies.createProductionBrowserLeaseBundle ?? createProductionBrowserLeaseBundle;
   const serverId = getOrCreateServerId(capturedPaseoHome, { logger });
   if (capturedEnterpriseMultiUser?.enabled === true) {
     enterpriseRuntime = await resolveEnterpriseRuntime(
@@ -1383,7 +1386,7 @@ export async function createPaseoDaemon(
       if (!browserProfiles) {
         throw new Error("enterprise browser profile authority unavailable");
       }
-      const browserBundle = createProductionBrowserLeaseBundle({
+      const browserBundle = capturedBrowserLeaseBundleFactory({
         paseoHome: capturedPaseoHome,
         nodeId: enterpriseRuntime.node.nodeId,
         downloadBaseRoot: path.join(capturedPaseoHome, "enterprise", "browser", "profile-data"),
