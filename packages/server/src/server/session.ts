@@ -3740,6 +3740,16 @@ export class Session {
     return (await authorization.assertAgent(action, agentId)) !== null;
   }
 
+  private async assertLegacyWorkspaceResource(
+    action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
+    workspaceId: string,
+  ): Promise<boolean> {
+    if (!this.enterpriseContext) return true;
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return false;
+    return (await authorization.assertWorkspace(action, workspaceId)) !== null;
+  }
+
   private emitLegacyResourceDenied(requestId: string, requestType: string, source?: object): void {
     const message: SessionOutboundMessage = {
       type: "rpc_error",
@@ -4296,6 +4306,11 @@ export class Session {
       "session: workspace.title.set.request",
     );
 
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", workspaceId))) {
+      this.emitLegacyResourceDenied(requestId, "workspace.title.set.request");
+      return;
+    }
+
     try {
       const trimmed = title?.trim() ?? "";
       const nextTitle = trimmed.length === 0 ? null : trimmed;
@@ -4365,6 +4380,10 @@ export class Session {
   ): Promise<void> {
     const logContext = { workspaceId, pinned, requestId };
     this.sessionLogger.info(logContext, "session: workspace.pin.set.request");
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", workspaceId))) {
+      this.emitLegacyResourceDenied(requestId, "workspace.pin.set.request");
+      return;
+    }
     const emitResponse = (accepted: boolean, pinnedAt: string | null, error: string | null) => {
       this.emit({
         type: "workspace.pin.set.response",
@@ -4407,6 +4426,12 @@ export class Session {
   private async handleWorkspaceRecoveryInspectRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.inspect.request" }>,
   ): Promise<void> {
+    if (
+      !(await this.assertLegacyWorkspaceResource("workspace.content.read", request.workspaceId))
+    ) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     const state = await this.workspaceRecovery.inspect(request.workspaceId);
     this.emit({
       type: "workspace.recovery.inspect.response",
@@ -4420,6 +4445,10 @@ export class Session {
   private async handleWorkspaceRecoveryRestoreRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.restore.request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", request.workspaceId))) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     try {
       await this.restoreWorkspaceAndEmit(request.workspaceId);
       this.emit({
@@ -7754,6 +7783,12 @@ export class Session {
   private async handleWorkspaceSetupStatusRequest(
     request: Extract<SessionInboundMessage, { type: "workspace_setup_status_request" }>,
   ): Promise<void> {
+    if (
+      !(await this.assertLegacyWorkspaceResource("workspace.content.read", request.workspaceId))
+    ) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     return handleWorkspaceSetupStatusRequestMessage(
       {
         emit: (message) => this.emit(message),
@@ -7767,6 +7802,10 @@ export class Session {
   private async handleWorkspaceSetupRunRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.setup.run.request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", request.workspaceId))) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     return handleWorkspaceSetupRunRequestMessage(
       {
         getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
@@ -7799,6 +7838,10 @@ export class Session {
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", request.workspaceId))) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     try {
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
@@ -7869,6 +7912,14 @@ export class Session {
   ): Promise<void> {
     const { requestId, workspaceId } = request;
     const requestedWorkspaceIds = Array.isArray(workspaceId) ? workspaceId : [workspaceId];
+    if (this.enterpriseContext) {
+      for (const requestedWorkspaceId of requestedWorkspaceIds) {
+        if (!(await this.assertLegacyWorkspaceResource("workspace.write", requestedWorkspaceId))) {
+          this.emitLegacyResourceDenied(requestId, request.type);
+          return;
+        }
+      }
+    }
     let agents: AgentSnapshotPayload[];
     try {
       agents = await this.listAgentPayloads();
@@ -8004,6 +8055,10 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.mark_unread.request" }>,
   ): Promise<void> {
     const { requestId, workspaceId } = request;
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", workspaceId))) {
+      this.emitLegacyResourceDenied(requestId, request.type);
+      return;
+    }
     let markedAgentId: string | null = null;
     try {
       const workspace = await this.workspaceRegistry.get(workspaceId);

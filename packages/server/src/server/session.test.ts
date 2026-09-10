@@ -1085,6 +1085,7 @@ async function createBinaryAuthorizationFixture(
       },
     },
   ],
+  permissions: readonly DaemonPermission[] = ["workspace.read", "hub.execute"],
 ) {
   if (process.platform !== "darwin") throw new Error("Darwin authorization fixture unavailable");
   const context = enterpriseContext(`generation-${name}`, {
@@ -1130,7 +1131,7 @@ async function createBinaryAuthorizationFixture(
     ownerPrincipalId: resolved.principal.principalId,
     createdByPrincipalId: resolved.principal.principalId,
   });
-  const sessionAuthorization = new SessionAuthorization(["workspace.read", "hub.execute"]);
+  const sessionAuthorization = new SessionAuthorization(permissions);
   const sessionId = `session-${name}`;
   const authorityState = new MemoryAuthorityReceiptState();
   const runtime = await createEnterpriseAuthorizationRuntime({
@@ -8299,6 +8300,112 @@ describe("enterprise dispatcher integration seam", () => {
       },
     });
     expect(messages).toEqual([]);
+    await session.cleanup();
+  });
+
+  test("enterprise workspace mutations enforce the current point owner before registry effects", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture(
+      "workspace-mutation-guard",
+      [
+        {
+          action: "workspace.write",
+          selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+        },
+      ],
+      ["workspace.manage", "hub.execute"],
+    );
+    const context = fixture.enterpriseSessionContext;
+    fixture.owners.registerWorkspace({
+      id: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: context.principal.organizationId,
+      nodeId: context.node.nodeId,
+      ownerPrincipalId: context.principal.principalId,
+      createdByPrincipalId: context.principal.principalId,
+    });
+    const workspace = {
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: context.principal.organizationId,
+      nodeId: context.node.nodeId,
+      ownerPrincipalId: context.principal.principalId,
+      createdByPrincipalId: context.principal.principalId,
+      projectId: "project-mutation",
+      cwd: "/tmp/workspace-mutation",
+      kind: "directory" as const,
+      displayName: "mutation",
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const update = vi.fn(async () => workspace);
+    const get = vi.fn(async () => null);
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      workspaceRegistry: {
+        get,
+        list: vi.fn(async () => [workspace]),
+        update,
+      },
+    });
+
+    await session.handleMessage({
+      type: "workspace.title.set.request",
+      workspaceId: workspace.workspaceId,
+      title: "renamed",
+      requestId: "workspace-title-allowed",
+    });
+    expect(update).toHaveBeenCalledTimes(1);
+
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: "wks_bbbbbbbbbbbbbbbb",
+      requestId: "workspace-archive-foreign",
+    });
+    expect(get).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "workspace-archive-foreign",
+        requestType: "archive_workspace_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+
+    await fixture.runtime.release();
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "workspace-archive-stale",
+    });
+    expect(get).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "workspace-archive-stale",
+        requestType: "archive_workspace_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
     await session.cleanup();
   });
 
