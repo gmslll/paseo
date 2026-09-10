@@ -49,6 +49,7 @@ import {
   type EnterpriseSessionDispatcherFactoryRegistration,
   type EnterpriseDispatcherLease,
   type EnterpriseDispatchContext,
+  type EnterpriseDispatchResponse,
 } from "./session/enterprise-dispatcher.js";
 import type {
   TerminalManager,
@@ -535,6 +536,12 @@ interface WorkspaceUpdatesSubscriptionState {
   pendingUpdatesByWorkspaceId: Map<string, WorkspaceUpdatePayload>;
   lastEmittedByWorkspaceId: Map<string, WorkspaceUpdatePayload>;
   visibleEmptyProjectIds?: Set<string>;
+  excludedWorkspaceIds: Set<string>;
+}
+
+interface WorkspacePublicationFence {
+  readonly workspaceId: string;
+  readonly generation: number;
 }
 
 class SessionRequestError extends Error {
@@ -906,6 +913,7 @@ export class Session {
   private isCleanedUp = false;
   private viewedTimelineAgentIds = new Set<string>();
   private readonly viewedTimelineAgentIdsBySource = new Map<object, Set<string>>();
+  private readonly viewedTimelineWorkspaceIdByAgentId = new Map<string, string>();
   private readonly clientCapabilitiesBySource = new Map<object, ReadonlySet<ClientCapability>>();
   private readonly defaultTimelineSubscriptionSource = {};
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
@@ -923,6 +931,7 @@ export class Session {
   private readonly defaultEventSubscriptionSource = {};
   private readonly eventSubscriptions = new Map<object, Set<SessionEventSubscription>>();
   private readonly workspaceUpdateTails = new Map<string, Promise<void>>();
+  private readonly workspacePublicationGenerations = new Map<string, number>();
   private clientActivity: {
     deviceType: "web" | "mobile";
     focusedAgentId: string | null;
@@ -1674,6 +1683,7 @@ export class Session {
     if (!source && !this.supports(CLIENT_CAPS.selectiveAgentTimeline)) {
       this.viewedTimelineAgentIdsBySource.clear();
       this.viewedTimelineAgentIds.clear();
+      this.viewedTimelineWorkspaceIdByAgentId.clear();
     }
   }
 
@@ -1682,14 +1692,23 @@ export class Session {
     this.eventSubscriptions.delete(source);
     if (this.viewedTimelineAgentIdsBySource.delete(source)) {
       this.rebuildViewedTimelineAgentIds();
+      this.pruneViewedTimelineWorkspaceIds();
     }
   }
 
-  private replaceAgentTimelineSubscription(source: object | undefined, agentIds: string[]): void {
+  private replaceAgentTimelineSubscription(
+    source: object | undefined,
+    agentIds: string[],
+    workspaceIdByAgentId?: ReadonlyMap<string, string>,
+  ): void {
     const subscriptionSource = source ?? this.defaultTimelineSubscriptionSource;
     if (agentIds.length === 0) this.viewedTimelineAgentIdsBySource.delete(subscriptionSource);
     else this.viewedTimelineAgentIdsBySource.set(subscriptionSource, new Set(agentIds));
     this.rebuildViewedTimelineAgentIds();
+    for (const [agentId, workspaceId] of workspaceIdByAgentId ?? []) {
+      this.viewedTimelineWorkspaceIdByAgentId.set(agentId, workspaceId);
+    }
+    this.pruneViewedTimelineWorkspaceIds();
   }
 
   private async handleAgentTimelineSubscriptionRequest(
@@ -1697,12 +1716,18 @@ export class Session {
     source?: object,
   ): Promise<void> {
     const agentIds = [...new Set(msg.agentIds)].sort();
+    const workspaceIdByAgentId = new Map<string, string>();
     if (this.enterpriseContext) {
       for (const agentId of agentIds) {
-        if (!(await this.assertLegacyAgentResource("workspace.content.read", agentId))) {
+        const canonical = await this.resolveEnterpriseLegacyAgentResource(
+          "workspace.content.read",
+          agentId,
+        );
+        if (!canonical) {
           this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
           return;
         }
+        workspaceIdByAgentId.set(canonical.agentId, canonical.workspaceId);
       }
     }
     if (
@@ -1710,7 +1735,7 @@ export class Session {
         ? this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source)
         : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
     ) {
-      this.replaceAgentTimelineSubscription(source, agentIds);
+      this.replaceAgentTimelineSubscription(source, agentIds, workspaceIdByAgentId);
     }
     const response: SessionOutboundMessage = {
       type: "agent.timeline.set_subscription.response",
@@ -1726,6 +1751,14 @@ export class Session {
       for (const agentId of agentIds) viewedAgentIds.add(agentId);
     }
     this.viewedTimelineAgentIds = viewedAgentIds;
+  }
+
+  private pruneViewedTimelineWorkspaceIds(): void {
+    for (const agentId of this.viewedTimelineWorkspaceIdByAgentId.keys()) {
+      if (!this.viewedTimelineAgentIds.has(agentId)) {
+        this.viewedTimelineWorkspaceIdByAgentId.delete(agentId);
+      }
+    }
   }
 
   private usesSelectiveTimelineDelivery(): boolean {
@@ -1930,7 +1963,14 @@ export class Session {
   }
 
   async syncWorkspaceGitObserverForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
+    if (this.workspaceUpdatesSubscription?.excludedWorkspaceIds.has(workspace.workspaceId)) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspace.workspaceId);
+      return;
+    }
     await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+    if (this.workspaceUpdatesSubscription?.excludedWorkspaceIds.has(workspace.workspaceId)) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspace.workspaceId);
+    }
   }
 
   async emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void> {
@@ -1981,7 +2021,7 @@ export class Session {
       Array.from(new Set(workspaceIds)).map(async (workspaceId) => {
         const workspace = await this.workspaceRegistry.get(workspaceId);
         if (workspace && !workspace.archivedAt) {
-          await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+          await this.syncWorkspaceGitObserverForWorkspace(workspace);
         }
       }),
     );
@@ -2217,7 +2257,11 @@ export class Session {
 
   private async syncWorkspaceMutationObserver(mutation: WorkspaceMutation): Promise<void> {
     const subscription = this.workspaceUpdatesSubscription;
-    if (!mutation.workspace || !subscription) {
+    if (
+      !mutation.workspace ||
+      !subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId)
+    ) {
       return;
     }
     const descriptorsByWorkspaceId = await this.buildWorkspaceDescriptorMap({
@@ -2226,6 +2270,8 @@ export class Session {
     });
     const descriptor = descriptorsByWorkspaceId.get(mutation.workspaceId);
     if (
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId) ||
       !descriptor ||
       !this.matchesWorkspaceFilter({ workspace: descriptor, filter: subscription.filter })
     ) {
@@ -2233,12 +2279,21 @@ export class Session {
       return;
     }
     const currentWorkspace = await this.workspaceRegistry.get(mutation.workspaceId);
-    if (!currentWorkspace || currentWorkspace.archivedAt) {
+    if (
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId) ||
+      !currentWorkspace ||
+      currentWorkspace.archivedAt
+    ) {
       this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
       return;
     }
     await this.workspaceGitObserver.syncObserverForWorkspace(currentWorkspace);
-    if (this.isCleanedUp) {
+    if (
+      this.isCleanedUp ||
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId)
+    ) {
       this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
     }
   }
@@ -2937,7 +2992,7 @@ export class Session {
                 });
                 // oxlint-disable-next-line max-depth -- contextual response remains inside receipt transaction.
                 if (!contextual) throw new Error("Enterprise response unavailable");
-                this.emit(contextual.response, contextual.authorizationContext);
+                await this.emitEnterpriseDispatcherResponse(msg, contextual);
               }
               return;
             }
@@ -4066,9 +4121,108 @@ export class Session {
     agentId: string,
   ): Promise<boolean> {
     if (!this.enterpriseContext) return true;
+    return (await this.resolveEnterpriseLegacyAgentResource(action, agentId)) !== null;
+  }
+
+  private async resolveEnterpriseLegacyAgentResource(
+    action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
+    agentId: string,
+  ): Promise<AgentUpdatePublicationScope | null> {
     const authorization = this.enterpriseLegacyResourceAuthorization;
-    if (!authorization || !authorization.isCurrent()) return false;
-    return (await authorization.assertAgent(action, agentId)) !== null;
+    if (!authorization || !authorization.isCurrent()) return null;
+    const canonical = await authorization.assertAgent(action, agentId);
+    if (!canonical || canonical.agentId !== agentId || !authorization.isCurrent()) return null;
+    return Object.freeze({ agentId: canonical.agentId, workspaceId: canonical.workspaceId });
+  }
+
+  private successfulOwnershipTransferWorkspaceId(
+    request: SessionInboundMessage,
+    contextual: EnterpriseDispatchResponse,
+  ): string | null {
+    if (
+      !this.enterpriseContext ||
+      request.type !== "enterprise.resource.ownership.transfer.request" ||
+      contextual.receiptClassification !== "authority" ||
+      contextual.authorizationContext !== undefined ||
+      contextual.response.type !== "enterprise.resource.ownership.transfer.response"
+    ) {
+      return null;
+    }
+    const resource = request.resource;
+    const response = contextual.response.payload;
+    if (
+      resource.resourceKind !== "workspace" ||
+      resource.organizationId !== this.enterpriseContext.principal.organizationId ||
+      resource.nodeId !== this.enterpriseContext.node.nodeId ||
+      request.expectedOwnerPrincipalId !== this.enterpriseContext.principal.principalId ||
+      response.requestId !== request.requestId ||
+      response.ownerPrincipalId !== request.newPrincipalId ||
+      response.resource.resourceKind !== "workspace" ||
+      response.resource.organizationId !== resource.organizationId ||
+      response.resource.nodeId !== resource.nodeId ||
+      response.resource.localResourceId !== resource.localResourceId
+    ) {
+      return null;
+    }
+    return resource.localResourceId;
+  }
+
+  private async emitEnterpriseDispatcherResponse(
+    request: SessionInboundMessage,
+    contextual: EnterpriseDispatchResponse,
+  ): Promise<void> {
+    const transferredWorkspaceId = this.successfulOwnershipTransferWorkspaceId(request, contextual);
+    if (
+      request.type === "enterprise.resource.ownership.transfer.request" &&
+      !transferredWorkspaceId
+    ) {
+      throw new Error("Enterprise ownership transfer response unavailable");
+    }
+    if (!transferredWorkspaceId) {
+      this.emit(contextual.response, contextual.authorizationContext);
+      return;
+    }
+    try {
+      await this.enqueueAuthorizedEmit(contextual.response, contextual.authorizationContext);
+    } finally {
+      this.invalidateTransferredWorkspaceScope(transferredWorkspaceId);
+    }
+  }
+
+  private invalidateTransferredWorkspaceScope(workspaceId: string): void {
+    this.workspacePublicationGenerations.set(
+      workspaceId,
+      (this.workspacePublicationGenerations.get(workspaceId) ?? 0) + 1,
+    );
+
+    const workspaceSubscription = this.workspaceUpdatesSubscription;
+    if (workspaceSubscription) {
+      workspaceSubscription.excludedWorkspaceIds.add(workspaceId);
+      workspaceSubscription.pendingUpdatesByWorkspaceId.delete(workspaceId);
+      workspaceSubscription.lastEmittedByWorkspaceId.delete(workspaceId);
+    }
+    this.workspaceUpdateTails.delete(workspaceId);
+    this.agentUpdates.invalidateWorkspace(workspaceId);
+
+    for (const agentIds of this.viewedTimelineAgentIdsBySource.values()) {
+      for (const agentId of agentIds) {
+        if (this.viewedTimelineWorkspaceIdByAgentId.get(agentId) === workspaceId) {
+          agentIds.delete(agentId);
+          this.viewedTimelineWorkspaceIdByAgentId.delete(agentId);
+        }
+      }
+    }
+    this.rebuildViewedTimelineAgentIds();
+    this.pruneViewedTimelineWorkspaceIds();
+
+    try {
+      this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+    } catch (error) {
+      this.sessionLogger.warn(
+        { err: error, workspaceId },
+        "Failed to remove transferred workspace observer",
+      );
+    }
   }
 
   private async authorizeCurrentAgentEventPublication(
@@ -6649,10 +6803,25 @@ export class Session {
     }
   }
 
+  private workspaceEntriesVisibleToGitObserver(
+    entries: FetchWorkspacesResponseEntry[],
+  ): FetchWorkspacesResponseEntry[] {
+    const excludedWorkspaceIds = this.workspaceUpdatesSubscription?.excludedWorkspaceIds;
+    if (!excludedWorkspaceIds) return entries;
+    return entries.filter((entry) => !excludedWorkspaceIds.has(entry.id));
+  }
+
   private bufferOrEmitWorkspaceUpdate(
     subscription: WorkspaceUpdatesSubscriptionState,
     payload: WorkspaceUpdatePayload,
   ): void {
+    const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
+    if (
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(workspaceId)
+    ) {
+      return;
+    }
     if (payload.kind === "upsert") {
       subscription.visibleEmptyProjectIds?.delete(payload.workspace.projectId);
     } else {
@@ -6664,11 +6833,9 @@ export class Session {
       }
     }
     if (subscription.isBootstrapping) {
-      const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
       subscription.pendingUpdatesByWorkspaceId.set(workspaceId, payload);
       return;
     }
-    const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
     subscription.lastEmittedByWorkspaceId.set(workspaceId, payload);
     this.emit(
       {
@@ -6695,6 +6862,8 @@ export class Session {
     subscription.pendingUpdatesByWorkspaceId.clear();
 
     for (const payload of pending) {
+      const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
       if (payload.kind === "upsert") {
         const snapshot = options?.snapshotByWorkspaceId?.get(payload.workspace.id);
         const updateActivityAtMs = payload.workspace.activityAt
@@ -6718,7 +6887,6 @@ export class Session {
           continue;
         }
       }
-      const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
       subscription.lastEmittedByWorkspaceId.set(workspaceId, payload);
       this.emit(
         {
@@ -6870,6 +7038,11 @@ export class Session {
     }
 
     const uniqueWorkspaceIds = new Set(Array.from(workspaceIds));
+    for (const workspaceId of uniqueWorkspaceIds) {
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) {
+        uniqueWorkspaceIds.delete(workspaceId);
+      }
+    }
     if (uniqueWorkspaceIds.size === 0) {
       return;
     }
@@ -6903,6 +7076,7 @@ export class Session {
     return next;
   }
 
+  // oxlint-disable-next-line complexity -- subscription, transfer, filter, and dedupe fences remain adjacent to publication.
   private async emitWorkspaceUpdateBatch(
     workspaceIds: ReadonlySet<string>,
     subscription: WorkspaceUpdatesSubscriptionState,
@@ -6921,6 +7095,7 @@ export class Session {
       if (this.workspaceUpdatesSubscription !== subscription) {
         return;
       }
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
       const workspace = descriptorsByWorkspaceId.get(workspaceId);
       const filteredWorkspace =
         workspace && this.matchesWorkspaceFilter({ workspace, filter: subscription.filter })
@@ -6945,6 +7120,7 @@ export class Session {
         if (this.workspaceUpdatesSubscription !== subscription) {
           return;
         }
+        if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
         subscription.lastEmittedByWorkspaceId.delete(workspaceId);
         const removePayload = await this.buildWorkspaceRemoveUpdatePayload(
           workspaceId,
@@ -6977,6 +7153,7 @@ export class Session {
         continue;
       }
 
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
       this.bufferOrEmitWorkspaceUpdate(subscription, nextPayload);
     }
   }
@@ -7247,13 +7424,16 @@ export class Session {
           pendingUpdatesByWorkspaceId: new Map(),
           lastEmittedByWorkspaceId: new Map(),
           visibleEmptyProjectIds: new Set(),
+          excludedWorkspaceIds: new Set(),
         };
       }
 
       const payload = request.sync
         ? await this.readWorkspaceDirectorySync(request)
         : await this.listFetchWorkspacesEntries(request);
-      this.workspaceGitObserver.syncObservers(payload.entries);
+      this.workspaceGitObserver.syncObservers(
+        this.workspaceEntriesVisibleToGitObserver(payload.entries),
+      );
       this.sessionLogger.debug(
         {
           requestId: request.requestId,
@@ -7563,6 +7743,7 @@ export class Session {
     if (subscriptionId && subscription.subscriptionId !== subscriptionId) return;
     if (!subscriptionId && !equal(subscription.filter, filter)) return;
     for (const entry of entries) {
+      if (subscription.excludedWorkspaceIds.has(entry.id)) continue;
       subscription.lastEmittedByWorkspaceId.set(entry.id, {
         kind: "upsert",
         workspace: entry,
@@ -9713,6 +9894,7 @@ export class Session {
     } catch {
       return Promise.resolve(false);
     }
+    const workspaceFence = this.captureWorkspacePublicationFence(authorizationContext);
     const requestId = this.outboundRequestId(event);
     const previous = requestId
       ? (this.outboundEmissionTailsByRequest.get(requestId) ?? Promise.resolve())
@@ -9720,7 +9902,12 @@ export class Session {
     const task = previous
       .catch(() => undefined)
       .then(async () => {
-        if (!this.enterpriseContext || this.isCleanedUp || this.authoritySubsystemFailed)
+        if (
+          !this.enterpriseContext ||
+          this.isCleanedUp ||
+          this.authoritySubsystemFailed ||
+          !this.isWorkspacePublicationFenceCurrent(workspaceFence)
+        )
           return false;
         let resolvedContext: OutboundAuthorizationContext | undefined = authorizationContext;
         if (!resolvedContext) {
@@ -9767,7 +9954,8 @@ export class Session {
           allowedByResourceAuthorization ||
           (this.isEnterpriseLegacyResourceCurrent() &&
             isSafeEmptyLegacyDirectoryResponse(event, resolvedContext));
-        if (allowed && !this.isCleanedUp) return this.deliverForSource(event, source);
+        if (allowed && !this.isCleanedUp && this.isWorkspacePublicationFenceCurrent(workspaceFence))
+          return this.deliverForSource(event, source);
         return false;
       })
       .catch((error) => {
@@ -9798,6 +9986,32 @@ export class Session {
       if (current?.size === 0) this.outboundEmissionTasksByRequest.delete(requestId);
     });
     return task;
+  }
+
+  private captureWorkspacePublicationFence(
+    context: OutboundAuthorizationContext | undefined,
+  ): readonly WorkspacePublicationFence[] {
+    if (context?.kind !== "resources") return [];
+    const workspaceIds = new Set(
+      context.resources.flatMap((resource) =>
+        resource.resourceKind === "workspace" ? [resource.localResourceId] : [],
+      ),
+    );
+    return Object.freeze(
+      Array.from(workspaceIds, (workspaceId) =>
+        Object.freeze({
+          workspaceId,
+          generation: this.workspacePublicationGenerations.get(workspaceId) ?? 0,
+        }),
+      ),
+    );
+  }
+
+  private isWorkspacePublicationFenceCurrent(fence: readonly WorkspacePublicationFence[]): boolean {
+    return fence.every(
+      ({ workspaceId, generation }) =>
+        (this.workspacePublicationGenerations.get(workspaceId) ?? 0) === generation,
+    );
   }
 
   private async flushOutboundEmissionTasks(requestId: string): Promise<void> {

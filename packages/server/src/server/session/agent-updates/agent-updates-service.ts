@@ -19,7 +19,11 @@ interface AgentUpdatesSubscriptionState {
   syncEnabled?: boolean;
   filter?: AgentUpdatesFilter;
   isBootstrapping: boolean;
-  pendingUpdatesByAgentId: Map<string, AgentUpdatePayload>;
+  pendingUpdatesByAgentId: Map<
+    string,
+    { payload: AgentUpdatePayload; workspaceId: string | undefined }
+  >;
+  excludedWorkspaceIds: Set<string>;
 }
 
 export interface AgentUpdatePublicationScope {
@@ -53,6 +57,8 @@ export interface AgentUpdatesService {
     options?: { snapshotUpdatedAtByAgentId?: Map<string, number> },
   ): Promise<void>;
   clearSubscription(subscriptionId: string): void;
+  /** Invalidate one transferred workspace without disturbing other subscribed workspaces. */
+  invalidateWorkspace(workspaceId: string): void;
   hasSubscription(): boolean;
   includesLiveAgent(agent: ManagedAgent): Promise<boolean>;
   forwardLiveAgent(agent: ManagedAgent): Promise<void>;
@@ -191,11 +197,14 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     scope?: AgentUpdatePublicationScope,
   ): void | Promise<unknown> {
     if (sealed || subscription !== sub) return;
+    const workspaceId =
+      scope?.workspaceId ?? (payload.kind === "upsert" ? payload.agent.workspaceId : undefined);
+    if (workspaceId && sub.excludedWorkspaceIds.has(workspaceId)) return;
     if (payload.kind === "upsert" && !deps.isProviderVisibleToClient(payload.agent.provider)) {
       return;
     }
     if (sub.isBootstrapping) {
-      sub.pendingUpdatesByAgentId.set(agentUpdateTargetId(payload), payload);
+      sub.pendingUpdatesByAgentId.set(agentUpdateTargetId(payload), { payload, workspaceId });
       return;
     }
 
@@ -245,6 +254,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
       filter: input.filter,
       isBootstrapping: true,
       pendingUpdatesByAgentId: new Map(),
+      excludedWorkspaceIds: new Set(),
     };
   }
 
@@ -267,7 +277,8 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     activeSubscription.pendingUpdatesByAgentId.clear();
 
     if (!deps.authorizeAgentId) {
-      for (const payload of pending) {
+      for (const { payload, workspaceId } of pending) {
+        if (workspaceId && activeSubscription.excludedWorkspaceIds.has(workspaceId)) continue;
         if (shouldSkipBufferedUpsert(payload, options)) continue;
         if (sealed || subscription !== activeSubscription) break;
         bufferOrEmit(activeSubscription, payload);
@@ -276,12 +287,19 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     }
 
     const flush = (async () => {
-      for (const payload of pending) {
+      for (const { payload, workspaceId } of pending) {
+        if (workspaceId && activeSubscription.excludedWorkspaceIds.has(workspaceId)) continue;
         if (shouldSkipBufferedUpsert(payload, options)) continue;
         const agentId = agentUpdateTargetId(payload);
         try {
           const scope = await currentScope(agentId);
-          if (scope === null || sealed || subscription !== activeSubscription) continue;
+          if (
+            scope === null ||
+            sealed ||
+            subscription !== activeSubscription ||
+            (scope && activeSubscription.excludedWorkspaceIds.has(scope.workspaceId))
+          )
+            continue;
           await bufferOrEmit(activeSubscription, payload, scope);
         } catch (error) {
           logPublicationFailure(error, agentId);
@@ -313,21 +331,37 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     }
   }
 
+  function invalidateWorkspace(workspaceId: string): void {
+    const activeSubscription = subscription;
+    if (sealed || !activeSubscription || activeSubscription.excludedWorkspaceIds.has(workspaceId)) {
+      return;
+    }
+    activeSubscription.excludedWorkspaceIds.add(workspaceId);
+    for (const [agentId, pending] of activeSubscription.pendingUpdatesByAgentId) {
+      if (pending.workspaceId === workspaceId) {
+        activeSubscription.pendingUpdatesByAgentId.delete(agentId);
+      }
+    }
+  }
+
   function hasSubscription(): boolean {
     return subscription !== null;
   }
 
+  // oxlint-disable-next-line complexity -- every async projection boundary rechecks the transferred-workspace fence.
   async function includesLiveAgent(agent: ManagedAgent): Promise<boolean> {
     const activeSubscription = subscription;
     if (sealed || !activeSubscription) return false;
 
     let scope = await currentScope(agent.id);
     if (scope === null) return false;
+    if (scope && activeSubscription.excludedWorkspaceIds.has(scope.workspaceId)) return false;
     const payload = await deps.enrichAgentPayload(toAgentPayload(agent));
     scope = await currentScope(agent.id);
     if (
       scope === null ||
       subscription !== activeSubscription ||
+      (scope && activeSubscription.excludedWorkspaceIds.has(scope.workspaceId)) ||
       !deps.isProviderVisibleToClient(payload.provider) ||
       (scope && payload.workspaceId !== scope.workspaceId)
     ) {
@@ -341,6 +375,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     return (
       scope !== null &&
       (!scope || payload.workspaceId === scope.workspaceId) &&
+      (!scope || !activeSubscription.excludedWorkspaceIds.has(scope.workspaceId)) &&
       subscription === activeSubscription &&
       project !== null &&
       matchesAgentUpdatesFilter({
@@ -357,7 +392,13 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
       const sub = subscription;
       if (sealed || !sub) return;
       let scope = await currentScope(payload.id);
-      if (scope === null || (scope && payload.workspaceId !== scope.workspaceId)) return;
+      if (
+        scope === null ||
+        (scope &&
+          (payload.workspaceId !== scope.workspaceId ||
+            sub.excludedWorkspaceIds.has(scope.workspaceId)))
+      )
+        return;
       const workspaceId = scope?.workspaceId ?? payload.workspaceId;
       const project = workspaceId
         ? await deps.buildProjectPlacementForWorkspaceId(workspaceId)
@@ -367,6 +408,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
         scope === null ||
         sealed ||
         subscription !== sub ||
+        (scope && sub.excludedWorkspaceIds.has(scope.workspaceId)) ||
         (scope && payload.workspaceId !== scope.workspaceId)
       ) {
         return;
@@ -413,16 +455,23 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     const sub = subscription;
     let scope = await currentScope(payload.id);
     if (scope === null) return;
+    if (scope && sub?.excludedWorkspaceIds.has(scope.workspaceId)) return;
     payload = await deps.enrichAgentPayload(payload);
     scope = await currentScope(payload.id);
-    if (scope === null || (scope && payload.workspaceId !== scope.workspaceId)) return;
+    if (
+      scope === null ||
+      (scope &&
+        (payload.workspaceId !== scope.workspaceId ||
+          sub?.excludedWorkspaceIds.has(scope.workspaceId)))
+    )
+      return;
     if (sub) await emitSubscribedLiveAgentUpdate(sub, payload, scope);
 
     // A lifecycle change updates exactly the canonical owning workspace, never
     // every workspace sharing its cwd.
     scope = await currentScope(payload.id);
     const workspaceId = scope?.workspaceId ?? payload.workspaceId;
-    if (scope !== null && !sealed && workspaceId) {
+    if (scope !== null && !sealed && workspaceId && !sub?.excludedWorkspaceIds.has(workspaceId)) {
       await deps.emitWorkspaceUpdateForWorkspaceId(workspaceId);
     }
   }
@@ -441,6 +490,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
       scope === null ||
       sealed ||
       subscription !== sub ||
+      (scope && sub.excludedWorkspaceIds.has(scope.workspaceId)) ||
       (scope && payload.workspaceId !== scope.workspaceId)
     ) {
       return;
@@ -532,6 +582,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     beginSubscription,
     flushBootstrapped,
     clearSubscription,
+    invalidateWorkspace,
     hasSubscription,
     includesLiveAgent,
     forwardLiveAgent,
