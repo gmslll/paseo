@@ -9,6 +9,17 @@ import {
 } from "@getpaseo/protocol/messages";
 import { EnterprisePrincipalAuthenticator } from "./authenticator.js";
 import { IdentityRegistry, type IdentityRegistryOptions } from "./registry.js";
+import {
+  bindEnterpriseAdmissionSession,
+  createEnterpriseAdmissionAuthorizationIssuer,
+  issueEnterpriseAdmissionEvidence,
+  releaseEnterpriseAdmissionSession,
+  replaceEnterpriseAdmissionSession,
+  type EnterpriseAdmissionAuthenticationEvidence,
+  type EnterpriseAdmissionAuthorizationHandle,
+  type EnterpriseAdmissionAuthorizationIssuer,
+  snapshotEnterpriseConnectionContext,
+} from "./admission-authorization.js";
 
 export interface EnterpriseAdmissionOptions extends Omit<
   IdentityRegistryOptions,
@@ -30,6 +41,8 @@ function cloneFreeze<T>(value: T): T {
 /** W1-owned singleton identity/admission seam. It never constructs a Session. */
 export class EnterpriseAdmission {
   readonly audit: ProductionAuditCapability;
+  readonly node: NodeContext;
+  readonly authorizationIssuer: EnterpriseAdmissionAuthorizationIssuer;
   readonly registry: IdentityRegistry;
   readonly authenticator: EnterprisePrincipalAuthenticator;
   constructor(options: EnterpriseAdmissionOptions) {
@@ -38,6 +51,16 @@ export class EnterpriseAdmission {
     const filePath = options.filePath;
     const principalSource = options.principalSource;
     const node = Object.freeze(NodeContextSchema.parse(options.node));
+    const mintSecret = Object.freeze(Object.create(null)) as object;
+    const authorizationIssuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret, () => {
+      try {
+        productionAuditCapabilityIssuer.requireCurrent(audit);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    admissionMintSecrets.set(this, mintSecret);
     const organizationId = OrganizationIdSchema.parse(options.organizationId);
     const invalidation = options.invalidation;
     const clock = options.clock;
@@ -69,12 +92,75 @@ export class EnterpriseAdmission {
       audit,
       daemonPassword,
     });
+    this.node = node;
+    this.authorizationIssuer = authorizationIssuer;
     productionAuditCapabilityIssuer.requireCurrent(audit);
     Object.freeze(this);
   }
   authenticate(token: string, context: ConnectionContext): Promise<PrincipalContext | null> {
     productionAuditCapabilityIssuer.requireCurrent(this.audit);
     return this.authenticateImpl(token, context);
+  }
+
+  authenticateEvidence(
+    token: string,
+    context: ConnectionContext,
+  ): Promise<EnterpriseAdmissionAuthenticationEvidence | null> {
+    productionAuditCapabilityIssuer.requireCurrent(this.audit);
+    return this.authenticateEvidenceImpl(token, context);
+  }
+
+  private async authenticateEvidenceImpl(
+    token: string,
+    context: ConnectionContext,
+  ): Promise<EnterpriseAdmissionAuthenticationEvidence | null> {
+    let canonicalContext: ConnectionContext;
+    try {
+      canonicalContext =
+        snapshotEnterpriseConnectionContext(context) ??
+        (() => {
+          throw new Error("invalid connection context");
+        })();
+    } catch {
+      return null;
+    }
+    const principal = await this.authenticateImpl(token, canonicalContext);
+    if (!principal) return null;
+    productionAuditCapabilityIssuer.requireCurrent(this.audit);
+    return issueEnterpriseAdmissionEvidence(
+      this.authorizationIssuer,
+      admissionMintSecrets.get(this)!,
+      principal,
+      this.node,
+      canonicalContext,
+    );
+  }
+
+  bindSession(
+    evidence: EnterpriseAdmissionAuthenticationEvidence,
+    clientId: unknown,
+  ): EnterpriseAdmissionAuthorizationHandle | null {
+    productionAuditCapabilityIssuer.requireCurrent(this.audit);
+    return bindEnterpriseAdmissionSession(this.authorizationIssuer, evidence, clientId);
+  }
+
+  replaceSession(
+    oldHandle: EnterpriseAdmissionAuthorizationHandle,
+    evidence: EnterpriseAdmissionAuthenticationEvidence,
+    clientId: unknown,
+  ): EnterpriseAdmissionAuthorizationHandle | null {
+    productionAuditCapabilityIssuer.requireCurrent(this.audit);
+    return replaceEnterpriseAdmissionSession(
+      this.authorizationIssuer,
+      oldHandle,
+      evidence,
+      clientId,
+    );
+  }
+
+  releaseSession(handle: EnterpriseAdmissionAuthorizationHandle): boolean {
+    productionAuditCapabilityIssuer.requireCurrent(this.audit);
+    return releaseEnterpriseAdmissionSession(this.authorizationIssuer, handle);
   }
 
   private async authenticateImpl(
@@ -115,3 +201,5 @@ export class EnterpriseAdmission {
     return true;
   }
 }
+
+const admissionMintSecrets = new WeakMap<EnterpriseAdmission, object>();

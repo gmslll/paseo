@@ -10,6 +10,7 @@ import type { OutboundAuthorityEmissionStatePort } from "../access/outbound-auth
 import type { PrincipalGrantVersionGuard } from "../access/resource-authorization.js";
 import type { PrincipalContext } from "@getpaseo/protocol/messages";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
+import type { EnterpriseAdmissionAuthenticationEvidence } from "./admission-authorization.js";
 
 export interface EnterpriseAdmissionPort {
   readonly audit: ProductionAuditCapability;
@@ -19,6 +20,10 @@ export interface EnterpriseAdmissionPort {
     isCurrentPrincipalContext(principal: PrincipalContext): Promise<boolean>;
   };
   authenticate(token: string, connection: ConnectionContext): Promise<PrincipalContext | null>;
+  authenticateEvidence(
+    token: string,
+    connection: ConnectionContext,
+  ): Promise<EnterpriseAdmissionAuthenticationEvidence | null>;
   isCurrentPrincipalContext(principal: PrincipalContext): Promise<boolean>;
 }
 export type EnterpriseAuthorityReceiptState = AuthoritySessionBindingLifecycle &

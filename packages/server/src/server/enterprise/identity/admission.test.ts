@@ -10,6 +10,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { EnterpriseAdmission } from "./admission.js";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
 import { productionAuditCapabilityIssuer } from "../audit/production-audit-runtime.js";
+import {
+  isCurrentEnterpriseAdmissionAuthorization,
+  resolveCurrentEnterpriseAdmissionAuthorization,
+} from "./admission-authorization.js";
 import { nodeIdentityRegistryFs } from "./fs-port.js";
 interface AuthStub {
   authenticateBearer: (token: string, context: unknown) => Promise<unknown>;
@@ -301,6 +305,41 @@ describe.runIf(process.platform === "darwin")("EnterpriseAdmission with producti
     expect(() => {
       (captured as { transport: string }).transport = "relay";
     }).toThrow();
+  });
+
+  test("authenticateEvidence keeps a frozen context across deferred caller mutation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-evidence-context-"));
+    const admission = new EnterpriseAdmission({
+      ...base(await issueAudit(root)),
+      filePath: path.join(root, "credentials.json"),
+    });
+    const principal = {
+      principalType: "human" as const,
+      principalId: "usr_0123456789abcdef",
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef01234567",
+      grantVersion: "1",
+      grants: [],
+    };
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => (entered = resolve));
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    (admission.authenticator as unknown as AuthStub).authenticateBearer = async () => {
+      entered();
+      await gate;
+      return principal;
+    };
+    (admission.authenticator as unknown as GuardStub).isCurrentPrincipalContext = async () => true;
+    const context = { node: { ...node }, transport: "direct" as const, peer: "loopback" as const };
+    const pending = admission.authenticateEvidence("token", context);
+    await started;
+    context.node.nodeId = "mutated";
+    (context as { cycle?: unknown }).cycle = context;
+    release();
+    const evidence = await pending;
+    expect(evidence).not.toBeNull();
+    expect(admission.bindSession(evidence!, "client")).not.toBeNull();
   });
 
   test("deferred guard snapshots principal and rejects malformed raw", async () => {
@@ -650,6 +689,41 @@ describe.runIf(process.platform === "darwin")("EnterpriseAdmission with producti
       "current runtime-issued production audit capability required",
     );
     expect(() => productionAuditCapabilityIssuer.requireCurrent(other)).not.toThrow();
+  });
+
+  test("enterprise evidence binds and releases an opaque session handle", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "admission-"));
+    const audit = await issueAudit(root);
+    const admission = new EnterpriseAdmission(base(audit));
+    const principal = {
+      principalType: "human",
+      principalId: "usr_0123456789abcdef",
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef01234567",
+      grantVersion: "1",
+      grants: [],
+    } as const;
+    (admission.authenticator as unknown as AuthStub).authenticateBearer = async () => principal;
+    (admission.authenticator as unknown as GuardStub).isCurrentPrincipalContext = async () => true;
+    const evidence = await admission.authenticateEvidence("token", {
+      node,
+      transport: "direct",
+      peer: "loopback",
+    });
+    expect(evidence).not.toBeNull();
+    const handle = admission.bindSession(evidence!, "client-a");
+    expect(handle).not.toBeNull();
+    expect(isCurrentEnterpriseAdmissionAuthorization(admission.authorizationIssuer, handle)).toBe(
+      true,
+    );
+    expect(
+      resolveCurrentEnterpriseAdmissionAuthorization(admission.authorizationIssuer, handle)
+        ?.clientId,
+    ).toBe("client-a");
+    expect(admission.releaseSession(handle!)).toBe(true);
+    expect(isCurrentEnterpriseAdmissionAuthorization(admission.authorizationIssuer, handle)).toBe(
+      false,
+    );
   });
 
   test("release-ready structural fake does not read close or filesystem", () => {
