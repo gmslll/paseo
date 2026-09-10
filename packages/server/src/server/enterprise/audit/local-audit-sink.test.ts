@@ -306,6 +306,12 @@ class FaultFiles implements AuditFileSystem {
       sync: async () => {
         const fault = this.record(`${kind}.sync`, `${label}:sync`);
         this.throwBefore(fault, `${kind}.sync`);
+        // Windows can reject FlushFileBuffers after the rollback truncate. Model the
+        // successful file-durability capability while preserving injected failures.
+        if (process.platform === "win32") {
+          this.throwAfter(fault, `${kind}.sync`);
+          return;
+        }
         await handle.sync();
         this.throwAfter(fault, `${kind}.sync`);
       },
@@ -1307,6 +1313,7 @@ describe("JsonlAuditStorage", () => {
   it("rolls back a file-fsync or parent-fsync failure before reporting it", async () => {
     const cases: Array<{ fault: FileFault; error: string }> = [
       { fault: { operation: "data.sync" }, error: "fault:data.sync" },
+      { fault: { operation: "data.sync", mode: "after" }, error: "fault:data.sync" },
       { fault: { operation: "directory.sync" }, error: "fault:directory.sync" },
     ];
     for (const testCase of cases) {
@@ -1361,7 +1368,9 @@ describe("JsonlAuditStorage", () => {
           new FaultFiles([{ operation: "directory.chmod", mode: "noop" }]),
         ).readAll(),
       ).rejects.toThrow("audit directory mode is not 700");
-      expect((await stat(directory)).mode & 0o777).toBe(0o777);
+      if (process.platform !== "win32") {
+        expect((await stat(directory)).mode & 0o777).toBe(0o777);
+      }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
