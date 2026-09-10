@@ -15,15 +15,20 @@ describe("admission invalidation sink", () => {
     const invalidate = vi.fn().mockResolvedValue(undefined);
     const sink = createAdmissionInvalidationSink();
     const unsubscribe = sink.register({ ...registration, invalidate });
-    await sink.publish({ ...registration, grantVersion: "wrong" });
+    await sink.publish({
+      ...registration,
+      kind: "revoke",
+      credentialIds: ["cred-a"],
+      grantVersion: "wrong",
+    });
     expect(invalidate).not.toHaveBeenCalled();
-    await sink.publish(registration);
+    await sink.publish({ ...registration, kind: "revoke", credentialIds: ["cred-a"] });
     expect(invalidate).toHaveBeenCalledWith({
       sessionBindingKey: "binding-a",
       sessionBindingGeneration: "generation-a",
     });
     unsubscribe();
-    await sink.publish(registration);
+    await sink.publish({ ...registration, kind: "logout_all", credentialIds: ["cred-a"] });
     expect(invalidate).toHaveBeenCalledTimes(1);
   });
 
@@ -32,7 +37,9 @@ describe("admission invalidation sink", () => {
     const sink = createAdmissionInvalidationSink();
     const invalidate = vi.fn().mockRejectedValue(error);
     sink.register({ ...registration, invalidate });
-    await expect(sink.publish(registration)).rejects.toBe(error);
+    await expect(
+      sink.publish({ ...registration, kind: "rotate", credentialIds: ["cred-a"] }),
+    ).rejects.toBe(error);
     expect(invalidate).toHaveBeenCalledTimes(1);
   });
 });

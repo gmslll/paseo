@@ -1,4 +1,6 @@
 export interface AdmissionInvalidationEvent {
+  readonly kind: "revoke" | "rotate" | "logout_all";
+  readonly credentialIds: readonly string[];
   readonly sessionBindingKey: string;
   readonly generation: string;
   readonly credentialId: string;
@@ -23,6 +25,7 @@ export interface AdmissionInvalidationRegistration {
 export interface AdmissionInvalidationSink {
   register(input: AdmissionInvalidationRegistration): () => void;
   publish(event: AdmissionInvalidationEvent): Promise<void>;
+  publishCredentialInvalidation(event: AdmissionInvalidationEvent): Promise<void>;
 }
 
 export function createAdmissionInvalidationSink(): AdmissionInvalidationSink {
@@ -52,19 +55,29 @@ export function createAdmissionInvalidationSink(): AdmissionInvalidationSink {
       };
     },
     async publish(event) {
+      if (
+        !event.credentialIds.length ||
+        new Set(event.credentialIds).size !== event.credentialIds.length ||
+        event.credentialIds.some((id) => !id)
+      )
+        return;
       const registration = registrations.get(event.sessionBindingKey)?.get(event.generation);
       if (
         !registration ||
         registration.credentialId !== event.credentialId ||
         registration.principalId !== event.principalId ||
         registration.organizationId !== event.organizationId ||
-        registration.grantVersion !== event.grantVersion
+        registration.grantVersion !== event.grantVersion ||
+        !event.credentialIds.includes(registration.credentialId)
       )
         return;
       await registration.invalidate({
         sessionBindingKey: registration.sessionBindingKey,
         sessionBindingGeneration: registration.generation,
       });
+    },
+    async publishCredentialInvalidation(event) {
+      return this.publish(event);
     },
   };
 }
