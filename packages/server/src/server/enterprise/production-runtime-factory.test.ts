@@ -17,6 +17,7 @@ import { EnterpriseAdmission } from "./identity/admission.js";
 import {
   createProductionEnterpriseRuntimeFactory,
   createProductionIdentityDispatcherRegistration,
+  provisionProductionEnterpriseInitialAdminFromHome,
   resolveProductionBrowserProfileRegistry,
 } from "./production-runtime-factory.js";
 
@@ -53,6 +54,57 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
 
   afterAll(async () => {
     await rm(addonDirectory, { recursive: true, force: true });
+  });
+
+  test("provisions a cold home with one authority graph and restores the issued administrator", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-production-provision-once-"));
+    const daemonPassword = await hash("break-glass", 4);
+    let restoredAudit: ProductionAuditCapability | undefined;
+    try {
+      const provision = () =>
+        provisionProductionEnterpriseInitialAdminFromHome(
+          {
+            paseoHome: root,
+            enterpriseConfig: config,
+            paseoServerId: connection.node.paseoServerId,
+            daemonPasswordHash: daemonPassword,
+            bootstrapPassword: "break-glass",
+            principalId,
+            displayName: "Initial administrator",
+          },
+          {
+            issueAudit: (options) =>
+              createProductionAuditRuntime({ ...options, nativeAddonPath: addonPath }),
+          },
+        );
+      const first = await provision();
+      expect(first).toMatchObject({
+        principalId,
+        alreadyProvisioned: false,
+        token: expect.any(String),
+      });
+      const second = await provision();
+      expect(second).toEqual({
+        principalId,
+        credentialId: first.credentialId,
+        alreadyProvisioned: true,
+      });
+
+      restoredAudit = await issueAudit(root);
+      const runtime = await createProductionEnterpriseRuntimeFactory({
+        paseoHome: root,
+        daemonPassword,
+      })({ config, audit: restoredAudit });
+      await expect(runtime.admission.authenticate(first.token!, connection)).resolves.toMatchObject(
+        {
+          principalId,
+          organizationId,
+        },
+      );
+    } finally {
+      await restoredAudit?.close().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("restores one authority graph and fans committed revocation into live Sessions", async () => {

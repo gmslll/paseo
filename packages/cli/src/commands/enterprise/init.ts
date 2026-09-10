@@ -12,6 +12,7 @@ export interface EnterpriseInitResult {
 
 export interface EnterpriseInitDependencies {
   provision(input: {
+    readonly home?: string;
     readonly principalId: string;
     readonly displayName?: string;
     readonly organizationId?: string;
@@ -49,6 +50,7 @@ export async function runEnterpriseInitCommand(
   const displayName = typeof options.displayName === "string" ? options.displayName : undefined;
   const organizationId =
     typeof options.organizationId === "string" ? options.organizationId : undefined;
+  const home = typeof options.home === "string" ? options.home : undefined;
   if (!principalId)
     throw { code: "ENTERPRISE_INIT_PRINCIPAL_REQUIRED", message: "--principal is required" };
   const prompt =
@@ -58,6 +60,7 @@ export async function runEnterpriseInitCommand(
   if (isCancel(supplied) || typeof supplied !== "string" || supplied.length === 0)
     throw { code: "ENTERPRISE_INIT_PASSWORD_REQUIRED", message: "A daemon password is required" };
   const result = await options.provision({
+    ...(home ? { home } : {}),
     principalId,
     ...(displayName ? { displayName } : {}),
     ...(organizationId ? { organizationId } : {}),
@@ -78,6 +81,7 @@ export function createEnterpriseInitCommand(
 ): Command {
   return new Command("init")
     .description("Provision the first local enterprise administrator")
+    .option("--home <path>", "Paseo home directory (default: ~/.paseo)")
     .requiredOption("--principal <id>", "Human principal ID (usr_...)")
     .option("--display-name <name>", "Administrator display name")
     .option("--organization <id>", "Organization ID (defaults to daemon config)")

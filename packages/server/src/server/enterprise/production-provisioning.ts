@@ -88,7 +88,7 @@ export function createProductionEnterpriseProvisioningPorts(input: {
         transport: "direct",
         peer: "loopback",
       }),
-    ensurePrincipalIntent: input.principalProvisioning.ensurePrincipalIntent,
+    ensurePrincipalIntent: (intent) => input.principalProvisioning.ensurePrincipalIntent(intent),
     provisionInitialGrant: ({ actor, principalId, organizationId, grants }) =>
       provisionInitialGrant({
         provider: input.provider,

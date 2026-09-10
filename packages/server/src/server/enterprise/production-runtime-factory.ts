@@ -1,7 +1,12 @@
 import path from "node:path";
 
-import { NodeContextSchema } from "@getpaseo/protocol/messages";
-import type { EnterpriseMultiUserConfig } from "../persisted-config.js";
+import {
+  ENTERPRISE_ACTIONS,
+  HumanPrincipalIdSchema,
+  NodeContextSchema,
+  OrganizationIdSchema,
+} from "@getpaseo/protocol/messages";
+import { EnterpriseMultiUserSchema, type EnterpriseMultiUserConfig } from "../persisted-config.js";
 import { createAdmissionInvalidationSink } from "../session/enterprise-admission-invalidation.js";
 import { createEnterpriseAgentSessionContextRegistry } from "../session/enterprise-agent-session-context-registry.js";
 import { MemoryAuthorityReceiptState } from "../session/enterprise-authority-receipt-state.js";
@@ -30,7 +35,10 @@ import {
   invalidateEnterprisePrincipal,
 } from "./identity/admission-authorization.js";
 import { createSessionBindingGeneration } from "./identity/authenticator.js";
-import { createProductionPrincipalGrantSource } from "./identity/principal-source.js";
+import {
+  createProductionPrincipalGrantSource,
+  createProductionPrincipalProvisioning,
+} from "./identity/principal-source.js";
 import { createProductionEnterpriseIdentityDispatcherRegistration } from "./identity/handlers.js";
 import type { CredentialInvalidation, CredentialInvalidationSink } from "./identity/registry.js";
 import type { EnterpriseAdmissionRuntime } from "./identity/runtime.js";
@@ -41,6 +49,11 @@ import type {
   EnterpriseSessionDispatcher,
   EnterpriseSessionDispatcherFactoryRegistration,
 } from "../session/enterprise-dispatcher.js";
+import {
+  createProductionEnterpriseProvisioningPorts,
+  provisionProductionEnterpriseInitialAdmin,
+  type ProductionInitialCredential,
+} from "./production-provisioning.js";
 
 export interface ProductionEnterpriseRuntimeFactoryOptions {
   readonly paseoHome: string;
@@ -55,6 +68,21 @@ export interface ProductionEnterpriseRuntimeFactoryInput {
 export type ProductionEnterpriseRuntimeFactory = (
   input: ProductionEnterpriseRuntimeFactoryInput,
 ) => Promise<EnterpriseAdmissionRuntime>;
+
+export interface ProductionEnterpriseInitialAdminInput {
+  readonly paseoHome: string;
+  readonly enterpriseConfig: EnterpriseMultiUserConfig;
+  readonly paseoServerId: string;
+  readonly daemonPasswordHash: string;
+  readonly bootstrapPassword: string;
+  readonly principalId: string;
+  readonly displayName?: string;
+  readonly organizationId?: string;
+}
+
+export interface ProductionEnterpriseInitialAdminDependencies {
+  readonly issueAudit?: typeof productionAuditCapabilityIssuer.issue;
+}
 
 const AUDIT_OPERATIONS = Object.freeze(["enterprise.audit.list_events.request"]);
 const productionIdentityRecords = new WeakMap<
@@ -170,6 +198,129 @@ export function createProductionEnterpriseRuntimeFactory(
     );
     return runtime;
   };
+}
+
+/**
+ * Provisions the first administrator without starting a daemon. The audit capability is the
+ * lifetime owner for the one-shot authority graph; closing it invalidates the admission issuer and
+ * the single authorization provider before this function returns.
+ */
+export async function provisionProductionEnterpriseInitialAdminFromHome(
+  input: ProductionEnterpriseInitialAdminInput,
+  dependencies: ProductionEnterpriseInitialAdminDependencies = {},
+): Promise<ProductionInitialCredential & { readonly principalId: string }> {
+  const paseoHome = capturePaseoHome(input.paseoHome);
+  const enterpriseConfig = Object.freeze(
+    EnterpriseMultiUserSchema.parse(structuredClone(input.enterpriseConfig)),
+  );
+  if (enterpriseConfig.enabled !== true) {
+    throw new Error("enterprise multi-user mode is not enabled");
+  }
+  const organizationId = OrganizationIdSchema.parse(
+    input.organizationId ?? enterpriseConfig.organizationId,
+  );
+  if (organizationId !== enterpriseConfig.organizationId) {
+    throw new Error("enterprise organization does not match daemon configuration");
+  }
+  const principalId = HumanPrincipalIdSchema.parse(input.principalId);
+  if (typeof input.daemonPasswordHash !== "string" || input.daemonPasswordHash.length === 0) {
+    throw new Error("enterprise initialization requires a configured daemon password");
+  }
+  if (typeof input.bootstrapPassword !== "string" || input.bootstrapPassword.length === 0) {
+    throw new Error("enterprise initialization requires the daemon password");
+  }
+  const node = Object.freeze(
+    NodeContextSchema.parse({
+      nodeId: enterpriseConfig.nodeId,
+      paseoServerId: input.paseoServerId,
+      mode: "standalone",
+    }),
+  );
+  const issueAudit = dependencies.issueAudit ?? productionAuditCapabilityIssuer.issue;
+  const audit = await issueAudit({
+    node,
+    auditRoot: path.join(paseoHome, "enterprise", "audit"),
+  });
+  let result: ProductionInitialCredential & { readonly principalId: string };
+  let primaryError: unknown;
+  try {
+    const currentAudit = productionAuditCapabilityIssuer.requireCurrent(audit);
+    const provider = createProductionAuthorizationRuntimeProvider({
+      audit: currentAudit,
+      grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
+    });
+    if (!provider) throw new Error("enterprise authorization provider unavailable");
+    const principalSource = createProductionPrincipalGrantSource({
+      filePath: path.join(paseoHome, "enterprise", "principals.json"),
+      grantStore: provider.grantStore,
+      audit: currentAudit,
+    });
+    const principalProvisioning = createProductionPrincipalProvisioning({
+      filePath: path.join(paseoHome, "enterprise", "principals.json"),
+      audit: currentAudit,
+    });
+    const sessionSink = createAdmissionInvalidationSink();
+    let admission: ReturnType<typeof createEnterpriseAdmission> | null = null;
+    const invalidation = createCredentialInvalidationBridge({
+      getAdmission: () => admission,
+      provider,
+      sessionSink,
+      audit: currentAudit,
+    });
+    admission = createEnterpriseAdmission({
+      filePath: path.join(paseoHome, "enterprise", "credentials.json"),
+      principalSource,
+      invalidation,
+      node,
+      audit: currentAudit,
+      organizationId,
+      daemonPassword: input.daemonPasswordHash,
+    });
+    await admission.registry.load();
+    const ports = createProductionEnterpriseProvisioningPorts({
+      audit: currentAudit,
+      admission,
+      provider,
+      principalProvisioning,
+    });
+    const grants = ENTERPRISE_ACTIONS.map((action) => ({
+      action,
+      selector: { kind: "organization" as const, organizationId },
+    }));
+    result = await provisionProductionEnterpriseInitialAdmin(
+      {
+        paseoHome,
+        organizationId,
+        principalId,
+        ...(input.displayName ? { displayName: input.displayName } : {}),
+        grants,
+      },
+      ports,
+      input.bootstrapPassword,
+    );
+    await principalSource.ready();
+    productionAuditCapabilityIssuer.requireCurrent(currentAudit);
+  } catch (error) {
+    primaryError = error;
+  }
+  let cleanupError: unknown;
+  try {
+    await audit.close();
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (primaryError !== undefined) {
+    if (cleanupError !== undefined) {
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        "enterprise initialization and audit cleanup failed",
+        { cause: primaryError },
+      );
+    }
+    throw primaryError;
+  }
+  if (cleanupError !== undefined) throw cleanupError;
+  return result!;
 }
 
 /** Returns the exact W4 profile registry captured by the production authority graph. */
