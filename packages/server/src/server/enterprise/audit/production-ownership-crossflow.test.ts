@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { WebSocket, type RawData } from "ws";
+import { hash } from "bcryptjs";
 import {
   decodeFileTransferFrame,
   FileTransferOpcode,
@@ -69,6 +71,7 @@ import {
   type EnterpriseDownloadHttpResponsePort,
   type EnterpriseWorkspaceFilesProductionProvider,
 } from "../runtime/production-workspace-files-runtime-provider.js";
+import { createProductionEnterpriseRuntimeFactory } from "../production-runtime-factory.js";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import type { FileBackedWorkspaceRegistry } from "../../workspace-registry.js";
 import {
@@ -1015,4 +1018,281 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       await daemon.stop().catch(() => undefined);
     }
   }, 30_000);
+
+  test("default production factory serves audit.list_events over Darwin WebSocket", async () => {
+    const root = path.join(suiteRoot, "default-ws");
+    const paseoHome = path.join(root, ".paseo");
+    const staticDir = path.join(root, "static");
+    const serverId = "srv_0123456789ab";
+    const principalA = "usr_aaaaaaaaaaaaaaaa";
+    const principalB = "usr_bbbbbbbbbbbbbbbb";
+    await mkdir(path.join(paseoHome, "enterprise"), { recursive: true, mode: 0o700 });
+    await mkdir(staticDir, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(paseoHome, "server-id"), `${serverId}\n`, { mode: 0o600 });
+    await writeFile(
+      path.join(paseoHome, "enterprise", "principals.json"),
+      JSON.stringify({
+        version: 1,
+        principals: {
+          [principalA]: {
+            principalId: principalA,
+            organizationId: principal.organizationId,
+            principalType: "human",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+          [principalB]: {
+            principalId: principalB,
+            organizationId: principal.organizationId,
+            principalType: "human",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      path.join(paseoHome, "enterprise", "grants.json"),
+      JSON.stringify({
+        [principalA]: {
+          principalId: principalA,
+          organizationId: principal.organizationId,
+          grants: [
+            {
+              action: "audit.read",
+              selector: { kind: "organization", organizationId: principal.organizationId },
+            },
+          ],
+          grantVersion: "grv_a",
+        },
+        [principalB]: {
+          principalId: principalB,
+          organizationId: principal.organizationId,
+          grants: [
+            {
+              action: "audit.read",
+              selector: { kind: "organization", organizationId: principal.organizationId },
+            },
+          ],
+          grantVersion: "grv_b",
+        },
+      }),
+      { mode: 0o600 },
+    );
+    const daemonPassword = await hash("default-ws-password", 12);
+    await writeFile(
+      path.join(paseoHome, "enterprise", "credentials.json"),
+      JSON.stringify({ version: 1, credentials: {} }),
+      { mode: 0o600 },
+    );
+    const seeded = await createProductionAuditRuntime({
+      node: { nodeId: node.nodeId, paseoServerId: serverId, mode: "standalone" },
+      auditRoot: path.join(paseoHome, "enterprise", "audit"),
+      nativeAddonPath: auditAddonPath,
+    });
+    await seeded.append(
+      {
+        organizationId: principal.organizationId,
+        actorPrincipalId: principalA,
+        action: "workspace.content.read",
+        resource: { kind: "workspace", id: workspaceId },
+        workspaceId,
+        outcome: "allowed",
+      },
+      { durability: "required" },
+    );
+    await seeded.close();
+    const preparatoryAudit = await createProductionAuditRuntime({
+      node: { nodeId: node.nodeId, paseoServerId: serverId, mode: "standalone" },
+      auditRoot: path.join(paseoHome, "enterprise", "audit"),
+      nativeAddonPath: auditAddonPath,
+    });
+    const preparatoryRuntime = await createProductionEnterpriseRuntimeFactory({
+      paseoHome,
+      daemonPassword,
+    })({
+      config: {
+        enabled: true,
+        organizationId: principal.organizationId,
+        nodeId: node.nodeId,
+        managementMode: "standalone",
+        legacyRecords: "owner_only",
+      },
+      audit: preparatoryAudit,
+    });
+    const breakGlass = await preparatoryRuntime.admission.authenticate("default-ws-password", {
+      node: preparatoryRuntime.node,
+      transport: "direct",
+      peer: "loopback",
+    });
+    if (!breakGlass) throw new Error("expected break-glass seed actor");
+    const issuedA = await preparatoryRuntime.admission.registry.issueToken({
+      actor: breakGlass,
+      principalId: principalA,
+      organizationId: principal.organizationId,
+    });
+    const issuedB = await preparatoryRuntime.admission.registry.issueToken({
+      actor: breakGlass,
+      principalId: principalB,
+      organizationId: principal.organizationId,
+    });
+    await expect(
+      preparatoryRuntime.admission.authenticate(issuedA.token, {
+        node: preparatoryRuntime.node,
+        transport: "direct",
+        peer: "loopback",
+        remoteAddress: "127.0.0.1",
+      }),
+    ).resolves.toMatchObject({ principalId: principalA });
+    await preparatoryAudit.close();
+    let connectedCount = 0;
+    let resolveDaemonReady!: () => void;
+    const daemonReady = new Promise<void>((resolve) => {
+      resolveDaemonReady = resolve;
+    });
+    const daemonLogger = pino(
+      { level: "info" },
+      {
+        write(chunk: string) {
+          if (chunk.includes("Client connected; awaiting hello")) {
+            connectedCount += 1;
+            if (connectedCount >= 2) resolveDaemonReady();
+          }
+        },
+      },
+    );
+    const daemon = await createPaseoDaemon(
+      {
+        listen: "127.0.0.1:0",
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: false,
+        staticDir,
+        mcpDebug: false,
+        agentClients: {},
+        agentStoragePath: path.join(paseoHome, "agents"),
+        relayEnabled: false,
+        appBaseUrl: "https://app.paseo.sh",
+        enterpriseMultiUser: {
+          enabled: true,
+          organizationId: principal.organizationId,
+          nodeId: node.nodeId,
+          managementMode: "standalone",
+          legacyRecords: "owner_only",
+        },
+      },
+      daemonLogger,
+      {
+        issueProductionAuditCapability: (input) =>
+          productionAuditCapabilityIssuer.issue({ ...input, nativeAddonPath: auditAddonPath }),
+        createEnterpriseAdmissionRuntime: createProductionEnterpriseRuntimeFactory({
+          paseoHome,
+          daemonPassword,
+        }),
+        createEnterpriseWorkspaceFilesProvider: ({ workspaceRoots }) =>
+          createProductionEnterpriseWorkspaceFilesProvider({
+            workspaceRoots,
+            nativeAddonPath: workspaceAddonPath,
+          }),
+      },
+    );
+    const sockets: WebSocket[] = [];
+    interface WsEnvelope {
+      type?: string;
+      message?: { type?: string; payload?: Record<string, unknown> };
+    }
+    const next = (socket: WebSocket, predicate: (value: unknown) => boolean) =>
+      new Promise<WsEnvelope>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("WebSocket response timeout")), 10_000);
+        const onMessage = (data: RawData) => {
+          let value: unknown;
+          try {
+            value = JSON.parse(data.toString());
+          } catch {
+            return;
+          }
+          if (!predicate(value)) return;
+          clearTimeout(timer);
+          socket.off("message", onMessage);
+          resolve(value as WsEnvelope);
+        };
+        socket.on("message", onMessage);
+      });
+    try {
+      await daemon.start();
+      const target = daemon.getListenTarget();
+      if (!target || target.type !== "tcp") throw new Error("expected TCP listener");
+      const connect = async (id: string, token: string) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${target.port}/ws`, [`paseo.bearer.${token}`]);
+        sockets.push(socket);
+        await new Promise<void>((resolve, reject) => {
+          socket.once("open", resolve);
+          socket.once("error", reject);
+        });
+        await daemonReady;
+        const infoPromise = next(
+          socket,
+          (v) => v?.type === "session" && v.message?.payload?.status === "server_info",
+        );
+        const hello = JSON.stringify({
+          type: "hello",
+          clientId: id,
+          clientType: "browser",
+          protocolVersion: 1,
+        });
+        socket.send(hello);
+        return { socket, info: await infoPromise };
+      };
+      const [a, b] = await Promise.all([
+        connect("default-a", issuedA.token),
+        connect("default-b", issuedB.token),
+      ]);
+      expect(a.info.message.payload.features.enterpriseAuditV1).toBe(true);
+      expect(b.info.message.payload.features.enterpriseAuditV1).toBe(true);
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.audit.list_events.request",
+            requestId: "audit-a",
+            workspaceId,
+            limit: 20,
+          },
+        }),
+      );
+      const allowed = await next(
+        a.socket,
+        (v) => v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response",
+      );
+      expect(allowed.message?.payload?.events).toHaveLength(1);
+      b.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.audit.list_events.request",
+            requestId: "audit-b",
+            workspaceId: "workspace-foreign",
+            limit: 20,
+          },
+        }),
+      );
+      const denied = await next(
+        b.socket,
+        (v) =>
+          v?.type === "rpc_error" ||
+          (v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response"),
+      );
+      const deniedEvents = denied.message?.payload?.events;
+      expect(
+        denied.type === "rpc_error" || (Array.isArray(deniedEvents) && deniedEvents.length === 0),
+      ).toBe(true);
+    } finally {
+      for (const socket of sockets) socket.close();
+      await daemon.stop().catch(() => undefined);
+    }
+  }, 45_000);
 });
