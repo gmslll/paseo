@@ -38,6 +38,7 @@ import {
   type SessionOptions,
   type SessionRuntimeMetrics,
 } from "./session.js";
+import type { EnterpriseSessionDispatcher } from "./session/enterprise-dispatcher.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
@@ -871,6 +872,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private readonly enterpriseRuntime?: EnterpriseAdmissionRuntime;
   private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
+  private readonly enterpriseDispatcher?: EnterpriseSessionDispatcher;
 
   constructor(
     server: HTTPServer,
@@ -920,11 +922,13 @@ export class VoiceAssistantWebSocketServer {
     workspaceLabelService?: WorkspaceLabelService,
     enterpriseRuntime?: EnterpriseAdmissionRuntime,
     enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider,
+    enterpriseDispatcher?: EnterpriseSessionDispatcher,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.enterpriseRuntime = enterpriseRuntime;
     this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
+    this.enterpriseDispatcher = enterpriseDispatcher;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -1934,6 +1938,7 @@ export class VoiceAssistantWebSocketServer {
       ...(options.enterpriseWorkspaceFilesRuntime
         ? { enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime }
         : {}),
+      ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
       permissions: options.permissions,
