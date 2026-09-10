@@ -41,7 +41,6 @@ function KnownHostRoute() {
       <Stack.Screen name="sessions" />
       <Stack.Screen name="open-project" />
       <Stack.Screen name="settings" />
-      <Stack.Screen name="enterprise" />
       <Stack.Screen name="plugin/[pluginId]/[surfaceId]" />
       <Stack.Screen name="plugin/[pluginId]/[contributionKind]/[contributionId]" />
     </ThemedStack>

@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from "react";
+import { isEnterpriseWorkbenchSignedIn } from "@/runtime/enterprise-workbench-assembly";
 import {
   useHostEnterpriseIdentityLifecycle,
   useHostEnterpriseIdentitySnapshot,
@@ -7,8 +8,12 @@ import {
 import { useSessionStore } from "@/stores/session-store";
 import { createBossResourceStore } from "@/stores/enterprise/boss-resource-store";
 import { createPatLoginFormModel } from "@/stores/enterprise/pat-login-form-model";
-import { EnterpriseWorkbenchContainer } from "./enterprise-workbench-screen";
-import { createEnterpriseUiBundle, type EnterpriseContentReaders } from "./enterprise-ui-port";
+import { EnterprisePatLoginForm } from "@/components/enterprise/enterprise-identity-ui";
+import { EnterpriseWorkbenchContainer } from "@/screens/enterprise/enterprise-workbench-screen";
+import {
+  createEnterpriseUiBundle,
+  type EnterpriseContentReaders,
+} from "@/screens/enterprise/enterprise-ui-port";
 
 const unavailableContentReaders: EnterpriseContentReaders<string, never> = {
   workspace: async () => Promise.reject(new Error("enterprise.content.unavailable")),
@@ -19,6 +24,7 @@ const unavailableContentReaders: EnterpriseContentReaders<string, never> = {
 
 /** Root assembly for the host scoped enterprise workbench. Content readers stay unavailable until
  * each resource type has a production port; this component never invents a generic reader. */
+
 export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   const lifecycle = useHostEnterpriseIdentityLifecycle(serverId);
   const identitySnapshot = useHostEnterpriseIdentitySnapshot(serverId);
@@ -39,13 +45,14 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
     serverId,
   ]);
 
+  const bundle = useMemo(() => (models ? createEnterpriseUiBundle(models) : null), [models]);
+  const signedIn = isEnterpriseWorkbenchSignedIn(identitySnapshot);
   const bossStore = useMemo(
     () =>
-      models
+      signedIn && models && bundle
         ? createBossResourceStore<never, string>({
-            port: createEnterpriseUiBundle(models).resourcePort,
-            organizationId:
-              models.lifecycle.readSnapshot().projection?.organizationId ?? "org_unavailable",
+            port: bundle.resourcePort,
+            organizationId: identitySnapshot.projection.organizationId,
             createRequestId: () =>
               `enterprise-ui-${Date.now()}-${Math.random().toString(36).slice(2)}`,
             isCurrentOrganizationScope: (organizationId) =>
@@ -59,13 +66,22 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
             },
           })
         : null,
-    [models],
+    [bundle, identitySnapshot, models, signedIn],
   );
   const patModel = useMemo(() => (models ? createPatLoginFormModel() : null), [models]);
 
   useEffect(() => () => bossStore?.dispose(), [bossStore]);
 
-  if (!models || !bossStore || !patModel) return null;
+  if (!models || !bundle || !patModel) return null;
+  if (!signedIn) {
+    return (
+      <EnterprisePatLoginForm
+        model={patModel}
+        authenticate={(token, signal) => bundle.uiPort.authenticatePat({ serverId, token, signal })}
+      />
+    );
+  }
+  if (!bossStore) return null;
   return (
     <EnterpriseWorkbenchContainer
       {...models}

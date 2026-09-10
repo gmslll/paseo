@@ -134,6 +134,7 @@ import {
 import { useLastWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { returnFromSettings, type SettingsView } from "@/navigation/settings-navigation";
 import { isNative, isWeb } from "@/constants/platform";
+import { EnterpriseWorkbenchHost } from "@/runtime/enterprise-workbench-host";
 
 // ---------------------------------------------------------------------------
 // View model
@@ -198,6 +199,7 @@ const HOST_SECTION_ITEMS: HostSectionItem[] = [
   { id: "usage", labelKey: "settings.hostSections.usage", icon: Gauge },
   { id: "terminals", labelKey: "settings.hostSections.terminals", icon: SquareTerminal },
   { id: "plugins", labelKey: "settings.hostSections.plugins", icon: Blocks },
+  { id: "enterprise", labelKey: "settings.hostSections.host", icon: Shield },
 ];
 
 function renderHostSettingsContent(
@@ -225,6 +227,8 @@ function renderHostSettingsContent(
       return <HostTerminalsPage serverId={view.serverId} />;
     case "plugins":
       return <HostPluginsPage serverId={view.serverId} />;
+    case "enterprise":
+      return <EnterpriseWorkbenchHost serverId={view.serverId} />;
     case "host":
       return <HostSettingsPage serverId={view.serverId} onHostRemoved={onHostRemoved} />;
   }
