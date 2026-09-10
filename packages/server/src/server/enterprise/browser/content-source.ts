@@ -25,6 +25,7 @@ export interface EnterpriseBrowserProfileContentReadSource {
   }): Promise<EnterpriseBrowserProfileContentPage>;
   close?(): Promise<void> | void;
 }
+type BrowserContentReadInput = Parameters<EnterpriseBrowserProfileContentReadSource["read"]>[0];
 type ReadProfile = (
   input: Parameters<
     NonNullable<
@@ -58,7 +59,7 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
   let closed = false;
   const source = Object.freeze({
     [sourceBrand]: true as const,
-    read: async ({ profile, selector, cursor, limit }) => {
+    read: async ({ profile, selector, cursor, limit }: BrowserContentReadInput) => {
       if (closed) throw new Error("Browser profile content source is closed.");
       const parsedSelector = EnterpriseBrowserProfileContentSelectorSchema.parse(selector);
       const page = await readProfile({
