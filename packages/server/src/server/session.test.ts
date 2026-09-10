@@ -84,6 +84,7 @@ import {
   type EnterpriseSessionDispatcherFactoryRegistration,
   type EnterpriseContentReadRequestType,
 } from "./session/enterprise-dispatcher.js";
+import { createEnterpriseIdentityDispatcher } from "./enterprise/identity/handlers.js";
 import {
   asSessionInternals as asSessionInternalsHelper,
   asAgentManager,
@@ -2180,6 +2181,78 @@ test("identity-self request is unavailable until its owning policy is registered
     type: "rpc_error",
     payload: { requestId: "identity-self-1", code: "unavailable" },
   });
+  await session.cleanup();
+});
+
+test("identity-self requests register and emit through the current session binding", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const logoutAll = vi.fn(async () => true);
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(authorityReceiptState, "register");
+  const context = enterpriseContext("generation-identity-self-current");
+  const dispatcher = createEnterpriseIdentityDispatcher({
+    listPrincipals: vi.fn(async () => []),
+    logoutAll,
+  });
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState,
+    enterpriseDispatcher: dispatcher,
+  });
+
+  await session.handleMessage({
+    type: "enterprise.identity.get_current.request",
+    requestId: "identity-current-1",
+  });
+  await session.handleMessage({
+    type: "enterprise.identity.logout_all.request",
+    requestId: "identity-logout-1",
+  });
+
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "enterprise.identity.get_current.response",
+      payload: expect.objectContaining({ requestId: "identity-current-1" }),
+    }),
+    expect.objectContaining({
+      type: "enterprise.identity.logout_all.response",
+      payload: { requestId: "identity-logout-1", loggedOut: true },
+    }),
+  ]);
+  expect(logoutAll).toHaveBeenCalledTimes(1);
+  expect(register).toHaveBeenCalledTimes(2);
+  expect(register.mock.calls[0]?.[0].binding).toMatchObject({
+    sessionBindingGeneration: context.sessionBindingGeneration,
+    organizationId: context.principal.organizationId,
+    principalId: context.principal.principalId,
+    credentialId: context.principal.credentialId,
+    grantVersion: context.principal.grantVersion,
+    nodeId: context.node.nodeId,
+    clientId: expect.any(String),
+  });
+  await session.cleanup();
+});
+
+test("identity-self requests fail closed when the current grant is stale", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const handle = vi.fn(() => false);
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-identity-self-stale"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    principalGrantVersionGuard: { isCurrent: () => false },
+    enterpriseDispatcher: { handle },
+  });
+
+  await session.handleMessage({
+    type: "enterprise.identity.get_current.request",
+    requestId: "identity-stale-1",
+  });
+
+  expect(handle).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
   await session.cleanup();
 });
 
