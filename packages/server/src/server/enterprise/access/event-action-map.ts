@@ -97,6 +97,10 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "enterprise.identity.list_principals.request": ["identity.manage"],
   "enterprise.organization.list_resources.request": ["workspace.metadata.read"],
   "enterprise.placement.resolve_workspace.request": ["workspace.metadata.read"],
+  "enterprise.workspace.content.read.request": ["workspace.content.read"],
+  "enterprise.agent.content.read.request": ["workspace.content.read"],
+  "enterprise.browser_profile.content.read.request": ["browser.use"],
+  "enterprise.app_slot.content.read.request": ["app.use"],
   "enterprise.resource.acquire_lease.request": ["browser.use", "app.use"],
   "enterprise.resource.release_lease.request": ["browser.use", "app.use"],
   "enterprise.resource.renew_lease.request": ["browser.use", "app.use"],
@@ -131,6 +135,20 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
 };
 
 export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGroup[] = [
+  {
+    policy: {
+      workspace: ["workspace.content.read"],
+      agent: ["workspace.content.read"],
+      browser_profile: ["browser.use"],
+      app_slot: ["app.use"],
+    },
+    events: [
+      "enterprise.workspace.content.read.response",
+      "enterprise.agent.content.read.response",
+      "enterprise.browser_profile.content.read.response",
+      "enterprise.app_slot.content.read.response",
+    ],
+  },
   {
     policy: workspacePolicy("workspace.metadata.read"),
     events: [

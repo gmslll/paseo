@@ -75,6 +75,10 @@ export const INBOUND_PERMISSION = {
   directory_suggestions_request: "workspace.read",
   "enterprise.access.list_grants.request": "access.manage",
   "enterprise.access.update_grants.request": "access.manage",
+  "enterprise.workspace.content.read.request": "workspace.read",
+  "enterprise.agent.content.read.request": "workspace.read",
+  "enterprise.browser_profile.content.read.request": "workspace.read",
+  "enterprise.app_slot.content.read.request": "workspace.read",
   "enterprise.audit.list_events.request": "daemon.read",
   "enterprise.browser.bind_profile.request": "access.manage",
   "enterprise.browser.list_profiles.request": "workspace.read",
@@ -222,6 +226,10 @@ export const INBOUND_PERMISSION = {
 
 export const OUTBOUND_PERMISSION = {
   activity_log: "workspace.read",
+  "enterprise.workspace.content.read.response": "workspace.read",
+  "enterprise.agent.content.read.response": "workspace.read",
+  "enterprise.browser_profile.content.read.response": "workspace.read",
+  "enterprise.app_slot.content.read.response": "workspace.read",
   "agent.config.apply.response": ["workspace.write", "hub.execute"],
   "agent.detach.response": "workspace.write",
   "agent.fork_context.response": "workspace.read",
