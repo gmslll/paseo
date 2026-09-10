@@ -330,4 +330,59 @@ describe("file principal grant source", () => {
       }
     },
   );
+
+  test.runIf(process.platform === "darwin")(
+    "provisioning rejects strict-schema and stable-intent conflicts",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-principal-provision-invalid-"));
+      let audit: ProductionAuditCapability | undefined;
+      try {
+        audit = await createProductionAuditRuntime({
+          node: {
+            nodeId: "nod_aaaaaaaaaaaaaaaa",
+            paseoServerId: "srv_provision_invalid",
+            mode: "standalone",
+          },
+          auditRoot: path.join(root, "audit"),
+          nativeAddonPath: addonPath,
+        });
+        const provisioning = createProductionPrincipalProvisioning({
+          filePath: path.join(root, "principals.json"),
+          audit,
+        });
+        await expect(
+          provisioning.ensurePrincipal({
+            principalId,
+            organizationId,
+            principalType: "human",
+            status: "active",
+            createdAt: "2026-01-01",
+            updatedAt: "2026-01-01",
+            unexpected: "reject",
+          } as never),
+        ).rejects.toThrow();
+        await provisioning.ensurePrincipal({
+          principalId,
+          organizationId,
+          principalType: "human",
+          status: "active",
+          createdAt: "2026-01-01",
+          updatedAt: "2026-01-01",
+        });
+        await expect(
+          provisioning.ensurePrincipal({
+            principalId,
+            organizationId,
+            principalType: "service",
+            status: "active",
+            createdAt: "2026-01-01",
+            updatedAt: "2026-01-01",
+          }),
+        ).rejects.toThrow("principal conflict");
+      } finally {
+        await audit?.close().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
