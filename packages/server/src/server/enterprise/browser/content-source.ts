@@ -139,7 +139,7 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
       organizationId: string;
       nodeId: string;
       view: string;
-      offset: number;
+      remainingNames: readonly string[];
       expiresAt: number;
     }
   >();
@@ -161,10 +161,7 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
             nextCursor: null,
           };
         }
-        const names = (await workspaceFs.listRoot(root))
-          .filter((name) => !name.includes("/"))
-          .sort();
-        let start = 0;
+        let snapshot: readonly string[] | null = null;
         if (cursor) {
           const record = cursorRecords.get(cursor);
           cursorRecords.delete(cursor);
@@ -177,17 +174,25 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
             record.view !== view
           )
             throw new Error("Invalid cursor.");
-          start = record.offset;
+          snapshot = record.remainingNames;
         }
-        const validNames: string[] = [];
-        for (const name of names) {
-          try {
-            if ((await workspaceFs.stat(root, [name])).kind === "file") validNames.push(name);
-          } catch (error) {
-            if (!["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? "")) throw error;
+        let validNames = snapshot;
+        if (!validNames) {
+          const names = (await workspaceFs.listRoot(root))
+            .filter((name) => !name.includes("/"))
+            .sort();
+          const filtered: string[] = [];
+          for (const name of names) {
+            try {
+              if ((await workspaceFs.stat(root, [name])).kind === "file") filtered.push(name);
+            } catch (error) {
+              if (!["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? ""))
+                throw error;
+            }
           }
+          validNames = filtered;
         }
-        const selected = validNames.slice(start, start + limit);
+        const selected = validNames.slice(0, limit);
         const items = [];
         for (const name of selected) {
           try {
@@ -209,8 +214,8 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
         return {
           items,
           nextCursor:
-            start + selected.length < validNames.length
-              ? issueCursor(cursorRecords, profile, view, start + selected.length)
+            selected.length < validNames.length
+              ? issueCursor(cursorRecords, profile, view, validNames.slice(selected.length))
               : null,
         };
       } finally {
@@ -229,13 +234,13 @@ function issueCursor(
       organizationId: string;
       nodeId: string;
       view: string;
-      offset: number;
+      remainingNames: readonly string[];
       expiresAt: number;
     }
   >,
   profile: AuthorizedBrowserProfile,
   view: string,
-  offset: number,
+  remainingNames: readonly string[],
 ): string {
   if (records.size >= 1024) throw new Error("Cursor ledger is full.");
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -246,7 +251,7 @@ function issueCursor(
       organizationId: profile.organizationId,
       nodeId: profile.homeNodeId,
       view,
-      offset,
+      remainingNames: Object.freeze([...remainingNames]),
       expiresAt: Date.now() + 60_000,
     });
     return token;
