@@ -169,9 +169,21 @@ describe("browser profile content source", () => {
       expect(first.items.map((item) => item.reference)).toEqual(["a.txt"]);
       expect(first.nextCursor).not.toBeNull();
       expect(first.nextCursor).not.toBe("1");
-      const second = await source.read({ profile: { ...profile, downloadRoot }, selector: { kind: "browser_profile", view: "artifacts" }, cursor: first.nextCursor ?? undefined, limit: 1 });
+      const second = await source.read({
+        profile: { ...profile, downloadRoot },
+        selector: { kind: "browser_profile", view: "artifacts" },
+        cursor: first.nextCursor ?? undefined,
+        limit: 1,
+      });
       expect(second.items.map((item) => item.reference)).toEqual(["b.txt"]);
-      await expect(source.read({ profile: { ...profile, downloadRoot }, selector: { kind: "browser_profile", view: "artifacts" }, cursor: first.nextCursor ?? undefined, limit: 1 })).rejects.toThrow();
+      await expect(
+        source.read({
+          profile: { ...profile, downloadRoot },
+          selector: { kind: "browser_profile", view: "artifacts" },
+          cursor: first.nextCursor ?? undefined,
+          limit: 1,
+        }),
+      ).rejects.toThrow();
       await source.close?.();
     } finally {
       await rm(downloadRoot, { recursive: true, force: true });
