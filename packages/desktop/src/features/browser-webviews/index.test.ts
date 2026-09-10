@@ -377,6 +377,46 @@ describe("browser webview attachment", () => {
     unregisterPaseoBrowser("browser-enterprise");
   });
 
+  test("keeps legacy sync registration available without a route while enterprise sync stays denied", async () => {
+    const publisher = createBrowserPageIdentityPublisherRegistry({
+      registry: getPaseoBrowserWebviewRegistry(),
+    });
+    const disposePublisher = await installPaseoBrowserPageIdentityPublisher(publisher);
+    const renderer = new FakeRenderer(8);
+    const profileSession = {};
+    const legacyGuest = new FakeBrowserGuest(308, renderer, profileSession);
+    const enterpriseGuest = new FakeBrowserGuest(309, renderer, profileSession);
+    try {
+      expect(
+        registerAttachedPaseoBrowser({
+          browserId: "browser-legacy-no-route",
+          workspaceId: "workspace-legacy",
+          webContentsId: legacyGuest.id,
+          sender: renderer,
+          profileSession,
+          findWebContents: () => legacyGuest,
+        }),
+      ).toBe(true);
+      expect(getPaseoBrowserIdForWebContents(legacyGuest)).toBe("browser-legacy-no-route");
+
+      expect(() =>
+        registerAttachedPaseoBrowser({
+          browserId: "browser-enterprise-no-route",
+          workspaceId: enterpriseAuthorization.workspaceId,
+          webContentsId: enterpriseGuest.id,
+          sender: renderer,
+          profileSession,
+          profileAuthorization: enterpriseAuthorization,
+          findWebContents: () => enterpriseGuest,
+        }),
+      ).toThrow(/awaitable page-identity barrier/u);
+      expect(getPaseoBrowserIdForWebContents(enterpriseGuest)).toBeNull();
+    } finally {
+      await unregisterPaseoBrowser("browser-legacy-no-route");
+      await disposePublisher();
+    }
+  });
+
   test("concurrent windows cannot swap browser identities", () => {
     const profileSession = {};
     const firstRenderer = new FakeRenderer(1);

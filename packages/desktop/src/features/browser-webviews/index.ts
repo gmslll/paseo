@@ -120,7 +120,7 @@ export function preparePaseoBrowserWebContents(contents: RegisteredBrowserWebCon
 }
 
 export function registerAttachedPaseoBrowser(input: RegisterAttachedBrowserInput): boolean {
-  if (pageIdentityPublisher) {
+  if (pageIdentityPublisher && input.profileAuthorization) {
     throw new Error(
       "Enterprise Browser registration requires the awaitable page-identity barrier.",
     );
