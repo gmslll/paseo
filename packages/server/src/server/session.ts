@@ -2326,6 +2326,7 @@ export class Session {
           if (!contextual || contextual.receiptClassification !== "resources") return;
           this.emit(contextual.response, contextual.authorizationContext);
         } finally {
+          await this.flushOutboundEmissionTasks(requestId);
           this.reservedAuthorityRequestIds.delete(requestId);
         }
         return;
