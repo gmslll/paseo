@@ -21,6 +21,7 @@ import {
   type EnterpriseBrowserProfileBindingPort,
   type EnterpriseBrowserProfileReadPort,
 } from "./handlers.js";
+import { isStableBrowserProfileBinding } from "./factory.js";
 import {
   ENTERPRISE_BROWSER_LEASE_OPERATIONS,
   createEnterpriseBrowserLeaseDispatcherRegistration,
@@ -344,6 +345,23 @@ function dispatchContext(context: EnterpriseSessionContext = sessionContext()) {
 }
 
 describe("EnterpriseBrowserLeaseHandler", () => {
+  test("rejects deferred A to B rebinding after authorization await", async () => {
+    const first = {
+      organizationId: "org-a",
+      nodeId: "node-a",
+      workspaceId: "ws",
+      browserProfileId: "profile-a",
+      boundAt: "a",
+    };
+    const second = { ...first, browserProfileId: "profile-b", boundAt: "b" };
+    let current = first;
+    const duringAuthorization = Promise.resolve().then(() => {
+      current = second;
+      return undefined;
+    });
+    await duringAuthorization;
+    expect(isStableBrowserProfileBinding(first, current)).toBe(false);
+  });
   test("lists only canonical profiles and binding projections for the authorized Workspace", async () => {
     const profiles = new MemoryProfiles([
       profile(),

@@ -20,6 +20,32 @@ import {
   type EnterpriseBrowserProfileReadPort,
 } from "./handlers.js";
 
+export function isStableBrowserProfileBinding(
+  first: {
+    organizationId: string;
+    nodeId: string;
+    workspaceId: string;
+    browserProfileId: string;
+    boundAt: string;
+  },
+  second: {
+    organizationId: string;
+    nodeId: string;
+    workspaceId: string;
+    browserProfileId: string;
+    boundAt: string;
+  } | null,
+): boolean {
+  return (
+    !!second &&
+    first.organizationId === second.organizationId &&
+    first.nodeId === second.nodeId &&
+    first.workspaceId === second.workspaceId &&
+    first.browserProfileId === second.browserProfileId &&
+    first.boundAt === second.boundAt
+  );
+}
+
 const sessionRuntimeBrand = Symbol("EnterpriseBrowserLeaseSessionRuntime");
 
 export const ENTERPRISE_BROWSER_LEASE_OPERATIONS = Object.freeze([
@@ -155,11 +181,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
             binding.workspaceId !== workspace.workspaceId ||
             binding.workspaceId !== agent.workspaceId ||
             binding.browserProfileId !== profile.browserProfileId ||
-            currentBinding.organizationId !== binding.organizationId ||
-            currentBinding.nodeId !== binding.nodeId ||
-            currentBinding.workspaceId !== binding.workspaceId ||
-            currentBinding.browserProfileId !== binding.browserProfileId ||
-            currentBinding.boundAt !== binding.boundAt
+            !isStableBrowserProfileBinding(binding, currentBinding)
           )
             throw new Error("Binding changed while resolving authorization.");
           return { workspace, agent, profile, bindingRevision: binding.boundAt };
