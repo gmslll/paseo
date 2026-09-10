@@ -9,6 +9,8 @@ import type { DesktopWindowChromeMode } from "./window/chrome.js";
 // with PASEO_BROWSER_PROFILE_PARTITION in features/browser-profile.ts; preload-sandbox.test.ts
 // guards both the no-local-import rule and this drift. Type-only imports are fine (erased at emit).
 const PASEO_BROWSER_PROFILE_PARTITION = "persist:paseo-browser";
+export const HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL = "paseo:browser-profile:hydrate-authorizations";
+export const REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL = "paseo:browser-profile:revoke-generation";
 
 type EventHandler = (payload: unknown) => void;
 
@@ -114,6 +116,10 @@ contextBridge.exposeInMainWorld("paseoDesktop", {
       ipcRenderer.invoke("paseo:menu:set-capturing-shortcut", capturing),
   },
   browser: {
+    hydrateBrowserProfileAuthorizations: (input: { authorizations: unknown[]; lifecycleGeneration: string }) =>
+      ipcRenderer.invoke(HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL, input),
+    revokeBrowserProfileGeneration: (input: { lifecycleGeneration: string }) =>
+      ipcRenderer.invoke(REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL, input),
     setShortcutPolicy: (input: BrowserKeyboardPolicy) =>
       ipcRenderer.invoke("paseo:browser:set-shortcut-policy", input),
     profilePartition: PASEO_BROWSER_PROFILE_PARTITION,
