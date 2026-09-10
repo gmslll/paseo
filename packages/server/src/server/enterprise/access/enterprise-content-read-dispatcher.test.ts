@@ -449,6 +449,34 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
           (event) => event.action === "app.use" && event.outcome === "allowed",
         ),
       ).toBe(true);
+      const allowedAuditCount = (await fixture.audit.snapshotEvents()).filter(
+        (event) => event.action === "app.use" && event.outcome === "allowed",
+      ).length;
+      expect(
+        await lease.dispatcher.handle({
+          sessionContext: fixture.context,
+          message: {
+            ...message,
+            requestId: "r-app-foreign",
+            resource: { ...message.resource, organizationId: "org_ffffffffffffffff" },
+          },
+        }),
+      ).toBe(false);
+      expect(
+        await lease.dispatcher.handle({
+          sessionContext: fixture.context,
+          message: {
+            ...message,
+            requestId: "r-app-missing",
+            resource: { ...message.resource, localResourceId: "aps_ffffffffffffffff" },
+          },
+        }),
+      ).toBe(false);
+      expect(
+        (await fixture.audit.snapshotEvents()).filter(
+          (event) => event.action === "app.use" && event.outcome === "allowed",
+        ),
+      ).toHaveLength(allowedAuditCount);
       await lease.close();
       await fixture.runtime.release();
     } finally {
