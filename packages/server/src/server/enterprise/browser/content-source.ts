@@ -5,6 +5,7 @@ import {
   type EnterpriseBrowserProfileContentItem,
   type EnterpriseBrowserProfileContentSelector,
 } from "@getpaseo/protocol/messages";
+import { DarwinWorkspaceFileSystem } from "../runtime/darwin-workspace-fs.js";
 const sourceBrand = Symbol("EnterpriseBrowserProfileContentReadSource");
 
 export interface EnterpriseBrowserProfileContentPage {
@@ -25,6 +26,7 @@ export interface EnterpriseBrowserProfileContentReadSource {
 
 export function createEnterpriseBrowserProfileContentReadSource(input: {
   readonly readProfile: (input: {
+    readonly profile: AuthorizedBrowserProfile;
     readonly browserProfileId: string;
     readonly view: EnterpriseBrowserProfileContentSelector["view"];
     readonly cursor?: string;
@@ -38,6 +40,7 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
       if (closed) throw new Error("Browser profile content source is closed.");
       const parsedSelector = EnterpriseBrowserProfileContentSelectorSchema.parse(selector);
       const page = await input.readProfile({
+        profile,
         browserProfileId: profile.browserProfileId,
         view: parsedSelector.view,
         cursor,
@@ -51,6 +54,57 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
     },
     close: () => {
       closed = true;
+    },
+  });
+}
+
+export function createProductionEnterpriseBrowserProfileContentReadSource(input: {
+  readonly workspaceFs?: DarwinWorkspaceFileSystem;
+}): EnterpriseBrowserProfileContentReadSource | null {
+  const workspaceFs = input.workspaceFs ?? new DarwinWorkspaceFileSystem();
+  if (!workspaceFs.releaseReady) return null;
+  return createEnterpriseBrowserProfileContentReadSource({
+    readProfile: async ({ profile, view, cursor, limit }) => {
+      const root = await workspaceFs.openWorkspaceRoot(profile.downloadRoot);
+      try {
+        if (view === "state") {
+          return {
+            items: [
+              {
+                itemId: profile.browserProfileId,
+                occurredAt: profile.updatedAt,
+                kind: "state",
+                label: profile.label,
+                status: profile.status,
+              },
+            ],
+            nextCursor: null,
+          };
+        }
+        const names = (await workspaceFs.listRoot(root)).filter((name) => !name.includes("/"));
+        const start = cursor ? Number(cursor) : 0;
+        const selected = names.slice(start, start + limit);
+        const items = await Promise.all(
+          selected.map(async (name) => {
+            const stat = await workspaceFs.stat(root, [name]);
+            return {
+              itemId: name,
+              occurredAt: new Date(stat.mtimeMs).toISOString(),
+              kind: "artifact",
+              reference: name,
+              label: name,
+              size: stat.size,
+            };
+          }),
+        );
+        return {
+          items,
+          nextCursor:
+            start + selected.length < names.length ? String(start + selected.length) : null,
+        };
+      } finally {
+        await root.close();
+      }
     },
   });
 }
