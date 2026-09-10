@@ -85,6 +85,47 @@ function revocableGuard() {
 }
 
 describe("ResourceAuthorizationService", () => {
+  test("permits only an exact empty organization projection with empty resource context", async () => {
+    const authorization = new ResourceAuthorizationService({
+      owners: new OwnerRegistry(),
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    const empty = {
+      type: "enterprise.organization.list_resources.response" as const,
+      payload: {
+        requestId: "empty",
+        principals: [],
+        resources: [],
+        nextCursor: null,
+      },
+    };
+
+    await expect(
+      authorization.canEmit(ctx, empty, { kind: "resources", resources: [] }),
+    ).resolves.toBe(true);
+    await expect(
+      authorization.canEmit(
+        ctx,
+        { ...empty, payload: { ...empty.payload, nextCursor: "leaky-cursor" } },
+        { kind: "resources", resources: [] },
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      authorization.canEmit(
+        ctx,
+        {
+          ...empty,
+          payload: {
+            ...empty.payload,
+            principals: [{ principalId: ctx.principalId, status: "active" }],
+          },
+        },
+        { kind: "resources", resources: [] },
+      ),
+    ).resolves.toBe(false);
+  });
+
   test("asserts resources and filters rows without making foreign ids enumerable", async () => {
     const owners = new OwnerRegistry();
     owners.registerWorkspace(workspaceRecord);

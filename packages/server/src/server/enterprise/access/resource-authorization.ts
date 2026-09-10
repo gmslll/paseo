@@ -215,9 +215,11 @@ export class ResourceAuthorizationService implements ResourceAuthorizationContra
     context: OutboundAuthorizationContext,
   ): Promise<boolean> {
     if (!this.isCurrent(ctx)) return false;
+    if (isExactEmptyResourcesContext(context)) {
+      return isSafeEmptyOrganizationProjection(event) && this.isCurrent(ctx);
+    }
     const parsed = OutboundAuthorizationContextSchema.safeParse(context);
     if (!parsed.success) return false;
-    if (parsed.data.kind === "resources" && parsed.data.resources.length === 0) return false;
     context = parsed.data;
     if (context.kind === "transport_control") {
       return isMatchingTransportControl(event, context.control) && this.isCurrent(ctx);
@@ -381,6 +383,43 @@ export class ResourceAuthorizationService implements ResourceAuthorizationContra
 }
 
 export class ResourceAuthorization extends ResourceAuthorizationService {}
+
+function isSafeEmptyOrganizationProjection(event: SessionOutboundMessage): boolean {
+  return (
+    event.type === "enterprise.organization.list_resources.response" &&
+    event.payload.principals.length === 0 &&
+    event.payload.resources.length === 0 &&
+    event.payload.nextCursor === null
+  );
+}
+
+function isExactEmptyResourcesContext(context: unknown): boolean {
+  try {
+    if (typeof context !== "object" || context === null || Array.isArray(context)) return false;
+    const keys = Reflect.ownKeys(context);
+    if (
+      keys.length !== 2 ||
+      !keys.includes("kind") ||
+      !keys.includes("resources") ||
+      keys.some((key) => typeof key !== "string")
+    ) {
+      return false;
+    }
+    const kind = Object.getOwnPropertyDescriptor(context, "kind");
+    const resources = Object.getOwnPropertyDescriptor(context, "resources");
+    return Boolean(
+      kind?.enumerable &&
+      "value" in kind &&
+      kind.value === "resources" &&
+      resources?.enumerable &&
+      "value" in resources &&
+      Array.isArray(resources.value) &&
+      resources.value.length === 0,
+    );
+  } catch {
+    return false;
+  }
+}
 
 function ownersMatch(
   left: NonNullable<ReturnType<typeof normalizeEnterpriseResourceOwner>>,

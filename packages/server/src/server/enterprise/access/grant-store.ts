@@ -539,6 +539,14 @@ export function readAuthoritativeGrantRecord(
   return GrantStore.prototype.get.call(store, principalId);
 }
 
+export function updateAuthoritativeGrantRecord(
+  store: GrantStore,
+  input: GrantUpdateInput,
+): Promise<GrantChange> {
+  if (!isAuthoritativeGrantStore(store)) return Promise.reject(new Error("invalid GrantStore"));
+  return GrantStore.prototype.update.call(store, input);
+}
+
 export function currentAuthoritativeGrantVersion(
   store: GrantStore,
   organizationId: string,

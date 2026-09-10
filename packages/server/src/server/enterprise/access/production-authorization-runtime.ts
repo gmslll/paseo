@@ -133,6 +133,8 @@ interface RuntimeRecord {
   readonly sessionAuthorization: SessionAuthorization;
   readonly authority: ResolvedProductionAuthorizationAuthority;
   readonly binding: AuthoritySessionBindingRecord;
+  readonly grantStore: GrantStore;
+  readonly owners: OwnerRegistry;
   readonly guard: RuntimeGrantVersionGuard;
   readonly fileBinary: FileBinaryOutboundAuthorizer;
   readonly outbound: BoundOutboundAuthorityEmissionAuthorizerImpl;
@@ -524,6 +526,8 @@ export async function createEnterpriseAuthorizationRuntime(
       sessionAuthorization: options.sessionAuthorization,
       authority,
       binding,
+      grantStore: options.grantStore,
+      owners: options.owners,
       guard,
       fileBinary,
       outbound,
@@ -546,6 +550,25 @@ export function isCurrentProductionAuthorizationRuntime(
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
     const record = runtimeRecords.get(value as object);
     return Boolean(record?.active && record.guard.isCurrent(record.authority.principal));
+  } catch {
+    return false;
+  }
+}
+
+export function isCurrentProductionAuthorizationRuntimeForAuthoritySources(
+  value: unknown,
+  grantStore: unknown,
+  owners: unknown,
+): value is ProductionAuthorizationRuntime {
+  try {
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+    const record = runtimeRecords.get(value as object);
+    return Boolean(
+      record?.active &&
+      record.grantStore === grantStore &&
+      record.owners === owners &&
+      record.guard.isCurrent(record.authority.principal),
+    );
   } catch {
     return false;
   }
