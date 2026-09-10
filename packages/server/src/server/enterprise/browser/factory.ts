@@ -116,7 +116,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
   const base = createEnterpriseBrowserLeaseDispatcherRegistration({
     runtime: input.runtime,
     authority: createUnavailableAuthority(),
-    authorityForSessionRuntime: ({ authorizationRuntime }) => {
+    authorityForSessionRuntime: ({ authorizationRuntime, context }) => {
       const authority = resolveCurrentProductionRuntimeAuthority(
         authorizationRuntime,
         input.provider,
@@ -151,7 +151,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
         },
       };
       input.bundle.bindSessionAuthority({
-        generation: input.context.sessionBindingGeneration,
+        generation: context.sessionBindingGeneration,
         isCurrentHandle: resolvedAuthority.isCurrentHandle,
         resolveAuthorization: resolvedAuthority.resolveLeaseAuthorization,
       });
