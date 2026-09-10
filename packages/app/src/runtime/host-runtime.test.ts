@@ -885,6 +885,29 @@ describe("HostRuntimeController", () => {
     await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-a" });
     const generationA = controller.getEnterpriseScopeGeneration();
     expect(generationA).toEqual(expect.any(String));
+    const fileFetch = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Response(init?.headers ? "ok" : "missing-auth", { status: 200 }),
+    );
+    const createEnterpriseFileRequest = createEnterpriseFileRequestFactory({
+      lifecycle: lifecycle!,
+      fetch: fileFetch,
+    });
+    const enterpriseFileRequest = createEnterpriseFileRequest({
+      host,
+      connection: host.connections[0]!,
+      clientId: "cid_browser_runtime",
+      runtimeGeneration: 1,
+    });
+    expect(enterpriseFileRequest).toBeTypeOf("function");
+    await expect(
+      enterpriseFileRequest!({
+        serverId: host.serverId,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "tabs/A.json",
+        scopeGeneration: generationA!,
+      }),
+    ).resolves.toMatchObject({ status: 200 });
     const authorizationA: BrowserProfileRuntimeAuthorization = {
       organizationId: "org_aaaaaaaaaaaaaaaa",
       homeNodeId: "nod_aaaaaaaaaaaaaaaa",
@@ -940,10 +963,27 @@ describe("HostRuntimeController", () => {
     expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
     await lifecycle!.logoutCurrent(host.serverId);
     expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
+    await expect(
+      enterpriseFileRequest!({
+        serverId: host.serverId,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "tabs/A-late.json",
+        scopeGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
 
     await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-b" });
     const generationB = controller.getEnterpriseScopeGeneration();
     expect(generationB).toEqual(expect.any(String));
+    await expect(
+      enterpriseFileRequest!({
+        serverId: host.serverId,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "attachments/B.json",
+        scopeGeneration: generationB!,
+      }),
+    ).resolves.toMatchObject({ status: 200 });
+    expect(fileFetch).toHaveBeenCalledTimes(2);
     await expect(
       controller.hydrateBrowserProfileAuthorizations({
         authorizations: [authorizationA],
