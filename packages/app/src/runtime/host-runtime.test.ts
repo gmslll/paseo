@@ -1125,6 +1125,68 @@ describe("HostRuntimeController", () => {
     expect(hydrateSpy).toHaveBeenCalledTimes(sortedCallCount);
   });
 
+  it("wires root residue targets so A partitions are cleared before B is published", async () => {
+    const host = makeHost({ serverId: "server-residue-targets" });
+    const cleared: string[] = [];
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        enterpriseResidueResetTargets: {
+          reset: ({ lifecycleGeneration }) => cleared.push(lifecycleGeneration),
+        },
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async ({ token }) => ({
+            projection: {
+              principalType: "human",
+              principalId: "usr_aaaaaaaaaaaaaaaa",
+              organizationId: "org_aaaaaaaaaaaaaaaa",
+              nodeId: "nod_aaaaaaaaaaaaaaaa",
+              paseoServerId: host.serverId,
+              displayName: token,
+              grantVersion: token,
+              navigation: [],
+              allowedOperations: [],
+            },
+            sessionBindingKey: `binding-${token}`,
+            teardownAttempt: async () => {},
+          }),
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {},
+            disposeRuntimeAndCachePartition: async () => {},
+            destroyDaemonClient: async () => {},
+            startNewClient: async () => {},
+            hydrateScope: async () => {},
+          },
+          remoteLogout: { logoutAll: async () => {} },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_residue_targets",
+      },
+    });
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "A" });
+    const generationA = controller.getEnterpriseScopeGeneration();
+    expect(generationA).toEqual(expect.any(String));
+    await lifecycle!.logoutCurrent(host.serverId);
+    expect(cleared).toEqual([generationA!]);
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "B" });
+    expect(controller.getEnterpriseScopeGeneration()).not.toBe(generationA);
+    expect(cleared).toEqual([generationA!]);
+  });
+
   it("seals browser capability when generation revoke fails", async () => {
     const host = makeHost({ serverId: "server-browser-sealed" });
     const revoke = vi.fn(async () => {

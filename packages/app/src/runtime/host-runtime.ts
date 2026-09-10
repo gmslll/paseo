@@ -77,6 +77,8 @@ import { useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
 import { invalidateCheckoutGitQueriesForServer } from "@/git/query-keys";
 import { queryClient } from "@/data/query-client";
 import type { EnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
+import { createEnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
+import type { EnterpriseResidueResetTargets } from "@/stores/enterprise/enterprise-residue-reset";
 import {
   invalidateServerDataQueriesAfterReconnect,
   mountServerDataPushRouter,
@@ -210,6 +212,8 @@ export interface HostRuntimeControllerDeps {
   browserProfileRuntimeBridge?: BrowserProfileRuntimeBridge;
   /** Root/W6 adapter for clearing enterprise-scoped app residue. */
   enterpriseResidueResetAdapter?: EnterpriseResidueResetAdapter;
+  /** Convenience root seam; HostRuntime owns adapter construction when supplied. */
+  enterpriseResidueResetTargets?: EnterpriseResidueResetTargets;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -852,7 +856,11 @@ export class HostRuntimeController {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
     this.browserProfileRuntimeBridge = this.deps.browserProfileRuntimeBridge ?? null;
-    this.enterpriseResidueResetAdapter = this.deps.enterpriseResidueResetAdapter ?? null;
+    this.enterpriseResidueResetAdapter =
+      this.deps.enterpriseResidueResetAdapter ??
+      (this.deps.enterpriseResidueResetTargets
+        ? createEnterpriseResidueResetAdapter(this.deps.enterpriseResidueResetTargets)
+        : null);
     this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
       ? createProcessCredentialVault()
       : null;
