@@ -47,13 +47,13 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
 describe("SessionAuthorization", () => {
   test("enterprise operations have explicit coarse permission requirements", () => {
     const inboundRequirements = {
-      "enterprise.access.list_grants.request": "access.manage",
-      "enterprise.access.update_grants.request": "access.manage",
-      "enterprise.audit.list_events.request": "daemon.read",
-      "enterprise.browser.bind_profile.request": "access.manage",
+      "enterprise.access.list_grants.request": "workspace.read",
+      "enterprise.access.update_grants.request": "workspace.write",
+      "enterprise.audit.list_events.request": "workspace.read",
+      "enterprise.browser.bind_profile.request": "workspace.write",
       "enterprise.browser.list_profiles.request": "workspace.read",
       "enterprise.identity.get_current.request": null,
-      "enterprise.identity.list_principals.request": "access.manage",
+      "enterprise.identity.list_principals.request": "workspace.read",
       "enterprise.identity.logout_all.request": null,
       "enterprise.node.list_nodes.request": "daemon.read",
       "enterprise.node.set_drain.request": "daemon.manage",
@@ -64,14 +64,14 @@ describe("SessionAuthorization", () => {
       "enterprise.resource.renew_lease.request": "workspace.write",
     } as const satisfies Partial<Record<SessionInboundMessage["type"], PermissionRequirement>>;
     const outboundRequirements = {
-      "enterprise.access.list_grants.response": "access.manage",
-      "enterprise.access.update_grants.response": "access.manage",
-      "enterprise.audit.list_events.response": "daemon.read",
-      "enterprise.browser.bind_profile.response": "access.manage",
+      "enterprise.access.list_grants.response": "workspace.read",
+      "enterprise.access.update_grants.response": "workspace.write",
+      "enterprise.audit.list_events.response": "workspace.read",
+      "enterprise.browser.bind_profile.response": "workspace.write",
       "enterprise.browser.list_profiles.response": "workspace.read",
       "enterprise.identity.credential_revoked": null,
       "enterprise.identity.get_current.response": null,
-      "enterprise.identity.list_principals.response": "access.manage",
+      "enterprise.identity.list_principals.response": "workspace.read",
       "enterprise.identity.logout_all.response": null,
       "enterprise.identity.scope_refreshed": null,
       "enterprise.node.list_nodes.response": "daemon.read",
