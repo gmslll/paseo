@@ -4276,11 +4276,21 @@ export class Session {
       await this.enqueueAuthorizedEmit(contextual.response, contextual.authorizationContext);
     } finally {
       try {
-        issuerSealedByFanout = claimAndFanoutWorkspaceOwnershipTransferTombstone({
+        const fanout = claimAndFanoutWorkspaceOwnershipTransferTombstone({
           issuerHandle: this.enterpriseWorkspaceOwnershipTransferSessionHandle,
           dispatcher: this.enterpriseWorkspaceOwnershipTransferDispatcher,
           contextualResponse: contextual,
-        }).issuerSealed;
+        });
+        issuerSealedByFanout = fanout.issuerSealed;
+        this.sessionLogger.trace(
+          {
+            claimed: fanout.claimed,
+            issuerSealed: fanout.issuerSealed,
+            targetedSessions: fanout.targetedSessions,
+            deliveredSessions: fanout.deliveredSessions,
+          },
+          "Workspace ownership transfer tombstone fanout completed",
+        );
       } finally {
         if (!issuerSealedByFanout) this.invalidateTransferredWorkspaceScope(transferredWorkspaceId);
       }
