@@ -6,6 +6,7 @@ import { describe, expect, test } from "vitest";
 import type { AuditEvent, AuditEventInput, AuditAppendOptions } from "@getpaseo/protocol/messages";
 import { EnterprisePrincipalAuthenticator } from "./authenticator.js";
 import { IdentityRegistry } from "./registry.js";
+import { nodeIdentityRegistryFs } from "./fs-port.js";
 
 const node = { nodeId: "nod_0123456789abcdef", paseoServerId: "srv", mode: "standalone" as const };
 
@@ -31,6 +32,11 @@ describe("EnterprisePrincipalAuthenticator", () => {
     };
     const registry = new IdentityRegistry({
       filePath: path.join(root, "credentials.json"),
+      fs: Object.assign(Object.create(nodeIdentityRegistryFs), {
+        noFollowFlag: 0x40000000,
+        open: (filePath: string, flags: number, mode?: number) =>
+          nodeIdentityRegistryFs.open(filePath, flags & ~0x40000000, mode),
+      }),
       node,
       principalSource: { resolvePrincipal: async () => null },
       audit,
