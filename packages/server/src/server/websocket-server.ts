@@ -38,7 +38,10 @@ import {
   type SessionOptions,
   type SessionRuntimeMetrics,
 } from "./session.js";
-import type { EnterpriseSessionDispatcher } from "./session/enterprise-dispatcher.js";
+import type {
+  EnterpriseSessionDispatcher,
+  EnterpriseSessionDispatcherFactory,
+} from "./session/enterprise-dispatcher.js";
 import type { EnterpriseFeatureAdvertisement } from "./enterprise/dispatcher-registry.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
@@ -874,6 +877,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseRuntime?: EnterpriseAdmissionRuntime;
   private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
   private readonly enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  private readonly enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
   private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
   private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 
@@ -928,6 +932,7 @@ export class VoiceAssistantWebSocketServer {
     enterpriseDispatcher?: EnterpriseSessionDispatcher,
     enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"],
     enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement,
+    enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -936,6 +941,7 @@ export class VoiceAssistantWebSocketServer {
     this.enterpriseDispatcher = enterpriseDispatcher;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
     this.enterpriseFeatureFlags = enterpriseFeatureFlags;
+    this.enterpriseDispatcherFactory = enterpriseDispatcherFactory;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -1948,6 +1954,9 @@ export class VoiceAssistantWebSocketServer {
       ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
       ...(this.enterpriseIdentitySelfAuthorization
         ? { enterpriseIdentitySelfAuthorization: this.enterpriseIdentitySelfAuthorization }
+        : {}),
+      ...(this.enterpriseDispatcherFactory
+        ? { enterpriseDispatcherFactory: this.enterpriseDispatcherFactory }
         : {}),
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
