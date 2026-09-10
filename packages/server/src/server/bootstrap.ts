@@ -783,6 +783,7 @@ export async function createPaseoDaemon(
     | undefined;
   let productionEnterpriseFeatureFlags: EnterpriseFeatureAdvertisement | undefined;
   let productionAgentOwnerBinder: ProductionAgentOwnerBinder | undefined;
+  let closeProductionBrowserBundle: (() => Promise<void>) | undefined;
   const logger = rootLogger.child({ module: "bootstrap" });
   const capturedPaseoHome = structuredClone(config.paseoHome);
   if (typeof capturedPaseoHome !== "string" || capturedPaseoHome.length === 0) {
@@ -1398,7 +1399,12 @@ export async function createPaseoDaemon(
         maxLeaseTtlMs: 60_000,
         onError: (error) => logger.error({ err: error }, "Enterprise browser lease failure"),
       });
-      constructionCleanupStack.push(() => browserBundle.close());
+      let browserBundleClosePromise: Promise<void> | null = null;
+      closeProductionBrowserBundle = async () => {
+        browserBundleClosePromise ??= browserBundle.close();
+        await browserBundleClosePromise;
+      };
+      constructionCleanupStack.push(() => closeProductionBrowserBundle?.());
       await browserBundle.profiles.initialize();
       await browserBundle.bindings.initialize();
       await browserBundle.leases.initialize();
@@ -2121,6 +2127,7 @@ export async function createPaseoDaemon(
           const currentWsServer = wsServer;
           await runCleanupStep(errors, () => currentWsServer.close());
         }
+        await runCleanupStep(errors, () => closeProductionBrowserBundle?.());
         await runCleanupStep(errors, () => serviceProxy.stopStandalone());
         await runCleanupStep(errors, () => httpServer.closeAllConnections());
         await runCleanupStep(
