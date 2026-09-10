@@ -10,6 +10,7 @@ const context = {
   sessionId: "session-test",
   clientId: "client-test",
   credentialId: "credential-test",
+  sessionBindingGeneration: "generation-test",
   enterpriseContext: {} as EnterpriseSessionContext,
 };
 const message = {
@@ -19,9 +20,9 @@ const message = {
 
 describe("enterprise session dispatcher seam", () => {
   test("passes the server-bound context to the registered dispatcher", async () => {
-    const handle = vi.fn(() => true);
+    const handle = vi.fn(() => message);
     const dispatcher: EnterpriseSessionDispatcher = { handle };
-    await expect(dispatchEnterpriseRequest(dispatcher, context, message)).resolves.toBe(true);
+    await expect(dispatchEnterpriseRequest(dispatcher, context, message)).resolves.toBe(message);
     expect(handle).toHaveBeenCalledWith({ sessionContext: context, message });
   });
 

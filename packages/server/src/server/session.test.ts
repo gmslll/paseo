@@ -826,7 +826,9 @@ test("Session construction fails closed when authority binding registration fail
   } as unknown as SessionOptions["authorityReceiptState"];
   expect(() =>
     createSessionForTest({
-      enterpriseContext: enterpriseContext(),
+      enterpriseContext: enterpriseContext("generation-dispatch", {
+        grants: [{ action: "identity.manage", selector: { kind: "self" } }],
+      }),
       enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
       authorityReceiptState,
       agentManager: { subscribe: subscribeAgent },
@@ -1770,22 +1772,21 @@ test("cleanup aggregates workspace and authority release errors while continuing
   expect(registryRelease).toHaveBeenCalledTimes(1);
 });
 
-test("identity-self request reaches its handler without authority receipt registration", async () => {
-  const state = new MemoryAuthorityReceiptState();
-  const register = vi.spyOn(state, "register");
+test("identity-self request is unavailable until its owning policy is registered", async () => {
+  const messages: SessionOutboundMessage[] = [];
   const session = createSessionForTest({
+    messages,
     enterpriseContext: enterpriseContext("generation-identity-self"),
     enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
-    authorityReceiptState: state,
   });
-  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
   await session.handleMessage({
     type: "enterprise.identity.get_current.request",
     requestId: "identity-self-1",
   });
-  expect(register).not.toHaveBeenCalled();
-  expect(dispatch).toHaveBeenCalledTimes(1);
-  dispatch.mockRestore();
+  expect(messages.at(-1)).toMatchObject({
+    type: "rpc_error",
+    payload: { requestId: "identity-self-1", code: "unavailable" },
+  });
   await session.cleanup();
 });
 
@@ -7366,32 +7367,12 @@ describe("enterprise dispatcher integration seam", () => {
     const messages: SessionOutboundMessage[] = [];
     const session = createSessionForTest({ messages });
     await session.handleMessage({
-      type: "enterprise.identity.get_current.request",
+      type: "enterprise.access.list_grants.request",
       requestId: "legacy-enterprise",
     });
     expect(messages.at(-1)).toMatchObject({
       type: "rpc_error",
       payload: { requestId: "legacy-enterprise", code: "unavailable" },
-    });
-  });
-
-  test("enterprise sessions route through one dispatcher and unknown operations are unavailable", async () => {
-    const messages: SessionOutboundMessage[] = [];
-    const handle = vi.fn(() => false);
-    const session = createSessionForTest({
-      messages,
-      enterpriseContext: enterpriseContext(),
-      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
-      enterpriseDispatcher: { handle },
-    });
-    await session.handleMessage({
-      type: "enterprise.identity.get_current.request",
-      requestId: "enterprise-unknown",
-    });
-    expect(handle).toHaveBeenCalledTimes(1);
-    expect(messages.at(-1)).toMatchObject({
-      type: "rpc_error",
-      payload: { requestId: "enterprise-unknown", code: "unavailable" },
     });
   });
 });

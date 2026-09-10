@@ -2252,7 +2252,12 @@ export class Session {
         }
         return;
       }
-      if (isEnterpriseRequest(msg) && (this.enterpriseDispatcher || !this.enterpriseContext)) {
+      if (
+        isEnterpriseRequest(msg) &&
+        (!this.enterpriseDispatcher ||
+          !this.enterpriseContext ||
+          !authorityReceiptPolicyForRequestType(msg.type))
+      ) {
         const requestId = sessionRequestId(msg);
         if (!this.enterpriseDispatcher || !this.enterpriseContext) {
           if (requestId) {
@@ -2267,27 +2272,6 @@ export class Session {
             });
           }
           return;
-        }
-        const handled = await dispatchEnterpriseRequest(
-          this.enterpriseDispatcher,
-          {
-            sessionId: this.sessionId,
-            clientId: this.clientId,
-            credentialId: this.enterpriseContext.principal.credentialId,
-            enterpriseContext: this.enterpriseContext,
-          },
-          msg,
-        );
-        if (!handled && requestId) {
-          this.onMessage({
-            type: "rpc_error",
-            payload: {
-              requestId,
-              requestType: msg.type,
-              error: ENTERPRISE_UNAVAILABLE_ERROR,
-              code: "unavailable",
-            },
-          });
         }
         return;
       }
@@ -2359,6 +2343,35 @@ export class Session {
             this.reservedAuthorityRequestIds.delete(requestId);
             reservedRequestId = null;
             registeredRequestId = requestId;
+            // oxlint-disable-next-line max-depth -- dispatcher runs inside receipt transaction.
+            if (this.enterpriseDispatcher && this.enterpriseContext && isEnterpriseRequest(msg)) {
+              const response = await dispatchEnterpriseRequest(
+                this.enterpriseDispatcher,
+                {
+                  sessionId: this.sessionId,
+                  clientId: this.clientId,
+                  credentialId: this.enterpriseContext.principal.credentialId,
+                  sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                  enterpriseContext: this.enterpriseContext,
+                },
+                msg,
+              );
+              // oxlint-disable-next-line max-depth -- unavailable response remains in transaction.
+              if (response === false) {
+                this.onMessage({
+                  type: "rpc_error",
+                  payload: {
+                    requestId,
+                    requestType: msg.type,
+                    error: ENTERPRISE_UNAVAILABLE_ERROR,
+                    code: "unavailable",
+                  },
+                });
+              } else {
+                this.emit(response);
+              }
+              return;
+            }
           } catch {
             // oxlint-disable-next-line max-depth -- failed registration still closes the W2 active handle.
             if (emissionRegisteredHandle && this.outboundAuthorityEmissionAuthorizer) {
@@ -2402,6 +2415,18 @@ export class Session {
             this.pendingAuthorityRequests.delete(requestId);
             this.reservedAuthorityRequestIds.delete(requestId);
             reservedRequestId = null;
+            // oxlint-disable-next-line max-depth -- enterprise failure response is transactional.
+            if (requestId && isEnterpriseRequest(msg)) {
+              this.onMessage({
+                type: "rpc_error",
+                payload: {
+                  requestId,
+                  requestType: msg.type,
+                  error: ENTERPRISE_UNAVAILABLE_ERROR,
+                  code: "unavailable",
+                },
+              });
+            }
             return;
           }
         }
