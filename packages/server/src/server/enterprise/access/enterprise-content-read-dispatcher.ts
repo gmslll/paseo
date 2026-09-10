@@ -5,6 +5,7 @@ import { resolveCurrentProductionRuntimeAuthority } from "./production-runtime-a
 import { isCurrentProductionAuthorizationRuntimeForAuthoritySources } from "./production-authorization-runtime.js";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
 import type { EnterpriseContentAgentProductionSource } from "../runtime/enterprise-content-read.js";
+import type { EnterpriseBrowserProfileContentReadSource } from "../browser/content-source.js";
 import {
   createEnterpriseWorkspaceContentReadSource,
   createEnterpriseAppSlotContentReadSource,
@@ -35,6 +36,7 @@ export interface EnterpriseContentReadFactoryInput {
   readonly provider: ProductionAuthorizationRuntimeProvider;
   readonly audit: ProductionAuditCapability;
   readonly agents: EnterpriseContentAgentProductionSource;
+  readonly createBrowserProfileSource?: () => EnterpriseBrowserProfileContentReadSource;
 }
 interface Pending {
   readonly context: EnterpriseDispatchContext;
@@ -79,7 +81,7 @@ function requestIdOf(
 export function createEnterpriseContentReadDispatcherRegistration(
   input: EnterpriseContentReadFactoryInput,
 ): EnterpriseSessionDispatcherFactoryRegistration | null {
-  const { provider, audit, agents } = input;
+  const { provider, audit, agents, createBrowserProfileSource } = input;
   let currentAudit: ProductionAuditCapability;
   try {
     currentAudit = productionAuditCapabilityIssuer.requireCurrent(audit);
@@ -93,6 +95,9 @@ export function createEnterpriseContentReadDispatcherRegistration(
         "enterprise.workspace.content.read.request",
         "enterprise.app_slot.content.read.request",
         "enterprise.agent.content.read.request",
+        ...(createBrowserProfileSource
+          ? ["enterprise.browser_profile.content.read.request" as const]
+          : []),
       ],
     },
     open(openInput) {
@@ -107,6 +112,8 @@ export function createEnterpriseContentReadDispatcherRegistration(
       });
       const appSlotSource = createEnterpriseAppSlotContentReadSource();
       const agentSource = createEnterpriseAgentContentReadSource({ agents });
+      const browserSource: EnterpriseBrowserProfileContentReadSource | null =
+        createBrowserProfileSource ? createBrowserProfileSource() : null;
       if (!source) throw new Error("workspace source unavailable");
       let closed = false;
       let closePromise: Promise<void> | null = null;
@@ -384,18 +391,19 @@ export function createEnterpriseContentReadDispatcherRegistration(
           reservations.clear();
           for (const item of pending) if (isObject(item.response)) issued.delete(item.response);
           pending.clear();
-          closePromise = Promise.allSettled([source.close(), appSlotSource.close()]).then(
-            (results) => {
-              const errors = results.flatMap((result) =>
-                result.status === "rejected" ? [result.reason] : [],
-              );
-              if (errors.length > 0)
-                throw new AggregateError(errors, "content source close failed", {
-                  cause: errors[0],
-                });
-              return undefined;
-            },
-          );
+          const closeOperations: Promise<void>[] = [source.close(), appSlotSource.close()];
+          const browserClose = browserSource?.close?.();
+          if (browserClose) closeOperations.push(browserClose);
+          closePromise = Promise.allSettled(closeOperations).then((results) => {
+            const errors = results.flatMap((result) =>
+              result.status === "rejected" ? [result.reason] : [],
+            );
+            if (errors.length > 0)
+              throw new AggregateError(errors, "content source close failed", {
+                cause: errors[0],
+              });
+            return undefined;
+          });
           return closePromise;
         },
       };
