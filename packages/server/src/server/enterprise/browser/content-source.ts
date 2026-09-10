@@ -1,16 +1,19 @@
-import type { AuthorizedBrowserProfile } from "@getpaseo/protocol/messages";
-
-export interface EnterpriseBrowserProfileContentSelector {
-  readonly kind: "browser_profile";
-  readonly view: "state" | "artifacts";
-}
+import {
+  EnterpriseBrowserProfileContentItemSchema,
+  EnterpriseBrowserProfileContentSelectorSchema,
+  type AuthorizedBrowserProfile,
+  type EnterpriseBrowserProfileContentItem,
+  type EnterpriseBrowserProfileContentSelector,
+} from "@getpaseo/protocol/messages";
+const sourceBrand = Symbol("EnterpriseBrowserProfileContentReadSource");
 
 export interface EnterpriseBrowserProfileContentPage {
-  readonly items: readonly Record<string, unknown>[];
+  readonly items: readonly EnterpriseBrowserProfileContentItem[];
   readonly nextCursor: string | null;
 }
 
 export interface EnterpriseBrowserProfileContentReadSource {
+  readonly [sourceBrand]: true;
   read(input: {
     readonly profile: AuthorizedBrowserProfile;
     readonly selector: EnterpriseBrowserProfileContentSelector;
@@ -28,13 +31,26 @@ export function createEnterpriseBrowserProfileContentReadSource(input: {
     readonly limit: number;
   }) => Promise<EnterpriseBrowserProfileContentPage>;
 }): EnterpriseBrowserProfileContentReadSource {
+  let closed = false;
   return Object.freeze({
-    read: ({ profile, selector, cursor, limit }) =>
-      input.readProfile({
+    [sourceBrand]: true as const,
+    read: async ({ profile, selector, cursor, limit }) => {
+      if (closed) throw new Error("Browser profile content source is closed.");
+      const parsedSelector = EnterpriseBrowserProfileContentSelectorSchema.parse(selector);
+      const page = await input.readProfile({
         browserProfileId: profile.browserProfileId,
-        view: selector.view,
+        view: parsedSelector.view,
         cursor,
         limit,
-      }),
+      });
+      if (closed) throw new Error("Browser profile content source is closed.");
+      return {
+        items: page.items.map((item) => EnterpriseBrowserProfileContentItemSchema.parse(item)),
+        nextCursor: page.nextCursor,
+      };
+    },
+    close: () => {
+      closed = true;
+    },
   });
 }
