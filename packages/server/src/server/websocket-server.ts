@@ -1967,6 +1967,10 @@ export class VoiceAssistantWebSocketServer {
       ...(options.admissionAuthorizationHandle
         ? { admissionAuthorizationHandle: options.admissionAuthorizationHandle }
         : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.sessionAuthorization
+        ? { sessionAuthorization: options.sessionAuthorization }
+        : {}),
       ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
       ...(this.enterpriseIdentitySelfAuthorization
         ? { enterpriseIdentitySelfAuthorization: this.enterpriseIdentitySelfAuthorization }
