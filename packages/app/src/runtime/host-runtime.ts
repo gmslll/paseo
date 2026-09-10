@@ -2438,7 +2438,16 @@ export class HostRuntimeStore {
     serverId: string,
     listener: (snapshot: EnterpriseIdentitySnapshot) => void,
   ): () => void {
-    return this.controllers.get(serverId)?.subscribeEnterpriseIdentity(listener) ?? (() => {});
+    const unsubscribeServer = this.subscribe(serverId, () => {
+      const snapshot = this.getEnterpriseIdentitySnapshot(serverId);
+      if (snapshot) listener(snapshot);
+    });
+    const unsubscribeIdentity =
+      this.controllers.get(serverId)?.subscribeEnterpriseIdentity(listener) ?? (() => {});
+    return () => {
+      unsubscribeIdentity();
+      unsubscribeServer();
+    };
   }
 
   getEnterpriseScopeGeneration(serverId: string): string | null {
