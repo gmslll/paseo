@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { type PrincipalScopeKey } from "./daemon-client.js";
 import {
+  createEnterpriseIdentityLifecycle,
   createProcessCredentialVault,
   MemoryCredentialVault,
   MemoryEnterpriseIdentityLifecycle,
@@ -58,6 +59,62 @@ const result = (teardownAttempt: () => Promise<void> = async () => {}) => ({
 });
 
 describe("enterprise identity lifecycle", () => {
+  it("keeps the snapshot reference stable between publishes", () => {
+    const p = ports();
+    const lifecycle = new MemoryEnterpriseIdentityLifecycle(
+      new MemoryCredentialVault(),
+      async () => result(),
+      p.teardown,
+      p.remoteLogout,
+    );
+    const first = lifecycle.readSnapshot();
+    expect(lifecycle.readSnapshot()).toBe(first);
+  });
+
+  it("production constructor authenticates, serves a file, and revokes through process vault", async () => {
+    const p = ports();
+    const lifecycle = createEnterpriseIdentityLifecycle({
+      vault: createProcessCredentialVault(),
+      ports: {
+        authenticate: async () => result(),
+        teardown: p.teardown,
+        remoteLogout: p.remoteLogout,
+      },
+    });
+    await lifecycle.bootstrap({ target: "enterprise_host", enterpriseIdentityV1: true });
+    const signedIn = await lifecycle.authenticateEnterpriseHost({
+      serverId: "server-a",
+      token: "pat",
+    });
+    const request = lifecycle.createEnterpriseFileRequest({
+      serverId: "server-a",
+      transport: { request: async () => new Response("ok") },
+    });
+    expect(
+      (
+        await request({
+          serverId: "server-a",
+          workspaceId: "wks_aaaaaaaaaaaaaaaa",
+          relativePath: "README.md",
+          scopeGeneration: signedIn.generation!,
+        })
+      ).status,
+    ).toBe(200);
+    await lifecycle.credentialRevoked({
+      serverId: "server-a",
+      generation: signedIn.generation!,
+      sessionBindingKey: signedIn.sessionBindingKey!,
+    });
+    await expect(
+      request({
+        serverId: "server-a",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "README.md",
+        scopeGeneration: signedIn.generation!,
+      }),
+    ).rejects.toThrow();
+  });
+
   it("keeps process credential vault secrets non-enumerable and isolated", () => {
     const vault = createProcessCredentialVault();
     const handle = vault.put("server-a", "pat");

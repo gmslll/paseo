@@ -10,11 +10,15 @@ import {
 } from "@getpaseo/client/internal/daemon-client";
 import type {
   EnterpriseFileRequestTransport,
+  EnterpriseIdentityLifecyclePorts,
   EnterpriseIdentityLifecycle,
   EnterpriseIdentitySnapshot,
   ProcessCredentialVault,
 } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
-import { createProcessCredentialVault } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import {
+  createEnterpriseIdentityLifecycle,
+  createProcessCredentialVault,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import {
   connectionFromListen,
   createRemoteSshHostConnection,
@@ -183,7 +187,15 @@ export interface HostRuntimeControllerDeps {
   createEnterpriseIdentityLifecycle?: (input: {
     serverId: string;
     vault: ProcessCredentialVault;
+    ports: EnterpriseIdentityLifecyclePorts;
   }) => EnterpriseIdentityLifecycle;
+  /**
+   * Host-owned authentication/teardown ports.  The default app wiring is
+   * fail-closed until the daemon advertises a typed enterprise auth RPC.
+   */
+  createEnterpriseIdentityLifecyclePorts?: (input: {
+    serverId: string;
+  }) => EnterpriseIdentityLifecyclePorts;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -563,6 +575,10 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
   };
 
   return {
+    createEnterpriseIdentityLifecyclePorts: ({ serverId }) =>
+      createUnavailableEnterpriseIdentityLifecyclePorts(serverId),
+    createEnterpriseIdentityLifecycle: ({ vault, ports }) =>
+      createEnterpriseIdentityLifecycle({ vault, ports }),
     createClient: ({ host, connection, clientId, runtimeGeneration }) => {
       const desktopTransportFactory = createDesktopDaemonTransportFactory();
       const webSocketConfig = { webSocketFactory: createAppWebSocketFactory() };
@@ -653,6 +669,25 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
   };
 }
 
+function createUnavailableEnterpriseIdentityLifecyclePorts(
+  serverId: string,
+): EnterpriseIdentityLifecyclePorts {
+  const unavailable = async (): Promise<never> => {
+    throw new Error(`Enterprise identity transport unavailable for ${serverId}`);
+  };
+  return {
+    authenticate: unavailable,
+    teardown: {
+      stopNetworkAndSubscriptions: unavailable,
+      disposeRuntimeAndCachePartition: unavailable,
+      destroyDaemonClient: unavailable,
+      startNewClient: unavailable,
+      hydrateScope: unavailable,
+    },
+    remoteLogout: { logoutAll: unavailable },
+  };
+}
+
 export class HostRuntimeController {
   private host: HostProfile;
   private deps: HostRuntimeControllerDeps;
@@ -693,6 +728,10 @@ export class HostRuntimeController {
         ? this.deps.createEnterpriseIdentityLifecycle({
             serverId: this.host.serverId,
             vault: this.enterpriseCredentialVault,
+            ports:
+              this.deps.createEnterpriseIdentityLifecyclePorts?.({
+                serverId: this.host.serverId,
+              }) ?? createUnavailableEnterpriseIdentityLifecyclePorts(this.host.serverId),
           })
         : null;
     this.onReconcileServerId = input.onReconcileServerId ?? null;

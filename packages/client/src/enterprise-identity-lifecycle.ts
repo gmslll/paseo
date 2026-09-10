@@ -124,6 +124,19 @@ export interface EnterpriseLifecycleTeardown {
 export interface EnterpriseRemoteLogout {
   logoutAll(serverId: string): Promise<void>;
 }
+/**
+ * Production lifecycle dependencies.  The host owns these ports; this module
+ * never discovers credentials or manufactures an authentication transport.
+ */
+export interface EnterpriseIdentityLifecyclePorts {
+  authenticate: (input: {
+    serverId: string;
+    token: string;
+    signal: AbortSignal;
+  }) => Promise<EnterpriseAuthenticationResult>;
+  teardown: EnterpriseLifecycleTeardown;
+  remoteLogout: EnterpriseRemoteLogout;
+}
 export interface EnterpriseIdentityLifecycle {
   bootstrap(input: {
     target: EnterpriseIdentityTarget;
@@ -192,7 +205,10 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
   ) {}
 
   readSnapshot(): EnterpriseIdentitySnapshot {
-    return freezeSnapshot(this.snapshot);
+    // publish() owns freezing and replaces the snapshot atomically. Returning
+    // the stored reference is required by useSyncExternalStore's identity
+    // contract; cloning here would make every read look like a state change.
+    return this.snapshot;
   }
   createEnterpriseFileRequest(input: {
     serverId: string;
@@ -608,6 +624,26 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
         listener(this.readSnapshot());
       } catch {}
   }
+}
+
+/**
+ * Construct the production lifecycle with process-owned ports.  The
+ * Memory-prefixed classes remain test fixtures; production callers use this
+ * constructor with createProcessCredentialVault and real host ports.
+ */
+export function createEnterpriseIdentityLifecycle(input: {
+  vault: CredentialVault;
+  ports: EnterpriseIdentityLifecyclePorts;
+}): EnterpriseIdentityLifecycle {
+  if (!input || !input.vault || !input.ports) {
+    throw new Error("Enterprise identity lifecycle dependencies unavailable");
+  }
+  return new MemoryEnterpriseIdentityLifecycle(
+    input.vault,
+    input.ports.authenticate,
+    input.ports.teardown,
+    input.ports.remoteLogout,
+  );
 }
 
 function freezeSnapshot(snapshot: EnterpriseIdentitySnapshot): EnterpriseIdentitySnapshot {
