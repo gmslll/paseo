@@ -15,6 +15,7 @@ import {
   type ProductionAuthorizationRuntimeProvider,
 } from "./production-authorization-runtime-provider.js";
 import { isCurrentProductionAuthorizationRuntimeForAuthoritySources } from "./production-authorization-runtime.js";
+import { isWorkspaceTransfer, type WorkspaceTransfer } from "./workspace-transfer.js";
 
 declare const enterpriseResourceDispatcherFactoryBrand: unique symbol;
 
@@ -26,12 +27,14 @@ export interface EnterpriseResourceDispatcherFactoryOptions {
   readonly provider: ProductionAuthorizationRuntimeProvider;
   readonly placement: PlacementResolver;
   readonly organizationResources: EnterpriseOrganizationResourceSource;
+  readonly workspaceTransfers?: WorkspaceTransfer;
 }
 
 interface FactoryRecord {
   readonly provider: ProductionAuthorizationRuntimeProvider;
   readonly placement: PlacementResolver;
   readonly organizationResources: EnterpriseOrganizationResourceSource;
+  readonly workspaceTransfers?: WorkspaceTransfer;
 }
 
 interface LeaseState {
@@ -39,7 +42,13 @@ interface LeaseState {
   readonly delegate: EnterpriseResourceDispatcher;
 }
 
-const FACTORY_OPTION_KEYS = new Set(["provider", "placement", "organizationResources"]);
+const FACTORY_OPTION_KEYS = new Set([
+  "provider",
+  "placement",
+  "organizationResources",
+  "workspaceTransfers",
+]);
+const FACTORY_REQUIRED_OPTION_KEYS = new Set(["provider", "placement", "organizationResources"]);
 const factoryRecords = new WeakMap<object, FactoryRecord>();
 
 export const ENTERPRISE_RESOURCE_DISPATCHER_MANIFEST: EnterpriseDispatcherManifest = Object.freeze({
@@ -57,13 +66,20 @@ export function createEnterpriseResourceDispatcherFactory(
   input: unknown,
 ): EnterpriseResourceDispatcherFactory | null {
   try {
-    const options = captureExactRecord(input, FACTORY_OPTION_KEYS);
+    const options = captureExactRecord(input, FACTORY_OPTION_KEYS, FACTORY_REQUIRED_OPTION_KEYS);
     if (!options) return null;
     const provider = options.provider;
     if (!isCurrentProductionAuthorizationRuntimeProvider(provider)) return null;
     const placement = capturePlacementResolver(options.placement);
     const organizationResources = captureOrganizationResourceSource(options.organizationResources);
-    if (!placement || !organizationResources) return null;
+    const workspaceTransfers = options.workspaceTransfers;
+    if (
+      !placement ||
+      !organizationResources ||
+      (workspaceTransfers !== undefined && !isWorkspaceTransfer(workspaceTransfers))
+    ) {
+      return null;
+    }
 
     let factory: EnterpriseResourceDispatcherFactory;
     const registration = Object.assign(Object.create(null) as object, {
@@ -76,7 +92,15 @@ export function createEnterpriseResourceDispatcherFactory(
       },
     });
     factory = Object.freeze(registration) as EnterpriseResourceDispatcherFactory;
-    factoryRecords.set(factory, Object.freeze({ provider, placement, organizationResources }));
+    factoryRecords.set(
+      factory,
+      Object.freeze({
+        provider,
+        placement,
+        organizationResources,
+        ...(workspaceTransfers ? { workspaceTransfers } : {}),
+      }),
+    );
     return factory;
   } catch {
     return null;
@@ -107,6 +131,7 @@ export function openEnterpriseResourceDispatcher(
       owners: record.provider.owners,
       placement: record.placement,
       organizationResources: record.organizationResources,
+      ...(record.workspaceTransfers ? { workspaceTransfers: record.workspaceTransfers } : {}),
     });
     if (
       !isCurrentProductionAuthorizationRuntimeForAuthoritySources(
@@ -195,15 +220,16 @@ function captureAuthorizationRuntime(input: unknown): unknown {
 
 function captureExactRecord(
   value: unknown,
-  expectedKeys: ReadonlySet<string>,
+  allowedKeys: ReadonlySet<string>,
+  requiredKeys: ReadonlySet<string>,
 ): Record<string, unknown> | null {
   if (!isObject(value)) return null;
   const prototype = Reflect.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return null;
   const keys = Reflect.ownKeys(value);
   if (
-    keys.length !== expectedKeys.size ||
-    keys.some((key) => typeof key !== "string" || !expectedKeys.has(key))
+    keys.some((key) => typeof key !== "string" || !allowedKeys.has(key)) ||
+    [...requiredKeys].some((key) => !keys.includes(key))
   ) {
     return null;
   }

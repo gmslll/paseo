@@ -13,9 +13,15 @@ import type {
   ResourceGrant,
 } from "@getpaseo/protocol/messages";
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { writeJsonFileAtomic } from "../../atomic-file.js";
 import { SessionAuthorization } from "../../authorization/index.js";
 import type { SessionInboundMessage } from "../../messages.js";
 import type { EnterpriseDispatchContext } from "../../session/enterprise-dispatcher.js";
+import {
+  createPersistedWorkspaceRecord,
+  FileBackedWorkspaceRegistry,
+} from "../../workspace-registry.js";
 import { createProductionAuditRuntime } from "../audit/production-audit-runtime.js";
 import {
   bindEnterpriseAdmissionSession,
@@ -45,6 +51,7 @@ import {
   type ProductionAuthorizationRuntimeOptions,
   type ProductionAuthorizationStatePort,
 } from "./production-authorization-runtime.js";
+import { createLocalWorkspaceTransfer, type WorkspaceTransfer } from "./workspace-transfer.js";
 
 const executeFile = promisify(execFile);
 const organizationId = "org_0123456789abcdef";
@@ -59,6 +66,10 @@ const identityManage: ResourceGrant = {
 };
 const workspaceMetadata: ResourceGrant = {
   action: "workspace.metadata.read",
+  selector: { kind: "workspace", workspaceIds: ["wks_a"] },
+};
+const workspaceManage: ResourceGrant = {
+  action: "workspace.manage",
   selector: { kind: "workspace", workspaceIds: ["wks_a"] },
 };
 const principalFields = {
@@ -202,6 +213,7 @@ describe("enterprise resource handler policy", () => {
         "enterprise.access.update_grants.request",
         "enterprise.organization.list_resources.request",
         "enterprise.placement.resolve_workspace.request",
+        "enterprise.resource.ownership.transfer.request",
       ].map(enterpriseResourceHandlerPolicyForRequestType),
     ).toEqual([
       {
@@ -224,13 +236,18 @@ describe("enterprise resource handler policy", () => {
         responseType: "enterprise.placement.resolve_workspace.response",
         authorization: "resources",
       },
+      {
+        requestType: "enterprise.resource.ownership.transfer.request",
+        responseType: "enterprise.resource.ownership.transfer.response",
+        authorization: "authority_receipt",
+      },
     ]);
     expect(
       enterpriseResourceHandlerPolicyForRequestType("enterprise.identity.get_current.request"),
     ).toBeNull();
     expect(
       ENTERPRISE_RESOURCE_HANDLER_REQUEST_TYPES.map(enterpriseResourceRequestPolicyForType),
-    ).toEqual(["authority", "authority", "resources", "resources"]);
+    ).toEqual(["authority", "authority", "resources", "resources", "authority"]);
     expect(enterpriseResourceRequestPolicyForType("enterprise.unknown.request")).toBeNull();
   });
 });
@@ -368,6 +385,279 @@ describe.runIf(process.platform === "darwin")("enterprise resource handler core"
       fixture.handler.handle({ sessionContext: fixture.context, message: missing }),
     ).resolves.toBe(false);
     await expect(fixture.storage.get(missing.principalId)).resolves.toBeNull();
+  });
+
+  test("transfers only a current Workspace and returns a one-use authority response with the audit receipt", async () => {
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(parent, `workspace-transfer-${fixtureNumber + 1}.json`),
+      createTestLogger(),
+    );
+    await registry.initialize();
+    await registry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "wks_a",
+        projectId: "prj_a",
+        cwd: path.join(parent, "workspace-a"),
+        kind: "directory",
+        displayName: "Workspace A",
+        createdAt: "2026-09-11T00:00:00.000Z",
+        updatedAt: "2026-09-11T00:00:00.000Z",
+      }),
+      organizationId,
+      nodeId: node.nodeId,
+      ownerPrincipalId: principalFields.principalId,
+      createdByPrincipalId: principalFields.principalId,
+    });
+    let principalReads = 0;
+    let principalEnabled = true;
+    const workspaceTransfers = createLocalWorkspaceTransfer({
+      workspaceRegistry: registry,
+      audit,
+      principalSource: {
+        isCurrent: () => true,
+        resolvePrincipal: async (principalId: string, requestedOrganizationId: string) => {
+          principalReads += 1;
+          return principalEnabled && principalId === targetRecord.principalId
+            ? {
+                principalType: "service" as const,
+                principalId,
+                organizationId: requestedOrganizationId,
+                grants: targetRecord.grants,
+                grantVersion: targetRecord.grantVersion,
+              }
+            : null;
+        },
+      },
+    });
+    if (!workspaceTransfers) throw new Error("expected WorkspaceTransfer");
+    const fixture = await createFixture({
+      grants: [workspaceMetadata, workspaceManage],
+      workspaceTransfers,
+    });
+    const beforeAudit = await audit.snapshotEvents();
+    const agentMessage = {
+      type: "enterprise.resource.ownership.transfer.request",
+      requestId: "transfer-agent",
+      resource: {
+        organizationId,
+        nodeId: node.nodeId,
+        resourceKind: "agent",
+        localResourceId: "agent_a",
+      },
+      expectedOwnerPrincipalId: principalFields.principalId,
+      expectedRevision: "0",
+      newPrincipalId: targetRecord.principalId,
+    } as const satisfies SessionInboundMessage;
+    await expect(
+      fixture.handler.handle({ sessionContext: fixture.context, message: agentMessage }),
+    ).resolves.toBe(false);
+    expect(principalReads).toBe(0);
+    expect(await audit.snapshotEvents()).toHaveLength(beforeAudit.length);
+
+    const ungrantedFixture = await createFixture({
+      grants: [workspaceMetadata],
+      workspaceTransfers,
+    });
+    await expect(
+      ungrantedFixture.handler.handle({
+        sessionContext: ungrantedFixture.context,
+        message: {
+          ...agentMessage,
+          requestId: "transfer-without-workspace-manage",
+          resource: workspaceRef(),
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(principalReads).toBe(0);
+    expect(await audit.snapshotEvents()).toHaveLength(beforeAudit.length);
+
+    const denialMessages = [
+      {
+        ...agentMessage,
+        requestId: "transfer-foreign",
+        resource: { ...workspaceRef(), organizationId: "org_fedcba9876543210" },
+      },
+      {
+        ...agentMessage,
+        requestId: "transfer-guessed",
+        resource: { ...workspaceRef(), localResourceId: "wks_guessed" },
+      },
+      {
+        ...agentMessage,
+        requestId: "transfer-stale",
+        resource: workspaceRef(),
+        expectedRevision: "9",
+      },
+      {
+        ...agentMessage,
+        requestId: "transfer-wrong-owner",
+        resource: workspaceRef(),
+        expectedOwnerPrincipalId: "usr_1111111111111111",
+      },
+      {
+        ...agentMessage,
+        requestId: "transfer-missing-principal",
+        resource: workspaceRef(),
+        newPrincipalId: "usr_fedcba9876543210",
+      },
+    ] as const satisfies readonly SessionInboundMessage[];
+    for (const denied of denialMessages) {
+      await expect(
+        fixture.handler.handle({ sessionContext: fixture.context, message: denied }),
+      ).resolves.toBe(false);
+    }
+    principalEnabled = false;
+    await expect(
+      fixture.handler.handle({
+        sessionContext: fixture.context,
+        message: { ...agentMessage, requestId: "transfer-disabled", resource: workspaceRef() },
+      }),
+    ).resolves.toBe(false);
+    principalEnabled = true;
+    expect(await audit.snapshotEvents()).toHaveLength(beforeAudit.length);
+    await expect(registry.get("wks_a")).resolves.toMatchObject({
+      ownerPrincipalId: principalFields.principalId,
+    });
+
+    const message = {
+      ...agentMessage,
+      requestId: "transfer-workspace",
+      resource: workspaceRef(),
+    } as const satisfies SessionInboundMessage;
+    const input = { sessionContext: fixture.context, message };
+    const response = await fixture.handler.handle(input);
+    if (response === false) throw new Error("expected transfer response");
+    expect(response.type).toBe("enterprise.resource.ownership.transfer.response");
+    if (response.type !== "enterprise.resource.ownership.transfer.response") {
+      throw new Error("wrong transfer response");
+    }
+    const transferAudit = (await audit.snapshotEvents()).slice(beforeAudit.length);
+    expect(transferAudit).toHaveLength(1);
+    const [finalizedIntent] = transferAudit;
+    if (!finalizedIntent) throw new Error("expected finalized transfer intent");
+    expect(finalizedIntent).toMatchObject({
+      action: "enterprise.resource.ownership.transfer",
+      outcome: "allowed",
+      metadata: {
+        phase: "intent",
+        newOwnerPrincipalId: targetRecord.principalId,
+        revision: "1",
+      },
+    });
+    expect(response).toEqual({
+      type: "enterprise.resource.ownership.transfer.response",
+      payload: {
+        requestId: "transfer-workspace",
+        resource: workspaceRef(),
+        ownerPrincipalId: targetRecord.principalId,
+        revision: "1",
+        receiptId: finalizedIntent.eventId,
+      },
+    });
+    expect(fixture.owners.getWorkspace("wks_a")?.ownerPrincipalId).toBe(targetRecord.principalId);
+    expect(consumeEnterpriseResourceHandlerResult(fixture.handler, input, response)).toEqual({
+      response,
+      authorization: "authority_receipt",
+    });
+    expect(consumeEnterpriseResourceHandlerResult(fixture.handler, input, response)).toBeNull();
+  });
+
+  test("persists intent and storage-failure metadata through the real audit sink", async () => {
+    let writes = 0;
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(parent, `workspace-transfer-failure-${fixtureNumber + 1}.json`),
+      createTestLogger(),
+      {
+        writeRecords: async (filePath, records) => {
+          writes += 1;
+          if (writes === 2) throw new Error("workspace-write");
+          await writeJsonFileAtomic(filePath, records);
+        },
+      },
+    );
+    await registry.initialize();
+    await registry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "wks_a",
+        projectId: "prj_a",
+        cwd: path.join(parent, "workspace-failure"),
+        kind: "directory",
+        displayName: "Workspace Failure",
+        createdAt: "2026-09-11T00:00:00.000Z",
+        updatedAt: "2026-09-11T00:00:00.000Z",
+      }),
+      organizationId,
+      nodeId: node.nodeId,
+      ownerPrincipalId: principalFields.principalId,
+      createdByPrincipalId: principalFields.principalId,
+    });
+    const workspaceTransfers = createLocalWorkspaceTransfer({
+      workspaceRegistry: registry,
+      audit,
+      principalSource: {
+        isCurrent: () => true,
+        resolvePrincipal: async (principalId: string, requestedOrganizationId: string) =>
+          principalId === targetRecord.principalId
+            ? {
+                principalType: "service" as const,
+                principalId,
+                organizationId: requestedOrganizationId,
+                grants: targetRecord.grants,
+                grantVersion: targetRecord.grantVersion,
+              }
+            : null,
+      },
+    });
+    if (!workspaceTransfers) throw new Error("expected WorkspaceTransfer");
+    const fixture = await createFixture({
+      grants: [workspaceMetadata, workspaceManage],
+      workspaceTransfers,
+    });
+    const beforeAudit = await audit.snapshotEvents();
+    await expect(
+      fixture.handler.handle({
+        sessionContext: fixture.context,
+        message: {
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-write-failure",
+          resource: workspaceRef(),
+          expectedOwnerPrincipalId: principalFields.principalId,
+          expectedRevision: "0",
+          newPrincipalId: targetRecord.principalId,
+        },
+      }),
+    ).resolves.toBe(false);
+
+    const transferEvents = (await audit.snapshotEvents()).slice(beforeAudit.length);
+    expect(transferEvents).toHaveLength(2);
+    const [intent, failure] = transferEvents;
+    if (!intent) throw new Error("expected finalized transfer intent");
+    expect(intent).toMatchObject({
+      action: "enterprise.resource.ownership.transfer",
+      outcome: "allowed",
+      metadata: {
+        phase: "intent",
+        newOwnerPrincipalId: targetRecord.principalId,
+        revision: "1",
+      },
+    });
+    expect(failure).toMatchObject({
+      action: "enterprise.resource.ownership.transfer",
+      outcome: "failed",
+      reasonCode: "workspace_ownership_transfer_failed",
+      metadata: {
+        phase: "storage",
+        newOwnerPrincipalId: targetRecord.principalId,
+        revision: "1",
+        intentEventId: intent.eventId,
+      },
+    });
+    await expect(registry.get("wks_a")).resolves.toMatchObject({
+      ownerPrincipalId: principalFields.principalId,
+    });
+    expect(fixture.owners.getWorkspace("wks_a")?.ownerPrincipalId).toBe(
+      principalFields.principalId,
+    );
   });
 
   test("does not emit a stale response when an update revokes the caller runtime", async () => {
@@ -702,6 +992,7 @@ async function createFixture(
     placement?: {
       resolveWorkspace(workspaceId: string): Promise<ReturnType<typeof workspaceRef> | null>;
     };
+    workspaceTransfers?: WorkspaceTransfer;
   } = {},
 ): Promise<Fixture> {
   fixtureNumber += 1;
@@ -778,6 +1069,7 @@ async function createFixture(
     organizationResources: overrides.organizationResources ?? {
       list: async () => defaultPage(),
     },
+    ...(overrides.workspaceTransfers ? { workspaceTransfers: overrides.workspaceTransfers } : {}),
   });
   const context: EnterpriseDispatchContext = {
     sessionId: runtime.binding.sessionId,

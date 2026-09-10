@@ -508,11 +508,11 @@ describe("InboundAuthorityRequestAuthorizer", () => {
     const requestTypes = new Set(
       ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES.map((policy) => policy.requestType),
     );
-    expect(ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES).toHaveLength(44);
-    expect(requestTypes.size).toBe(43);
+    expect(ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES).toHaveLength(45);
+    expect(requestTypes.size).toBe(44);
 
     const actor = principal(
-      (["identity.manage", "audit.read"] as const).map((action) => ({
+      (["identity.manage", "audit.read", "workspace.manage"] as const).map((action) => ({
         action,
         selector: { kind: "organization" as const, organizationId },
       })),

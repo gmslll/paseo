@@ -99,12 +99,21 @@ describe.runIf(process.platform === "darwin")("enterprise resource dispatcher fa
       "enterprise.access.update_grants.request",
       "enterprise.organization.list_resources.request",
       "enterprise.placement.resolve_workspace.request",
+      "enterprise.resource.ownership.transfer.request",
     ]);
     expect(
       createEnterpriseResourceDispatcherFactory({
         provider: fixture.provider,
         placement,
         organizationResources: undefined,
+      }),
+    ).toBeNull();
+    expect(
+      createEnterpriseResourceDispatcherFactory({
+        provider: fixture.provider,
+        placement,
+        organizationResources: source,
+        workspaceTransfers: { transfer: async () => null, close() {} },
       }),
     ).toBeNull();
     await fixture.runtime.release();

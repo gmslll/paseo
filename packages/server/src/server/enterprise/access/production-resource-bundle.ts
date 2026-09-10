@@ -25,12 +25,21 @@ import {
   isCurrentProductionAuthorizationRuntimeProvider,
   type ProductionAuthorizationRuntimeProvider,
 } from "./production-authorization-runtime-provider.js";
+import {
+  productionAuditCapabilityIssuer,
+  type ProductionAuditCapability,
+} from "../audit/production-audit-runtime.js";
+import type { ProductionPrincipalGrantSource } from "../identity/principal-source.js";
+import { isAuthoritativeGrantStoreForAudit } from "./grant-store.js";
+import { createLocalWorkspaceTransfer, type WorkspaceTransfer } from "./workspace-transfer.js";
 
 export interface ProductionResourceBundleOptions {
   readonly provider: ProductionAuthorizationRuntimeProvider;
   readonly workspaceRegistry: FileBackedWorkspaceRegistry;
   readonly agentRecords: ProductionAgentRecordSource;
   readonly nodeId: NodeId;
+  readonly audit?: ProductionAuditCapability;
+  readonly principalSource?: ProductionPrincipalGrantSource;
 }
 
 export interface ProductionAgentRecordSource {
@@ -41,47 +50,40 @@ export interface ProductionResourceBundle {
   readonly dispatcherFactory: EnterpriseResourceDispatcherFactory;
   readonly placement: PlacementResolver;
   readonly organizationResources: EnterpriseOrganizationResourceSource;
+  readonly workspaceTransfers?: WorkspaceTransfer;
 }
 
-const BUNDLE_KEYS = new Set(["provider", "workspaceRegistry", "agentRecords", "nodeId"]);
+interface CapturedProductionResourceBundleOptions {
+  readonly provider: ProductionAuthorizationRuntimeProvider;
+  readonly workspaceRegistry: FileBackedWorkspaceRegistry;
+  readonly agentRecords: ProductionAgentRecordSource;
+  readonly nodeId: NodeId;
+  readonly audit?: ProductionAuditCapability;
+  readonly principalSource?: ProductionPrincipalGrantSource;
+}
+
+const RESOURCE_SOURCE_KEYS = new Set(["provider", "workspaceRegistry", "agentRecords", "nodeId"]);
+const BUNDLE_KEYS = new Set([...RESOURCE_SOURCE_KEYS, "audit", "principalSource"]);
+const BUNDLE_REQUIRED_KEYS = RESOURCE_SOURCE_KEYS;
 const PLACEMENT_KEYS = new Set(["workspaceRegistry", "nodeId"]);
 
 export async function createProductionResourceBundle(
   input: unknown,
 ): Promise<ProductionResourceBundle | null> {
   try {
-    const captured = captureExactRecord(input, BUNDLE_KEYS);
+    const captured = captureExactRecord(input, BUNDLE_KEYS, BUNDLE_REQUIRED_KEYS);
     if (!captured || !isCurrentProductionAuthorizationRuntimeProvider(captured.provider)) {
       return null;
     }
     if (!(captured.workspaceRegistry instanceof FileBackedWorkspaceRegistry)) return null;
     if (!isAgentRecordSource(captured.agentRecords)) return null;
     if (!NodeIdSchema.safeParse(captured.nodeId).success) return null;
-    const bundle = captured as unknown as {
-      provider: ProductionAuthorizationRuntimeProvider;
-      workspaceRegistry: FileBackedWorkspaceRegistry;
-      agentRecords: ProductionAgentRecordSource;
-      nodeId: NodeId;
-    };
+    const bundle = captured as unknown as CapturedProductionResourceBundleOptions;
 
     await bundle.workspaceRegistry.initialize();
     const records = await bundle.workspaceRegistry.list();
     if (!isCurrentProductionAuthorizationRuntimeProvider(bundle.provider)) return null;
-    for (const record of records) {
-      if (record.nodeId !== bundle.nodeId || record.archivedAt !== null) continue;
-      const existing = getAuthoritativeWorkspace(bundle.provider.owners, record.workspaceId);
-      if (existing) {
-        if (!sameOwner(existing, record)) return null;
-        continue;
-      }
-      bundle.provider.owners.registerWorkspace({
-        id: record.workspaceId,
-        organizationId: record.organizationId,
-        nodeId: record.nodeId,
-        ownerPrincipalId: record.ownerPrincipalId,
-        createdByPrincipalId: record.createdByPrincipalId,
-      });
-    }
+    if (!registerPersistedWorkspaceOwners(bundle, records)) return null;
     await registerAgentRecords(bundle.provider, bundle.agentRecords, bundle.nodeId);
 
     const placement = createProductionPlacementResolver({
@@ -95,16 +97,65 @@ export async function createProductionResourceBundle(
       nodeId: bundle.nodeId,
     });
     if (!placement || !organizationResources) return null;
+    const workspaceTransfers = createBundleWorkspaceTransfer(bundle);
+    if (workspaceTransfers === null) return null;
     const dispatcherFactory = createEnterpriseResourceDispatcherFactory({
       provider: bundle.provider,
       placement,
       organizationResources,
+      ...(workspaceTransfers ? { workspaceTransfers } : {}),
     });
     if (!dispatcherFactory) return null;
-    return Object.freeze({ dispatcherFactory, placement, organizationResources });
+    return Object.freeze({
+      dispatcherFactory,
+      placement,
+      organizationResources,
+      ...(workspaceTransfers ? { workspaceTransfers } : {}),
+    });
   } catch {
     return null;
   }
+}
+
+function registerPersistedWorkspaceOwners(
+  bundle: CapturedProductionResourceBundleOptions,
+  records: readonly PersistedWorkspaceRecord[],
+): boolean {
+  for (const record of records) {
+    if (record.nodeId !== bundle.nodeId || record.archivedAt !== null) continue;
+    const existing = getAuthoritativeWorkspace(bundle.provider.owners, record.workspaceId);
+    if (existing) {
+      if (!sameOwner(existing, record)) return false;
+      continue;
+    }
+    bundle.provider.owners.registerWorkspace({
+      id: record.workspaceId,
+      organizationId: record.organizationId,
+      nodeId: record.nodeId,
+      ownerPrincipalId: record.ownerPrincipalId,
+      createdByPrincipalId: record.createdByPrincipalId,
+    });
+  }
+  return true;
+}
+
+function createBundleWorkspaceTransfer(
+  bundle: CapturedProductionResourceBundleOptions,
+): WorkspaceTransfer | null | undefined {
+  if (bundle.audit === undefined && bundle.principalSource === undefined) return undefined;
+  if (!bundle.audit || !bundle.principalSource) return null;
+  if (
+    !productionAuditCapabilityIssuer.current(bundle.audit) ||
+    !isAuthoritativeGrantStoreForAudit(bundle.provider.grantStore, bundle.audit) ||
+    !bundle.principalSource.isCurrent()
+  ) {
+    return null;
+  }
+  return createLocalWorkspaceTransfer({
+    workspaceRegistry: bundle.workspaceRegistry,
+    audit: bundle.audit,
+    principalSource: bundle.principalSource,
+  });
 }
 
 export function createProductionPlacementResolver(input: unknown): PlacementResolver | null {
@@ -236,7 +287,7 @@ function captureOrganizationInput(value: unknown): {
   agentRecords: ProductionAgentRecordSource;
   nodeId: NodeId;
 } | null {
-  const captured = captureExactRecord(value, BUNDLE_KEYS);
+  const captured = captureExactRecord(value, RESOURCE_SOURCE_KEYS);
   if (
     !captured ||
     !isCurrentProductionAuthorizationRuntimeProvider(captured.provider) ||
@@ -315,15 +366,16 @@ function resourceId(row: EnterpriseOrganizationResourceProjection): string {
 
 function captureExactRecord(
   value: unknown,
-  expected: ReadonlySet<string>,
+  allowed: ReadonlySet<string>,
+  required: ReadonlySet<string> = allowed,
 ): Record<string, unknown> | null {
   if (!isObject(value)) return null;
   const prototype = Reflect.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return null;
   const keys = Reflect.ownKeys(value);
   if (
-    keys.length !== expected.size ||
-    keys.some((key) => typeof key !== "string" || !expected.has(key))
+    keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
+    [...required].some((key) => !keys.includes(key))
   )
     return null;
   const captured = Object.create(null) as Record<string, unknown>;

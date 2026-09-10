@@ -6,6 +6,7 @@ import {
   EnterpriseOrganizationResourceProjectionSchema,
   EnterprisePlacementResolveWorkspaceResponseSchema,
   EnterprisePrincipalSummaryProjectionSchema,
+  EnterpriseResourceOwnershipTransferResponseSchema,
   GlobalResourceRefSchema,
   NodeContextSchema,
   PrincipalContextSchema,
@@ -41,12 +42,18 @@ import {
   isCurrentProductionAuthorizationRuntimeForAuthoritySources,
   type ProductionAuthorizationRuntime,
 } from "./production-authorization-runtime.js";
+import {
+  isWorkspaceTransfer,
+  transferWorkspaceOwnership,
+  type WorkspaceTransfer,
+} from "./workspace-transfer.js";
 
 export const ENTERPRISE_RESOURCE_HANDLER_REQUEST_TYPES = Object.freeze([
   "enterprise.access.list_grants.request",
   "enterprise.access.update_grants.request",
   "enterprise.organization.list_resources.request",
   "enterprise.placement.resolve_workspace.request",
+  "enterprise.resource.ownership.transfer.request",
 ] as const satisfies readonly SessionInboundMessage["type"][]);
 
 export type EnterpriseResourceHandlerRequestType =
@@ -56,10 +63,12 @@ export type EnterpriseResourceHandlerPolicy = Readonly<
   | {
       requestType:
         | "enterprise.access.list_grants.request"
-        | "enterprise.access.update_grants.request";
+        | "enterprise.access.update_grants.request"
+        | "enterprise.resource.ownership.transfer.request";
       responseType:
         | "enterprise.access.list_grants.response"
-        | "enterprise.access.update_grants.response";
+        | "enterprise.access.update_grants.response"
+        | "enterprise.resource.ownership.transfer.response";
       authorization: "authority_receipt";
     }
   | {
@@ -93,6 +102,11 @@ const HANDLER_POLICIES = Object.freeze([
     requestType: "enterprise.placement.resolve_workspace.request",
     responseType: "enterprise.placement.resolve_workspace.response",
     authorization: "resources",
+  }),
+  Object.freeze({
+    requestType: "enterprise.resource.ownership.transfer.request",
+    responseType: "enterprise.resource.ownership.transfer.response",
+    authorization: "authority_receipt",
   }),
 ] as const satisfies readonly EnterpriseResourceHandlerPolicy[]);
 
@@ -138,6 +152,7 @@ export interface EnterpriseResourceHandlerDependencies {
   readonly owners: OwnerRegistry;
   readonly placement: PlacementResolver;
   readonly organizationResources: EnterpriseOrganizationResourceSource;
+  readonly workspaceTransfers?: WorkspaceTransfer;
 }
 
 export interface EnterpriseResourceDispatcher extends EnterpriseSessionDispatcher {
@@ -198,6 +213,7 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
   private readonly owners: OwnerRegistry;
   private readonly resolveWorkspace: PlacementResolver["resolveWorkspace"];
   private readonly listOrganizationResources: EnterpriseOrganizationResourceSource["list"];
+  private readonly workspaceTransfers: WorkspaceTransfer | undefined;
 
   constructor(dependencies: EnterpriseResourceHandlerDependencies) {
     this.runtime = dependencies.runtime;
@@ -207,6 +223,7 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
     this.listOrganizationResources = dependencies.organizationResources.list.bind(
       dependencies.organizationResources,
     );
+    this.workspaceTransfers = dependencies.workspaceTransfers;
     if (
       !isAuthoritativeGrantStore(this.grantStore) ||
       !isOwnerRegistry(this.owners) ||
@@ -217,6 +234,9 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
       )
     ) {
       throw new Error("enterprise resource handlers require exact production authority sources");
+    }
+    if (this.workspaceTransfers !== undefined && !isWorkspaceTransfer(this.workspaceTransfers)) {
+      throw new Error("enterprise resource handlers require a nominal WorkspaceTransfer");
     }
     enterpriseResourceHandlers.add(this);
     Object.freeze(this);
@@ -239,6 +259,9 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
           break;
         case "enterprise.placement.resolve_workspace.request":
           output = await this.resolvePlacement({ ...captured, message: captured.message });
+          break;
+        case "enterprise.resource.ownership.transfer.request":
+          output = await this.transferOwnership({ ...captured, message: captured.message });
           break;
       }
     } catch {
@@ -383,6 +406,90 @@ export class EnterpriseResourceAuthorizationHandlers implements EnterpriseSessio
       return null;
     if (!this.isCurrent(input.sessionContext)) return null;
     return deepFreeze({ response, authorization: "resources" as const, context });
+  }
+
+  private async transferOwnership(
+    input: CanonicalHandlerInput & {
+      readonly message: Extract<
+        SessionInboundMessage,
+        { type: "enterprise.resource.ownership.transfer.request" }
+      >;
+    },
+  ): Promise<ConsumedEnterpriseResourceHandlerResult | null> {
+    if (!this.workspaceTransfers || input.message.resource.resourceKind !== "workspace")
+      return null;
+    const principal = input.sessionContext.enterpriseContext.principal;
+    const resource = input.message.resource;
+    if (
+      resource.organizationId !== principal.organizationId ||
+      resource.nodeId !== input.sessionContext.enterpriseContext.node.nodeId ||
+      input.message.expectedOwnerPrincipalId !== principal.principalId
+    ) {
+      return null;
+    }
+    const canonical = getAuthoritativeWorkspace(this.owners, resource.localResourceId);
+    if (
+      !canonical ||
+      canonical.organizationId !== resource.organizationId ||
+      canonical.nodeId !== resource.nodeId ||
+      canonical.ownerPrincipalId !== principal.principalId
+    ) {
+      return null;
+    }
+    const authorized = await this.runtime.resourceAuthorization.assertWorkspace(
+      principal,
+      "workspace.manage",
+      canonical.workspaceId,
+    );
+    if (!this.isCurrent(input.sessionContext) || !sameWorkspaceAuthority(authorized, canonical)) {
+      return null;
+    }
+    const transferIsCurrent = () => {
+      if (!this.isCurrent(input.sessionContext)) return false;
+      const current = getAuthoritativeWorkspace(this.owners, canonical.workspaceId);
+      return Boolean(current && sameWorkspaceAuthority(current, canonical));
+    };
+    const committed = await transferWorkspaceOwnership(this.workspaceTransfers, {
+      actor: principal,
+      sessionId: input.sessionContext.sessionId,
+      workspace: authorized,
+      expectedOwnerPrincipalId: input.message.expectedOwnerPrincipalId,
+      expectedRevision: input.message.expectedRevision,
+      newPrincipalId: input.message.newPrincipalId,
+      isCurrent: transferIsCurrent,
+    });
+    if (!committed) return null;
+    this.owners.registerWorkspace({
+      id: committed.workspace.workspaceId,
+      organizationId: committed.workspace.organizationId,
+      nodeId: committed.workspace.nodeId,
+      ownerPrincipalId: committed.workspace.ownerPrincipalId,
+      createdByPrincipalId: committed.workspace.createdByPrincipalId,
+    });
+    const current = getAuthoritativeWorkspace(this.owners, canonical.workspaceId);
+    if (
+      !this.isCurrent(input.sessionContext) ||
+      !current ||
+      current.organizationId !== canonical.organizationId ||
+      current.nodeId !== canonical.nodeId ||
+      current.ownerPrincipalId !== input.message.newPrincipalId ||
+      current.createdByPrincipalId !== canonical.createdByPrincipalId
+    ) {
+      return null;
+    }
+    const response = canonicalResponse(
+      EnterpriseResourceOwnershipTransferResponseSchema.parse({
+        type: "enterprise.resource.ownership.transfer.response",
+        payload: {
+          requestId: input.message.requestId,
+          resource,
+          ownerPrincipalId: current.ownerPrincipalId,
+          revision: committed.workspace.ownershipRevision,
+          receiptId: committed.receiptId,
+        },
+      }),
+    );
+    return deepFreeze({ response, authorization: "authority_receipt" as const });
   }
 
   private async listResources(
@@ -748,6 +855,31 @@ function isObject(value: unknown): value is object {
 
 function sameCanonical(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameWorkspaceAuthority(
+  left: {
+    readonly workspaceId: string;
+    readonly organizationId: string;
+    readonly nodeId: string;
+    readonly ownerPrincipalId: string;
+    readonly createdByPrincipalId: string;
+  },
+  right: {
+    readonly workspaceId: string;
+    readonly organizationId: string;
+    readonly nodeId: string;
+    readonly ownerPrincipalId: string;
+    readonly createdByPrincipalId: string;
+  },
+): boolean {
+  return (
+    left.workspaceId === right.workspaceId &&
+    left.organizationId === right.organizationId &&
+    left.nodeId === right.nodeId &&
+    left.ownerPrincipalId === right.ownerPrincipalId &&
+    left.createdByPrincipalId === right.createdByPrincipalId
+  );
 }
 
 function deepFreeze<T>(value: T): T {

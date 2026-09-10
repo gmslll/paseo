@@ -18,6 +18,10 @@ import {
   createProductionResourceBundle,
 } from "./production-resource-bundle.js";
 import { createProductionAuditRuntime } from "../audit/production-audit-runtime.js";
+import {
+  createProductionPrincipalGrantSource,
+  createProductionPrincipalProvisioning,
+} from "../identity/principal-source.js";
 import { createProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 
 const nodeId = "nod_0123456789abcdef" as const;
@@ -100,6 +104,40 @@ describe("production resource bundle ports", () => {
           grantFilePath: path.join(root, "grants.json"),
         });
         expect(provider).not.toBeNull();
+        if (!provider) throw new Error("expected provider");
+        const newOwnerPrincipalId = "usr_1111111111111111";
+        await provider.grantStore.update({
+          actor: {
+            principalType: "human",
+            principalId: "usr_0123456789abcdef",
+            organizationId,
+            credentialId: "cred_resource_bundle",
+            grantVersion: "grv_resource_bundle",
+            grants: [],
+          },
+          principalId: newOwnerPrincipalId,
+          organizationId,
+          grants: [],
+          expectedVersion: null,
+        });
+        const principalProvisioning = createProductionPrincipalProvisioning({
+          filePath: path.join(root, "principals.json"),
+          audit,
+        });
+        await principalProvisioning.ensurePrincipal({
+          principalId: newOwnerPrincipalId,
+          organizationId,
+          principalType: "human",
+          status: "active",
+          createdAt: "2026-09-11T00:00:00.000Z",
+          updatedAt: "2026-09-11T00:00:00.000Z",
+        });
+        const principalSource = createProductionPrincipalGrantSource({
+          filePath: path.join(root, "principals.json"),
+          grantStore: provider.grantStore,
+          audit,
+        });
+        await principalSource.ready();
         const registry = new FileBackedWorkspaceRegistry(
           path.join(root, "workspaces.json"),
           createTestLogger(),
@@ -129,6 +167,7 @@ describe("production resource bundle ports", () => {
           nodeId,
         });
         expect(bundle).not.toBeNull();
+        expect(bundle?.workspaceTransfers).toBeUndefined();
         await expect(bundle?.placement.resolveWorkspace("workspace-bundle")).resolves.toMatchObject(
           { localResourceId: "workspace-bundle" },
         );
@@ -164,6 +203,27 @@ describe("production resource bundle ports", () => {
         ).resolves.toMatchObject({
           resources: [{ agentId: "agent-bundle", workspaceId: "workspace-bundle" }],
         });
+        const transferBundle = await createProductionResourceBundle({
+          provider,
+          workspaceRegistry: registry,
+          agentRecords: { list: () => agentRecords },
+          nodeId,
+          audit,
+          principalSource,
+        });
+        expect(transferBundle?.workspaceTransfers).toBeDefined();
+        expect(transferBundle?.dispatcherFactory.manifest.operations).toContain(
+          "enterprise.resource.ownership.transfer.request",
+        );
+        await expect(
+          createProductionResourceBundle({
+            provider,
+            workspaceRegistry: registry,
+            agentRecords: { list: () => agentRecords },
+            nodeId,
+            audit,
+          }),
+        ).resolves.toBeNull();
       } finally {
         await audit.close();
         await rm(root, { recursive: true, force: true });

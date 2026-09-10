@@ -96,6 +96,7 @@ describe("SessionAuthorization", () => {
       "enterprise.resource.acquire_lease.request": "workspace.write",
       "enterprise.resource.release_lease.request": "workspace.write",
       "enterprise.resource.renew_lease.request": "workspace.write",
+      "enterprise.resource.ownership.transfer.request": "workspace.manage",
     } as const satisfies Partial<Record<SessionInboundMessage["type"], PermissionRequirement>>;
     const outboundRequirements = {
       "enterprise.access.list_grants.response": "workspace.read",
@@ -115,6 +116,7 @@ describe("SessionAuthorization", () => {
       "enterprise.resource.acquire_lease.response": "workspace.write",
       "enterprise.resource.release_lease.response": "workspace.write",
       "enterprise.resource.renew_lease.response": "workspace.write",
+      "enterprise.resource.ownership.transfer.response": "workspace.manage",
       "enterprise.resource.status": "workspace.read",
       "enterprise.resource.waiting": "workspace.read",
     } as const satisfies Partial<Record<SessionOutboundMessage["type"], PermissionRequirement>>;
