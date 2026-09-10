@@ -80,6 +80,7 @@ import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
 import {
   resolveEnterpriseContentReadPolicy,
+  type EnterpriseSessionDispatcherFactoryRegistration,
   type EnterpriseContentReadRequestType,
 } from "./session/enterprise-dispatcher.js";
 import {
@@ -397,6 +398,7 @@ interface SessionForTestOptions {
   admissionAuthorizationHandle?: SessionOptions["admissionAuthorizationHandle"];
   enterpriseAuthorizationRuntime?: SessionOptions["enterpriseAuthorizationRuntime"];
   enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
+  enterpriseDispatcherRegistration?: SessionOptions["enterpriseDispatcherRegistration"];
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 }
 
@@ -535,6 +537,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     admissionAuthorizationHandle: options.admissionAuthorizationHandle,
     enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime,
     enterpriseDispatcher: options.enterpriseDispatcher,
+    enterpriseDispatcherRegistration: options.enterpriseDispatcherRegistration,
     enterpriseIdentitySelfAuthorization: options.enterpriseIdentitySelfAuthorization,
   };
   return new Session(sessionOptions);
@@ -746,6 +749,29 @@ test("fails closed for an unregistered content handler", async () => {
       code: "unavailable",
     },
   });
+});
+
+test("passes the per-session workspace files runtime through dispatcher registration", async () => {
+  const filesRuntime = makeEnterpriseRuntime(async () => {});
+  const close = vi.fn(async () => {});
+  const open = vi.fn(() => ({
+    dispatcher: { handle: vi.fn(() => false) },
+    close,
+  }));
+  const registration: EnterpriseSessionDispatcherFactoryRegistration = {
+    manifest: { operations: ["workspace.content.read"] },
+    open,
+  };
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseWorkspaceFilesRuntime: filesRuntime,
+    enterpriseDispatcherRegistration: registration,
+  });
+
+  expect(open).toHaveBeenCalledWith(expect.objectContaining({ filesRuntime }));
+  await session.cleanup();
+  expect(close).toHaveBeenCalledTimes(1);
 });
 
 test("reserves a content request id until the outbound tail settles", async () => {

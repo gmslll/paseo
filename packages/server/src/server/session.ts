@@ -1069,6 +1069,7 @@ export class Session {
         clientId,
         context: this.enterpriseContext,
         authorizationRuntime: enterpriseAuthorizationRuntime,
+        filesRuntime: enterpriseWorkspaceFilesRuntime,
       });
       this.enterpriseDispatcher = this.enterpriseDispatcherLease.dispatcher;
     }

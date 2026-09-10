@@ -272,6 +272,7 @@ export interface EnterpriseSessionDispatcherFactoryRegistration {
     readonly clientId: string;
     readonly context: EnterpriseSessionContext;
     readonly authorizationRuntime?: unknown;
+    readonly filesRuntime?: unknown;
     readonly requestLifecycle?: unknown;
   }): EnterpriseDispatcherLease;
 }
