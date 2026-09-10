@@ -1803,7 +1803,7 @@ describe("enterprise admission", () => {
       expect(earlyWarning?.[0].err).toBe(primary);
       await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
       expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
-      expect(h.nextSessionBindingGeneration).toHaveBeenCalledOnce();
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
       const warning = logger.warn.mock.calls.find(
         (call) => call[1] === "pending websocket message failed",
@@ -1842,7 +1842,7 @@ describe("enterprise admission", () => {
       await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
       expect(socket.readyState).toBe(3);
       expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
-      expect(h.nextSessionBindingGeneration).toHaveBeenCalledOnce();
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
       expect(internals.sessions.size).toBe(0);
       expect(internals.externalSessionsByKey.size).toBe(0);
       expect(internals.externalSessionsByBaseKey.size).toBe(0);
@@ -1880,7 +1880,7 @@ describe("enterprise admission", () => {
       await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
       expect(socket.readyState).toBe(3);
       expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
-      expect(h.nextSessionBindingGeneration).toHaveBeenCalledOnce();
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
       expect(internals.sessions.size).toBe(0);
       expect(internals.externalSessionsByKey.size).toBe(0);
       expect(internals.externalSessionsByBaseKey.size).toBe(0);
@@ -2378,7 +2378,7 @@ describe("enterprise admission", () => {
     expect(args.authorityReceiptState).toBe(h.authorityReceiptState);
     expect(args.principalGrantVersionGuard).toBe(h.grantVersionGuard);
     expect(args.resourceAuthorization).toBe(h.resourceAuthorization);
-    expect(h.nextSessionBindingGeneration).toHaveBeenCalledTimes(1);
+    expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
     expect(h.canEmit).toHaveBeenCalledWith(
       h.principal,
       expect.objectContaining({

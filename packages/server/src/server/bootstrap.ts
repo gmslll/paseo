@@ -2047,6 +2047,7 @@ export async function createPaseoDaemon(
     logger.info({ elapsed: elapsed() }, "Bootstrap complete, ready to start listening");
 
     let shutdownRunPromise: Promise<readonly unknown[]> | null = null;
+    let hubRelationshipShutdown: Promise<void> | null = null;
     const collectShutdownErrors = (): Promise<readonly unknown[]> => {
       if (shutdownRunPromise) return shutdownRunPromise;
       const errors: unknown[] = [];
@@ -2060,6 +2061,11 @@ export async function createPaseoDaemon(
       } catch (error) {
         appendError(errors, error);
       }
+      try {
+        hubRelationshipShutdown = hubRelationships.stop();
+      } catch (error) {
+        appendError(errors, error);
+      }
       shutdownRunPromise = Promise.resolve().then(async () => {
         await runCleanupStep(errors, () => pluginRuntime.stopAllPlugins());
         await runCleanupStep(errors, () => unsubscribePluginProviders());
@@ -2067,7 +2073,7 @@ export async function createPaseoDaemon(
         for (const unsubscribe of configUnsubscribes) {
           await runCleanupStep(errors, unsubscribe);
         }
-        await runCleanupStep(errors, () => hubRelationships.stop());
+        await runCleanupStep(errors, () => hubRelationshipShutdown ?? hubRelationships.stop());
         await runCleanupStep(errors, () => workspaceReconciliation.dispose());
         await runCleanupStep(errors, () => scriptHealthMonitor.stop());
         await runCleanupStep(errors, () => scheduleService.stop());
