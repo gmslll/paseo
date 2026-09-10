@@ -1082,6 +1082,28 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       ]),
       { mode: 0o600 },
     );
+    const appSlotId = "aps_0123456789abcdef";
+    await writeFile(
+      path.join(paseoHome, "enterprise", "app-slots.json"),
+      JSON.stringify({
+        version: 1,
+        records: [
+          {
+            appSlotId,
+            organizationId: principal.organizationId,
+            nodeId: node.nodeId,
+            businessIdentityId: "bid_0123456789abcdef",
+            appBundleId: "com.example.crossflow",
+            accountBindingKey: "crossflow-account",
+            ownerPrincipalId: principalA,
+            concurrency: 1,
+            credentialRef: "keychain://crossflow",
+            status: "ready",
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
     await writeFile(path.join(paseoHome, "server-id"), `${serverId}\n`, { mode: 0o600 });
     await writeFile(
       path.join(paseoHome, "enterprise", "principals.json"),
@@ -1126,6 +1148,10 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             {
               action: "workspace.metadata.read",
               selector: { kind: "workspace", workspaceIds: [workspaceId] },
+            },
+            {
+              action: "app.use",
+              selector: { kind: "organization", organizationId: principal.organizationId },
             },
           ],
           grantVersion: "grv_a",
@@ -1341,6 +1367,8 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       });
       expect(a.info.message.payload.features.enterpriseAuditV1).toBe(true);
       expect(b.info.message.payload.features.enterpriseAuditV1).toBe(true);
+      expect(a.info.message.payload.features.enterpriseAppSlotContentReadV1).toBe(true);
+      expect(b.info.message.payload.features.enterpriseAppSlotContentReadV1).toBe(true);
       const allowedPromise = next(
         a.socket,
         (v) => v?.type === "session" && v.message?.type === "enterprise.audit.list_events.response",
@@ -1462,9 +1490,12 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       const contentRequest = (
         type: string,
         requestId: string,
-        resourceKind: "workspace" | "agent",
+        resourceKind: "workspace" | "agent" | "app_slot",
         localResourceId: string,
-        selector: { kind: "workspace" | "agent"; view: "files" | "timeline" | "transcript" },
+        selector: {
+          kind: "workspace" | "agent" | "app_slot";
+          view: "files" | "timeline" | "transcript" | "state";
+        },
       ) => ({
         type,
         requestId,
@@ -1603,6 +1634,79 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         requestId: "content-agent-b",
         code: expect.stringMatching(/^(access_denied|unavailable)$/),
       });
+      const appAllowedPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.app_slot.content.read.response" &&
+          v.message?.payload?.requestId === "content-app-a",
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: contentRequest(
+            "enterprise.app_slot.content.read.request",
+            "content-app-a",
+            "app_slot",
+            appSlotId,
+            { kind: "app_slot", view: "state" },
+          ),
+        }),
+      );
+      const appAllowed = await appAllowedPromise;
+      expect(appAllowed.message?.payload?.resource?.localResourceId).toBe(appSlotId);
+      const appPage = appAllowed.message?.payload?.page;
+      expect(appPage?.items).toHaveLength(1);
+      expect(appPage?.items?.[0]).toMatchObject({
+        kind: "state",
+        label: "com.example.crossflow",
+        status: "ready",
+        itemId: expect.any(String),
+        occurredAt: expect.any(String),
+      });
+      const appResponseText = JSON.stringify(appAllowed);
+      expect(appResponseText).not.toContain("credentialRef");
+      expect(appResponseText).not.toContain("keychain://crossflow");
+      expect(appResponseText).not.toContain("accountBindingKey");
+      let appDeniedShape: { code: unknown; error: unknown; requestType: unknown } | undefined;
+      for (const [requestId, localResourceId] of [
+        ["content-app-b", appSlotId],
+        ["content-app-missing", "aps_ffffffffffffffff"],
+      ] as const) {
+        const appDeniedPromise = next(
+          b.socket,
+          (v) =>
+            (v?.type === "rpc_error" && v.payload?.requestId === requestId) ||
+            (v?.type === "session" &&
+              v.message?.type === "rpc_error" &&
+              v.message?.payload?.requestId === requestId),
+        );
+        b.socket.send(
+          JSON.stringify({
+            type: "session",
+            message: contentRequest(
+              "enterprise.app_slot.content.read.request",
+              requestId,
+              "app_slot",
+              localResourceId,
+              { kind: "app_slot", view: "state" },
+            ),
+          }),
+        );
+        const appDenied = await appDeniedPromise;
+        const appDeniedPayload = appDenied.payload ?? appDenied.message?.payload;
+        expect(appDeniedPayload).toMatchObject({
+          requestId,
+          code: expect.stringMatching(/^(access_denied|unavailable)$/),
+        });
+        const shape = {
+          code: appDeniedPayload.code,
+          error: appDeniedPayload.error,
+          requestType: appDeniedPayload.requestType,
+        };
+        if (appDeniedShape === undefined) appDeniedShape = shape;
+        else expect(shape).toEqual(appDeniedShape);
+      }
       const contentAuditPromise = next(
         a.socket,
         (v) =>
@@ -1645,6 +1749,46 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
           expect.objectContaining({ actorPrincipalId: principalA, outcome: "allowed" }),
         ]),
       );
+      const allAuditPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.audit.list_events.response" &&
+          v.message?.payload?.requestId === "audit-content-all-a",
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.audit.list_events.request",
+            requestId: "audit-content-all-a",
+            limit: 50,
+          },
+        }),
+      );
+      const allAudit = await allAuditPromise;
+      const allEvents = allAudit.message?.payload?.events;
+      expect(allEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "app.use",
+            actorPrincipalId: principalA,
+            sessionId: expect.any(String),
+            resource: expect.objectContaining({ kind: "app_slot", id: appSlotId }),
+          }),
+        ]),
+      );
+      const appAllowedEvents = allEvents?.filter(
+        (event) => event.action === "app.use" && event.outcome === "allowed",
+      );
+      expect(appAllowedEvents).toHaveLength(1);
+      expect(appAllowedEvents?.[0]).toMatchObject({
+        action: "app.use",
+        outcome: "allowed",
+        actorPrincipalId: principalA,
+        resource: { kind: "app_slot", id: appSlotId },
+        sessionId: expect.any(String),
+      });
     } finally {
       for (const socket of sockets) socket.close();
       await daemon.stop().catch(() => undefined);
