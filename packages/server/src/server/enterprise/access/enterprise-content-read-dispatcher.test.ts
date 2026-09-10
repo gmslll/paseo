@@ -2,6 +2,11 @@ import { describe, expect, test } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  BrowserProfileRegistry,
+  JsonFileBrowserProfileStorage,
+} from "../browser/profile-registry.js";
+import { createEnterpriseBrowserProfileContentReadSource } from "../browser/content-source.js";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import { EnterpriseWorkspaceContentReadResponseSchema } from "@getpaseo/protocol/messages";
 import { createProductionAppSlotRegistry } from "../runtime/production-app-slot-registry.js";
@@ -577,6 +582,125 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       await fixture.runtime.release();
     } finally {
       await closeProductionRuntimeFixture();
+    }
+  });
+
+  test("reads an authorized browser profile and consumes once", async () => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "paseo-w2-browser-"));
+    const profiles = new BrowserProfileRegistry({
+      storage: new JsonFileBrowserProfileStorage(path.join(tmp, "profiles.json")),
+      canonicalResolver: {
+        resolve: ({ browserProfileId }) => ({
+          partitionKey: `persist:${browserProfileId}`,
+          downloadRoot: path.join(tmp, browserProfileId),
+        }),
+      },
+      createProfileId: () => "brp_0123456789abcdef",
+      now: () => "2026-01-01T00:00:00.000Z",
+    });
+    const fixture = await createProductionRuntimeFixture("content-browser", {
+      grants: [
+        {
+          action: "browser.use",
+          selector: { kind: "organization", organizationId: "org_0123456789abcdef" },
+        },
+      ],
+      browserProfiles: profiles,
+    });
+    try {
+      const created = await profiles.create({
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        homeNodeId: fixture.context.enterpriseContext.node.nodeId,
+        businessIdentityId: "bid_0123456789abcdef",
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        platform: "generic",
+        businessAccountKey: "acct",
+        label: "Profile",
+        status: "ready",
+      });
+      const source = createEnterpriseBrowserProfileContentReadSource({
+        readProfile: async () => ({
+          items: [
+            {
+              itemId: "state",
+              occurredAt: "2026-01-01T00:00:00.000Z",
+              kind: "state",
+              label: "Profile",
+              status: "ready",
+            },
+          ],
+          nextCursor: null,
+        }),
+        onClose: () => {},
+      });
+      const registration = createEnterpriseContentReadDispatcherRegistration({
+        provider: fixture.provider,
+        audit: fixture.audit,
+        agents: {
+          listAgents: async () => [],
+          getAgent: async () => null,
+          getTimelineRows: async () => [],
+        },
+        createBrowserProfileSource: () => source,
+      });
+      if (!registration) throw new Error("registration");
+      const unused = async (..._args: never[]): Promise<never> => {
+        throw new Error("unused");
+      };
+      const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
+        stat: unused,
+        list: async () => [],
+        openRead: unused,
+        write: unused,
+        create: unused,
+        rename: unused,
+        copy: unused,
+        delete: unused,
+        watch: unused,
+        issueDownloadToken: unused,
+        createUploadStore: () => {
+          throw new Error("unused");
+        },
+        cleanup: async () => {},
+      };
+      const lease = registration.open({
+        sessionId: fixture.context.sessionId,
+        clientId: fixture.context.clientId,
+        context: fixture.context.enterpriseContext,
+        authorizationRuntime: fixture.runtime,
+        filesRuntime,
+      });
+      const message = {
+        type: "enterprise.browser_profile.content.read.request" as const,
+        requestId: "r-browser",
+        resource: {
+          organizationId: fixture.context.enterpriseContext.principal.organizationId,
+          nodeId: fixture.context.enterpriseContext.node.nodeId,
+          resourceKind: "browser_profile" as const,
+          localResourceId: created.browserProfileId,
+        },
+        selector: { kind: "browser_profile" as const, view: "state" as const },
+        page: { limit: 1 },
+      };
+      const response = await lease.dispatcher.handle({ sessionContext: fixture.context, message });
+      expect(response).not.toBe(false);
+      if (response === false) throw new Error("response");
+      expect(
+        lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
+      ).not.toBeNull();
+      expect(
+        lease.dispatcher.consumeResponse?.({ sessionContext: fixture.context, message, response }),
+      ).toBeNull();
+      expect(
+        (await fixture.audit.snapshotEvents()).some(
+          (event) => event.action === "browser.use" && event.outcome === "allowed",
+        ),
+      ).toBe(true);
+      await lease.close();
+      await fixture.runtime.release();
+    } finally {
+      await closeProductionRuntimeFixture();
+      await rm(tmp, { recursive: true, force: true });
     }
   });
 });
