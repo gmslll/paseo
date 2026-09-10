@@ -202,6 +202,7 @@ import { createProductionAuthorizationRuntimeProvider } from "./enterprise/acces
 import { createProductionEnterpriseWorkspaceFilesProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
 import type { EnterpriseSessionDispatcher } from "./session/enterprise-dispatcher.js";
+import type { SessionOptions } from "./session.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -497,6 +498,7 @@ export interface PaseoDaemon {
 
 export interface PaseoDaemonDependencies {
   enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
   createEnterpriseWorkspaceFilesProvider?: (input: {
     workspaceRoots: FileBackedWorkspaceRegistry;
   }) => EnterpriseWorkspaceFilesProductionProvider | null;
@@ -2083,6 +2085,7 @@ export async function createPaseoDaemon(
                 enterpriseRuntime,
                 enterpriseWorkspaceFilesProvider ?? undefined,
                 dependencies.enterpriseDispatcher,
+                dependencies.enterpriseIdentitySelfAuthorization,
               );
               requireStartAudit();
               pluginRuntime.bindPaseoSessionHost(wsServer);
