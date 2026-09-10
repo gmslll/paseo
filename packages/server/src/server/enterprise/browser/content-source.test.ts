@@ -195,13 +195,26 @@ describe("browser profile content source", () => {
 
   test("rejects extra and accessor source options", () => {
     const readProfile = async () => ({ items: [], nextCursor: null });
+    const invoke = (value: unknown) =>
+      Reflect.apply(createEnterpriseBrowserProfileContentReadSource, undefined, [value]);
+    expect(() => invoke({ readProfile, extra: true })).toThrow();
     expect(() =>
-      createEnterpriseBrowserProfileContentReadSource({ readProfile, extra: true } as never),
+      invoke(Object.defineProperty({ readProfile }, "onClose", { get: () => undefined })),
     ).toThrow();
     expect(() =>
-      createEnterpriseBrowserProfileContentReadSource(
-        Object.defineProperty({ readProfile }, "onClose", { get: () => undefined }) as never,
-      ),
+      Reflect.apply(createProductionEnterpriseBrowserProfileContentReadSource, undefined, [
+        { addonPath: "x", extra: true },
+      ]),
+    ).toThrow();
+    expect(() =>
+      Reflect.apply(createProductionEnterpriseBrowserProfileContentReadSource, undefined, [
+        Object.defineProperty({ addonPath: "x" }, "workspaceFs", { get: () => undefined }),
+      ]),
+    ).toThrow();
+    expect(() =>
+      Reflect.apply(createProductionEnterpriseBrowserProfileContentReadSource, undefined, [
+        { addonPath: "x", workspaceFs: {} },
+      ]),
     ).toThrow();
   });
 });
