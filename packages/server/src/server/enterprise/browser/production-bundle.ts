@@ -1,5 +1,5 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type { AuditSink } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import {
@@ -75,7 +75,7 @@ export async function prepareProductionBrowserProfileRegistry(input: {
         nodeId: input.nodeId,
         downloadBaseRoot: input.downloadBaseRoot,
       }),
-    createProfileId: input.createId ?? (() => `brp_${randomUUID().replaceAll("-", "")}`),
+    createProfileId: input.createId ?? (() => `brp_${randomBytes(8).toString("hex")}`),
   });
   await registry.initialize();
   return registry;
@@ -143,7 +143,7 @@ export function createProductionBrowserLeaseBundle(
           nodeId: options.nodeId,
           downloadBaseRoot: options.downloadBaseRoot,
         }),
-      createProfileId: options.createId ?? (() => `brp_${randomUUID().replaceAll("-", "")}`),
+      createProfileId: options.createId ?? (() => `brp_${randomBytes(8).toString("hex")}`),
     });
   const bindings = new BrowserProfileBindingRegistry({
     storage: new JsonFileBrowserProfileBindingStorage(
