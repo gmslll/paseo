@@ -9,14 +9,17 @@ import {
   FileTransferOpcode,
 } from "@getpaseo/protocol/binary-frames/index";
 import type {
+  EnterpriseWorkspaceAuthorizationRecord,
   NodeContext,
   PrincipalContext,
+  ResourceAuthorization,
   SessionOutboundMessage,
 } from "@getpaseo/protocol/messages";
 import pino from "pino";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { extractHttpBearerToken } from "../../auth.js";
 import { OWNER_PERMISSIONS, SessionAuthorization } from "../../authorization/index.js";
+import { createPaseoDaemon, type PaseoDaemonConfig } from "../../bootstrap.js";
 import { Session, type SessionOptions } from "../../session.js";
 import { createEnterpriseAgentSessionContextRegistry } from "../../session/enterprise-agent-session-context-registry.js";
 import { MemoryAuthorityReceiptState } from "../../session/enterprise-authority-receipt-state.js";
@@ -59,6 +62,7 @@ import {
   type EnterpriseAdmissionAuthorizationIssuer,
 } from "../identity/admission-authorization.js";
 import { EnterpriseAdmission } from "../identity/admission.js";
+import type { EnterpriseAdmissionRuntime } from "../identity/runtime.js";
 import { createEnterpriseSessionBindingKey } from "@getpaseo/protocol/messages";
 import {
   createProductionEnterpriseWorkspaceFilesProvider,
@@ -66,6 +70,7 @@ import {
   type EnterpriseWorkspaceFilesProductionProvider,
 } from "../runtime/production-workspace-files-runtime-provider.js";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
+import type { FileBackedWorkspaceRegistry } from "../../workspace-registry.js";
 import {
   createProductionAuditRuntime,
   productionAuditCapabilityIssuer,
@@ -366,6 +371,40 @@ async function handleAuthenticatedHttpDownload(input: {
     node: input.admission.node,
     query: input.query,
     response: input.response,
+  });
+}
+
+function createBootstrapAdmissionRuntime(
+  audit: ProductionAuditCapability,
+  admission: EnterpriseAdmission,
+): EnterpriseAdmissionRuntime {
+  const deny = async () => {
+    throw new Error("denied");
+  };
+  const resourceAuthorization = {
+    filterWorkspaces<T extends EnterpriseWorkspaceAuthorizationRecord>(
+      _principal: PrincipalContext,
+      rows: readonly T[],
+    ): T[] {
+      return [...rows];
+    },
+    assertWorkspace: deny,
+    assertAgent: deny,
+    assertBrowserProfile: deny,
+    assertAppSlot: deny,
+    resolveWorkspacePath: deny,
+    canEmit: async () => false,
+  } satisfies ResourceAuthorization;
+  let generation = 0;
+  return Object.freeze({
+    audit,
+    admission,
+    node: admission.node,
+    agentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    grantVersionGuard: { isCurrent: () => true },
+    resourceAuthorization,
+    nextSessionBindingGeneration: () => `bootstrap-http-${++generation}`,
   });
 }
 
@@ -739,4 +778,241 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
     expect(authority.admission.releaseSession(authority.handle)).toBe(true);
     await audit.close();
   });
+
+  test("serves the same real Darwin PAT and Session token through the public daemon route", async () => {
+    const caseRoot = path.join(suiteRoot, "public-http-route");
+    const paseoHome = path.join(caseRoot, ".paseo");
+    const staticDir = path.join(caseRoot, "static");
+    const workspaceInput = path.join(caseRoot, "workspace");
+    await Promise.all([
+      mkdir(paseoHome, { recursive: true }),
+      mkdir(staticDir, { recursive: true }),
+      mkdir(workspaceInput, { recursive: true }),
+    ]);
+    const workspaceRoot = await realpath(workspaceInput);
+    const content = "public-route-real-darwin-file";
+    await writeFile(path.join(workspaceRoot, "public.txt"), content);
+    const enterpriseMultiUser = {
+      enabled: true as const,
+      organizationId: principal.organizationId,
+      nodeId: node.nodeId,
+      managementMode: "standalone" as const,
+      legacyRecords: "owner_only" as const,
+    };
+    const config: PaseoDaemonConfig = {
+      listen: "127.0.0.1:0",
+      paseoHome,
+      corsAllowedOrigins: [],
+      hostnames: true,
+      mcpEnabled: false,
+      staticDir,
+      mcpDebug: false,
+      agentClients: {},
+      agentStoragePath: path.join(paseoHome, "agents"),
+      relayEnabled: false,
+      appBaseUrl: "https://app.paseo.sh",
+      enterpriseMultiUser,
+    };
+
+    let admission: EnterpriseAdmission | null = null;
+    let daemonAudit: ProductionAuditCapability | null = null;
+    let workspaceRegistry: FileBackedWorkspaceRegistry | null = null;
+    let filesProvider: EnterpriseWorkspaceFilesProductionProvider | null = null;
+    let workspaceRootReads = 0;
+    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }), {
+      issueProductionAuditCapability: (options) =>
+        productionAuditCapabilityIssuer.issue({ ...options, nativeAddonPath: auditAddonPath }),
+      createEnterpriseAdmissionRuntime: async ({ audit }) => {
+        daemonAudit = audit;
+        admission = new EnterpriseAdmission({
+          filePath: path.join(paseoHome, "enterprise", "identities.json"),
+          principalSource: {
+            async resolvePrincipal(principalId, organizationId) {
+              if (
+                principalId !== principal.principalId ||
+                organizationId !== principal.organizationId
+              ) {
+                return null;
+              }
+              return {
+                principalType: principal.principalType,
+                principalId: principal.principalId,
+                organizationId: principal.organizationId,
+                grantVersion: principal.grantVersion,
+                grants: principal.grants,
+              };
+            },
+          },
+          node: audit.node,
+          audit,
+          organizationId: principal.organizationId,
+          invalidation: { publish: async () => undefined },
+          credentialIds: { next: () => principal.credentialId },
+          secrets: { next: () => Buffer.alloc(32, 9).toString("base64url") },
+        });
+        return createBootstrapAdmissionRuntime(audit, admission);
+      },
+      createEnterpriseWorkspaceFilesProvider: ({ workspaceRoots }) => {
+        workspaceRegistry = workspaceRoots;
+        filesProvider = createProductionEnterpriseWorkspaceFilesProvider({
+          workspaceRoots: {
+            async get(requestedWorkspaceId) {
+              workspaceRootReads += 1;
+              return workspaceRoots.get(requestedWorkspaceId);
+            },
+          },
+          nativeAddonPath: workspaceAddonPath,
+        });
+        return filesProvider;
+      },
+    });
+
+    let authorizationRuntime: ProductionAuthorizationRuntime | null = null;
+    let filesRuntime: EnterpriseWorkspaceFilesRuntime | null = null;
+    let handle: EnterpriseAdmissionAuthorizationHandle | null = null;
+    try {
+      if (!admission || !daemonAudit || !workspaceRegistry || !filesProvider?.releaseReady) {
+        throw new Error("expected release-ready public route dependencies");
+      }
+      const now = new Date().toISOString();
+      await workspaceRegistry.upsert({
+        workspaceId,
+        organizationId: principal.organizationId,
+        nodeId: node.nodeId,
+        ownerPrincipalId: principal.principalId,
+        createdByPrincipalId: principal.principalId,
+        projectId: "project-public-http",
+        cwd: workspaceRoot,
+        kind: "directory",
+        displayName: "public-http",
+        title: null,
+        branch: null,
+        worktreeRoot: null,
+        baseBranch: null,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        pinnedAt: null,
+      });
+      const grantFilePath = path.join(paseoHome, "enterprise", "grants.json");
+      await new FileBackedGrantStorage(grantFilePath).put({
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+        grants: principal.grants,
+        grantVersion: principal.grantVersion,
+      });
+      const authorizationProvider = createProductionAuthorizationRuntimeProvider({
+        audit: daemonAudit,
+        grantFilePath,
+      });
+      if (!authorizationProvider) throw new Error("expected authorization provider");
+      authorizationProvider.owners.registerWorkspace({
+        id: workspaceId,
+        organizationId: principal.organizationId,
+        nodeId: node.nodeId,
+        ownerPrincipalId: principal.principalId,
+        createdByPrincipalId: principal.principalId,
+      });
+      const issuedPat = await admission.registry.issueToken({
+        actor: principal,
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+      });
+      const evidence = await admission.authenticateEvidence(issuedPat.token, {
+        node: daemonAudit.node,
+        transport: "direct",
+        peer: "loopback",
+      });
+      if (!evidence) throw new Error("expected PAT admission evidence");
+      handle = admission.bindSession(evidence, clientId);
+      if (!handle) throw new Error("expected PAT admission handle");
+      const sessionAuthorization = new SessionAuthorization(OWNER_PERMISSIONS);
+      authorizationRuntime = await createProductionAuthorizationRuntimeForSession(
+        authorizationProvider,
+        {
+          admissionAuthorizationIssuer: admission.authorizationIssuer,
+          admissionAuthorizationHandle: handle,
+          sessionAuthorization,
+          sessionId: "session-public-http",
+          authorityState: new MemoryAuthorityReceiptState(),
+        },
+      );
+      if (!authorizationRuntime) throw new Error("expected authorization runtime");
+      filesRuntime = filesProvider.createSessionRuntime(authorizationRuntime);
+      if (!filesRuntime) throw new Error("expected workspace files runtime");
+
+      await daemon.start();
+      const target = daemon.getListenTarget();
+      if (!target || target.type !== "tcp") throw new Error("expected isolated TCP listener");
+      const route = `http://127.0.0.1:${target.port}/api/files/download`;
+      const issued = await filesRuntime.issueDownloadToken({
+        workspaceId,
+        relativePath: "public.txt",
+        requestId: "public-http-download",
+      });
+      const query = new URLSearchParams({
+        workspaceId: issued.workspaceId,
+        relativePath: issued.relativePath,
+        token: issued.token,
+      });
+      const readsAfterIssue = workspaceRootReads;
+
+      const missingPat = await fetch(`${route}?${query}`);
+      expect(missingPat.status).toBe(403);
+      const wrongPat = await fetch(`${route}?${query}`, {
+        headers: { Authorization: "Bearer not-a-personal-access-token" },
+      });
+      expect(wrongPat.status).toBe(403);
+      expect(workspaceRootReads).toBe(readsAfterIssue);
+
+      const success = await fetch(`${route}?${query}`, {
+        headers: { Authorization: `Bearer ${issuedPat.token}` },
+      });
+      expect(success.status).toBe(200);
+      expect(success.headers.get("content-type")).toBe("text/plain");
+      expect(await success.text()).toBe(content);
+      const readsAfterSuccess = workspaceRootReads;
+      expect(readsAfterSuccess).toBeGreaterThan(readsAfterIssue);
+
+      const replay = await fetch(`${route}?${query}`, {
+        headers: { Authorization: `Bearer ${issuedPat.token}` },
+      });
+      expect(replay.status).toBe(403);
+      const wrongDownload = new URLSearchParams({
+        workspaceId,
+        relativePath: "public.txt",
+        token: "not-an-issued-download-token",
+      });
+      const wrong = await fetch(`${route}?${wrongDownload}`, {
+        headers: { Authorization: `Bearer ${issuedPat.token}` },
+      });
+      expect(wrong.status).toBe(403);
+      expect(workspaceRootReads).toBe(readsAfterSuccess);
+
+      const closedIssued = await filesRuntime.issueDownloadToken({
+        workspaceId,
+        relativePath: "public.txt",
+        requestId: "public-http-closed",
+      });
+      await filesRuntime.cleanup("session-closed");
+      const readsAfterClose = workspaceRootReads;
+      const closedQuery = new URLSearchParams({
+        workspaceId: closedIssued.workspaceId,
+        relativePath: closedIssued.relativePath,
+        token: closedIssued.token,
+      });
+      const closed = await fetch(`${route}?${closedQuery}`, {
+        headers: { Authorization: `Bearer ${issuedPat.token}` },
+      });
+      expect(closed.status).toBe(403);
+      expect(workspaceRootReads).toBe(readsAfterClose);
+    } finally {
+      await filesRuntime?.cleanup("session-closed").catch(() => undefined);
+      await authorizationRuntime?.release().catch(() => undefined);
+      if (admission && handle) admission.releaseSession(handle);
+      await daemon.stop().catch(() => undefined);
+    }
+  }, 30_000);
 });
