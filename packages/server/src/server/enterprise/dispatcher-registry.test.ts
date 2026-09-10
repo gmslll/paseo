@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EnterpriseDispatchContext } from "../session/enterprise-dispatcher.js";
 import {
+  contentFeaturesForEnterpriseManifest,
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
 } from "./dispatcher-registry.js";
@@ -132,6 +133,21 @@ describe("enterprise dispatcher registry", () => {
       enterpriseAuditV1: true,
     });
     expect("enterpriseDistributedNodeV1" in registry.features).toBe(false);
+  });
+
+  it("advertises content reads only for operations present in the release-ready manifest", () => {
+    expect(
+      contentFeaturesForEnterpriseManifest({
+        operations: [
+          "enterprise.workspace.content.read.request",
+          "enterprise.browser_profile.content.read.request",
+        ],
+      }),
+    ).toEqual({
+      enterpriseWorkspaceContentReadV1: true,
+      enterpriseBrowserProfileContentReadV1: true,
+    });
+    expect(contentFeaturesForEnterpriseManifest(undefined)).toEqual({});
   });
 
   it("opens each family per session and routes through one composite lease", async () => {

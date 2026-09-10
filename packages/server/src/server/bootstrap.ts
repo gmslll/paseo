@@ -216,8 +216,11 @@ import type {
   EnterpriseDispatcherRegistry,
   EnterpriseFeatureAdvertisement,
 } from "./enterprise/dispatcher-registry.js";
-import { createEnterpriseDispatcherRegistry } from "./enterprise/dispatcher-registry.js";
-import { createEnterpriseSessionDispatcherRegistration } from "./enterprise/dispatcher-registry.js";
+import {
+  contentFeaturesForEnterpriseManifest,
+  createEnterpriseDispatcherRegistry,
+  createEnterpriseSessionDispatcherRegistration,
+} from "./enterprise/dispatcher-registry.js";
 import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
 import {
   bindProductionAgentOwners,
@@ -1403,6 +1406,9 @@ export async function createPaseoDaemon(
         enterpriseResourceAuthorizationV1: true,
         enterpriseBrowserProfilesV1: true,
         enterpriseAuditV1: true,
+        ...contentFeaturesForEnterpriseManifest(
+          productionEnterpriseDispatcherRegistration.manifest,
+        ),
       });
       browserToolsBroker = new BrowserToolsBroker({
         enterprise: browserBundle.browserToolsRuntime,

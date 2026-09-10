@@ -27,11 +27,42 @@ export type EnterpriseFeatureAdvertisement = Readonly<
       | "enterpriseIdentityV1"
       | "enterpriseResourceAuthorizationV1"
       | "enterpriseBrowserProfilesV1"
-      | "enterpriseAuditV1",
+      | "enterpriseAuditV1"
+      | "enterpriseWorkspaceContentReadV1"
+      | "enterpriseAgentContentReadV1"
+      | "enterpriseBrowserProfileContentReadV1"
+      | "enterpriseAppSlotContentReadV1",
       true
     >
   >
 >;
+
+const contentFeatureOperations = Object.freeze({
+  enterpriseWorkspaceContentReadV1: "enterprise.workspace.content.read.request",
+  enterpriseAgentContentReadV1: "enterprise.agent.content.read.request",
+  enterpriseBrowserProfileContentReadV1: "enterprise.browser_profile.content.read.request",
+  enterpriseAppSlotContentReadV1: "enterprise.app_slot.content.read.request",
+});
+
+export function contentFeaturesForEnterpriseManifest(
+  manifest: EnterpriseDispatcherManifest | undefined,
+): EnterpriseFeatureAdvertisement {
+  const operations = new Set(manifest?.operations ?? []);
+  return Object.freeze({
+    ...(operations.has(contentFeatureOperations.enterpriseWorkspaceContentReadV1)
+      ? { enterpriseWorkspaceContentReadV1: true as const }
+      : {}),
+    ...(operations.has(contentFeatureOperations.enterpriseAgentContentReadV1)
+      ? { enterpriseAgentContentReadV1: true as const }
+      : {}),
+    ...(operations.has(contentFeatureOperations.enterpriseBrowserProfileContentReadV1)
+      ? { enterpriseBrowserProfileContentReadV1: true as const }
+      : {}),
+    ...(operations.has(contentFeatureOperations.enterpriseAppSlotContentReadV1)
+      ? { enterpriseAppSlotContentReadV1: true as const }
+      : {}),
+  });
+}
 
 const familyFlags: Readonly<Record<EnterpriseFeatureFamily, keyof EnterpriseFeatureAdvertisement>> =
   Object.freeze({
