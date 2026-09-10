@@ -360,6 +360,13 @@ export type BrowserAutomationExecuteRequestMessage = BrowserAutomationExecuteReq
 export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteResponse;
 
 export interface DaemonClientConfig {
+  enterpriseFileRequest?: (input: {
+    readonly serverId: string;
+    readonly workspaceId: string;
+    readonly relativePath: string;
+    readonly signal?: AbortSignal;
+    readonly scopeGeneration?: string;
+  }) => Promise<Response>;
   /** Deliver compact bodies/hash references to a caller-owned snapshot cache.
    * The default keeps public SDK snapshot entries expanded. */
   providerSnapshots?: "wire";
@@ -1119,6 +1126,24 @@ interface PingProbe {
 }
 
 export class DaemonClient {
+  public enterpriseFileDownload(input: {
+    readonly serverId: string;
+    readonly workspaceId: string;
+    readonly relativePath: string;
+    readonly signal?: AbortSignal;
+    readonly scopeGeneration?: string;
+  }): Promise<Response> {
+    if (!this.config.enterpriseFileRequest) {
+      return Promise.reject(new Error("Enterprise file download unavailable"));
+    }
+    const snapshot = structuredClone({
+      serverId: input.serverId,
+      workspaceId: input.workspaceId,
+      relativePath: input.relativePath,
+      scopeGeneration: input.scopeGeneration,
+    });
+    return this.config.enterpriseFileRequest({ ...snapshot, signal: input.signal });
+  }
   /**
    * Batch A enterprise RPC wrapper. Domain-specific methods are added by the
    * owning workstream; this wrapper only snapshots payloads and correlates the
