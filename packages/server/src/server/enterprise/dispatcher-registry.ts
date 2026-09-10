@@ -17,12 +17,17 @@ export interface EnterpriseDispatcherRegistration {
   readonly dispatcher: EnterpriseSessionDispatcher;
 }
 
-export interface EnterpriseFeatureAdvertisement {
-  readonly enterpriseIdentityV1: boolean;
-  readonly enterpriseResourceAuthorizationV1: boolean;
-  readonly enterpriseBrowserProfilesV1: boolean;
-  readonly enterpriseAuditV1: boolean;
-}
+export type EnterpriseFeatureAdvertisement = Readonly<
+  Partial<
+    Record<
+      | "enterpriseIdentityV1"
+      | "enterpriseResourceAuthorizationV1"
+      | "enterpriseBrowserProfilesV1"
+      | "enterpriseAuditV1",
+      true
+    >
+  >
+>;
 
 const familyFlags: Readonly<Record<EnterpriseFeatureFamily, keyof EnterpriseFeatureAdvertisement>> =
   Object.freeze({
@@ -94,11 +99,15 @@ export function createEnterpriseDispatcherRegistry(
     );
   }
   const features = Object.freeze({
-    enterpriseIdentityV1: familyComplete.get("identity") === true,
-    enterpriseResourceAuthorizationV1: familyComplete.get("resourceAuthorization") === true,
-    enterpriseBrowserProfilesV1: familyComplete.get("browserProfiles") === true,
-    enterpriseAuditV1: familyComplete.get("audit") === true,
-  });
+    ...(familyComplete.get("identity") === true ? { enterpriseIdentityV1: true as const } : {}),
+    ...(familyComplete.get("resourceAuthorization") === true
+      ? { enterpriseResourceAuthorizationV1: true as const }
+      : {}),
+    ...(familyComplete.get("browserProfiles") === true
+      ? { enterpriseBrowserProfilesV1: true as const }
+      : {}),
+    ...(familyComplete.get("audit") === true ? { enterpriseAuditV1: true as const } : {}),
+  }) satisfies EnterpriseFeatureAdvertisement;
   const registeredRequestTypes = Object.freeze([...requestMap.keys()].sort());
   const registry: EnterpriseDispatcherRegistry = {
     features,

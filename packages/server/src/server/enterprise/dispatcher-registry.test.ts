@@ -34,7 +34,7 @@ describe("enterprise dispatcher registry", () => {
     ).resolves.toBe(false);
     expect(handle).toHaveBeenCalledTimes(1);
     expect(registry.features.enterpriseIdentityV1).toBe(true);
-    expect(registry.features.enterpriseAuditV1).toBe(false);
+    expect(registry.features.enterpriseAuditV1).toBeUndefined();
   });
 
   it("forwards a registered dispatcher's policy classification", () => {
