@@ -37,6 +37,31 @@ describe("enterprise dispatcher registry", () => {
     expect(registry.features.enterpriseAuditV1).toBe(false);
   });
 
+  it("forwards a registered dispatcher's policy classification", () => {
+    const registry = createEnterpriseDispatcherRegistry([
+      {
+        family: "resourceAuthorization",
+        requestTypes: [
+          "enterprise.organization.list_resources.request",
+          "enterprise.placement.resolve_workspace.request",
+          "enterprise.access.list_grants.request",
+          "enterprise.access.update_grants.request",
+        ],
+        dispatcher: {
+          handle: () => false,
+          requestPolicyForType: (type) =>
+            type === "enterprise.organization.list_resources.request" ? "resources" : null,
+        },
+      },
+    ]);
+    expect(registry.requestPolicyForType?.("enterprise.organization.list_resources.request")).toBe(
+      "resources",
+    );
+    expect(registry.requestPolicyForType?.("enterprise.placement.resolve_workspace.request")).toBe(
+      null,
+    );
+  });
+
   it("rejects duplicate request or family registrations", () => {
     const dispatcher = { handle: () => false };
     expect(() =>

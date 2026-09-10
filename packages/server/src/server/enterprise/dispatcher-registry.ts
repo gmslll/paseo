@@ -103,6 +103,15 @@ export function createEnterpriseDispatcherRegistry(
   const registry: EnterpriseDispatcherRegistry = {
     features,
     registeredRequestTypes,
+    requestPolicyForType: (requestType) => {
+      const dispatcher = requestMap.get(requestType);
+      if (!dispatcher?.requestPolicyForType) return null;
+      try {
+        return dispatcher.requestPolicyForType(requestType);
+      } catch {
+        return null;
+      }
+    },
     handle: async ({ sessionContext, message }): Promise<SessionOutboundMessage | false> => {
       const dispatcher = requestMap.get(message.type);
       if (!dispatcher) return false;
