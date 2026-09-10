@@ -10,15 +10,14 @@ import {
 } from "@getpaseo/relay/e2ee";
 import { buildRelayWebSocketUrl } from "@getpaseo/protocol/daemon-endpoints";
 import type { ExternalSocketMetadata } from "./websocket-server.js";
-import type { EnterpriseAdmissionAuthenticationEvidence } from "./enterprise/identity/admission-authorization.js";
 import { createEncryptedRelaySocket } from "./websocket/encrypted-relay-socket.js";
 
-export interface RelayTransportOptions {
+export interface RelayTransportOptions<TAuthentication = unknown> {
   logger: pino.Logger;
   attachSocket: (
     ws: RelaySocketLike,
     metadata?: ExternalSocketMetadata,
-    evidence?: EnterpriseAdmissionAuthenticationEvidence,
+    evidence?: TAuthentication,
   ) => Promise<void>;
   relayEndpoint: string; // "host:port"
   relayUseTls: boolean;
@@ -28,7 +27,7 @@ export interface RelayTransportOptions {
   authenticateEnterprise?: (input: {
     token: string;
     challenge: string;
-  }) => Promise<EnterpriseAdmissionAuthenticationEvidence | null>;
+  }) => Promise<TAuthentication | null>;
 }
 
 export interface RelayTransportController {
@@ -116,7 +115,7 @@ function tryParseControlMessage(raw: unknown): ControlMessage | null {
   }
 }
 
-export function startRelayTransport({
+export function startRelayTransport<TAuthentication = unknown>({
   logger,
   attachSocket,
   relayEndpoint,
@@ -125,7 +124,7 @@ export function startRelayTransport({
   daemonKeyPair,
   createWebSocket = createDefaultRelayWebSocket,
   authenticateEnterprise,
-}: RelayTransportOptions): RelayTransportController {
+}: RelayTransportOptions<TAuthentication>): RelayTransportController {
   const relayLogger = logger.child({ module: "relay-transport" });
 
   let stopped = false;
@@ -425,20 +424,20 @@ export function startRelayTransport({
   return { stop };
 }
 
-async function attachEncryptedSocket(
+async function attachEncryptedSocket<TAuthentication>(
   socket: RelayWebSocketLike,
   daemonKeyPair: KeyPair,
   logger: pino.Logger,
   attachSocket: (
     ws: RelaySocketLike,
     metadata?: ExternalSocketMetadata,
-    evidence?: EnterpriseAdmissionAuthenticationEvidence,
+    evidence?: TAuthentication,
   ) => Promise<void>,
   metadata?: ExternalSocketMetadata,
   authenticateEnterprise?: (input: {
     token: string;
     challenge: string;
-  }) => Promise<EnterpriseAdmissionAuthenticationEvidence | null>,
+  }) => Promise<TAuthentication | null>,
 ): Promise<void> {
   try {
     const relayTransport = createRelayTransportAdapter(socket, logger);
@@ -454,7 +453,7 @@ async function attachEncryptedSocket(
     };
     const challenge = authenticateEnterprise ? randomBytes(32).toString("base64url") : null;
     let authenticated = !authenticateEnterprise;
-    let authenticationEvidence: EnterpriseAdmissionAuthenticationEvidence | undefined;
+    let authenticationEvidence: TAuthentication | undefined;
     let authenticating = false;
     let authSettled = authenticated;
     let authResolve: (() => void) | undefined;

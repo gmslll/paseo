@@ -6,6 +6,7 @@ import {
   startRelayTransport,
   type RelaySocketLike,
   type RelayTransportController,
+  type RelayTransportOptions,
 } from "./relay-transport.js";
 
 export interface RelayRuntimeConfig {
@@ -26,7 +27,9 @@ interface RelayRuntimeOptions {
   ): Promise<void>;
   serverId: string;
   daemonKeyPair: KeyPair;
-  startTransport?: typeof startRelayTransport;
+  startTransport?: (
+    options: RelayTransportOptions<EnterpriseAdmissionAuthenticationEvidence>,
+  ) => RelayTransportController;
   authenticateEnterprise?: (input: {
     token: string;
     challenge: string;
