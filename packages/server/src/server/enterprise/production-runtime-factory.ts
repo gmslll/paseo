@@ -34,6 +34,8 @@ import { createProductionPrincipalGrantSource } from "./identity/principal-sourc
 import { createProductionEnterpriseIdentityDispatcherRegistration } from "./identity/handlers.js";
 import type { CredentialInvalidation, CredentialInvalidationSink } from "./identity/registry.js";
 import type { EnterpriseAdmissionRuntime } from "./identity/runtime.js";
+import { prepareProductionBrowserProfileRegistry } from "./browser/production-bundle.js";
+import type { BrowserProfileRegistry } from "./browser/profile-registry.js";
 import type {
   EnterpriseDispatcherLease,
   EnterpriseSessionDispatcher,
@@ -62,6 +64,7 @@ const productionIdentityRecords = new WeakMap<
     readonly source: ReturnType<typeof createProductionPrincipalGrantSource>;
     readonly audit: ProductionAuditCapability;
     readonly provider: ProductionAuthorizationRuntimeProvider;
+    readonly browserProfiles: BrowserProfileRegistry;
   }
 >();
 
@@ -89,9 +92,16 @@ export function createProductionEnterpriseRuntimeFactory(
       throw new Error("enterprise audit and node configuration do not match");
     }
 
+    const browserProfiles = await prepareProductionBrowserProfileRegistry({
+      paseoHome,
+      nodeId: node.nodeId,
+      downloadBaseRoot: path.join(paseoHome, "enterprise", "browser", "profile-data"),
+    });
+    productionAuditCapabilityIssuer.requireCurrent(currentAudit);
     const authorizationRuntimeProvider = createProductionAuthorizationRuntimeProvider({
       audit: currentAudit,
       grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
+      browserProfiles,
     });
     if (!authorizationRuntimeProvider) {
       throw new Error("enterprise authorization provider unavailable");
@@ -133,6 +143,7 @@ export function createProductionEnterpriseRuntimeFactory(
       nodeId: node.nodeId,
       grantVersionGuard,
       authorityVerifier: new StrictOutboundAuthorityVerifier(node.nodeId, authorityReceiptState),
+      browserProfiles,
     });
     productionAuditCapabilityIssuer.requireCurrent(currentAudit);
     const runtime = Object.freeze({
@@ -154,10 +165,35 @@ export function createProductionEnterpriseRuntimeFactory(
         source: principalSource,
         audit: currentAudit,
         provider: authorizationRuntimeProvider,
+        browserProfiles,
       }),
     );
     return runtime;
   };
+}
+
+/** Returns the exact W4 profile registry captured by the production authority graph. */
+export function resolveProductionBrowserProfileRegistry(input: {
+  readonly admission: EnterpriseAdmissionRuntime["admission"];
+  readonly audit: ProductionAuditCapability;
+  readonly provider: ProductionAuthorizationRuntimeProvider;
+}): BrowserProfileRegistry | null {
+  try {
+    const record = productionIdentityRecords.get(input.admission);
+    if (
+      !record ||
+      record.admission !== input.admission ||
+      record.audit !== input.audit ||
+      record.provider !== input.provider ||
+      !productionAuditCapabilityIssuer.current(record.audit) ||
+      !record.source.isCurrent()
+    ) {
+      return null;
+    }
+    return record.browserProfiles;
+  } catch {
+    return null;
+  }
 }
 
 export function createProductionIdentityDispatcherRegistration(input: {

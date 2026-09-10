@@ -17,6 +17,7 @@ import { EnterpriseAdmission } from "./identity/admission.js";
 import {
   createProductionEnterpriseRuntimeFactory,
   createProductionIdentityDispatcherRegistration,
+  resolveProductionBrowserProfileRegistry,
 } from "./production-runtime-factory.js";
 
 const executeFile = promisify(execFile);
@@ -87,6 +88,29 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
       const principal = await runtime.admission.authenticate(issued.token, connection);
       expect(principal).toMatchObject({ principalId, organizationId, grantVersion: "grv_1" });
       expect(runtime.grantVersionGuard.isCurrent(principal!)).toBe(true);
+      const browserProfiles = resolveProductionBrowserProfileRegistry({
+        admission: runtime.admission,
+        audit,
+        provider: runtime.authorizationRuntimeProvider!,
+      });
+      expect(browserProfiles).not.toBeNull();
+      const browserProfile = await browserProfiles!.create({
+        organizationId,
+        homeNodeId: nodeId,
+        businessIdentityId: "bid_1111111111111111",
+        ownerPrincipalId: principalId,
+        platform: "generic",
+        businessAccountKey: "production-factory-account",
+        label: "Production factory profile",
+        status: "ready",
+      });
+      await expect(
+        runtime.resourceAuthorization.assertBrowserProfile(
+          principal!,
+          "browser.use",
+          browserProfile.browserProfileId,
+        ),
+      ).resolves.toMatchObject({ browserProfileId: browserProfile.browserProfileId });
       const identityRegistration = createProductionIdentityDispatcherRegistration({
         admission: runtime.admission,
         audit,
@@ -220,7 +244,12 @@ describe.runIf(process.platform === "darwin")("production enterprise runtime fac
     await new FileBackedGrantStorage(path.join(enterpriseRoot, "grants.json")).put({
       principalId,
       organizationId: grantOrganizationId,
-      grants: [],
+      grants: [
+        {
+          action: "browser.use",
+          selector: { kind: "organization", organizationId: grantOrganizationId },
+        },
+      ],
       grantVersion: "grv_1",
     });
     return root;

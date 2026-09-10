@@ -231,6 +231,7 @@ import {
 import {
   createProductionAuditDispatcherRegistration,
   createProductionIdentityDispatcherRegistration,
+  resolveProductionBrowserProfileRegistry,
 } from "./enterprise/production-runtime-factory.js";
 import {
   productionAuditCapabilityIssuer,
@@ -1341,10 +1342,19 @@ export async function createPaseoDaemon(
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
       });
+      const browserProfiles = resolveProductionBrowserProfileRegistry({
+        admission: enterpriseRuntime.admission,
+        audit: enterpriseRuntime.audit,
+        provider: authorizationRuntimeProvider,
+      });
+      if (!browserProfiles) {
+        throw new Error("enterprise browser profile authority unavailable");
+      }
       const browserBundle = createProductionBrowserLeaseBundle({
         paseoHome: capturedPaseoHome,
         nodeId: enterpriseRuntime.node.nodeId,
         downloadBaseRoot: path.join(capturedPaseoHome, "enterprise", "browser", "profile-data"),
+        profiles: browserProfiles,
         auditSink: enterpriseRuntime.audit,
         clock: {
           now: () => Date.now(),
