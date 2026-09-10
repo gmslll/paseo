@@ -14,6 +14,7 @@ import {
   EnterpriseResourceRenewLeaseRequestSchema,
   EnterpriseResourceRenewLeaseResponseSchema,
   FencedLeaseSchema,
+  GlobalResourceRefSchema,
   projectBrowserProfileSummary,
   type AuthorizedAgent,
   type AuthorizedBrowserProfile,
@@ -22,8 +23,10 @@ import {
   type BrowserProfileRecord,
   type EnterpriseAction,
   type FencedLease,
+  type GlobalResourceRef,
   type PrincipalContext,
   type SessionInboundMessage,
+  type SessionOutboundMessage,
 } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import {
@@ -34,6 +37,7 @@ import {
 } from "../../session/enterprise-agent-session-context-registry.js";
 import type {
   EnterpriseDispatchContext,
+  EnterpriseDispatchResponse,
   EnterpriseDispatchResult,
   EnterpriseSessionDispatcher,
 } from "../../session/enterprise-dispatcher.js";
@@ -91,6 +95,7 @@ export interface EnterpriseBrowserLeaseHandlerOptions {
   leases: EnterpriseBrowserLeasePort;
   authority: EnterpriseBrowserLeaseAuthorityPort;
   leaseTtlMs: number;
+  isCurrentSession?: (context: EnterpriseDispatchContext) => boolean;
 }
 
 interface EnterpriseBrowserLeaseHandlerRuntime {
@@ -106,7 +111,30 @@ interface EnterpriseBrowserLeaseHandlerRuntime {
   resolveAgentHandle: EnterpriseBrowserLeaseAuthorityPort["resolveAgentHandle"];
   isCurrentHandle: EnterpriseBrowserLeaseAuthorityPort["isCurrentHandle"];
   resolveLeaseAuthorization: EnterpriseBrowserLeaseAuthorityPort["resolveLeaseAuthorization"];
+  isCurrentSession: (context: EnterpriseDispatchContext) => boolean;
   leaseTtlMs: number;
+}
+
+type BrowserResourceRequestType =
+  | "enterprise.browser.list_profiles.request"
+  | "enterprise.browser.bind_profile.request";
+
+interface BrowserResourceResult {
+  readonly response: SessionOutboundMessage;
+  readonly requestType: BrowserResourceRequestType;
+  readonly requestId: string;
+  readonly resources: GlobalResourceRef[];
+}
+
+interface PendingBrowserResponse extends BrowserResourceResult {
+  readonly context: EnterpriseDispatchContext;
+  readonly message: SessionInboundMessage;
+}
+
+interface BrowserHandlerIdentity {
+  readonly originalContext: EnterpriseDispatchContext;
+  readonly originalMessage: SessionInboundMessage;
+  readonly sessionContext: EnterpriseDispatchContext;
 }
 
 interface HeldBrowserLease {
@@ -134,6 +162,14 @@ const LeaseAuthorizationSchema = z
   })
   .strict();
 
+const StrictListProfilesResponseSchema = EnterpriseBrowserListProfilesResponseSchema.extend({
+  payload: EnterpriseBrowserListProfilesResponseSchema.shape.payload.strict(),
+}).strict();
+
+const StrictBindProfileResponseSchema = EnterpriseBrowserBindProfileResponseSchema.extend({
+  payload: EnterpriseBrowserBindProfileResponseSchema.shape.payload.strict(),
+}).strict();
+
 const W4_REQUEST_TYPES = new Set<string>([
   "enterprise.browser.list_profiles.request",
   "enterprise.browser.bind_profile.request",
@@ -147,6 +183,8 @@ const ENTERPRISE_RESOURCE_UNAVAILABLE = "Enterprise resource unavailable";
 export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatcher {
   private readonly runtime: EnterpriseBrowserLeaseHandlerRuntime;
   private readonly heldLeases = new Map<string, HeldBrowserLease>();
+  private readonly issued = new WeakMap<object, PendingBrowserResponse>();
+  private readonly pending = new Set<PendingBrowserResponse>();
   private closed = false;
   private closePromise: Promise<void> | null = null;
 
@@ -175,8 +213,12 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     const resolveAgentHandle = authority.resolveAgentHandle;
     const isCurrentHandle = authority.isCurrentHandle;
     const resolveLeaseAuthorization = authority.resolveLeaseAuthorization;
+    const isCurrentSession = options.isCurrentSession ?? (() => true);
     if (!Number.isSafeInteger(leaseTtlMs) || leaseTtlMs <= 0) {
       throw new Error("Browser lease handler TTL must be a positive safe integer.");
+    }
+    if (typeof isCurrentSession !== "function") {
+      throw new Error("Browser lease handler current-session check is invalid.");
     }
     this.runtime = Object.freeze({
       listProfiles: listProfiles.bind(profiles),
@@ -191,6 +233,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       resolveAgentHandle: resolveAgentHandle.bind(authority),
       isCurrentHandle: isCurrentHandle.bind(authority),
       resolveLeaseAuthorization: resolveLeaseAuthorization.bind(authority),
+      isCurrentSession,
       leaseTtlMs,
     });
   }
@@ -199,6 +242,8 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     readonly sessionContext: EnterpriseDispatchContext;
     readonly message: SessionInboundMessage;
   }): Promise<EnterpriseDispatchResult> {
+    const originalContext = input.sessionContext;
+    const originalMessage = input.message;
     let message: SessionInboundMessage;
     let type: string;
     try {
@@ -215,11 +260,20 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     } catch {
       return false;
     }
+    if (!this.isCurrentSession(originalContext)) return false;
     switch (type) {
       case "enterprise.browser.list_profiles.request":
-        return this.handleListProfiles(sessionContext, message, type);
+        return this.handleListProfiles(
+          { originalContext, originalMessage, sessionContext },
+          message,
+          type,
+        );
       case "enterprise.browser.bind_profile.request":
-        return this.handleBindProfile(sessionContext, message, type);
+        return this.handleBindProfile(
+          { originalContext, originalMessage, sessionContext },
+          message,
+          type,
+        );
       case "enterprise.resource.acquire_lease.request":
         return this.handleAcquireLease(sessionContext, message, type);
       case "enterprise.resource.renew_lease.request":
@@ -231,9 +285,66 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     }
   }
 
+  public consumeResponse({
+    sessionContext,
+    message,
+    response,
+  }: {
+    readonly sessionContext: EnterpriseDispatchContext;
+    readonly message: SessionInboundMessage;
+    readonly response: SessionOutboundMessage;
+  }): EnterpriseDispatchResponse | null {
+    if (!isObject(response)) return null;
+    const issued = this.issued.get(response);
+    if (!issued) return null;
+    this.issued.delete(response);
+    this.pending.delete(issued);
+    try {
+      if (
+        issued.context !== sessionContext ||
+        issued.message !== message ||
+        issued.response !== response ||
+        !this.isCurrentSession(sessionContext)
+      ) {
+        return null;
+      }
+      if (issued.requestType === "enterprise.browser.list_profiles.request") {
+        const request = EnterpriseBrowserListProfilesRequestSchema.parse(message);
+        const parsedResponse = StrictListProfilesResponseSchema.parse(response);
+        if (
+          request.requestId !== issued.requestId ||
+          parsedResponse.payload.requestId !== issued.requestId
+        ) {
+          return null;
+        }
+      } else {
+        const request = EnterpriseBrowserBindProfileRequestSchema.parse(message);
+        const parsedResponse = StrictBindProfileResponseSchema.parse(response);
+        if (
+          request.requestId !== issued.requestId ||
+          parsedResponse.payload.requestId !== issued.requestId
+        ) {
+          return null;
+        }
+      }
+      return deepFreeze({
+        response: issued.response,
+        authorizationContext: {
+          kind: "resources",
+          resources: issued.resources,
+        },
+        receiptClassification: "resources",
+      });
+    } catch {
+      return null;
+    }
+  }
+
   public close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
+    for (const issued of this.pending) this.issued.delete(issued.response);
+    this.pending.clear();
     const held = [...this.heldLeases.values()];
     this.heldLeases.clear();
     this.closePromise = (async () => {
@@ -255,7 +366,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   }
 
   private async handleListProfiles(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     message: SessionInboundMessage,
     type: "enterprise.browser.list_profiles.request",
   ): Promise<EnterpriseDispatchResult> {
@@ -266,14 +377,15 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       return false;
     }
     try {
-      return await this.listAuthorizedProfiles(sessionContext, request);
+      const result = await this.listAuthorizedProfiles(input, request);
+      return this.issuePending(input, result);
     } catch {
       return denied(request.type, request.requestId);
     }
   }
 
   private async handleBindProfile(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     message: SessionInboundMessage,
     type: "enterprise.browser.bind_profile.request",
   ): Promise<EnterpriseDispatchResult> {
@@ -284,7 +396,8 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
       return false;
     }
     try {
-      return await this.bindAuthorizedProfile(sessionContext, request);
+      const result = await this.bindAuthorizedProfile(input, request);
+      return this.issuePending(input, result);
     } catch {
       return denied(request.type, request.requestId);
     }
@@ -419,14 +532,17 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   }
 
   private async listAuthorizedProfiles(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     request: z.infer<typeof EnterpriseBrowserListProfilesRequestSchema>,
-  ): Promise<z.infer<typeof EnterpriseBrowserListProfilesResponseSchema>> {
+  ): Promise<BrowserResourceResult> {
+    const sessionContext = input.sessionContext;
     const principal = sessionContext.enterpriseContext.principal;
     const workspace = snapshotWorkspace(
       await this.runtime.assertWorkspace(principal, "workspace.metadata.read", request.workspaceId),
     );
+    this.assertCurrentSession(input.originalContext);
     const records = (await this.runtime.listProfiles()).map(snapshotProfile);
+    this.assertCurrentSession(input.originalContext);
     const visibleProfiles: AuthorizedBrowserProfile[] = [];
     for (const record of records) {
       if (!profileMatchesWorkspace(record, workspace)) continue;
@@ -435,6 +551,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
           const authorized = snapshotProfile(
             await this.runtime.assertBrowserProfile(principal, action, record.browserProfileId),
           );
+          this.assertCurrentSession(input.originalContext);
           if (sameProfile(record, authorized)) visibleProfiles.push(authorized);
           break;
         } catch {
@@ -465,30 +582,46 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
           boundAt: binding.boundAt,
         }),
       );
+    this.assertCurrentSession(input.originalContext);
     const currentWorkspace = snapshotWorkspace(
       await this.runtime.assertWorkspace(principal, "workspace.metadata.read", request.workspaceId),
     );
+    this.assertCurrentSession(input.originalContext);
     if (!sameWorkspace(workspace, currentWorkspace)) {
       throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
     }
-    return EnterpriseBrowserListProfilesResponseSchema.parse({
-      type: "enterprise.browser.list_profiles.response",
-      payload: {
-        requestId: request.requestId,
-        profiles: visibleProfiles.map(projectBrowserProfileSummary),
-        bindings,
-      },
+    const response = deepFreeze(
+      StrictListProfilesResponseSchema.parse({
+        type: "enterprise.browser.list_profiles.response",
+        payload: {
+          requestId: request.requestId,
+          profiles: visibleProfiles.map(projectBrowserProfileSummary),
+          bindings,
+        },
+      }),
+    );
+    const resources = deepFreeze([
+      workspaceResourceRef(workspace),
+      ...visibleProfiles.map(browserProfileResourceRef),
+    ]);
+    return deepFreeze({
+      response,
+      requestType: request.type,
+      requestId: request.requestId,
+      resources,
     });
   }
 
   private async bindAuthorizedProfile(
-    sessionContext: EnterpriseDispatchContext,
+    input: BrowserHandlerIdentity,
     request: z.infer<typeof EnterpriseBrowserBindProfileRequestSchema>,
-  ): Promise<z.infer<typeof EnterpriseBrowserBindProfileResponseSchema>> {
+  ): Promise<BrowserResourceResult> {
+    const sessionContext = input.sessionContext;
     const principal = sessionContext.enterpriseContext.principal;
     const workspace = snapshotWorkspace(
       await this.runtime.assertWorkspace(principal, "workspace.metadata.read", request.workspaceId),
     );
+    this.assertCurrentSession(input.originalContext);
     const authorizedProfile = snapshotProfile(
       await this.runtime.assertBrowserProfile(
         principal,
@@ -496,7 +629,9 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         request.browserProfileId,
       ),
     );
+    this.assertCurrentSession(input.originalContext);
     const registryProfile = await this.runtime.getProfile(authorizedProfile.browserProfileId);
+    this.assertCurrentSession(input.originalContext);
     if (!registryProfile || !sameProfile(authorizedProfile, snapshotProfile(registryProfile))) {
       throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
     }
@@ -506,6 +641,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     const currentWorkspace = snapshotWorkspace(
       await this.runtime.assertWorkspace(principal, "workspace.metadata.read", request.workspaceId),
     );
+    this.assertCurrentSession(input.originalContext);
     const currentProfile = snapshotProfile(
       await this.runtime.assertBrowserProfile(
         principal,
@@ -513,6 +649,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         request.browserProfileId,
       ),
     );
+    this.assertCurrentSession(input.originalContext);
     if (
       !sameWorkspace(workspace, currentWorkspace) ||
       !sameProfile(authorizedProfile, currentProfile)
@@ -526,9 +663,11 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         actor: principal,
       }),
     );
+    this.assertCurrentSession(input.originalContext);
     const postBindWorkspace = snapshotWorkspace(
       await this.runtime.assertWorkspace(principal, "workspace.metadata.read", request.workspaceId),
     );
+    this.assertCurrentSession(input.originalContext);
     const postBindProfile = snapshotProfile(
       await this.runtime.assertBrowserProfile(
         principal,
@@ -536,6 +675,7 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
         request.browserProfileId,
       ),
     );
+    this.assertCurrentSession(input.originalContext);
     if (
       !sameWorkspace(workspace, postBindWorkspace) ||
       !sameProfile(authorizedProfile, postBindProfile) ||
@@ -543,19 +683,58 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     ) {
       throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
     }
-    return EnterpriseBrowserBindProfileResponseSchema.parse({
-      type: "enterprise.browser.bind_profile.response",
-      payload: {
-        requestId: request.requestId,
-        binding: {
-          organizationId: bound.organizationId,
-          nodeId: bound.nodeId,
-          workspaceId: bound.workspaceId,
-          browserProfileId: bound.browserProfileId,
-          boundAt: bound.boundAt,
+    const response = deepFreeze(
+      StrictBindProfileResponseSchema.parse({
+        type: "enterprise.browser.bind_profile.response",
+        payload: {
+          requestId: request.requestId,
+          binding: {
+            organizationId: bound.organizationId,
+            nodeId: bound.nodeId,
+            workspaceId: bound.workspaceId,
+            browserProfileId: bound.browserProfileId,
+            boundAt: bound.boundAt,
+          },
         },
-      },
+      }),
+    );
+    const resources = deepFreeze([
+      workspaceResourceRef(postBindWorkspace),
+      browserProfileResourceRef(postBindProfile),
+    ]);
+    return deepFreeze({
+      response,
+      requestType: request.type,
+      requestId: request.requestId,
+      resources,
     });
+  }
+
+  private issuePending(
+    input: BrowserHandlerIdentity,
+    result: BrowserResourceResult,
+  ): SessionOutboundMessage | false {
+    if (!this.isCurrentSession(input.originalContext)) return false;
+    const pending = Object.freeze({
+      ...result,
+      context: input.originalContext,
+      message: input.originalMessage,
+    });
+    this.issued.set(result.response, pending);
+    this.pending.add(pending);
+    return result.response;
+  }
+
+  private assertCurrentSession(context: EnterpriseDispatchContext): void {
+    if (!this.isCurrentSession(context)) throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
+  }
+
+  private isCurrentSession(context: EnterpriseDispatchContext): boolean {
+    try {
+      return !this.closed && this.runtime.isCurrentSession(context) === true;
+    } catch {
+      return false;
+    }
   }
 
   private async resolveCurrentAuthorization(
@@ -863,6 +1042,57 @@ function assertLeaseMatchesAuthorization(
   ) {
     throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
   }
+}
+
+const GLOBAL_RESOURCE_REF_KEYS = new Set([
+  "organizationId",
+  "nodeId",
+  "resourceKind",
+  "localResourceId",
+]);
+
+function workspaceResourceRef(workspace: AuthorizedWorkspace): GlobalResourceRef {
+  return strictResourceRef({
+    organizationId: workspace.organizationId,
+    nodeId: workspace.nodeId,
+    resourceKind: "workspace",
+    localResourceId: workspace.workspaceId,
+  });
+}
+
+function browserProfileResourceRef(profile: AuthorizedBrowserProfile): GlobalResourceRef {
+  return strictResourceRef({
+    organizationId: profile.organizationId,
+    nodeId: profile.homeNodeId,
+    resourceKind: "browser_profile",
+    localResourceId: profile.browserProfileId,
+  });
+}
+
+function strictResourceRef(input: GlobalResourceRef): GlobalResourceRef {
+  const keys = Reflect.ownKeys(input);
+  if (
+    keys.length !== GLOBAL_RESOURCE_REF_KEYS.size ||
+    keys.some((key) => typeof key !== "string" || !GLOBAL_RESOURCE_REF_KEYS.has(key))
+  ) {
+    throw new Error(ENTERPRISE_RESOURCE_UNAVAILABLE);
+  }
+  return deepFreeze(GlobalResourceRefSchema.parse(structuredClone(input)));
+}
+
+function isObject(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+
+function deepFreeze<T>(value: T): T {
+  if (isObject(value)) {
+    for (const key of Reflect.ownKeys(value)) {
+      const child = Reflect.get(value, key);
+      if (isObject(child)) deepFreeze(child);
+    }
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function denied(requestType: string, requestId: string): EnterpriseDispatchResult {

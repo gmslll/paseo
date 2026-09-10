@@ -307,6 +307,9 @@ function createHandler(
     bindings?: MemoryBindings;
     leases?: MemoryLeases;
     authority?: MemoryAuthority;
+    isCurrentSession?: NonNullable<
+      ConstructorParameters<typeof EnterpriseBrowserLeaseHandler>[0]["isCurrentSession"]
+    >;
   } = {},
 ): {
   handler: EnterpriseBrowserLeaseHandler;
@@ -326,6 +329,7 @@ function createHandler(
       leases,
       authority,
       leaseTtlMs: 60_000,
+      isCurrentSession: input.isCurrentSession,
     }),
     profiles,
     bindings,
@@ -345,6 +349,19 @@ function dispatchContext(context: EnterpriseSessionContext = sessionContext()) {
 }
 
 describe("EnterpriseBrowserLeaseHandler", () => {
+  test("classifies only Profile list and bind responses as resources", () => {
+    const { handler } = createHandler();
+    expect(handler.requestPolicyForType("enterprise.browser.list_profiles.request")).toBe(
+      "resources",
+    );
+    expect(handler.requestPolicyForType("enterprise.browser.bind_profile.request")).toBe(
+      "resources",
+    );
+    expect(handler.requestPolicyForType("enterprise.resource.acquire_lease.request")).toBeNull();
+    expect(handler.requestPolicyForType("enterprise.resource.renew_lease.request")).toBeNull();
+    expect(handler.requestPolicyForType("enterprise.resource.release_lease.request")).toBeNull();
+  });
+
   test("rejects deferred A to B rebinding after authorization await", async () => {
     const first = {
       organizationId: "org-a",
@@ -426,15 +443,130 @@ describe("EnterpriseBrowserLeaseHandler", () => {
       return original(context, action, profileId);
     };
     const { handler } = createHandler({ authority });
-    const response = await handler.handle({
-      sessionContext: dispatchContext(),
-      message: {
-        type: "enterprise.browser.list_profiles.request",
-        requestId: "request-manage-only-list",
-        workspaceId: WORKSPACE_ID,
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-manage-only-list",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    expect(response).toMatchObject({ type: "enterprise.browser.list_profiles.response" });
+    if (response === false) throw new Error("expected list response");
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toEqual({
+      response,
+      receiptClassification: "resources",
+      authorizationContext: {
+        kind: "resources",
+        resources: [
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "workspace",
+            localResourceId: WORKSPACE_ID,
+          },
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "browser_profile",
+            localResourceId: PROFILE_ID,
+          },
+        ],
       },
     });
-    expect(response).toMatchObject({ type: "enterprise.browser.list_profiles.response" });
+  });
+
+  test("accepts only the exact list response once and burns an identity mismatch", async () => {
+    const { handler } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-list-exact",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message,
+        response: structuredClone(response),
+      }),
+    ).toBeNull();
+    expect(
+      handler.consumeResponse({ sessionContext: context, message, response })
+        ?.receiptClassification,
+    ).toBe("resources");
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+
+    const nextMessage = { ...message, requestId: "request-list-cloned-message" };
+    const nextResponse = await handler.handle({ sessionContext: context, message: nextMessage });
+    if (nextResponse === false) throw new Error("expected next list response");
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message: { ...nextMessage },
+        response: nextResponse,
+      }),
+    ).toBeNull();
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message: nextMessage,
+        response: nextResponse,
+      }),
+    ).toBeNull();
+
+    const finalMessage = { ...message, requestId: "request-list-cloned-context" };
+    const finalResponse = await handler.handle({ sessionContext: context, message: finalMessage });
+    if (finalResponse === false) throw new Error("expected final list response");
+    expect(
+      handler.consumeResponse({
+        sessionContext: { ...context },
+        message: finalMessage,
+        response: finalResponse,
+      }),
+    ).toBeNull();
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message: finalMessage,
+        response: finalResponse,
+      }),
+    ).toBeNull();
+  });
+
+  test("burns a pending list response when runtime currentness is lost", async () => {
+    let current = true;
+    const { handler } = createHandler({ isCurrentSession: () => current });
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-list-stale",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+    current = false;
+
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+    current = true;
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+  });
+
+  test("clears pending list responses on close", async () => {
+    const { handler } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-list-close",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+
+    await handler.close();
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
   });
 
   test("denies an unavailable Workspace before reading Profile registries", async () => {
@@ -464,18 +596,16 @@ describe("EnterpriseBrowserLeaseHandler", () => {
 
   test("binds an authorized Profile and omits binding actor authority from the response", async () => {
     const { handler, bindings } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.bind_profile.request" as const,
+      requestId: "request-bind",
+      workspaceId: WORKSPACE_ID,
+      browserProfileId: PROFILE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
 
-    await expect(
-      handler.handle({
-        sessionContext: dispatchContext(),
-        message: {
-          type: "enterprise.browser.bind_profile.request",
-          requestId: "request-bind",
-          workspaceId: WORKSPACE_ID,
-          browserProfileId: PROFILE_ID,
-        },
-      }),
-    ).resolves.toEqual({
+    expect(response).toEqual({
       type: "enterprise.browser.bind_profile.response",
       payload: {
         requestId: "request-bind",
@@ -488,8 +618,35 @@ describe("EnterpriseBrowserLeaseHandler", () => {
         },
       },
     });
-
+    if (response === false) throw new Error("expected bind response");
     expect(bindings.bound).toHaveLength(1);
+    const consumed = handler.consumeResponse({ sessionContext: context, message, response });
+    expect(consumed).toEqual({
+      response,
+      receiptClassification: "resources",
+      authorizationContext: {
+        kind: "resources",
+        resources: [
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "workspace",
+            localResourceId: WORKSPACE_ID,
+          },
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "browser_profile",
+            localResourceId: PROFILE_ID,
+          },
+        ],
+      },
+    });
+    expect(Object.isFrozen(response)).toBe(true);
+    expect(Object.isFrozen(consumed)).toBe(true);
+    expect(Object.isFrozen(consumed?.authorizationContext)).toBe(true);
+    expect(Object.isFrozen(consumed?.authorizationContext?.resources)).toBe(true);
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
   });
 
   test("denies a foreign Profile without mutating bindings", async () => {
@@ -1085,10 +1242,11 @@ describe("EnterpriseBrowserLeaseHandler", () => {
         context: sessionContext(),
       }),
     ).toThrow(/sessionId/);
+    const openContext = sessionContext();
     const sessionLease = registration?.open({
       sessionId: "session-1",
       clientId: "client-1",
-      context: sessionContext(),
+      context: openContext,
     });
     expect(sessionLease).toBeDefined();
     if (!sessionLease) throw new Error("factory did not open a session lease");
@@ -1106,7 +1264,7 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     expect(foreignRuntimeLease).toBeDefined();
     await foreignRuntimeLease?.close();
     await sessionLease.dispatcher.handle({
-      sessionContext: dispatchContext(),
+      sessionContext: dispatchContext(openContext),
       message: {
         type: "enterprise.resource.acquire_lease.request",
         requestId: "request-factory-acquire",
@@ -1121,7 +1279,7 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     expect(leases.released).toEqual([{ handle: authority.handle, lease: lease() }]);
     await expect(
       sessionLease.dispatcher.handle({
-        sessionContext: dispatchContext(),
+        sessionContext: dispatchContext(openContext),
         message: {
           type: "enterprise.browser.list_profiles.request",
           requestId: "request-after-close",
@@ -1129,6 +1287,67 @@ describe("EnterpriseBrowserLeaseHandler", () => {
         },
       }),
     ).resolves.toBe(false);
+  });
+
+  test("rechecks the exact open authorization runtime and Session before consume", async () => {
+    const profiles = new MemoryProfiles([profile()]);
+    const bindings = new MemoryBindings([binding()]);
+    const leases = new MemoryLeases();
+    const authority = new MemoryAuthority();
+    const runtime = createEnterpriseBrowserLeaseSessionRuntime({
+      profiles,
+      bindings,
+      leases,
+      leaseTtlMs: 60_000,
+    });
+    const authorizationRuntime = Object.freeze({ runtime: "production-authority" });
+    const checkedRuntimes: unknown[] = [];
+    let current = true;
+    const registration = createEnterpriseBrowserLeaseDispatcherRegistration({
+      runtime,
+      authority,
+      isCurrentAuthorizationRuntime: (candidate) => {
+        checkedRuntimes.push(candidate);
+        return current;
+      },
+    });
+    const openContext = sessionContext();
+    const sessionLease = registration?.open({
+      sessionId: "session-1",
+      clientId: "client-1",
+      context: openContext,
+      authorizationRuntime,
+    });
+    if (!sessionLease) throw new Error("factory did not open a session lease");
+    const context = dispatchContext(openContext);
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-runtime-current",
+      workspaceId: WORKSPACE_ID,
+    };
+
+    await expect(
+      sessionLease.dispatcher.handle({
+        sessionContext: {
+          ...context,
+          enterpriseContext: { ...context.enterpriseContext },
+        },
+        message,
+      }),
+    ).resolves.toBe(false);
+    const response = await sessionLease.dispatcher.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+    current = false;
+    expect(
+      sessionLease.dispatcher.consumeResponse?.({ sessionContext: context, message, response }),
+    ).toBeNull();
+    current = true;
+    expect(
+      sessionLease.dispatcher.consumeResponse?.({ sessionContext: context, message, response }),
+    ).toBeNull();
+    expect(checkedRuntimes.length).toBeGreaterThan(1);
+    expect(checkedRuntimes.every((candidate) => candidate === authorizationRuntime)).toBe(true);
+    await sessionLease.close();
   });
 
   test("does not register when typed runtime or authority dependencies are absent", () => {

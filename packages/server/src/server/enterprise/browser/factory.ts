@@ -72,6 +72,7 @@ export type EnterpriseBrowserLeaseSessionRuntimeInput = Omit<
 export interface EnterpriseBrowserLeaseDispatcherFactoryOptions {
   readonly runtime: EnterpriseBrowserLeaseSessionRuntime;
   readonly authority: EnterpriseBrowserLeaseAuthorityPort;
+  readonly isCurrentAuthorizationRuntime?: (authorizationRuntime: unknown) => boolean;
   readonly authorityForSessionRuntime?: (input: {
     readonly authorizationRuntime: unknown;
     readonly requestLifecycle: unknown;
@@ -124,6 +125,18 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
       const dispatcher = new EnterpriseBrowserLeaseHandler({
         ...captured.options,
         authority,
+        isCurrentSession: (context) => {
+          const matchesOpenSession =
+            context.sessionId === input.sessionId &&
+            context.clientId === input.clientId &&
+            context.credentialId === input.context.principal.credentialId &&
+            context.sessionBindingGeneration === input.context.sessionBindingGeneration &&
+            context.enterpriseContext === input.context;
+          if (!matchesOpenSession) return false;
+          return captured.isCurrentAuthorizationRuntime
+            ? captured.isCurrentAuthorizationRuntime(input.authorizationRuntime)
+            : true;
+        },
       });
       return Object.freeze({
         dispatcher,
@@ -139,15 +152,15 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
   bundle: ProductionBrowserLeaseBundle;
   runtime: EnterpriseBrowserLeaseSessionRuntime;
 }): EnterpriseSessionDispatcherFactoryRegistration | null {
+  const provider = input.provider;
   const unbindByGeneration = new Map<string, { readonly unbind: () => void }>();
   const base = createEnterpriseBrowserLeaseDispatcherRegistration({
     runtime: input.runtime,
     authority: createUnavailableAuthority(),
+    isCurrentAuthorizationRuntime: (authorizationRuntime) =>
+      resolveCurrentProductionRuntimeAuthority(authorizationRuntime, provider) !== null,
     authorityForSessionRuntime: ({ authorizationRuntime, context: sessionContext }) => {
-      const authority = resolveCurrentProductionRuntimeAuthority(
-        authorizationRuntime,
-        input.provider,
-      );
+      const authority = resolveCurrentProductionRuntimeAuthority(authorizationRuntime, provider);
       if (!authority) return null;
       const resolvedAuthority: EnterpriseBrowserLeaseAuthorityPort = {
         assertWorkspace: (principalContext, action, workspaceId) =>
@@ -272,6 +285,7 @@ function captureFactoryOptions(
 ): {
   readonly options: EnterpriseBrowserLeaseHandlerOptions;
   readonly authorityForSessionRuntime?: EnterpriseBrowserLeaseDispatcherFactoryOptions["authorityForSessionRuntime"];
+  readonly isCurrentAuthorizationRuntime?: EnterpriseBrowserLeaseDispatcherFactoryOptions["isCurrentAuthorizationRuntime"];
 } | null {
   try {
     if (!options) return null;
@@ -279,6 +293,7 @@ function captureFactoryOptions(
     if (runtime[sessionRuntimeBrand] !== "EnterpriseBrowserLeaseSessionRuntime") return null;
     const authority = options.authority;
     const authorityForSessionRuntime = options.authorityForSessionRuntime;
+    const isCurrentAuthorizationRuntime = options.isCurrentAuthorizationRuntime;
     const authorityAssertWorkspace = authority.assertWorkspace;
     const authorityAssertProfile = authority.assertBrowserProfile;
     const authorityResolveHandle = authority.resolveAgentHandle;
@@ -306,8 +321,15 @@ function captureFactoryOptions(
     ) {
       return null;
     }
+    if (
+      isCurrentAuthorizationRuntime !== undefined &&
+      typeof isCurrentAuthorizationRuntime !== "function"
+    ) {
+      return null;
+    }
     return Object.freeze({
       authorityForSessionRuntime,
+      isCurrentAuthorizationRuntime,
       options: Object.freeze({
         ...runtime,
         authority: capturedAuthority,
