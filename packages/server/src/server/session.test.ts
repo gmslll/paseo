@@ -9731,6 +9731,10 @@ describe("enterprise dispatcher integration seam", () => {
           action: "workspace.write",
           selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
         },
+        {
+          action: "workspace.manage",
+          selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+        },
       ],
       ["workspace.manage", "hub.execute"],
     );
@@ -9792,6 +9796,16 @@ describe("enterprise dispatcher integration seam", () => {
       requestId: "workspace-title-allowed",
     });
     expect(update).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual({
+      type: "workspace.title.set.response",
+      payload: {
+        requestId: "workspace-title-allowed",
+        workspaceId: workspace.workspaceId,
+        accepted: true,
+        title: "renamed",
+        error: null,
+      },
+    });
 
     await session.handleMessage({
       type: "archive_workspace_request",

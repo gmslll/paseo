@@ -4874,6 +4874,11 @@ export class Session {
       this.emitLegacyResourceDenied(requestId, "workspace.title.set.request");
       return;
     }
+    const responseContext = this.createWorkspaceOutboundContext(workspaceId);
+    if (this.enterpriseContext && !responseContext) {
+      this.emitLegacyResourceDenied(requestId, "workspace.title.set.request");
+      return;
+    }
 
     try {
       const trimmed = title?.trim() ?? "";
@@ -4885,29 +4890,35 @@ export class Session {
         updatedAt,
       }));
       if (!updated) {
-        this.emit({
+        this.emit(
+          {
+            type: "workspace.title.set.response",
+            payload: {
+              requestId,
+              workspaceId,
+              accepted: false,
+              title: null,
+              error: "Workspace not found",
+            },
+          },
+          responseContext,
+        );
+        return;
+      }
+
+      this.emit(
+        {
           type: "workspace.title.set.response",
           payload: {
             requestId,
             workspaceId,
-            accepted: false,
-            title: null,
-            error: "Workspace not found",
+            accepted: true,
+            title: nextTitle,
+            error: null,
           },
-        });
-        return;
-      }
-
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: true,
-          title: nextTitle,
-          error: null,
         },
-      });
+        responseContext,
+      );
 
       await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
     } catch (error) {
@@ -4924,16 +4935,19 @@ export class Session {
           content: `Failed to set workspace title: ${getErrorMessage(error)}`,
         },
       });
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: false,
-          title: null,
-          error: getErrorMessageOr(error, "Failed to set workspace title"),
+      this.emit(
+        {
+          type: "workspace.title.set.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            title: null,
+            error: getErrorMessageOr(error, "Failed to set workspace title"),
+          },
         },
-      });
+        responseContext,
+      );
     }
   }
 
