@@ -21,6 +21,9 @@ import type { PatLoginFormModel } from "@/stores/enterprise/pat-login-form-model
 import type { BrowserBindingFormModel } from "./forms/browser-binding-form-model";
 import type { GrantEditorFormModel } from "./forms/grant-editor-form-model";
 import type { EnterpriseUiPort } from "./enterprise-ui-port";
+import { createEnterpriseUiBundle, type EnterpriseContentReaders } from "./enterprise-ui-port";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { EnterpriseIdentityLifecycle } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import { getIdentityDisplayPolicyFromParsed } from "@/stores/enterprise/display-policy";
 import { StyleSheet } from "react-native-unistyles";
 import { Text, View } from "react-native";
@@ -47,6 +50,61 @@ export interface EnterpriseWorkbenchScreenProps<TGeneration extends string, TCon
   readonly onAuthenticated?: (value: unknown) => void;
   readonly createRequestId?: () => string;
   readonly resourceStatuses?: readonly unknown[];
+}
+
+/**
+ * Mountable W6 container. Root supplies the already-selected host runtime client/lifecycle and
+ * resource-specific readers; credentials and lifecycle teardown remain owned by W3.
+ */
+export interface EnterpriseWorkbenchContainerProps<
+  TGeneration extends string,
+  TContent,
+> extends Omit<
+  EnterpriseWorkbenchScreenProps<TGeneration, TContent>,
+  "identity" | "generation" | "uiPort"
+> {
+  readonly serverId: string;
+  readonly lifecycle: EnterpriseIdentityLifecycle;
+  readonly daemonClient: DaemonClient;
+  readonly contentReaders: EnterpriseContentReaders<TGeneration, TContent>;
+}
+
+export function EnterpriseWorkbenchContainer<TGeneration extends string, TContent>(
+  props: EnterpriseWorkbenchContainerProps<TGeneration, TContent>,
+) {
+  const lifecycleSnapshot = useSyncExternalStore(
+    (listener) => props.lifecycle.subscribe(listener),
+    () => props.lifecycle.readSnapshot(),
+    () => props.lifecycle.readSnapshot(),
+  );
+  const bundle = React.useMemo(
+    () =>
+      createEnterpriseUiBundle({
+        lifecycle: props.lifecycle,
+        daemonClient: props.daemonClient,
+        serverId: props.serverId,
+        contentReaders: props.contentReaders,
+      }),
+    [props.lifecycle, props.daemonClient, props.serverId, props.contentReaders],
+  );
+  const identity = React.useMemo(
+    () => ({
+      target: lifecycleSnapshot.target,
+      state: lifecycleSnapshot.state,
+      serverId: props.serverId,
+      ...(lifecycleSnapshot.projection ? { projection: lifecycleSnapshot.projection } : {}),
+    }),
+    [lifecycleSnapshot, props.serverId],
+  );
+  const generation = (lifecycleSnapshot.generation ?? "enterprise-unavailable") as TGeneration;
+  return (
+    <EnterpriseWorkbenchScreen
+      {...props}
+      identity={identity}
+      generation={generation}
+      uiPort={bundle.uiPort}
+    />
+  );
 }
 
 function parseIdentity(value: unknown): IdentityView | undefined {
