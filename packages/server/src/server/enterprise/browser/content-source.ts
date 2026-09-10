@@ -160,7 +160,15 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
             throw new Error("Invalid cursor.");
           start = record.offset;
         }
-        const selected = names.slice(start, start + limit);
+        const validNames: string[] = [];
+        for (const name of names) {
+          try {
+            if ((await workspaceFs.stat(root, [name])).kind === "file") validNames.push(name);
+          } catch (error) {
+            if (!["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? "")) throw error;
+          }
+        }
+        const selected = validNames.slice(start, start + limit);
         const items = [];
         for (const name of selected) {
           try {
@@ -182,7 +190,7 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
         return {
           items,
           nextCursor:
-            start + selected.length < names.length
+            start + selected.length < validNames.length
               ? issueCursor(cursorRecords, profile, view, start + selected.length)
               : null,
         };
