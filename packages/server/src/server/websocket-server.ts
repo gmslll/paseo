@@ -109,6 +109,7 @@ import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import {
   OWNER_PERMISSIONS,
+  deriveEnterpriseSessionPermissions,
   SessionAuthorization,
   type DaemonPermission,
 } from "./authorization/index.js";
@@ -2261,9 +2262,10 @@ export class VoiceAssistantWebSocketServer {
         return;
       }
       enterpriseSessionBindingGeneration = resolved.sessionBindingGeneration;
+      const enterprisePermissions = deriveEnterpriseSessionPermissions(resolved.principal);
       enterpriseAuthorizationHandle = handle;
       if (runtime.authorizationRuntimeProvider) {
-        sessionAuthorization = new SessionAuthorization(OWNER_PERMISSIONS);
+        sessionAuthorization = new SessionAuthorization(enterprisePermissions);
         sessionId = randomUUID();
         const createdAuthorizationRuntime = await createProductionAuthorizationRuntimeForSession(
           runtime.authorizationRuntimeProvider,
@@ -2292,7 +2294,7 @@ export class VoiceAssistantWebSocketServer {
       admission = Object.freeze({
         kind: "enterprise",
         principalId: resolved.principal.principalId,
-        permissions: OWNER_PERMISSIONS,
+        permissions: enterprisePermissions,
         enterprise: Object.freeze({
           principal: resolved.principal as PrincipalContext,
           node: resolved.node as NodeContext,
