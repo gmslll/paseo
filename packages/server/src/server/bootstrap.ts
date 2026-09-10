@@ -243,6 +243,10 @@ import { ScriptHealthMonitor } from "./script-health-monitor.js";
 import { createScriptStatusEmitter } from "./script-status-projection.js";
 import { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 import { createWorkspaceScriptsService } from "./session/workspace-scripts/workspace-scripts-service.js";
+import {
+  attachmentContentDisposition,
+  writeHttpDownloadChunk,
+} from "./enterprise/http-download-response.js";
 import { assertWorkspaceAutomationAllowedForWorkspace } from "./workspace-automation-gate.js";
 import { spawnWorkspaceScript } from "./worktree-bootstrap.js";
 import {
@@ -1078,11 +1082,11 @@ export async function createPaseoDaemon(
             },
             begin: async (metadata) => {
               res.setHeader("Content-Type", metadata.mimeType);
-              res.setHeader("Content-Disposition", `attachment; filename="${metadata.fileName}"`);
+              res.setHeader("Content-Disposition", attachmentContentDisposition(metadata.fileName));
               res.setHeader("Content-Length", metadata.size.toString());
             },
             write: async (bytes) => {
-              res.write(bytes);
+              await writeHttpDownloadChunk(res, bytes);
             },
             end: async () => {
               res.end();
