@@ -72,6 +72,7 @@ import {
   type EnterpriseDownloadHttpResponsePort,
   type EnterpriseWorkspaceFilesProductionProvider,
 } from "../runtime/production-workspace-files-runtime-provider.js";
+import { createProductionEnterpriseBrowserProfileContentReadSource } from "../browser/content-source.js";
 import { createProductionEnterpriseRuntimeFactory } from "../production-runtime-factory.js";
 import type { EnterpriseWorkspaceFilesRuntime } from "../runtime/workspace-files-runtime.js";
 import type { FileBackedWorkspaceRegistry } from "../../workspace-registry.js";
@@ -418,7 +419,9 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
   let workspaceAddonPath = "";
 
   beforeAll(async () => {
-    suiteRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-enterprise-ownership-"));
+    suiteRoot = await realpath(
+      await mkdtemp(path.join(os.tmpdir(), "paseo-enterprise-ownership-")),
+    );
     auditAddonPath = path.join(suiteRoot, "darwin-audit-fs.node");
     workspaceAddonPath = path.join(suiteRoot, "darwin-workspace-fs.node");
     await Promise.all([
@@ -1105,6 +1108,63 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       }),
       { mode: 0o600 },
     );
+    const browserProfileId = "brp_0123456789abcdef";
+    const browserDownloadRoot = await realpath(
+      path.join(paseoHome, "enterprise", "browser", "profile-data", browserProfileId, "downloads"),
+    ).catch(async () => {
+      const input = path.join(
+        paseoHome,
+        "enterprise",
+        "browser",
+        "profile-data",
+        browserProfileId,
+        "downloads",
+      );
+      await mkdir(input, { recursive: true });
+      return realpath(input);
+    });
+    await writeFile(
+      path.join(paseoHome, "enterprise", "browser", "browser-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        records: [
+          {
+            browserProfileId,
+            organizationId: principal.organizationId,
+            homeNodeId: node.nodeId,
+            businessIdentityId: "bid_0123456789abcdef",
+            ownerPrincipalId: principalA,
+            platform: "generic",
+            businessAccountKey: "crossflow-browser-account",
+            label: "Crossflow Browser",
+            partitionKey: `persist:paseo-enterprise-${browserProfileId}`,
+            downloadRoot: browserDownloadRoot,
+            credentialRef: "keychain://crossflow-browser",
+            status: "ready",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      path.join(paseoHome, "enterprise", "browser", "browser-profile-bindings.json"),
+      JSON.stringify({
+        version: 1,
+        bindings: [
+          {
+            organizationId: principal.organizationId,
+            nodeId: node.nodeId,
+            workspaceId,
+            browserProfileId,
+            boundByPrincipalId: principalA,
+            boundAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
     await writeFile(path.join(paseoHome, "server-id"), `${serverId}\n`, { mode: 0o600 });
     await writeFile(
       path.join(paseoHome, "enterprise", "principals.json"),
@@ -1162,6 +1222,10 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
               action: "app.use",
               selector: { kind: "organization", organizationId: principal.organizationId },
             },
+            {
+              action: "browser.use",
+              selector: { kind: "organization", organizationId: principal.organizationId },
+            },
           ],
           grantVersion: "grv_a",
         },
@@ -1187,6 +1251,10 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             {
               action: "workspace.metadata.read",
               selector: { kind: "workspace", workspaceIds: [workspaceId] },
+            },
+            {
+              action: "browser.profile.manage",
+              selector: { kind: "organization", organizationId: principal.organizationId },
             },
           ],
           grantVersion: "grv_c",
@@ -1315,6 +1383,10 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
             workspaceRoots,
             nativeAddonPath: workspaceAddonPath,
           }),
+        createProductionBrowserProfileContentReadSource: () =>
+          createProductionEnterpriseBrowserProfileContentReadSource({
+            addonPath: workspaceAddonPath,
+          }),
       },
     );
     const sockets: WebSocket[] = [];
@@ -1381,7 +1453,6 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       ]);
       phase = "c-connect";
       const c = await connect("default-c", issuedC.token);
-      c.socket.close();
       const liveAgent = await daemon.agentManager.createAgent(
         { provider: "mock", cwd: workspaceRoot, model: "ten-second-stream" },
         "00000000-0000-4000-8000-000000000777",
@@ -1402,6 +1473,8 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       });
       expect(a.info.message.payload.features.enterpriseAuditV1).toBe(true);
       expect(b.info.message.payload.features.enterpriseAuditV1).toBe(true);
+      expect(a.info.message.payload.features.enterpriseBrowserProfileContentReadV1).toBe(true);
+      expect(c.info.message.payload.features.enterpriseBrowserProfileContentReadV1).toBe(true);
       expect(a.info.message.payload.features.enterpriseAppSlotContentReadV1).toBe(true);
       expect(b.info.message.payload.features.enterpriseAppSlotContentReadV1).toBe(true);
       const allowedPromise = next(
@@ -1525,11 +1598,11 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
       const contentRequest = (
         type: string,
         requestId: string,
-        resourceKind: "workspace" | "agent" | "app_slot",
+        resourceKind: "workspace" | "agent" | "app_slot" | "browser_profile",
         localResourceId: string,
         selector: {
-          kind: "workspace" | "agent" | "app_slot";
-          view: "files" | "timeline" | "transcript" | "state";
+          kind: "workspace" | "agent" | "app_slot" | "browser_profile";
+          view: "files" | "timeline" | "transcript" | "state" | "artifacts";
         },
       ) => ({
         type,
@@ -1742,6 +1815,121 @@ describe.runIf(process.platform === "darwin")("real Darwin enterprise ownership 
         if (appDeniedShape === undefined) appDeniedShape = shape;
         else expect(shape).toEqual(appDeniedShape);
       }
+      phase = "browser-list-c";
+      const listPromise = next(
+        c.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.browser.list_profiles.response" &&
+          v.message?.payload?.requestId === "browser-list-c",
+      );
+      c.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.browser.list_profiles.request",
+            requestId: "browser-list-c",
+            workspaceId,
+          },
+        }),
+      );
+      expect((await listPromise).message?.payload?.profiles).toEqual(
+        expect.arrayContaining([expect.objectContaining({ browserProfileId })]),
+      );
+      phase = "browser-bind-c";
+      const bindPromise = next(
+        c.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.browser.bind_profile.response" &&
+          v.message?.payload?.requestId === "browser-bind-c",
+      );
+      c.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "enterprise.browser.bind_profile.request",
+            requestId: "browser-bind-c",
+            workspaceId,
+            browserProfileId,
+          },
+        }),
+      );
+      expect((await bindPromise).message?.payload?.binding?.browserProfileId).toBe(
+        browserProfileId,
+      );
+      phase = "browser-a";
+      const browserAllowedPromise = next(
+        a.socket,
+        (v) =>
+          v?.type === "session" &&
+          v.message?.type === "enterprise.browser_profile.content.read.response" &&
+          v.message?.payload?.requestId === "content-browser-a",
+      );
+      a.socket.send(
+        JSON.stringify({
+          type: "session",
+          message: contentRequest(
+            "enterprise.browser_profile.content.read.request",
+            "content-browser-a",
+            "browser_profile",
+            browserProfileId,
+            { kind: "browser_profile", view: "state" },
+          ),
+        }),
+      );
+      const browserAllowed = await browserAllowedPromise;
+      expect(browserAllowed.message?.payload?.resource?.localResourceId).toBe(browserProfileId);
+      expect(browserAllowed.message?.payload?.page?.items).toEqual([
+        expect.objectContaining({
+          kind: "state",
+          label: "Crossflow Browser",
+          status: "ready",
+          itemId: browserProfileId,
+          occurredAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ]);
+      const browserText = JSON.stringify(browserAllowed);
+      expect(browserText).not.toContain("persist:paseo-enterprise-");
+      expect(browserText).not.toContain("profile-data");
+      expect(browserText).not.toContain("crossflow-browser-account");
+      let browserDeniedShape: { code: unknown; error: unknown; requestType: unknown } | undefined;
+      for (const [requestId, localResourceId] of [
+        ["content-browser-c", browserProfileId],
+        ["content-browser-missing", "brp_ffffffffffffffff"],
+      ] as const) {
+        phase = requestId;
+        const browserDeniedPromise = next(c.socket, (v) => {
+          const payload = v?.type === "session" ? v.message?.payload : v?.payload;
+          return payload?.requestId === requestId;
+        });
+        c.socket.send(
+          JSON.stringify({
+            type: "session",
+            message: contentRequest(
+              "enterprise.browser_profile.content.read.request",
+              requestId,
+              "browser_profile",
+              localResourceId,
+              { kind: "browser_profile", view: "state" },
+            ),
+          }),
+        );
+        const browserDenied = await browserDeniedPromise;
+        const payload = browserDenied.payload ?? browserDenied.message?.payload;
+        expect(payload).toMatchObject({
+          requestId,
+          code: expect.stringMatching(/^(access_denied|unavailable)$/),
+        });
+        const shape = {
+          code: payload.code,
+          error: payload.error,
+          requestType: payload.requestType,
+        };
+        if (browserDeniedShape === undefined) browserDeniedShape = shape;
+        else expect(shape).toEqual(browserDeniedShape);
+      }
+      phase = "content-audit";
       const contentAuditPromise = next(
         a.socket,
         (v) =>
