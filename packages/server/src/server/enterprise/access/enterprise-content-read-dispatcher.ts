@@ -10,6 +10,7 @@ import type { SessionInboundMessage, SessionOutboundMessage } from "../../messag
 import {
   EnterpriseWorkspaceContentReadRequestSchema,
   GlobalResourceRefSchema,
+  EnterpriseWorkspaceContentSelectorSchema,
   EnterpriseWorkspaceContentReadResponseSchema,
   type GlobalResourceRef,
 } from "@getpaseo/protocol/messages";
@@ -105,7 +106,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
         dispatcher: {
           requestPolicyForType: (type: string) =>
             type === "enterprise.workspace.content.read.request" ? ("resources" as const) : null,
-          handle: async ({ sessionContext, message }): Promise<false> => {
+          handle: async ({ sessionContext, message }): Promise<SessionOutboundMessage | false> => {
             const parsed = EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
             if (
               !parsed.success ||
@@ -130,6 +131,14 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 localResourceId: workspace.workspaceId,
               });
               if (!equal(parsed.data.resource, canonical)) return false;
+              const selector = EnterpriseWorkspaceContentSelectorSchema.parse(parsed.data.selector);
+              const page = await source.read({
+                resource: workspace,
+                selector,
+                page: parsed.data.page,
+              });
+              if (!current(sessionContext)) return false;
+              void page;
               return false;
             } finally {
               reservations.delete(parsed.data.requestId);
