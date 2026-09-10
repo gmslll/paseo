@@ -30,6 +30,13 @@ export interface EnterpriseAdmissionOptions extends Omit<
   organizationId: string;
   daemonPassword?: string;
 }
+
+/** Typed production seam for integration-owned runtime assembly. */
+export function createEnterpriseAdmission(
+  options: EnterpriseAdmissionOptions,
+): EnterpriseAdmission {
+  return new EnterpriseAdmission(options);
+}
 function cloneFreeze<T>(value: T): T {
   if (!value || typeof value !== "object") return value;
   // oxlint-disable-next-line no-explicit-any -- recursive structural clone boundary.
