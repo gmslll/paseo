@@ -30,3 +30,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0017: Browser Profile runtime authorization](decisions/0017-browser-profile-runtime-authorization.md)
 - [ADR 0026: Provider history and search resource contract](decisions/0026-provider-history-and-search-resource-contract.md)
 - [ADR 0027: Single-resource ownership transfer contract](decisions/0027-single-resource-ownership-transfer.md)
+- [ADR 0028: Browser page identity observation ownership](decisions/0028-browser-page-identity-observation.md)
