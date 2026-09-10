@@ -55,6 +55,30 @@ export interface ProductionBrowserLeaseBundleOptions extends Omit<
   canonicalResolver?: BrowserProfileCanonicalResolver;
   quarantine?: BrowserProfileBindingQuarantineSink;
   createId?: () => string;
+  profiles?: BrowserProfileRegistry;
+}
+
+export async function prepareProductionBrowserProfileRegistry(input: {
+  paseoHome: string;
+  nodeId: string;
+  downloadBaseRoot: string;
+  canonicalResolver?: BrowserProfileCanonicalResolver;
+  createId?: () => string;
+}): Promise<BrowserProfileRegistry> {
+  const registry = new BrowserProfileRegistry({
+    storage: new JsonFileBrowserProfileStorage(
+      path.join(input.paseoHome, "enterprise", "browser", "browser-profiles.json"),
+    ),
+    canonicalResolver:
+      input.canonicalResolver ??
+      createNodeBrowserProfileCanonicalResolver({
+        nodeId: input.nodeId,
+        downloadBaseRoot: input.downloadBaseRoot,
+      }),
+    createProfileId: input.createId ?? (() => `brp_${randomUUID().replaceAll("-", "")}`),
+  });
+  await registry.initialize();
+  return registry;
 }
 
 export interface ProductionBrowserLeaseBundle {
@@ -109,16 +133,18 @@ export function createProductionBrowserLeaseBundle(
 ): ProductionBrowserLeaseBundle {
   const root = path.join(options.paseoHome, "enterprise");
   const browserRoot = path.join(root, "browser");
-  const profiles = new BrowserProfileRegistry({
-    storage: new JsonFileBrowserProfileStorage(path.join(browserRoot, "browser-profiles.json")),
-    canonicalResolver:
-      options.canonicalResolver ??
-      createNodeBrowserProfileCanonicalResolver({
-        nodeId: options.nodeId,
-        downloadBaseRoot: options.downloadBaseRoot,
-      }),
-    createProfileId: options.createId ?? (() => `brp_${randomUUID().replaceAll("-", "")}`),
-  });
+  const profiles =
+    options.profiles ??
+    new BrowserProfileRegistry({
+      storage: new JsonFileBrowserProfileStorage(path.join(browserRoot, "browser-profiles.json")),
+      canonicalResolver:
+        options.canonicalResolver ??
+        createNodeBrowserProfileCanonicalResolver({
+          nodeId: options.nodeId,
+          downloadBaseRoot: options.downloadBaseRoot,
+        }),
+      createProfileId: options.createId ?? (() => `brp_${randomUUID().replaceAll("-", "")}`),
+    });
   const bindings = new BrowserProfileBindingRegistry({
     storage: new JsonFileBrowserProfileBindingStorage(
       path.join(browserRoot, "browser-profile-bindings.json"),
