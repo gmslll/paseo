@@ -446,6 +446,15 @@ function agentDirectorySearchQuery(request: AgentDirectoryRequestMessage): strin
   if (request.type !== "fetch_agent_history_request") return "";
   return request.search?.trim() ?? "";
 }
+
+function isEnterpriseProviderBoundaryRequest(message: SessionInboundMessage): boolean {
+  return (
+    message.type === "fetch_recent_provider_sessions_request" ||
+    message.type === "forge.search.request" ||
+    message.type === "github_search_request" ||
+    message.type === "workspace.github.search_repositories.request"
+  );
+}
 type FetchAgentsRequestFilter = NonNullable<FetchAgentsRequestMessage["filter"]>;
 type FetchAgentsRequestSort = NonNullable<FetchAgentsRequestMessage["sort"]>[number];
 type FetchAgentsResponsePayload = Extract<
@@ -2356,6 +2365,11 @@ export class Session {
             },
           });
         }
+        return;
+      }
+      if (this.enterpriseContext && isEnterpriseProviderBoundaryRequest(msg)) {
+        const requestId = sessionRequestId(msg);
+        if (requestId) this.emitLegacyResourceDenied(requestId, msg.type);
         return;
       }
       if (

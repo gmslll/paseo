@@ -8165,6 +8165,53 @@ describe("enterprise dispatcher integration seam", () => {
     });
   });
 
+  test("enterprise provider and forge searches deny before provider side effects", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const listAgents = vi.fn().mockResolvedValue([]);
+    const searchRepositories = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-provider-boundary"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentStorage: { list: listAgents },
+      github: { searchRepositories },
+    });
+
+    await session.handleMessage({
+      type: "fetch_recent_provider_sessions_request",
+      requestId: "provider-boundary",
+    });
+    await session.handleMessage({
+      type: "workspace.github.search_repositories.request",
+      requestId: "forge-boundary",
+      query: "paseo",
+      limit: 10,
+    });
+
+    expect(listAgents).not.toHaveBeenCalled();
+    expect(searchRepositories).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "provider-boundary",
+          requestType: "fetch_recent_provider_sessions_request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "forge-boundary",
+          requestType: "workspace.github.search_repositories.request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
   test("enterprise fetch-agent success uses the canonical authorized id without enumeration", async () => {
     if (process.platform !== "darwin") return;
     const fixture = await createBinaryAuthorizationFixture("fetch-agent-success");
