@@ -22,8 +22,11 @@ import {
   EnterpriseAgentContentReadResponseSchema,
   EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseAppSlotContentReadResponseSchema,
+  EnterpriseBrowserBindProfileRequestSchema,
+  EnterpriseBrowserListProfilesRequestSchema,
   EnterpriseBrowserProfileContentReadRequestSchema,
   EnterpriseBrowserProfileContentReadResponseSchema,
+  EnterpriseResourceAcquireLeaseRequestSchema,
   EnterpriseWorkspaceContentReadRequestSchema,
   EnterpriseWorkspaceContentReadResponseSchema,
 } from "@getpaseo/protocol/messages";
@@ -113,6 +116,8 @@ import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 interface SessionHandlerInternals {
   listFetchAgentsEntries(params: SessionInboundMessage): Promise<unknown>;
   readAgentDirectorySync(params: SessionInboundMessage): Promise<unknown>;
+  listFetchWorkspacesEntries(params: SessionInboundMessage): Promise<unknown>;
+  readWorkspaceDirectorySync(params: SessionInboundMessage): Promise<unknown>;
   terminalController: {
     dispatch(message: SessionInboundMessage): Promise<void> | undefined;
   };
@@ -763,6 +768,60 @@ test("fails closed for an unregistered content handler", async () => {
       code: "unavailable",
     },
   });
+});
+
+test("routes dynamically registered browser resource policies through the resource branch", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const requests = [
+    EnterpriseBrowserListProfilesRequestSchema.parse({
+      type: "enterprise.browser.list_profiles.request",
+      requestId: "browser-list-dynamic",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+    }),
+    EnterpriseBrowserBindProfileRequestSchema.parse({
+      type: "enterprise.browser.bind_profile.request",
+      requestId: "browser-bind-dynamic",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+    }),
+    EnterpriseResourceAcquireLeaseRequestSchema.parse({
+      type: "enterprise.resource.acquire_lease.request",
+      requestId: "browser-lease-dynamic",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      resourceKind: "browser_profile",
+      mode: "read",
+    }),
+  ];
+  const handle = vi.fn(async () => false);
+  const dispatcher = {
+    requestPolicyForType: vi.fn(() => "resources" as const),
+    handle,
+  };
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-dynamic-browser-resource"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: dispatcher,
+  });
+
+  for (const request of requests) {
+    await session.handleMessage(request);
+  }
+
+  expect(handle).toHaveBeenCalledTimes(requests.length);
+  expect(messages).toEqual(
+    requests.map((request) => ({
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        requestType: request.type,
+        error: "Enterprise operation unavailable",
+        code: "unavailable",
+      },
+    })),
+  );
+  await session.cleanup();
 });
 
 test("passes the per-session workspace files runtime through dispatcher registration", async () => {
@@ -1634,7 +1693,17 @@ test("resource-scoped request keeps handler behavior without authority receipt r
     filter: {},
   });
   expect(register).not.toHaveBeenCalled();
-  expect(messages).toHaveLength(0);
+  expect(messages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: "resource-1",
+        requestType: "fetch_workspaces_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    },
+  ]);
   await session.cleanup();
 });
 
@@ -8512,6 +8581,218 @@ describe("enterprise dispatcher integration seam", () => {
       requestId: "metadata-only",
     })) as { entries: unknown[] };
     expect(entries.entries).toEqual([]);
+    await session.cleanup();
+  });
+
+  test("enterprise workspaces filter ownership before paging and sync", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-workspaces-filter", [
+      {
+        action: "workspace.content.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+    ]);
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const workspaceA = {
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+      projectId: "project-a",
+      cwd: "/repo/a",
+      kind: "directory" as const,
+      displayName: "z-authorized",
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const workspaceB = {
+      ...workspaceA,
+      workspaceId: "wks_bbbbbbbbbbbbbbbb",
+      ownerPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+      createdByPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+      projectId: "project-b",
+      cwd: "/repo/b",
+      displayName: "a-foreign",
+    };
+    fixture.owners.registerWorkspace({
+      id: workspaceA.workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: workspaceB.workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: workspaceB.ownerPrincipalId,
+      createdByPrincipalId: workspaceB.createdByPrincipalId,
+    });
+    const projects = [
+      {
+        projectId: "project-a",
+        rootPath: "/repo/a",
+        kind: "git" as const,
+        displayName: "A",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        archivedAt: null,
+      },
+      {
+        projectId: "project-b",
+        rootPath: "/repo/b",
+        kind: "git" as const,
+        displayName: "B",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        archivedAt: null,
+      },
+    ];
+    const workspaceById = new Map(
+      [workspaceA, workspaceB].map((workspace) => [workspace.workspaceId, workspace] as const),
+    );
+    const projectById = new Map(projects.map((project) => [project.projectId, project] as const));
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      workspaceRegistry: {
+        list: vi.fn().mockResolvedValue([workspaceA, workspaceB]),
+        get: vi.fn((id: string) => Promise.resolve(workspaceById.get(id))),
+      },
+      projectRegistry: {
+        list: vi.fn().mockResolvedValue(projects),
+        get: vi.fn((id: string) => Promise.resolve(projectById.get(id))),
+      },
+    });
+    const request = {
+      type: "fetch_workspaces_request" as const,
+      requestId: "fetch-workspaces-filtered",
+      sort: [{ key: "name" as const, direction: "asc" as const }],
+      page: { limit: 1 },
+    };
+    const page = (await asSessionInternals(session).listFetchWorkspacesEntries(request)) as {
+      entries: Array<{ id: string }>;
+      emptyProjects: unknown[];
+      pageInfo: { hasMore: boolean };
+    };
+    expect(page.entries.map((entry) => entry.id)).toEqual([workspaceA.workspaceId]);
+    expect(page.pageInfo.hasMore).toBe(false);
+    expect(page.emptyProjects).toEqual([]);
+    const sync = (await asSessionInternals(session).readWorkspaceDirectorySync({
+      ...request,
+      sync: { generation: "workspace-sync", afterSeq: 0 },
+    })) as { entries: Array<{ id: string }> };
+    expect(sync.entries.map((entry) => entry.id)).toEqual([workspaceA.workspaceId]);
+    await session.cleanup();
+  });
+
+  test("enterprise workspace directory denies a revocation during descriptor loading", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-workspaces-current-race");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const workspace = {
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+      projectId: "project-race",
+      cwd: "/repo/race",
+      kind: "directory" as const,
+      displayName: "race",
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    fixture.owners.registerWorkspace({
+      id: workspace.workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const project = {
+      projectId: workspace.projectId,
+      rootPath: workspace.cwd,
+      kind: "git" as const,
+      displayName: "Race",
+      createdAt: workspace.createdAt,
+      updatedAt: workspace.updatedAt,
+      archivedAt: null,
+    };
+    const descriptorLoadStarted = deferred<void>();
+    const releaseDescriptorLoad = deferred<void>();
+    let workspaceListCalls = 0;
+    const workspaceList = vi.fn(async () => {
+      workspaceListCalls += 1;
+      if (workspaceListCalls === 2) {
+        descriptorLoadStarted.resolve();
+        await releaseDescriptorLoad.promise;
+      }
+      return [workspace];
+    });
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      workspaceRegistry: {
+        list: workspaceList,
+        get: vi.fn(async () => workspace),
+      },
+      projectRegistry: {
+        list: vi.fn(async () => [project]),
+        get: vi.fn(async () => project),
+      },
+    });
+
+    const loading = asSessionInternals(session).listFetchWorkspacesEntries({
+      type: "fetch_workspaces_request",
+      requestId: "fetch-workspaces-current-race",
+    });
+    await descriptorLoadStarted.promise;
+    await fixture.runtime.release();
+    releaseDescriptorLoad.resolve();
+
+    await expect(loading).rejects.toMatchObject({ code: "access_denied" });
     await session.cleanup();
   });
 });

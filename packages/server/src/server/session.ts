@@ -2396,8 +2396,14 @@ export class Session {
         }
         return;
       }
-      if (isEnterpriseResourceRequest(msg) && this.enterpriseDispatcher && this.enterpriseContext) {
-        if (this.enterpriseDispatcher.requestPolicyForType?.(msg.type) !== "resources") return;
+      const registeredEnterpriseResourcePolicy =
+        this.enterpriseDispatcher?.requestPolicyForType?.(msg.type) === "resources";
+      if (
+        (isEnterpriseResourceRequest(msg) || registeredEnterpriseResourcePolicy) &&
+        this.enterpriseDispatcher &&
+        this.enterpriseContext
+      ) {
+        if (!registeredEnterpriseResourcePolicy) return;
         const requestId = sessionRequestId(msg);
         if (!requestId || this.reservedAuthorityRequestIds.has(requestId)) return;
         this.reservedAuthorityRequestIds.add(requestId);
@@ -3762,6 +3768,27 @@ export class Session {
       const original = originals.get(row.id);
       return original ? [original] : [];
     });
+  }
+
+  private async allowedEnterpriseWorkspaceIds(): Promise<ReadonlySet<string>> {
+    if (!this.enterpriseContext) return new Set();
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    const rows = (await this.workspaceRegistry.list()).flatMap((workspace) => {
+      try {
+        const owner = normalizeEnterpriseResourceOwner(workspace);
+        return owner ? [{ ...owner, id: workspace.workspaceId }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const authorized = authorization.filterWorkspaces(rows);
+    if (!authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    return new Set(authorized.map((workspace) => workspace.id));
   }
 
   private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -6076,7 +6103,14 @@ export class Session {
     pageInfo: FetchWorkspacesResponsePageInfo;
   }> {
     try {
-      return await this.workspaceDirectory.listFetchEntries(request);
+      const allowedWorkspaceIds = this.enterpriseContext
+        ? await this.allowedEnterpriseWorkspaceIds()
+        : undefined;
+      const result = await this.workspaceDirectory.listFetchEntries(request, allowedWorkspaceIds);
+      if (!this.isEnterpriseLegacyResourceCurrent()) {
+        throw new SessionRequestError("access_denied", "Resource unavailable");
+      }
+      return this.enterpriseContext ? { ...result, emptyProjects: [] } : result;
     } catch (error) {
       if (error instanceof CursorError) {
         throw new SessionRequestError("invalid_cursor", error.message);
@@ -6493,7 +6527,7 @@ export class Session {
   private async handleFetchAgents(
     request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
   ): Promise<void> {
-    if (this.enterpriseContext && !this.enterpriseLegacyResourceAuthorization?.isCurrent()) {
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
       this.emitLegacyResourceDenied(request.requestId, request.type);
       return;
     }
@@ -6630,6 +6664,10 @@ export class Session {
   private async handleFetchWorkspacesRequest(
     request: Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>,
   ): Promise<void> {
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
     const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
 
@@ -6918,10 +6956,14 @@ export class Session {
         "Sequenced workspace directory reads do not support filters.",
       );
     }
-    return this.directorySync.synchronizeWorkspaces(
-      await this.workspaceDirectory.listDescriptors(),
-      request.sync ?? {},
-    );
+    const allowedWorkspaceIds = this.enterpriseContext
+      ? await this.allowedEnterpriseWorkspaceIds()
+      : undefined;
+    const descriptors = await this.workspaceDirectory.listDescriptors(allowedWorkspaceIds);
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    return this.directorySync.synchronizeWorkspaces(descriptors, request.sync ?? {});
   }
 
   // Build the bootstrap snapshot used by `flushBootstrappedWorkspaceUpdates`
@@ -8738,6 +8780,12 @@ export class Session {
         clearTimeout(timeoutHandle);
       }
     }
+  }
+
+  private isEnterpriseLegacyResourceCurrent(): boolean {
+    return (
+      !this.enterpriseContext || Boolean(this.enterpriseLegacyResourceAuthorization?.isCurrent())
+    );
   }
 
   /**
