@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type {
   AuditEvent,
   AuditEventInput,
@@ -241,6 +241,7 @@ function createTestRegistry(input: {
   secrets?: readonly string[];
   principalSource?: PrincipalGrantSource;
   clock?: { now(): string };
+  hasher?: { hash(secret: string): Promise<string> };
 }): {
   registry: IdentityRegistry;
   audit: ReturnType<typeof memoryAudit>;
@@ -259,7 +260,7 @@ function createTestRegistry(input: {
       clock: input.clock ?? { now: () => TEST_NOW },
       credentialIds: sequenceSource(input.credentialIds ?? TEST_CREDENTIAL_IDS),
       secrets: sequenceSource(input.secrets ?? TEST_SECRETS),
-      hasher: { hash: async (secret) => testDigest(secret) },
+      hasher: input.hasher ?? { hash: async (secret) => testDigest(secret) },
       verifier: { compare: async (secret, digest) => digest === testDigest(secret) },
     }),
     audit,
@@ -1552,5 +1553,71 @@ describe("IdentityRegistry", () => {
         organizationId: principal.organizationId,
       }),
     ).rejects.toThrow();
+  });
+  test("initial credential serializes deferred hashing to one issued and one already", async () => {
+    let enterHash!: () => void;
+    let releaseHash!: () => void;
+    const entered = new Promise<void>((resolve) => (enterHash = resolve));
+    const gate = new Promise<void>((resolve) => (releaseHash = resolve));
+    const hasher = {
+      hash: vi.fn(async (secret: string) => {
+        enterHash();
+        await gate;
+        return testDigest(secret);
+      }),
+    };
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-initial-serial-"));
+    const { registry, audit } = createTestRegistry({
+      filePath: path.join(root, "credentials.json"),
+      hasher,
+    });
+    await registry.load();
+    const first = registry.issueInitialCredential({
+      actor,
+      principalId: principal.principalId,
+      organizationId: principal.organizationId,
+    });
+    await entered;
+    const second = registry.issueInitialCredential({
+      actor,
+      principalId: principal.principalId,
+      organizationId: principal.organizationId,
+    });
+    releaseHash();
+    const results = await Promise.all([first, second]);
+    expect(results.filter((result) => result.status === "issued")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "already_provisioned")).toHaveLength(1);
+    expect(hasher.hash).toHaveBeenCalledOnce();
+    expect(
+      audit.events.filter((event) => event.action === "identity.credential.issue"),
+    ).toHaveLength(1);
+  });
+
+  test("initial credential audit failure does not report already provisioned", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-initial-audit-"));
+    const audit = memoryAudit();
+    const auditError = new Error("initial audit failure");
+    audit.sink.append = async () => {
+      throw auditError;
+    };
+    const { registry } = createTestRegistry({
+      filePath: path.join(root, "credentials.json"),
+      audit,
+    });
+    await registry.load();
+    await expect(
+      registry.issueInitialCredential({
+        actor,
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+      }),
+    ).rejects.toBe(auditError);
+    await expect(
+      registry.issueInitialCredential({
+        actor,
+        principalId: principal.principalId,
+        organizationId: principal.organizationId,
+      }),
+    ).rejects.toBe(auditError);
   });
 });
