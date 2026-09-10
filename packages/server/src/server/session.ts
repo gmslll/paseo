@@ -2387,7 +2387,20 @@ export class Session {
                   },
                 });
               } else {
-                this.emit(response);
+                const contextual = this.enterpriseDispatcher.consumeResponse?.({
+                  sessionContext: {
+                    sessionId: this.sessionId,
+                    clientId: this.clientId,
+                    credentialId: this.enterpriseContext.principal.credentialId,
+                    sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                    enterpriseContext: this.enterpriseContext,
+                  },
+                  message: msg,
+                  response,
+                });
+                // oxlint-disable-next-line max-depth -- contextual response remains inside receipt transaction.
+                if (!contextual) throw new Error("Enterprise response unavailable");
+                this.emit(contextual.response, contextual.authorizationContext);
               }
               return;
             }

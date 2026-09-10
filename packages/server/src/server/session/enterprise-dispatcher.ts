@@ -1,4 +1,5 @@
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
+import type { OutboundAuthorizationContext } from "@getpaseo/protocol/messages";
 import type { OutboundAuthorityReceiptPolicy } from "../enterprise/access/event-action-map.js";
 import type { EnterpriseSessionContext } from "../enterprise/identity/session-context.js";
 
@@ -12,7 +13,24 @@ export interface EnterpriseDispatchContext {
   readonly enterpriseContext: EnterpriseSessionContext;
 }
 
+export type EnterpriseReceiptClassification =
+  | "authority"
+  | "resources"
+  | "identity_self"
+  | "transport_control";
+export interface EnterpriseDispatchResponse {
+  readonly response: SessionOutboundMessage;
+  readonly authorizationContext?: OutboundAuthorizationContext;
+  readonly receiptClassification: EnterpriseReceiptClassification;
+}
 export type EnterpriseDispatchResult = SessionOutboundMessage | false;
+export interface EnterpriseResponseContextConsumer {
+  consumeResponse(input: {
+    readonly sessionContext: EnterpriseDispatchContext;
+    readonly message: SessionInboundMessage;
+    readonly response: SessionOutboundMessage;
+  }): EnterpriseDispatchResponse | null;
+}
 export type EnterpriseIdentityRequestType =
   | "enterprise.identity.get_current.request"
   | "enterprise.identity.logout_all.request";
@@ -88,7 +106,8 @@ export interface EnterpriseSessionDispatcher {
   handle(input: {
     readonly sessionContext: EnterpriseDispatchContext;
     readonly message: SessionInboundMessage;
-  }): Promise<SessionOutboundMessage | false> | SessionOutboundMessage | false;
+  }): Promise<EnterpriseDispatchResult> | EnterpriseDispatchResult;
+  readonly consumeResponse?: EnterpriseResponseContextConsumer["consumeResponse"];
 }
 
 export const ENTERPRISE_UNAVAILABLE_ERROR = "Enterprise operation unavailable";
