@@ -2273,6 +2273,7 @@ export class Session {
           {
             sessionId: this.sessionId,
             clientId: this.clientId,
+            credentialId: this.enterpriseContext.principal.credentialId,
             enterpriseContext: this.enterpriseContext,
           },
           msg,

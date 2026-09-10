@@ -9,6 +9,7 @@ import {
 const context = {
   sessionId: "session-test",
   clientId: "client-test",
+  credentialId: "credential-test",
   enterpriseContext: {} as EnterpriseSessionContext,
 };
 const message = {

@@ -5,6 +5,8 @@ import type { EnterpriseSessionContext } from "../enterprise/identity/session-co
 export interface EnterpriseDispatchContext {
   readonly sessionId: string;
   readonly clientId: string;
+  /** Server-retained credential identifier; raw credentials never cross this seam. */
+  readonly credentialId: string;
   readonly enterpriseContext: EnterpriseSessionContext;
 }
 
