@@ -451,6 +451,16 @@ export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
     ["identity.manage"],
   ),
   authorityReceiptPolicy(
+    "enterprise.identity.get_current.response",
+    "enterprise.identity.get_current.request",
+    noActions,
+  ),
+  authorityReceiptPolicy(
+    "enterprise.identity.logout_all.response",
+    "enterprise.identity.logout_all.request",
+    noActions,
+  ),
+  authorityReceiptPolicy(
     "enterprise.node.list_nodes.response",
     "enterprise.node.list_nodes.request",
   ),
