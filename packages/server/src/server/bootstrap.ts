@@ -220,6 +220,7 @@ import {
   contentFeaturesForEnterpriseManifest,
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
+  pageIdentityFeaturesForEnterpriseManifest,
   workspaceOwnershipTransferFeatureForManifest,
 } from "./enterprise/dispatcher-registry.js";
 import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
@@ -1474,6 +1475,9 @@ export async function createPaseoDaemon(
           productionEnterpriseDispatcherRegistration.manifest,
         ),
         ...workspaceOwnershipTransferFeatureForManifest(
+          productionEnterpriseDispatcherRegistration.manifest,
+        ),
+        ...pageIdentityFeaturesForEnterpriseManifest(
           productionEnterpriseDispatcherRegistration.manifest,
         ),
       });
