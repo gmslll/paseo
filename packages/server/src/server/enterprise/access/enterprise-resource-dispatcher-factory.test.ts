@@ -15,6 +15,7 @@ import {
 } from "../identity/admission-authorization.js";
 import {
   createEnterpriseResourceDispatcherFactory,
+  EnterpriseResourceDispatcherOpenError,
   openEnterpriseResourceDispatcher,
 } from "./enterprise-resource-dispatcher-factory.js";
 import {
@@ -138,15 +139,32 @@ describe.runIf(process.platform === "darwin")("enterprise resource dispatcher fa
 
   test("rejects structural providers and foreign runtimes without touching authority fields", async () => {
     const fixture = await createFixture("foreign");
-    let touched = 0;
+    const foreign = await createFixture("foreign-other");
     const factory = createEnterpriseResourceDispatcherFactory({
+      provider: fixture.provider,
+      placement: { resolveWorkspace: async () => null },
+      organizationResources: {
+        list: async () => ({ principals: [], resources: [], nextCursor: null }),
+      },
+    });
+    expect(factory).not.toBeNull();
+    expect(() =>
+      factory?.open({
+        sessionId: "foreign-session",
+        clientId: "foreign-client",
+        context: {} as never,
+        authorizationRuntime: foreign.runtime,
+      }),
+    ).toThrow(EnterpriseResourceDispatcherOpenError);
+    let touched = 0;
+    const structural = createEnterpriseResourceDispatcherFactory({
       provider: { grantStore: {}, owners: {} },
       placement: { resolveWorkspace: async () => null },
       organizationResources: {
         list: async () => ({ principals: [], resources: [], nextCursor: null }),
       },
     });
-    expect(factory).toBeNull();
+    expect(structural).toBeNull();
     const foreignRuntime = new Proxy(
       {},
       {
@@ -156,9 +174,10 @@ describe.runIf(process.platform === "darwin")("enterprise resource dispatcher fa
         },
       },
     );
-    expect(openEnterpriseResourceDispatcher(factory, foreignRuntime)).toBeNull();
+    expect(openEnterpriseResourceDispatcher(structural, foreignRuntime)).toBeNull();
     expect(touched).toBe(0);
     await fixture.runtime.release();
+    await foreign.runtime.release();
   });
 });
 
