@@ -107,6 +107,8 @@ interface ActiveRequestState {
   readonly binding: AuthoritySessionBindingRecord;
   readonly mintedReceiptIds: Set<string>;
   tail: Promise<void>;
+  teardownPromise: Promise<void> | null;
+  readonly teardownFailures: unknown[];
   lifecycle: "registering" | "open" | "terminal_pending" | "terminal" | "closed";
 }
 
@@ -163,6 +165,8 @@ export class OutboundAuthorityEmissionAuthorizer {
         binding,
         mintedReceiptIds: new Set(),
         tail: Promise.resolve(),
+        teardownPromise: null,
+        teardownFailures: [],
         lifecycle: "registering",
       };
       this.requests.set(handle, state);
@@ -223,26 +227,25 @@ export class OutboundAuthorityEmissionAuthorizer {
       if (
         !state ||
         !samePrincipal(state.principal, principal) ||
-        !sameBinding(state.binding, binding)
+        !sameBinding(state.binding, binding) ||
+        state.lifecycle === "closed" ||
+        state.lifecycle === "terminal"
       ) {
         return false;
       }
-      if (state.lifecycle === "closed" || state.lifecycle === "terminal") return false;
       state.lifecycle = "closed";
       state.claimed.close();
-      try {
-        await this.closeState({ ...this.reference(state), reason: input.reason });
-        return true;
-      } catch {
-        return false;
-      }
+      const teardown = this.closeState({ ...this.reference(state), reason: input.reason });
+      state.teardownPromise = teardown;
+      await teardown;
+      return true;
     } catch {
       return false;
     }
   }
 
   /** @internal Runtime teardown needs the exact delegate failure after local revocation. */
-  async closeForTeardown(input: CloseActiveAuthorizedRequestInput): Promise<void> {
+  closeForTeardown(input: CloseActiveAuthorizedRequestInput): Promise<void> {
     const handle = input.handle;
     const principal = canonicalPrincipal(input.principal);
     const binding = canonicalBinding(input.binding);
@@ -254,10 +257,44 @@ export class OutboundAuthorityEmissionAuthorizer {
     ) {
       throw new Error("active authorized request does not match runtime teardown");
     }
-    if (state.lifecycle === "closed" || state.lifecycle === "terminal") return;
+    if (state.teardownPromise) return state.teardownPromise;
+    if (state.lifecycle === "closed") {
+      return rejectCleanupFailures(state.teardownFailures);
+    }
+    const pendingTail = state.tail;
     state.lifecycle = "closed";
     state.claimed.close();
-    await this.closeState({ ...this.reference(state), reason: input.reason });
+    const reference = this.reference(state);
+    const teardown = (async () => {
+      const failures: unknown[] = [];
+      const cleanup = (async () => {
+        try {
+          await this.burnFreshReceiptsState(reference);
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
+          const closeResult: unknown = await this.closeState({
+            ...reference,
+            reason: input.reason,
+          });
+          if (closeResult === false) {
+            failures.push(new Error("authority state rejected active request close"));
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      })();
+      await Promise.allSettled([pendingTail, cleanup]);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "active authorized request cleanup failed", {
+          cause: failures[0],
+        });
+      }
+    })();
+    state.teardownPromise = teardown;
+    return teardown;
   }
 
   private async authorizeEmissionSerial(
@@ -422,21 +459,34 @@ export class OutboundAuthorityEmissionAuthorizer {
   private async failClosed(state: ActiveRequestState, burn = false): Promise<false> {
     state.lifecycle = "closed";
     state.claimed.close();
+    if (state.teardownPromise) return false;
     const reference = this.reference(state);
     if (burn) {
       try {
         await this.burnFreshReceiptsState(reference);
-      } catch {
+      } catch (error) {
+        state.teardownFailures.push(error);
         // The state port must also invalidate receipts when close runs.
       }
     }
     try {
       await this.closeState({ ...reference, reason: "authorization_failed" });
-    } catch {
+    } catch (error) {
+      state.teardownFailures.push(error);
       // The local capability remains closed even when external cleanup fails.
     }
     return false;
   }
+}
+
+function rejectCleanupFailures(failures: readonly unknown[]): Promise<void> {
+  if (failures.length === 0) return Promise.resolve();
+  if (failures.length === 1) return Promise.reject(failures[0]);
+  return Promise.reject(
+    new AggregateError(failures, "active authorized request cleanup failed", {
+      cause: failures[0],
+    }),
+  );
 }
 
 function canonicalPrincipal(input: PrincipalContext): PrincipalContext {

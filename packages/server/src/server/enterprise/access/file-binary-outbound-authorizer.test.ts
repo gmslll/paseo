@@ -452,6 +452,45 @@ describe.runIf(process.platform === "darwin")("FileBinaryOutboundAuthorizer", ()
       await fixture.cleanup();
     },
   );
+
+  test.each(["begin", "end"] as const)(
+    "burns the %s emission and closes the stream when workspace owner changes before delivery",
+    async (phase) => {
+      const fixture = await createFixture(`delivery-owner-${phase}`);
+      const requestId = `delivery-owner-${phase}`;
+      const opened = await fixture.binary.open({
+        resource,
+        frame: canonicalizeFileTransferFrame(beginBytes(requestId, 0))!,
+      });
+      expect(opened).not.toBeNull();
+      if (!opened) throw new Error("expected stream");
+
+      let emission = opened.emission;
+      if (phase === "end") {
+        expect(fixture.binary.consumeForDelivery(opened.stream, opened.emission)).not.toBeNull();
+        const endEmission = await fixture.binary.authorizeNext({
+          stream: opened.stream,
+          frame: canonicalizeFileTransferFrame(endBytes(requestId))!,
+        });
+        expect(endEmission).not.toBeNull();
+        if (!endEmission) throw new Error("expected end emission");
+        emission = endEmission;
+      }
+
+      fixture.owners.registerWorkspace({
+        id: "wks_a",
+        organizationId: principal.organizationId,
+        nodeId: node.nodeId,
+        ownerPrincipalId: "usr_fedcba9876543210",
+        createdByPrincipalId: principal.principalId,
+      });
+
+      expect(fixture.binary.consumeForDelivery(opened.stream, emission)).toBeNull();
+      expect(fixture.binary.consumeForDelivery(opened.stream, emission)).toBeNull();
+      expect(fixture.binary.close(opened.stream, "cancel")).toBe(false);
+      await fixture.cleanup();
+    },
+  );
 });
 
 async function openStream(

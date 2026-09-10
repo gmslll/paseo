@@ -103,6 +103,58 @@ class TeardownAuthorityState extends EmptyAuthorityState {
   }
 }
 
+class PendingRegisterAuthorityState extends TeardownAuthorityState {
+  readonly registerStarted = deferred<void>();
+  readonly releaseRegister = deferred<void>();
+
+  override async register(input: Parameters<ProductionAuthorizationStatePort["register"]>[0]) {
+    this.registerStarted.resolve();
+    await this.releaseRegister.promise;
+    return input.binding;
+  }
+}
+
+class PendingReceiptAuthorityState extends EmptyAuthorityState {
+  readonly receiptMinted = deferred<void>();
+  readonly releaseReceipt = deferred<void>();
+  readonly receipts = new Set<string>();
+  private binding: Awaited<ReturnType<ProductionAuthorizationStatePort["register"]>> = null;
+  burnCalls = 0;
+  closeCalls = 0;
+
+  override async register(input: Parameters<ProductionAuthorizationStatePort["register"]>[0]) {
+    this.binding = input.binding;
+    return input.binding;
+  }
+
+  override async resolveOpen() {
+    return this.binding;
+  }
+
+  override async mintFreshReceipt(
+    input: Parameters<ProductionAuthorizationStatePort["mintFreshReceipt"]>[0],
+  ) {
+    const receipt = input.materializeReceipt({
+      receiptId: "receipt-pending-runtime-release",
+      expiresAt: 2_000_000_000_000,
+    });
+    if (receipt) this.receipts.add(receipt.receiptId);
+    this.receiptMinted.resolve();
+    await this.releaseReceipt.promise;
+    return receipt;
+  }
+
+  override async burnFreshReceipts() {
+    this.burnCalls += 1;
+    this.receipts.clear();
+  }
+
+  override async close() {
+    this.closeCalls += 1;
+    this.receipts.clear();
+  }
+}
+
 class Versions implements GrantVersionSource {
   private nextValue = 1;
   next() {
@@ -392,6 +444,105 @@ describe("production enterprise authorization runtime", () => {
   );
 
   test.runIf(process.platform === "darwin")(
+    "waits for a pending registration and fails its late authority state closed",
+    async () => {
+      const closeError = new Error("late registration close failed");
+      const state = new PendingRegisterAuthorityState([closeError]);
+      const fixture = await createFixture("pending-registration", undefined, state, [
+        "workspace.read",
+        "daemon.read",
+      ]);
+      const runtime = await createEnterpriseAuthorizationRuntime(fixture.options);
+      if (!runtime) throw new Error("expected production authorization runtime");
+      const handle = prepareDaemonRequest(
+        runtime,
+        fixture.sessionAuthorization,
+        "pending-register",
+      );
+
+      const registration = runtime.outboundAuthorityEmissionAuthorizer.register(handle);
+      await state.registerStarted.promise;
+      let releaseSettled = false;
+      const release = runtime.release();
+      void release.then(
+        () => {
+          releaseSettled = true;
+          return undefined;
+        },
+        () => {
+          releaseSettled = true;
+          return undefined;
+        },
+      );
+      expect(isCurrentProductionAuthorizationRuntime(runtime)).toBe(false);
+      await Promise.resolve();
+      expect(releaseSettled).toBe(false);
+
+      state.releaseRegister.resolve();
+      await state.closeStarted.promise;
+      expect(releaseSettled).toBe(false);
+      state.releaseClose.resolve();
+
+      await expect(registration).resolves.toBe(false);
+      const error = await release.catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(ProductionAuthorizationRuntimeTeardownError);
+      if (!(error instanceof ProductionAuthorizationRuntimeTeardownError)) throw error;
+      expect(error.errors).toEqual([closeError]);
+      expect(error.cause).toBe(closeError);
+      expect(runtime.release()).toBe(release);
+      expect(state.closeCalls).toBe(1);
+      await fixture.audit.close();
+    },
+  );
+
+  test.runIf(process.platform === "darwin")(
+    "waits for pending receipt materialization and burns the late receipt before release",
+    async () => {
+      const state = new PendingReceiptAuthorityState();
+      const fixture = await createFixture("pending-receipt", undefined, state, [
+        "workspace.read",
+        "daemon.read",
+      ]);
+      const runtime = await createEnterpriseAuthorizationRuntime(fixture.options);
+      if (!runtime) throw new Error("expected production authorization runtime");
+      const handle = prepareDaemonRequest(runtime, fixture.sessionAuthorization, "pending-receipt");
+      await expect(runtime.outboundAuthorityEmissionAuthorizer.register(handle)).resolves.toBe(
+        true,
+      );
+
+      const emission = runtime.outboundAuthorityEmissionAuthorizer.authorizeEmission(
+        handle,
+        daemonStatusResponse("pending-receipt"),
+      );
+      await state.receiptMinted.promise;
+      expect(state.receipts).toEqual(new Set(["receipt-pending-runtime-release"]));
+      let releaseSettled = false;
+      const release = runtime.release();
+      void release.then(
+        () => {
+          releaseSettled = true;
+          return undefined;
+        },
+        () => {
+          releaseSettled = true;
+          return undefined;
+        },
+      );
+      await Promise.resolve();
+      expect(releaseSettled).toBe(false);
+
+      state.releaseReceipt.resolve();
+      await expect(emission).resolves.toBeNull();
+      await expect(release).resolves.toBeUndefined();
+      expect(state.receipts.size).toBe(0);
+      expect(state.burnCalls).toBe(1);
+      expect(state.closeCalls).toBe(1);
+      expect(runtime.release()).toBe(release);
+      await fixture.audit.close();
+    },
+  );
+
+  test.runIf(process.platform === "darwin")(
     "invalidates the old runtime and accepts only the exact replacement handle",
     async () => {
       const fixture = await createFixture("replace");
@@ -486,6 +637,15 @@ async function registerDaemonRequest(
   authorization: SessionAuthorization,
   requestId: string,
 ): Promise<void> {
+  const handle = prepareDaemonRequest(runtime, authorization, requestId);
+  await expect(runtime.outboundAuthorityEmissionAuthorizer.register(handle)).resolves.toBe(true);
+}
+
+function prepareDaemonRequest(
+  runtime: ProductionAuthorizationRuntime,
+  authorization: SessionAuthorization,
+  requestId: string,
+) {
   const message = { type: "daemon.get_status.request", requestId } as SessionInboundMessage;
   const decision = authorization.authorizeInbound(message);
   if (!decision) throw new Error("expected daemon authorization decision");
@@ -496,9 +656,24 @@ async function registerDaemonRequest(
     pending,
   );
   if (!consumed) throw new Error("expected active authorized request handle");
-  await expect(
-    runtime.outboundAuthorityEmissionAuthorizer.register(consumed.activeRequestHandle),
-  ).resolves.toBe(true);
+  return consumed.activeRequestHandle;
+}
+
+function daemonStatusResponse(requestId: string) {
+  return {
+    type: "daemon.get_status.response" as const,
+    payload: {
+      requestId,
+      serverId: "srv_authorization",
+      version: "1.0.0",
+      pid: 1,
+      nodePath: "/usr/bin/node",
+      startedAt: null,
+      listen: "127.0.0.1:0",
+      relay: null,
+      providers: [],
+    },
+  };
 }
 
 function deferred<T>() {

@@ -195,53 +195,104 @@ class RuntimeGrantVersionGuard implements PrincipalGrantVersionGuard {
 
 class BoundOutboundAuthorityEmissionAuthorizerImpl implements BoundOutboundAuthorityEmissionAuthorizer {
   private readonly activeHandles = new Set<ActiveAuthorizedRequestHandle>();
+  private readonly pendingOperations = new Set<Promise<unknown>>();
+  private readonly pendingCleanupFailures: unknown[] = [];
+  #closing = false;
 
   constructor(
     private readonly delegate: OutboundAuthorityEmissionAuthorizer,
     private readonly principal: ResolvedProductionAuthorizationAuthority["principal"],
     private readonly binding: AuthoritySessionBindingRecord,
+    private readonly onCleanupFailure: () => Promise<void>,
   ) {
     Object.freeze(this);
   }
 
-  async register(handle: ActiveAuthorizedRequestHandle): Promise<boolean> {
-    const registered = await this.delegate.register({
-      handle,
-      principal: this.principal,
-      binding: this.binding,
-    });
-    if (registered) this.activeHandles.add(handle);
-    return registered;
+  register(handle: ActiveAuthorizedRequestHandle): Promise<boolean> {
+    if (this.#closing) return Promise.resolve(false);
+    return this.track(
+      (async () => {
+        const registered = await this.delegate.register({
+          handle,
+          principal: this.principal,
+          binding: this.binding,
+        });
+        if (!registered) {
+          if (this.#closing) await this.captureLateCleanup(handle);
+          return false;
+        }
+        this.activeHandles.add(handle);
+        if (!this.#closing) return true;
+        await this.captureLateCleanup(handle);
+        this.activeHandles.delete(handle);
+        return false;
+      })(),
+    );
   }
 
   authorizeEmission(
     handle: ActiveAuthorizedRequestHandle,
     event: SessionOutboundMessage,
   ): Promise<AuthorityContext | null> {
-    return this.delegate.authorizeEmission({
-      handle,
-      principal: this.principal,
-      binding: this.binding,
-      event,
-    });
+    if (this.#closing) return Promise.resolve(null);
+    return this.track(
+      (async () => {
+        const context = await this.delegate.authorizeEmission({
+          handle,
+          principal: this.principal,
+          binding: this.binding,
+          event,
+        });
+        if (!this.#closing) return context;
+        await this.captureLateCleanup(handle);
+        this.activeHandles.delete(handle);
+        return null;
+      })(),
+    );
   }
 
-  async close(
+  close(
     handle: ActiveAuthorizedRequestHandle,
     reason: Exclude<ActiveAuthorizedRequestCloseReason, "authorization_failed">,
   ): Promise<boolean> {
-    this.activeHandles.delete(handle);
-    return this.delegate.close({
+    if (this.#closing || !this.activeHandles.has(handle)) return Promise.resolve(false);
+    const cleanup = this.delegate.closeForTeardown({
       handle,
       principal: this.principal,
       binding: this.binding,
       reason,
     });
+    let operation!: Promise<boolean>;
+    operation = cleanup.then(
+      () => {
+        this.activeHandles.delete(handle);
+        return true;
+      },
+      (error: unknown) => {
+        this.pendingOperations.delete(operation);
+        this.activeHandles.delete(handle);
+        this.pendingCleanupFailures.push(error);
+        void this.onCleanupFailure().catch(() => undefined);
+        return false;
+      },
+    );
+    return this.track(operation);
   }
 
   async releaseAll(): Promise<readonly unknown[]> {
+    this.seal();
+    const failures: unknown[] = [];
+    while (this.pendingOperations.size > 0) {
+      const pending = [...this.pendingOperations];
+      const results = await Promise.allSettled(pending);
+      for (const result of results) {
+        if (result.status === "rejected") appendFailure(failures, result.reason);
+      }
+    }
+    for (const failure of this.pendingCleanupFailures.splice(0)) {
+      appendFailure(failures, failure);
+    }
     const handles = [...this.activeHandles];
-    this.activeHandles.clear();
     const results = await Promise.allSettled(
       handles.map(async (handle) => {
         await this.delegate.closeForTeardown({
@@ -252,10 +303,46 @@ class BoundOutboundAuthorityEmissionAuthorizerImpl implements BoundOutboundAutho
         });
       }),
     );
-    return Object.freeze(
-      results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
-    );
+    this.activeHandles.clear();
+    for (const result of results) {
+      if (result.status === "rejected") appendFailure(failures, result.reason);
+    }
+    return Object.freeze(failures);
   }
+
+  seal(): void {
+    this.#closing = true;
+  }
+
+  private track<T>(operation: Promise<T>): Promise<T> {
+    this.pendingOperations.add(operation);
+    void operation.then(
+      () => this.pendingOperations.delete(operation),
+      () => this.pendingOperations.delete(operation),
+    );
+    return operation;
+  }
+
+  private async captureLateCleanup(handle: ActiveAuthorizedRequestHandle): Promise<void> {
+    try {
+      await this.delegate.closeForTeardown({
+        handle,
+        principal: this.principal,
+        binding: this.binding,
+        reason: "release",
+      });
+    } catch (error) {
+      this.pendingCleanupFailures.push(error);
+    }
+  }
+}
+
+function appendFailure(failures: unknown[], failure: unknown): void {
+  if (failure instanceof AggregateError) {
+    for (const nested of failure.errors) appendFailure(failures, nested);
+    return;
+  }
+  failures.push(failure);
 }
 
 function beginRuntimeTeardown(
@@ -266,6 +353,7 @@ function beginRuntimeTeardown(
 
   record.active = false;
   record.guard.close();
+  record.outbound.seal();
   const immediateFailures: unknown[] = [];
   try {
     record.fileBinary.closeAll(reason);
@@ -355,10 +443,15 @@ export async function createEnterpriseAuthorizationRuntime(
       nodeId: authority.node.nodeId,
       state: ports.state,
     });
+    let runtimeRecord: RuntimeRecord | null = null;
     const outbound = new BoundOutboundAuthorityEmissionAuthorizerImpl(
       outboundDelegate,
       authority.principal,
       binding,
+      () =>
+        runtimeRecord
+          ? beginRuntimeTeardown(runtimeRecord, "revoked")
+          : Promise.reject(new Error("authorization runtime is not registered")),
     );
     const binaryDependencies: FileBinaryOutboundAuthorizerDependencies = {
       admissionAuthorizationIssuer: options.admissionAuthorizationIssuer,
@@ -398,14 +491,15 @@ export async function createEnterpriseAuthorizationRuntime(
       outbound,
       fileBinary,
     });
-    runtimeRecords.set(runtime, {
+    runtimeRecord = {
       active: true,
       guard,
       fileBinary,
       outbound,
       unsubscribe,
       teardownPromise: null,
-    });
+    };
+    runtimeRecords.set(runtime, runtimeRecord);
     return runtime;
   } catch {
     unsubscribe?.();
