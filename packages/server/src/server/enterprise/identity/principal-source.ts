@@ -1,21 +1,37 @@
 import { z } from "zod";
-import type { OrganizationId } from "@getpaseo/protocol/messages";
+import {
+  OrganizationIdSchema,
+  PrincipalIdSchema,
+  type OrganizationId,
+} from "@getpaseo/protocol/messages";
 import type { PrincipalGrantSource } from "./registry.js";
 import type { IdentityRegistryFsPort } from "./fs-port.js";
 
 const PrincipalMetadataSchema = z
   .strictObject({
-    principalId: z.string().min(1),
-    organizationId: z.string().min(1),
+    principalId: PrincipalIdSchema,
+    organizationId: OrganizationIdSchema,
     principalType: z.enum(["human", "service"]),
     displayName: z.string().min(1).optional(),
     metadata: z.record(z.string(), z.string()).optional(),
   })
   .refine((value) => value.principalId !== "owner", "break-glass owner is not durable");
-const IdentityDocumentSchema = z.strictObject({
-  version: z.literal(1),
-  principals: z.record(z.string(), PrincipalMetadataSchema),
-});
+const IdentityDocumentSchema = z
+  .strictObject({
+    version: z.literal(1),
+    principals: z.record(z.string(), PrincipalMetadataSchema),
+  })
+  .superRefine((document, ctx) => {
+    for (const [key, value] of Object.entries(document.principals)) {
+      if (key !== value.principalId) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["principals", key],
+          message: "principal key mismatch",
+        });
+      }
+    }
+  });
 
 export function createFilePrincipalGrantSource(input: {
   readonly filePath: string;
