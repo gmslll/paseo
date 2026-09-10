@@ -221,8 +221,8 @@ class FaultFiles implements AuditFileSystem {
   ) {
     const syntheticNoFollowFlag = 0x40000000;
     this.noFollowFlag = noFollowFlag ?? (fileConstants.O_NOFOLLOW || syntheticNoFollowFlag);
-    this.delegateNoFollowFlag = fileConstants.O_NOFOLLOW || syntheticNoFollowFlag;
-    this.node = new NodeAuditFileSystem(this.delegateNoFollowFlag);
+    this.delegateNoFollowFlag = fileConstants.O_NOFOLLOW === 0 ? syntheticNoFollowFlag : 0;
+    this.node = new NodeAuditFileSystem(fileConstants.O_NOFOLLOW || syntheticNoFollowFlag);
   }
 
   async ensureDirectory(directory: string, mode: number): Promise<void> {
@@ -236,7 +236,7 @@ class FaultFiles implements AuditFileSystem {
     const fault = this.record("directory.open", "open:directory");
     this.opens.push({ kind: "directory", name: path.basename(directory), flags });
     this.throwBefore(fault, "directory.open");
-    const handle = await this.node.openDirectory(directory, flags & ~this.noFollowFlag);
+    const handle = await this.node.openDirectory(directory, flags & ~this.delegateNoFollowFlag);
     this.throwAfter(fault, "directory.open");
     const label = `directory${++this.nextHandleId}`;
     return this.wrapDirectory(handle, label);
@@ -315,7 +315,7 @@ class FaultFiles implements AuditFileSystem {
         const fault = this.record(`${kind}.open`, `open:${kind}`);
         this.opens.push({ kind: "file", name, flags, mode });
         this.throwBefore(fault, `${kind}.open`);
-        const fileHandle = await handle.openFile(name, flags & ~this.noFollowFlag, mode);
+        const fileHandle = await handle.openFile(name, flags & ~this.delegateNoFollowFlag, mode);
         this.throwAfter(fault, `${kind}.open`);
         const fileLabel = `${kind}${++this.nextHandleId}`;
         return this.wrapFile(fileHandle, kind, fileLabel);

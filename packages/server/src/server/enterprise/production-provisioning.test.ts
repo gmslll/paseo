@@ -67,6 +67,8 @@ describe("production enterprise initial provisioning orchestration", () => {
   });
 
   test("fails before persistence when audit/current authority is unavailable", async () => {
+    const homeInput = await mkdtemp(path.join(os.tmpdir(), "paseo-enterprise-init-unavailable-"));
+    const home = await realpath(homeInput);
     const ports = {
       current: () => false,
       authenticateBreakGlass: vi.fn(),
@@ -74,18 +76,22 @@ describe("production enterprise initial provisioning orchestration", () => {
       provisionInitialGrant: vi.fn(),
       issueInitialCredential: vi.fn(),
     };
-    await expect(
-      provisionProductionEnterpriseInitialAdmin(
-        {
-          paseoHome: "/tmp/paseo",
-          organizationId: organization,
-          principalId: principal,
-          grants: [],
-        },
-        ports,
-        "password",
-      ),
-    ).rejects.toThrow(/unavailable/);
-    expect(ports.authenticateBreakGlass).not.toHaveBeenCalled();
+    try {
+      await expect(
+        provisionProductionEnterpriseInitialAdmin(
+          {
+            paseoHome: home,
+            organizationId: organization,
+            principalId: principal,
+            grants: [],
+          },
+          ports,
+          "password",
+        ),
+      ).rejects.toThrow(/unavailable/);
+      expect(ports.authenticateBreakGlass).not.toHaveBeenCalled();
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });
