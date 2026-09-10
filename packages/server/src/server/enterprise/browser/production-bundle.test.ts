@@ -221,13 +221,14 @@ describe("production browser lease bundle", () => {
         lifecycleGeneration: "session-1",
       });
 
-      await expect(
-        bundle.pageIdentity.verify({
-          browserId: "11111111-1111-4111-8111-111111111111",
-          browserProfileId: created.browserProfileId,
-          bindingRevision: "binding-1",
-        }),
-      ).resolves.toMatchObject({ observationRevision: "observation-1" });
+      const proof = await bundle.pageIdentity.verify({
+        browserId: "11111111-1111-4111-8111-111111111111",
+        browserProfileId: created.browserProfileId,
+        bindingRevision: "binding-1",
+      });
+      expect(proof).toMatchObject({ observationRevision: "observation-1" });
+      await bundle.invalidateHost("browser-route-1");
+      await expect(bundle.pageIdentity.recheck(proof)).resolves.toBeUndefined();
       expect(bundle.pageIdentityObservationRegistration.manifest.operations).toEqual([
         "enterprise.browser.page_identity.observe.request",
       ]);

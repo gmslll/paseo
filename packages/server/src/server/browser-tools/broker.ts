@@ -36,7 +36,7 @@ import {
 } from "./page-identity-registry.js";
 
 export interface BrowserHostClient {
-  /** Opaque server-assigned registration identity. Never sourced from a host payload. */
+  /** Opaque server-assigned transport route/registration identity. Not an authenticated client ID. */
   id: string;
   hostKind: string;
   supportedCommands: readonly BrowserAutomationCommandName[];
@@ -66,6 +66,7 @@ export interface EnterpriseBrowserToolsExecuteInput {
 
 export interface EnterpriseBrowserProfileHostBindingInput {
   handle: EnterpriseAgentContextHandle;
+  /** Browser transport route/registration identity, not the authenticated client ID. */
   hostClientId: string;
 }
 
@@ -87,7 +88,7 @@ export interface EnterpriseBrowserToolsRuntime {
 }
 
 interface PendingBrowserToolsRequest {
-  clientId: string;
+  routeId: string;
   request: BrowserAutomationExecuteRequest;
   enterpriseAuthorization?: BrowserProfileLeaseAuthorization;
   rememberAffinity: boolean;
@@ -96,7 +97,7 @@ interface PendingBrowserToolsRequest {
 }
 
 interface RegisteredBrowserHost {
-  id: string;
+  routeId: string;
   hostKind: string;
   sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void | Promise<void>;
   enterpriseProfiles?: Readonly<{ version: 1 }>;
@@ -112,7 +113,7 @@ export interface BrowserToolsBrokerOptions {
   createRequestId?: () => string;
   enterprise?: EnterpriseBrowserToolsRuntime;
   pageIdentity?: BrowserPageIdentityRegistry;
-  onHostTeardownError?: (error: Error, hostClientId: string) => void;
+  onHostTeardownError?: (error: Error, routeId: string) => void;
 }
 
 interface EnterpriseRuntimeSnapshot {
@@ -165,7 +166,7 @@ export class BrowserToolsBroker {
   private readonly createRequestId: () => string;
   private readonly enterpriseRuntime: EnterpriseRuntimeSnapshot | null;
   private readonly pageIdentity: BrowserPageIdentityRegistry | null;
-  private readonly onHostTeardownError: (error: Error, hostClientId: string) => void;
+  private readonly onHostTeardownError: (error: Error, routeId: string) => void;
   private readonly clients = new Map<string, RegisteredBrowserHost>();
   private readonly pending = new Map<string, PendingBrowserToolsRequest>();
   private readonly browserHostByBrowserId = new Map<string, string>();
@@ -222,26 +223,26 @@ export class BrowserToolsBroker {
 
   public registerClient(client: BrowserHostClient): () => void {
     const snapshot = snapshotBrowserHostClient(client);
-    const existing = this.clients.get(snapshot.id);
+    const existing = this.clients.get(snapshot.routeId);
     if (existing) {
       this.detachRegisteredClient(existing);
-      this.beginHostTeardown(snapshot.id);
+      this.beginHostTeardown(snapshot.routeId);
     }
-    const teardownBarrier = this.hostTeardownBarriers.get(snapshot.id);
+    const teardownBarrier = this.hostTeardownBarriers.get(snapshot.routeId);
     const registeredAt = ++this.registrationSequence;
     let host!: RegisteredBrowserHost;
     const ready = teardownBarrier
       ? teardownBarrier.then(
           () => {
-            if (this.clients.get(snapshot.id) !== host) {
+            if (this.clients.get(snapshot.routeId) !== host) {
               return false;
             }
             this.readyHosts.add(host);
             return true;
           },
           () => {
-            if (this.clients.get(snapshot.id) === host) {
-              this.clients.delete(snapshot.id);
+            if (this.clients.get(snapshot.routeId) === host) {
+              this.clients.delete(snapshot.routeId);
             }
             return false;
           },
@@ -252,51 +253,53 @@ export class BrowserToolsBroker {
       registeredAt,
       ready,
     });
-    this.clients.set(snapshot.id, host);
+    this.clients.set(snapshot.routeId, host);
     if (!teardownBarrier) {
       this.readyHosts.add(host);
     }
-    return () => this.unregisterClient(snapshot.id, registeredAt);
+    return () => this.unregisterClient(snapshot.routeId, registeredAt);
   }
 
-  public unregisterClient(clientId: string, registeredAt?: number): void {
-    const current = this.clients.get(clientId);
+  public unregisterClient(routeId: string, registeredAt?: number): void {
+    const current = this.clients.get(routeId);
     if (!current || (registeredAt !== undefined && current.registeredAt !== registeredAt)) {
       return;
     }
     this.detachRegisteredClient(current);
-    this.beginHostTeardown(clientId);
+    this.beginHostTeardown(routeId);
   }
 
   private detachRegisteredClient(current: RegisteredBrowserHost): void {
-    const clientId = current.id;
-    if (this.clients.get(clientId) === current) {
-      this.clients.delete(clientId);
+    const routeId = current.routeId;
+    if (this.clients.get(routeId) === current) {
+      this.clients.delete(routeId);
     }
     this.readyHosts.delete(current);
-    this.pageIdentity?.invalidateHost(clientId);
+    if (current.authenticatedSession) {
+      this.pageIdentity?.invalidateHostSession(current.authenticatedSession);
+    }
 
-    for (const [browserId, ownerClientId] of this.browserHostByBrowserId) {
-      if (ownerClientId !== clientId) {
+    for (const [browserId, ownerRouteId] of this.browserHostByBrowserId) {
+      if (ownerRouteId !== routeId) {
         continue;
       }
       this.browserHostByBrowserId.delete(browserId);
-      this.strandedBrowserHostByBrowserId.set(browserId, clientId);
+      this.strandedBrowserHostByBrowserId.set(browserId, routeId);
     }
 
-    for (const [affinityKey, ownerClientId] of this.enterpriseBrowserHostByAffinity) {
-      if (ownerClientId === clientId) {
+    for (const [affinityKey, ownerRouteId] of this.enterpriseBrowserHostByAffinity) {
+      if (ownerRouteId === routeId) {
         this.enterpriseBrowserHostByAffinity.delete(affinityKey);
       }
     }
-    for (const [profileKey, ownerClientId] of this.enterpriseBrowserHostByProfile) {
-      if (ownerClientId === clientId) {
+    for (const [profileKey, ownerRouteId] of this.enterpriseBrowserHostByProfile) {
+      if (ownerRouteId === routeId) {
         this.enterpriseBrowserHostByProfile.delete(profileKey);
       }
     }
 
     for (const [requestId, pending] of this.pending) {
-      if (pending.clientId !== clientId) {
+      if (pending.routeId !== routeId) {
         continue;
       }
       this.pending.delete(requestId);
@@ -312,22 +315,22 @@ export class BrowserToolsBroker {
     }
   }
 
-  private beginHostTeardown(clientId: string): Promise<void> {
+  private beginHostTeardown(routeId: string): Promise<void> {
     if (!this.enterpriseRuntime) {
       return Promise.resolve();
     }
-    const prior = this.hostTeardownBarriers.get(clientId) ?? Promise.resolve();
-    const barrier = prior.then(() => this.enterpriseRuntime!.invalidateHost(clientId));
-    this.hostTeardownBarriers.set(clientId, barrier);
+    const prior = this.hostTeardownBarriers.get(routeId) ?? Promise.resolve();
+    const barrier = prior.then(() => this.enterpriseRuntime!.invalidateHost(routeId));
+    this.hostTeardownBarriers.set(routeId, barrier);
     void barrier.then(
       () => {
-        if (this.hostTeardownBarriers.get(clientId) === barrier) {
-          this.hostTeardownBarriers.delete(clientId);
+        if (this.hostTeardownBarriers.get(routeId) === barrier) {
+          this.hostTeardownBarriers.delete(routeId);
         }
         return undefined;
       },
       (error: unknown) => {
-        this.onHostTeardownError(toError(error), clientId);
+        this.onHostTeardownError(toError(error), routeId);
         return undefined;
       },
     );
@@ -468,7 +471,7 @@ export class BrowserToolsBroker {
       if (!selected.ok) {
         result = selected.payload;
       } else {
-        await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value.id);
+        await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value);
         const unsupported = this.unsupportedCommandFailure({
           host: selected.value,
           commandName: snapshot.command.command,
@@ -503,7 +506,7 @@ export class BrowserToolsBroker {
           await runtime.attachHost({
             handle: snapshot.handle,
             lease,
-            hostClientId: selected.value.id,
+            hostClientId: selected.value.routeId,
           });
           await this.assertAuthorizationStillCurrent(
             runtime,
@@ -511,7 +514,7 @@ export class BrowserToolsBroker {
             handleAuthority,
             authorization,
           );
-          await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value.id);
+          await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value);
           result = await this.sendRequest({
             host: selected.value,
             request,
@@ -528,10 +531,15 @@ export class BrowserToolsBroker {
           );
           if (
             result.ok &&
-            this.clients.get(selected.value.id) === selected.value &&
+            this.clients.get(selected.value.routeId) === selected.value &&
             this.readyHosts.has(selected.value)
           ) {
-            this.rememberBrowserHostForPayload(selected.value.id, result, request, authorization);
+            this.rememberBrowserHostForPayload(
+              selected.value.routeId,
+              result,
+              request,
+              authorization,
+            );
           } else if (result.ok) {
             result = this.noBrowserHostFailure(requestId);
           }
@@ -608,7 +616,7 @@ export class BrowserToolsBroker {
       await runtime.attachHost({
         handle: snapshot.handle,
         lease,
-        hostClientId: host.id,
+        hostClientId: host.routeId,
       });
       await this.assertAuthorizationStillCurrent(
         runtime,
@@ -632,7 +640,7 @@ export class BrowserToolsBroker {
         handleAuthority,
         authorization,
       );
-      if ((await this.getReadyHost(host.id)) !== host) {
+      if ((await this.getReadyHost(host.routeId)) !== host) {
         return false;
       }
       await this.assertAuthorizationStillCurrent(
@@ -645,7 +653,7 @@ export class BrowserToolsBroker {
         getEnterpriseBrowserProfileKey({
           authorization,
         }),
-        host.id,
+        host.routeId,
       );
       return true;
     } catch {
@@ -692,14 +700,26 @@ export class BrowserToolsBroker {
   private async recheckPageIdentityExecution(
     input: EnterprisePageIdentityExecution | null,
     authorization: BrowserProfileLeaseAuthorization,
-    hostClientId?: string,
+    host?: RegisteredBrowserHost,
   ): Promise<void> {
     if (!input || !this.pageIdentity) return;
+    const authenticatedSession = host?.authenticatedSession;
+    if (
+      host &&
+      (!authenticatedSession || this.failedPageIdentitySessions.has(authenticatedSession))
+    ) {
+      throw new Error("Authenticated Browser host Session is unavailable.");
+    }
     await this.pageIdentity.recheck(input.verification, {
       browserId: input.browserId,
       browserProfileId: authorization.profile.browserProfileId,
       bindingRevision: authorization.bindingRevision,
-      ...(hostClientId ? { hostClientId } : {}),
+      ...(authenticatedSession
+        ? {
+            hostClientId: authenticatedSession.clientId,
+            hostSessionBindingGeneration: authenticatedSession.sessionBindingGeneration,
+          }
+        : {}),
     });
   }
 
@@ -752,12 +772,12 @@ export class BrowserToolsBroker {
     return pendingHosts.length > 0 ? Promise.all(pendingHosts.map((host) => host.ready)) : null;
   }
 
-  private async getReadyHost(clientId: string): Promise<RegisteredBrowserHost | null> {
-    const host = this.clients.get(clientId);
+  private async getReadyHost(routeId: string): Promise<RegisteredBrowserHost | null> {
+    const host = this.clients.get(routeId);
     if (
       !host ||
       !(await host.ready) ||
-      this.clients.get(clientId) !== host ||
+      this.clients.get(routeId) !== host ||
       !this.readyHosts.has(host)
     ) {
       return null;
@@ -790,10 +810,10 @@ export class BrowserToolsBroker {
     throw new Error("Unable to allocate a unique Browser automation request ID.");
   }
 
-  private allocateDerivedRequestId(baseRequestId: string, hostClientId: string): string {
+  private allocateDerivedRequestId(baseRequestId: string, routeId: string): string {
     for (let attempt = 0; attempt < MAX_REQUEST_ID_ALLOCATION_ATTEMPTS; attempt += 1) {
       const suffix = attempt === 0 ? "" : `:${attempt}`;
-      const requestId = `${baseRequestId}:${hostClientId}${suffix}`;
+      const requestId = `${baseRequestId}:${routeId}${suffix}`;
       try {
         this.claimRequestId(requestId);
         return requestId;
@@ -859,7 +879,7 @@ export class BrowserToolsBroker {
     clearTimeout(pending.timeout);
     if (pending.rememberAffinity) {
       this.rememberBrowserHostForPayload(
-        pending.clientId,
+        pending.routeId,
         parsed.data.payload,
         pending.request,
         pending.enterpriseAuthorization,
@@ -904,7 +924,10 @@ export class BrowserToolsBroker {
     try {
       hostResponses = await Promise.all(
         hosts.map(async (host) => {
-          const childRequestId = this.allocateDerivedRequestId(params.request.requestId, host.id);
+          const childRequestId = this.allocateDerivedRequestId(
+            params.request.requestId,
+            host.routeId,
+          );
           childRequestIds.push(childRequestId);
           return {
             host,
@@ -929,7 +952,7 @@ export class BrowserToolsBroker {
     }
 
     for (const { host, payload } of hostResponses) {
-      this.rememberBrowserHostForPayload(host.id, payload, params.request);
+      this.rememberBrowserHostForPayload(host.routeId, payload, params.request);
     }
 
     return {
@@ -979,9 +1002,9 @@ export class BrowserToolsBroker {
         : { ok: false, payload: this.noBrowserHostFailure(requestId) };
     }
 
-    const ownerClientId = this.browserHostByBrowserId.get(browserId);
-    if (ownerClientId) {
-      const host = this.clients.get(ownerClientId);
+    const ownerRouteId = this.browserHostByBrowserId.get(browserId);
+    if (ownerRouteId) {
+      const host = this.clients.get(ownerRouteId);
       if (host && this.readyHosts.has(host)) {
         return { ok: true, value: host };
       }
@@ -991,12 +1014,12 @@ export class BrowserToolsBroker {
       };
     }
 
-    const strandedOwnerClientId = this.strandedBrowserHostByBrowserId.get(browserId);
-    if (strandedOwnerClientId) {
-      const reconnectedHost = this.clients.get(strandedOwnerClientId);
+    const strandedOwnerRouteId = this.strandedBrowserHostByBrowserId.get(browserId);
+    if (strandedOwnerRouteId) {
+      const reconnectedHost = this.clients.get(strandedOwnerRouteId);
       if (reconnectedHost && this.readyHosts.has(reconnectedHost)) {
         this.strandedBrowserHostByBrowserId.delete(browserId);
-        this.browserHostByBrowserId.set(browserId, strandedOwnerClientId);
+        this.browserHostByBrowserId.set(browserId, strandedOwnerRouteId);
         return { ok: true, value: reconnectedHost };
       }
       return {
@@ -1058,8 +1081,8 @@ export class BrowserToolsBroker {
     const homeNodeId = authorization.profile.homeNodeId;
     const eligibleHosts = this.listEnterpriseHostsForNode(homeNodeId);
     const profileKey = getEnterpriseBrowserProfileKey({ authorization });
-    const profileOwnerClientId = this.enterpriseBrowserHostByProfile.get(profileKey);
-    const routedHost = profileOwnerClientId ? this.clients.get(profileOwnerClientId) : undefined;
+    const profileOwnerRouteId = this.enterpriseBrowserHostByProfile.get(profileKey);
+    const routedHost = profileOwnerRouteId ? this.clients.get(profileOwnerRouteId) : undefined;
     if (routedHost && !this.isEnterpriseHostForNode(routedHost, homeNodeId)) {
       this.enterpriseBrowserHostByProfile.delete(profileKey);
     }
@@ -1094,8 +1117,8 @@ export class BrowserToolsBroker {
       };
     }
     const affinityKey = getEnterpriseBrowserAffinityKey({ authorization, browserId });
-    const ownerClientId = this.enterpriseBrowserHostByAffinity.get(affinityKey);
-    const host = ownerClientId ? this.clients.get(ownerClientId) : undefined;
+    const ownerRouteId = this.enterpriseBrowserHostByAffinity.get(affinityKey);
+    const host = ownerRouteId ? this.clients.get(ownerRouteId) : undefined;
     if (host && this.isEnterpriseHostForNode(host, homeNodeId)) {
       return { ok: true, value: host };
     }
@@ -1182,7 +1205,7 @@ export class BrowserToolsBroker {
   }
 
   private rememberBrowserHostForPayload(
-    clientId: string,
+    routeId: string,
     payload: BrowserToolsResponsePayload,
     request: BrowserAutomationExecuteRequest,
     enterpriseAuthorization?: BrowserProfileLeaseAuthorization,
@@ -1195,13 +1218,13 @@ export class BrowserToolsBroker {
       if (!request.workspaceId || !enterpriseAuthorization) {
         return;
       }
-      this.rememberEnterpriseBrowserHostForPayload(clientId, payload, enterpriseAuthorization);
+      this.rememberEnterpriseBrowserHostForPayload(routeId, payload, enterpriseAuthorization);
       return;
     }
 
     if (payload.result.command === "list_tabs") {
       for (const tab of payload.result.tabs) {
-        this.browserHostByBrowserId.set(tab.browserId, clientId);
+        this.browserHostByBrowserId.set(tab.browserId, routeId);
         this.strandedBrowserHostByBrowserId.delete(tab.browserId);
       }
       return;
@@ -1214,20 +1237,20 @@ export class BrowserToolsBroker {
     }
 
     if ("browserId" in payload.result) {
-      this.browserHostByBrowserId.set(payload.result.browserId, clientId);
+      this.browserHostByBrowserId.set(payload.result.browserId, routeId);
       this.strandedBrowserHostByBrowserId.delete(payload.result.browserId);
     }
   }
 
   private rememberEnterpriseBrowserHostForPayload(
-    clientId: string,
+    routeId: string,
     payload: Extract<BrowserToolsResponsePayload, { ok: true }>,
     authorization: BrowserProfileLeaseAuthorization,
   ): void {
     const affinityKey = (browserId: string): string =>
       getEnterpriseBrowserAffinityKey({ authorization, browserId });
 
-    const host = this.clients.get(clientId);
+    const host = this.clients.get(routeId);
     const pageIdentity = this.pageIdentity;
     const authenticatedSession = host?.authenticatedSession;
     if (
@@ -1262,12 +1285,12 @@ export class BrowserToolsBroker {
 
     this.enterpriseBrowserHostByProfile.set(
       getEnterpriseBrowserProfileKey({ authorization }),
-      clientId,
+      routeId,
     );
 
     if (payload.result.command === "list_tabs") {
       for (const tab of payload.result.tabs) {
-        this.enterpriseBrowserHostByAffinity.set(affinityKey(tab.browserId), clientId);
+        this.enterpriseBrowserHostByAffinity.set(affinityKey(tab.browserId), routeId);
       }
       return;
     }
@@ -1277,7 +1300,7 @@ export class BrowserToolsBroker {
       return;
     }
     if ("browserId" in payload.result) {
-      this.enterpriseBrowserHostByAffinity.set(affinityKey(payload.result.browserId), clientId);
+      this.enterpriseBrowserHostByAffinity.set(affinityKey(payload.result.browserId), routeId);
     }
   }
 
@@ -1286,7 +1309,7 @@ export class BrowserToolsBroker {
       this.failedPageIdentitySessions.add(host.authenticatedSession);
     }
     this.detachRegisteredClient(host);
-    this.beginHostTeardown(host.id);
+    this.beginHostTeardown(host.routeId);
   }
 
   private responseSenderMatches(
@@ -1294,7 +1317,7 @@ export class BrowserToolsBroker {
     senderId: string | null,
   ): boolean {
     if (senderId !== null) {
-      return senderId === pending.clientId;
+      return senderId === pending.routeId;
     }
     return pending.request.enterpriseContext === undefined;
   }
@@ -1329,7 +1352,7 @@ export class BrowserToolsBroker {
     timeoutMs: number;
   }): Promise<BrowserToolsResponsePayload> {
     const { host, request, timeoutMs } = params;
-    if (this.clients.get(host.id) !== host || !this.readyHosts.has(host)) {
+    if (this.clients.get(host.routeId) !== host || !this.readyHosts.has(host)) {
       return Promise.resolve(this.noBrowserHostFailure(request.requestId));
     }
     return new Promise<BrowserToolsResponsePayload>((resolve) => {
@@ -1348,7 +1371,7 @@ export class BrowserToolsBroker {
       }, timeoutMs);
 
       this.pending.set(request.requestId, {
-        clientId: host.id,
+        routeId: host.routeId,
         request,
         ...(params.enterpriseAuthorization
           ? { enterpriseAuthorization: params.enterpriseAuthorization }
@@ -1775,7 +1798,6 @@ function snapshotBrowserHostClient(
 
   const { enterpriseCapability, trustedHomeNodeId, trustedSession } =
     snapshotEnterpriseBrowserHostIdentity({
-      id,
       enterpriseProfiles,
       homeNodeId,
       authenticatedSession,
@@ -1794,7 +1816,7 @@ function snapshotBrowserHostClient(
     ...(trustedSession ? { authenticatedSession: trustedSession } : {}),
   });
   return Object.freeze({
-    id,
+    routeId: id,
     hostKind: hostKind.trim(),
     supportedCommands: new Set(commands),
     sendBrowserAutomationRequest: (request: BrowserAutomationExecuteRequest) =>
@@ -1807,7 +1829,6 @@ function snapshotBrowserHostClient(
 }
 
 function snapshotEnterpriseBrowserHostIdentity(input: {
-  id: string;
   enterpriseProfiles: unknown;
   homeNodeId: unknown;
   authenticatedSession: unknown;
@@ -1816,7 +1837,7 @@ function snapshotEnterpriseBrowserHostIdentity(input: {
   trustedHomeNodeId?: string;
   trustedSession?: AuthenticatedBrowserHostSession;
 } {
-  const { id, enterpriseProfiles, homeNodeId, authenticatedSession } = input;
+  const { enterpriseProfiles, homeNodeId, authenticatedSession } = input;
   if (enterpriseProfiles === undefined) {
     if (homeNodeId !== undefined || authenticatedSession !== undefined) {
       throw new Error("A legacy Browser host cannot claim Enterprise authority.");
@@ -1839,7 +1860,6 @@ function snapshotEnterpriseBrowserHostIdentity(input: {
   if (authenticatedSession === undefined) return { enterpriseCapability, trustedHomeNodeId };
   if (
     !isAuthenticatedBrowserHostSession(authenticatedSession) ||
-    authenticatedSession.clientId !== id ||
     authenticatedSession.homeNodeId !== homeNodeId
   ) {
     throw new Error("Enterprise Browser host Session does not match its registration.");

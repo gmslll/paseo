@@ -202,7 +202,82 @@ describe("BrowserPageIdentityRegistry", () => {
         bindingRevision: BINDING_REVISION,
         hostClientId: "desktop-client-1",
       }),
+    ).rejects.toMatchObject({ reasonCode: "observation_unavailable" });
+    await expect(
+      registry.recheck(proof, {
+        browserId: BROWSER_ID,
+        browserProfileId: PROFILE_ID,
+        bindingRevision: BINDING_REVISION,
+        hostClientId: "desktop-client-1",
+        hostSessionBindingGeneration: "session-1",
+      }),
     ).resolves.toBeUndefined();
+  });
+
+  test("isolates two authenticated Sessions for the same client and tears down only the exact generation", async () => {
+    const registry = new BrowserPageIdentityRegistry({
+      profiles: { get: async () => profile() },
+    });
+    const oldHost = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-shared",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-old",
+    });
+    const newHost = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-shared",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "session-new",
+    });
+    const target = {
+      browserId: BROWSER_ID,
+      browserProfileId: PROFILE_ID,
+      bindingRevision: BINDING_REVISION,
+    };
+    registry.registerBrowser({ host: oldHost, ...target });
+    registry.registerBrowser({ host: newHost, ...target });
+    await registry.observe(
+      oldHost,
+      observation({
+        lifecycleGeneration: "session-old",
+        observationRevision: "observation-old",
+      }),
+    );
+    await registry.observe(
+      newHost,
+      observation({
+        lifecycleGeneration: "session-new",
+        observationRevision: "observation-new",
+      }),
+    );
+
+    const oldProof = await registry.verify({
+      ...target,
+      hostClientId: "desktop-client-shared",
+      hostSessionBindingGeneration: "session-old",
+    });
+    const newProof = await registry.verify({
+      ...target,
+      hostClientId: "desktop-client-shared",
+      hostSessionBindingGeneration: "session-new",
+    });
+    expect(oldProof.observationRevision).toBe("observation-old");
+    expect(newProof.observationRevision).toBe("observation-new");
+
+    registry.invalidateHostSession(structuredClone(oldHost));
+    await expect(registry.recheck(oldProof)).resolves.toBeUndefined();
+    registry.invalidateHostSession(oldHost);
+
+    await expect(registry.recheck(oldProof)).rejects.toMatchObject({
+      reasonCode: "observation_stale",
+    });
+    await expect(registry.recheck(newProof)).resolves.toBeUndefined();
+    await expect(
+      registry.verify({
+        ...target,
+        hostClientId: "desktop-client-shared",
+        hostSessionBindingGeneration: "session-new",
+      }),
+    ).resolves.toMatchObject({ observationRevision: "observation-new" });
   });
 
   test.each([
@@ -260,7 +335,7 @@ describe("BrowserPageIdentityRegistry", () => {
         instance.registry.invalidateBinding(PROFILE_ID, BINDING_REVISION),
       (instance: ReturnType<typeof fixture>) => instance.registry.invalidateSession("session-1"),
       (instance: ReturnType<typeof fixture>) =>
-        instance.registry.invalidateHost("desktop-client-1"),
+        instance.registry.invalidateHostSession(instance.host),
     ];
     for (const [index, invalidate] of invalidators.entries()) {
       const instance = fixture();
@@ -458,7 +533,7 @@ describe("BrowserPageIdentityRegistry", () => {
         bindingRevision: BINDING_REVISION,
       }),
     ).toThrow(BrowserPageIdentityVerificationError);
-    registry.invalidateHost("desktop-client-1");
+    registry.invalidateHostSession(host);
     const nextHost = createAuthenticatedBrowserHostSession({
       clientId: "desktop-client-1",
       homeNodeId: NODE_ID,

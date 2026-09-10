@@ -178,7 +178,7 @@ export interface ProductionBrowserLeaseBundle {
   readonly bindings: BrowserProfileBindingRegistry;
   readonly leases: BrowserProfileLeaseManager;
   readonly close: () => Promise<void>;
-  readonly invalidateHost: (hostClientId: string) => Promise<void>;
+  readonly invalidateHost: (routeId: string) => Promise<void>;
   readonly invalidateSession: (generation: string) => Promise<void>;
   readonly bindSessionAuthority: (input: {
     generation: string;
@@ -333,10 +333,9 @@ export function createProductionBrowserLeaseBundle(
     pageIdentityVerifier,
     pageIdentityObservationRegistration,
     pageIdentityInvalidationRegistration,
-    invalidateHost: (hostClientId) => {
-      pageIdentity.invalidateHost(hostClientId);
-      return leases.invalidateHost(hostClientId);
-    },
+    // This ID is the Broker transport route. Page identity retirement requires the exact
+    // nominal authenticated Session and is performed by the Broker registration lifecycle.
+    invalidateHost: (routeId) => leases.invalidateHost(routeId),
     invalidateSession: (generation) => {
       pageIdentity.invalidateSession(generation);
       return leases.invalidateSession(generation);

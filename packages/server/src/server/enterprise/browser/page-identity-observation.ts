@@ -75,7 +75,7 @@ function createRegistration(
         close: () => {
           if (closed) return;
           closed = true;
-          registry.invalidateSession(session.context.sessionBindingGeneration);
+          registry.invalidateHostSession(host);
         },
       });
     },

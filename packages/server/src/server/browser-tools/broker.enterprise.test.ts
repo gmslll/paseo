@@ -1221,6 +1221,153 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     expect(replacement.respond(fixture.broker, oldRequest, newTabSuccess(oldRequest))).toBe(false);
   });
 
+  test("keeps transport routes separate from same-client authenticated Session generations", async () => {
+    const fixture = await createEnterpriseFixture();
+    const pageIdentity = fixture.pageIdentity;
+    if (!pageIdentity) throw new Error("Expected Browser page identity registry.");
+    const oldSession = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-shared",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "host-session-old",
+    });
+    const newSession = createAuthenticatedBrowserHostSession({
+      clientId: "desktop-client-shared",
+      homeNodeId: NODE_ID,
+      sessionBindingGeneration: "host-session-new",
+    });
+    const oldHost = new EnterpriseHost("browser-route-old", {
+      authenticatedSession: oldSession,
+    });
+    const newHost = new EnterpriseHost("browser-route-new", {
+      authenticatedSession: newSession,
+    });
+    const unregisterOld = fixture.broker.registerClient(oldHost);
+    fixture.broker.registerClient(newHost);
+    expect(fixture.broker.getRegisteredClientCount()).toBe(2);
+
+    const registration = {
+      browserId: BROWSER_A,
+      browserProfileId: PROFILE_A,
+      bindingRevision: "binding-workspace-a",
+    };
+    pageIdentity.registerBrowser({ host: oldSession, ...registration });
+    pageIdentity.registerBrowser({ host: newSession, ...registration });
+    await pageIdentity.observe(oldSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-old-route",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-old-route",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "host-session-old",
+    });
+    await pageIdentity.observe(newSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "observe-new-route",
+      browser: { browserId: BROWSER_A, browserProfileId: PROFILE_A },
+      hostname: "shop.example",
+      accountLabelHash: "sha256:account-a",
+      observationRevision: "observation-new-route",
+      bindingRevision: "binding-workspace-a",
+      lifecycleGeneration: "host-session-new",
+    });
+    const oldProof = await pageIdentity.verify({
+      ...registration,
+      hostClientId: "desktop-client-shared",
+      hostSessionBindingGeneration: "host-session-old",
+    });
+    const newProof = await pageIdentity.verify({
+      ...registration,
+      hostClientId: "desktop-client-shared",
+      hostSessionBindingGeneration: "host-session-new",
+    });
+
+    await expect(
+      fixture.broker.bindEnterpriseProfileHost({
+        handle: fixture.handles.a,
+        hostClientId: newHost.id,
+      }),
+    ).resolves.toBe(true);
+    const execution = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "list_tabs", args: {} },
+    });
+    await vi.waitFor(() => expect(newHost.receivedRequests).toHaveLength(1));
+    const request = newHost.receivedRequests[0];
+    if (!request.enterpriseContext || !request.workspaceId) {
+      throw new Error("Expected enterprise list-tabs context.");
+    }
+    const response = {
+      type: "browser.automation.execute.response" as const,
+      payload: {
+        requestId: request.requestId,
+        ok: true as const,
+        enterpriseContext: request.enterpriseContext,
+        result: {
+          command: "list_tabs" as const,
+          tabs: [
+            {
+              browserId: BROWSER_A,
+              workspaceId: request.workspaceId,
+              enterpriseContext: request.enterpriseContext,
+              url: "https://shop.example",
+              title: "Shop",
+            },
+          ],
+        },
+      },
+    };
+    expect(fixture.broker.receiveResponse("desktop-client-shared", response)).toBe(false);
+    expect(fixture.broker.receiveResponse(newHost.id, response)).toBe(true);
+    await expect(execution).resolves.toMatchObject({ ok: true });
+
+    const beforeWrongGenerationAcquireCount = fixture.acquired.length;
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+        pageIdentityVerification: oldProof,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.acquired).toHaveLength(beforeWrongGenerationAcquireCount);
+    expect(newHost.receivedRequests).toHaveLength(1);
+
+    unregisterOld();
+    await fixture.manager.waitForIdle();
+    expect(fixture.broker.getRegisteredClientCount()).toBe(1);
+    await expect(pageIdentity.recheck(oldProof)).rejects.toMatchObject({
+      reasonCode: "observation_stale",
+    });
+    await expect(pageIdentity.recheck(newProof)).resolves.toBeUndefined();
+
+    const snapshot = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "snapshot", args: { browserId: BROWSER_A } },
+      pageIdentityVerification: newProof,
+    });
+    await vi.waitFor(() => expect(newHost.receivedRequests).toHaveLength(2));
+    const snapshotRequest = newHost.receivedRequests[1];
+    expect(
+      newHost.respond(fixture.broker, snapshotRequest, {
+        ok: true,
+        enterpriseContext: snapshotRequest.enterpriseContext,
+        result: {
+          command: "snapshot",
+          browserId: BROWSER_A,
+          workspaceId: snapshotRequest.workspaceId,
+          url: "https://shop.example",
+          title: "Shop",
+          format: "aria-yaml",
+          snapshot: "- document",
+          truncated: false,
+          stats: { nodeCount: 1, refCount: 0, textLength: 10 },
+        },
+      }),
+    ).toBe(true);
+    await expect(snapshot).resolves.toMatchObject({ ok: true });
+  });
+
   test("rejects wrong host, wrong lease, and wrong-Profile tabs without completing the request", async () => {
     const fixture = await createEnterpriseFixture();
     const host = new EnterpriseHost("host-a");
@@ -1529,6 +1676,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
         browserProfileId: PROFILE_A,
         bindingRevision: "binding-workspace-a",
         hostClientId: host.id,
+        hostSessionBindingGeneration: authenticatedSession.sessionBindingGeneration,
       }),
     ).resolves.toMatchObject({ observationRevision: "observation-before-new-tab" });
   });

@@ -39,7 +39,14 @@ const BrowserRegistrationInputSchema = z
 
 const VerificationTargetSchema = BrowserRegistrationInputSchema.extend({
   hostClientId: z.string().min(1).optional(),
-}).strict();
+  hostSessionBindingGeneration: z.string().min(1).optional(),
+})
+  .strict()
+  .refine(
+    (target) =>
+      (target.hostClientId === undefined) === (target.hostSessionBindingGeneration === undefined),
+    { message: "Browser host identity requires both client ID and Session generation." },
+  );
 
 export type BrowserPageIdentityFailureReason =
   | "account_label_mismatch"
@@ -93,6 +100,7 @@ export interface BrowserPageIdentityVerificationTarget {
   readonly browserProfileId: string;
   readonly bindingRevision: string;
   readonly hostClientId?: string;
+  readonly hostSessionBindingGeneration?: string;
 }
 
 export interface BrowserPageIdentityProfileSource {
@@ -390,7 +398,9 @@ export class BrowserPageIdentityRegistry {
           record.browserId === target.browserId &&
           record.browserProfileId === target.browserProfileId &&
           record.bindingRevision === target.bindingRevision &&
-          (target.hostClientId === undefined || record.host.clientId === target.hostClientId),
+          (target.hostClientId === undefined ||
+            (record.host.clientId === target.hostClientId &&
+              record.host.sessionBindingGeneration === target.hostSessionBindingGeneration)),
       )
       .sort((left, right) => right.sequence - left.sequence);
     const registration = candidates[0];
@@ -463,7 +473,9 @@ export class BrowserPageIdentityRegistry {
         proof.registration.browserProfileId !== target.browserProfileId ||
         proof.registration.bindingRevision !== target.bindingRevision ||
         (target.hostClientId !== undefined &&
-          proof.registration.host.clientId !== target.hostClientId)
+          (proof.registration.host.clientId !== target.hostClientId ||
+            proof.registration.host.sessionBindingGeneration !==
+              target.hostSessionBindingGeneration))
       ) {
         throw new BrowserPageIdentityVerificationError("observation_rebound");
       }
@@ -527,12 +539,12 @@ export class BrowserPageIdentityRegistry {
     }
   }
 
-  public invalidateHost(hostClientId: string): void {
-    const clientId = parseNonEmptyString(hostClientId, "clientId");
-    for (const [key, session] of this.hostSessions) {
-      if (session.host.clientId === clientId) {
-        this.retireHostSession(key, session);
-      }
+  public invalidateHostSession(host: AuthenticatedBrowserHostSession): void {
+    if (!isAuthenticatedBrowserHostSession(host)) return;
+    const key = authenticatedHostKey(host);
+    const session = this.hostSessions.get(key);
+    if (session && sameAuthenticatedHost(session.host, host)) {
+      this.retireHostSession(key, session);
     }
   }
 
