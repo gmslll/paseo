@@ -1576,6 +1576,83 @@ describe.runIf(process.platform === "darwin")("enterprise production binary auth
     await openingFixture.audit.close();
   });
 
+  test("public file explorer cleanup waits for blocked Begin delivery and emits no late frames", async () => {
+    const fixture = await createBinaryAuthorizationFixture("public-cleanup-barrier");
+    const beginDeliveryStarted = deferred<void>();
+    const releaseBeginDelivery = deferred<void>();
+    const delivered: Array<{ source: object; frame: Uint8Array }> = [];
+    const close = vi.fn(async () => {});
+    const workspaceRuntime = {
+      ...makeEnterpriseRuntime(async () => {}),
+      openRead: vi.fn(async () => ({
+        workspaceId: "workspace-1",
+        relativePath: "notes.txt",
+        size: 1,
+        mtimeMs: 0,
+        revision: "public-cleanup-r1",
+        read: async () => new Uint8Array([1]),
+        close,
+      })),
+    } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+    const session = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      onBinaryMessageToSource: async (source, frame) => {
+        delivered.push({ source, frame });
+        if (decodeFileTransferFrame(frame)?.opcode === FileTransferOpcode.FileBegin) {
+          beginDeliveryStarted.resolve();
+          await releaseBeginDelivery.promise;
+        }
+      },
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      enterpriseWorkspaceFilesRuntime: workspaceRuntime,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+    const source = Object.freeze({ id: "public-cleanup-source" });
+    const request = session.handleMessage(
+      {
+        type: "file_explorer_request",
+        cwd: "ignored",
+        workspaceId: "workspace-1",
+        path: "notes.txt",
+        mode: "file",
+        acceptBinary: true,
+        requestId: "public-cleanup-request",
+      },
+      source,
+    );
+    await beginDeliveryStarted.promise;
+    const internals = session as unknown as {
+      activeFileBinaryStreams: Map<object | undefined, Map<string, unknown>>;
+    };
+    expect(internals.activeFileBinaryStreams.size).toBe(1);
+    let cleanupSettled = false;
+    const cleanup = session.cleanup().then(() => (cleanupSettled = true));
+    expect(internals.activeFileBinaryStreams.size).toBe(0);
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(false);
+    releaseBeginDelivery.resolve();
+    await Promise.all([request, cleanup]);
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(true);
+    expect(internals.activeFileBinaryStreams.size).toBe(0);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.source).toBe(source);
+    expect(decodeFileTransferFrame(delivered[0]!.frame)?.opcode).toBe(FileTransferOpcode.FileBegin);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
+    await fixture.audit.close();
+  });
+
   test("rejects a wrong Session identity and leaves construction rollback to the caller", async () => {
     const fixture = await createBinaryAuthorizationFixture("construction-owner");
     const common = {
