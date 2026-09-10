@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { statSync } from "node:fs";
 import { describe, expect, test, vi } from "vitest";
 import type {
   AuditEvent,
@@ -199,7 +200,18 @@ class FaultFs implements IdentityRegistryFsPort {
 
   fsync(fd: number): void {
     this.visit({ operation: "fsync", fd, path: this.pathsByFd.get(fd) });
-    this.delegate.fsync(fd);
+    try {
+      this.delegate.fsync(fd);
+    } catch (error) {
+      const filePath = this.pathsByFd.get(fd);
+      if (
+        process.platform !== "win32" ||
+        !filePath ||
+        (error as NodeJS.ErrnoException).code !== "EPERM" ||
+        !statSync(filePath).isDirectory()
+      )
+        throw error;
+    }
   }
 
   rename(from: string, to: string): void {

@@ -1115,7 +1115,32 @@ export class VoiceAssistantWebSocketServer {
       },
     });
     wss.on("connection", (ws, request) => {
-      const task = this.attachAuthenticatedSocket(ws, request, password);
+      const socket = request.socket;
+      let paused = false;
+      if (socket && typeof socket.pause === "function") {
+        try {
+          socket.pause();
+          paused = true;
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to pause websocket during authentication");
+        }
+      } else {
+        paused = true;
+      }
+      if (!paused) {
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "WebSocket authentication unavailable");
+        return;
+      }
+      const task = this.attachAuthenticatedSocket(ws, request, password).finally(() => {
+        if (socket && typeof socket.resume === "function") {
+          try {
+            socket.resume();
+          } catch (error) {
+            this.logger.warn({ err: error }, "Failed to resume websocket after authentication");
+            safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "WebSocket authentication failed");
+          }
+        }
+      });
       this.authenticationTasks.set(ws, task);
       void task.then(
         () => this.authenticationTasks.delete(ws),

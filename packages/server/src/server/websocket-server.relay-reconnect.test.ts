@@ -1721,6 +1721,50 @@ describe("enterprise admission", () => {
     }
   });
 
+  test("buffers eager hello until deferred authentication installs handlers", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) => {
+      await gate;
+      return issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        h.node,
+        connection as never,
+      );
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const request = createDirectRequest() as ReturnType<typeof createDirectRequest> & {
+      socket: { pause: () => void; resume: () => void };
+    };
+    let paused = false;
+    request.socket.pause = () => {
+      paused = true;
+    };
+    let eagerHello = false;
+    request.socket.resume = () => {
+      paused = false;
+      if (eagerHello) socket.emit("message", JSON.stringify(createHelloMessage("eager-client")));
+    };
+    request.headers["sec-websocket-protocol"] = "paseo.bearer.pat-test";
+    const wsServer = wsModuleMock.MockWebSocketServer.instances.at(-1);
+    const connectionHandler = wsServer?.handlers.get("connection");
+    connectionHandler?.(socket, request);
+    eagerHello = true;
+    await vi.waitFor(() => expect(h.authenticateEvidence).toHaveBeenCalledOnce());
+    expect(paused).toBe(true);
+    expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+    release();
+    await vi.waitFor(() => expect(sentServerInfoEnvelopes(socket)).toHaveLength(1));
+    expect(sentServerInfoEnvelopes(socket)).toHaveLength(1);
+    await server.close();
+  });
+
   test("rechecks socket and admission immediately before server_info send", async () => {
     const h = createEnterpriseRuntimeHarness();
     const server = createServer({ enterpriseRuntime: h.runtime });
