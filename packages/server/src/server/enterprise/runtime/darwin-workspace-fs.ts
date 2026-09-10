@@ -53,6 +53,7 @@ interface DarwinWorkspaceBinding {
   unlinkAt(dirfd: number, name: string, directory: boolean): void;
   readDirectory(dirfd: number): unknown;
   duplicateDescriptor(descriptor: number): number;
+  fsync(descriptor: number): void;
   statAt(dirfd: number, name: string): unknown;
 }
 
@@ -935,6 +936,7 @@ function captureBinding(value: unknown): DarwinWorkspaceBinding | null {
     const nativeReadDirectory = source.readDirectory;
     const duplicateDescriptor = source.duplicateDescriptor;
     const statAt = source.statAt;
+    const fsync = source.fsync;
     const validMetadata =
       apiVersion === DARWIN_WORKSPACE_BINDING_API_VERSION &&
       abiVersion === DARWIN_WORKSPACE_BINDING_ABI_VERSION &&
@@ -949,7 +951,8 @@ function captureBinding(value: unknown): DarwinWorkspaceBinding | null {
       typeof unlinkAt === "function" &&
       typeof nativeReadDirectory === "function" &&
       typeof duplicateDescriptor === "function" &&
-      typeof statAt === "function";
+      typeof statAt === "function" &&
+      typeof fsync === "function";
     if (!validMetadata || !validSymbols) return null;
     return Object.freeze({
       apiVersion,
@@ -965,6 +968,7 @@ function captureBinding(value: unknown): DarwinWorkspaceBinding | null {
       readDirectory: nativeReadDirectory.bind(source),
       duplicateDescriptor: duplicateDescriptor.bind(source),
       statAt: statAt.bind(source),
+      fsync: fsync.bind(source),
     });
   } catch {
     return null;

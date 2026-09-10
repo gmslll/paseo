@@ -314,6 +314,19 @@ static napi_value rename_at(napi_env env, napi_callback_info info) {
   return output;
 }
 
+static napi_value fsync_fd(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  int32_t descriptor = -1;
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok || argc != 1 ||
+      !get_bounded_int32(env, argv[0], 0, INT32_MAX, "fd", &descriptor))
+    return NULL;
+  if (fsync(descriptor) != 0) return throw_errno(env, errno, "fsync");
+  napi_value output;
+  napi_get_undefined(env, &output);
+  return output;
+}
+
 static napi_value unlink_at(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
@@ -467,6 +480,7 @@ static napi_value initialize(napi_env env, napi_value exports) {
       {"openAt", NULL, open_at, NULL, NULL, NULL, napi_default, NULL},
       {"mkdirAt", NULL, mkdir_at, NULL, NULL, NULL, napi_default, NULL},
       {"renameAt", NULL, rename_at, NULL, NULL, NULL, napi_default, NULL},
+      {"fsync", NULL, fsync_fd, NULL, NULL, NULL, napi_default, NULL},
       {"unlinkAt", NULL, unlink_at, NULL, NULL, NULL, napi_default, NULL},
       {"readDirectory", NULL, read_directory, NULL, NULL, NULL, napi_default,
        NULL},
