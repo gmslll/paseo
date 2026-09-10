@@ -39,6 +39,11 @@ import {
 } from "@/utils/daemon-endpoints";
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@getpaseo/protocol/connection-offer";
+import {
+  BrowserProfileIdSchema,
+  NodeIdSchema,
+  OrganizationIdSchema,
+} from "@getpaseo/protocol/messages";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
 import { connectToDaemon } from "@/utils/test-daemon-connection";
@@ -196,6 +201,8 @@ export interface HostRuntimeControllerDeps {
   createEnterpriseIdentityLifecyclePorts?: (input: {
     serverId: string;
   }) => EnterpriseIdentityLifecyclePorts;
+  /** W3-owned bridge to the W4 browser runtime authorization registry. */
+  browserProfileRuntimeBridge?: BrowserProfileRuntimeBridge;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -213,6 +220,36 @@ export interface HostRuntimeControllerDeps {
     connection: HostConnection;
   }) => () => void;
 }
+
+export interface BrowserProfileRuntimeAuthorization {
+  readonly organizationId: string;
+  readonly homeNodeId: string;
+  readonly workspaceId: string;
+  readonly browserProfileId: string;
+  readonly bindingRevision: string;
+  readonly lifecycleGeneration: string;
+}
+
+export interface BrowserProfileRuntimeBridge {
+  hydrateBrowserProfileAuthorizations(input: {
+    readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
+    readonly lifecycleGeneration: string;
+  }): Promise<void>;
+  revokeBrowserProfileGeneration(input: { readonly lifecycleGeneration: string }): Promise<void>;
+}
+
+const BrowserProfileRuntimeAuthorizationSchema = z
+  .object({
+    organizationId: OrganizationIdSchema,
+    homeNodeId: NodeIdSchema,
+    workspaceId: z.string().min(1),
+    browserProfileId: BrowserProfileIdSchema,
+    bindingRevision: z.string().min(1),
+    lifecycleGeneration: z.string().min(1),
+  })
+  .strict();
+
+const BrowserProfileLifecycleGenerationSchema = z.string().min(1);
 
 /**
  * Binds the lifecycle-owned credential vault to a host transport without
@@ -712,6 +749,14 @@ export class HostRuntimeController {
   private probeCycleInFlight: Promise<void> | null = null;
   private readonly enterpriseCredentialVault: ProcessCredentialVault | null;
   private readonly enterpriseIdentityLifecycle: EnterpriseIdentityLifecycle | null;
+  private readonly browserProfileRuntimeBridge: BrowserProfileRuntimeBridge | null;
+  private browserProfileLifecycleGeneration: string | null = null;
+  private lastRevokedBrowserProfileGeneration: string | null = null;
+  private browserProfileRevocationInFlight: {
+    generation: string;
+    promise: Promise<void>;
+  } | null = null;
+  private browserProfileBridgeSealed = false;
 
   constructor(input: {
     host: HostProfile;
@@ -720,20 +765,46 @@ export class HostRuntimeController {
   }) {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
+    this.browserProfileRuntimeBridge = this.deps.browserProfileRuntimeBridge ?? null;
     this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
       ? createProcessCredentialVault()
       : null;
+    const identityPorts = this.deps.createEnterpriseIdentityLifecycle
+      ? (this.deps.createEnterpriseIdentityLifecyclePorts?.({
+          serverId: this.host.serverId,
+        }) ?? createUnavailableEnterpriseIdentityLifecyclePorts(this.host.serverId))
+      : null;
+    const lifecyclePorts =
+      identityPorts && this.browserProfileRuntimeBridge
+        ? {
+            ...identityPorts,
+            teardown: {
+              ...identityPorts.teardown,
+              stopNetworkAndSubscriptions: async () => {
+                const generation = this.browserProfileLifecycleGeneration;
+                if (generation) {
+                  await this.revokeBrowserProfileGeneration(generation);
+                }
+                await identityPorts.teardown.stopNetworkAndSubscriptions();
+              },
+            },
+          }
+        : identityPorts;
     this.enterpriseIdentityLifecycle =
       this.deps.createEnterpriseIdentityLifecycle && this.enterpriseCredentialVault
         ? this.deps.createEnterpriseIdentityLifecycle({
             serverId: this.host.serverId,
             vault: this.enterpriseCredentialVault,
-            ports:
-              this.deps.createEnterpriseIdentityLifecyclePorts?.({
-                serverId: this.host.serverId,
-              }) ?? createUnavailableEnterpriseIdentityLifecyclePorts(this.host.serverId),
+            ports: lifecyclePorts!,
           })
         : null;
+    if (this.enterpriseIdentityLifecycle) {
+      this.enterpriseIdentityLifecycle.subscribe((snapshot) => {
+        if (snapshot.state === "signed_in" && snapshot.generation) {
+          this.browserProfileLifecycleGeneration = snapshot.generation;
+        }
+      });
+    }
     this.onReconcileServerId = input.onReconcileServerId ?? null;
     this.connectionMachineState = {
       tag: "booting",
@@ -774,6 +845,75 @@ export class HostRuntimeController {
 
   getEnterpriseScopeGeneration(): string | null {
     return this.enterpriseIdentityLifecycle?.readSnapshot().generation ?? null;
+  }
+
+  async hydrateBrowserProfileAuthorizations(input: {
+    readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
+    readonly lifecycleGeneration: string;
+  }): Promise<void> {
+    const bridge = this.browserProfileRuntimeBridge;
+    const lifecycle = this.enterpriseIdentityLifecycle;
+    if (!bridge || !lifecycle || this.browserProfileBridgeSealed) {
+      throw new Error("Browser profile runtime unavailable");
+    }
+    const snapshot = lifecycle.readSnapshot();
+    const generation = snapshot.generation;
+    if (snapshot.state !== "signed_in" || !generation) {
+      throw new Error("Browser profile identity is not signed in");
+    }
+    const parsedGeneration = BrowserProfileLifecycleGenerationSchema.safeParse(
+      input.lifecycleGeneration,
+    );
+    if (
+      !parsedGeneration.success ||
+      parsedGeneration.data !== generation ||
+      !Array.isArray(input.authorizations)
+    ) {
+      throw new Error("Invalid browser profile authorization generation");
+    }
+    const detached = input.authorizations.map((authorization) => {
+      const parsed = BrowserProfileRuntimeAuthorizationSchema.safeParse(authorization);
+      if (!parsed.success || parsed.data.lifecycleGeneration !== parsedGeneration.data) {
+        throw new Error("Invalid browser profile authorization generation");
+      }
+      return Object.freeze(structuredClone(parsed.data));
+    });
+    try {
+      await bridge.hydrateBrowserProfileAuthorizations({
+        authorizations: Object.freeze(detached),
+        lifecycleGeneration: parsedGeneration.data,
+      });
+    } catch (error) {
+      this.browserProfileBridgeSealed = true;
+      throw error;
+    }
+  }
+
+  private async revokeBrowserProfileGeneration(generation: string): Promise<void> {
+    if (this.lastRevokedBrowserProfileGeneration === generation) return;
+    if (this.browserProfileRevocationInFlight?.generation === generation) {
+      return this.browserProfileRevocationInFlight.promise;
+    }
+    const bridge = this.browserProfileRuntimeBridge;
+    if (!bridge) return;
+    const promise = (async () => {
+      try {
+        await bridge.revokeBrowserProfileGeneration({ lifecycleGeneration: generation });
+        this.lastRevokedBrowserProfileGeneration = generation;
+        if (this.browserProfileLifecycleGeneration === generation) {
+          this.browserProfileLifecycleGeneration = null;
+        }
+      } catch (error) {
+        this.browserProfileBridgeSealed = true;
+        throw error;
+      } finally {
+        if (this.browserProfileRevocationInFlight?.generation === generation) {
+          this.browserProfileRevocationInFlight = null;
+        }
+      }
+    })();
+    this.browserProfileRevocationInFlight = { generation, promise };
+    return promise;
   }
 
   authenticateEnterpriseHost(
@@ -827,6 +967,14 @@ export class HostRuntimeController {
       this.unsubscribeClientHandlers();
       this.unsubscribeClientHandlers = null;
     }
+    let browserRevokeError: unknown;
+    if (this.browserProfileLifecycleGeneration) {
+      try {
+        await this.revokeBrowserProfileGeneration(this.browserProfileLifecycleGeneration);
+      } catch (error) {
+        browserRevokeError = error;
+      }
+    }
     if (this.activeClient) {
       const prev = this.activeClient;
       this.activeClient = null;
@@ -837,6 +985,7 @@ export class HostRuntimeController {
       ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
       client: null,
     });
+    if (browserRevokeError) throw browserRevokeError;
   }
 
   async updateHost(host: HostProfile): Promise<void> {

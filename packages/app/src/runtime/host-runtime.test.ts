@@ -26,6 +26,8 @@ import {
   HostRuntimeController,
   HostRuntimeStore,
   readInitialDaemonConnectionHint,
+  type BrowserProfileRuntimeAuthorization,
+  type BrowserProfileRuntimeBridge,
   type HostRuntimeControllerDeps,
   type HostRuntimeStorage,
 } from "./host-runtime";
@@ -804,6 +806,237 @@ describe("HostRuntimeController", () => {
     expect(controller.getEnterpriseScopeGeneration()).toBeNull();
     expect(generations.at(-1)).toBeUndefined();
     unsubscribe();
+  });
+
+  it("revokes browser authorizations before lifecycle teardown and rejects late generations", async () => {
+    const host = makeHost({ serverId: "server-browser-runtime" });
+    const events: string[] = [];
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const bridge: BrowserProfileRuntimeBridge = {
+      hydrateBrowserProfileAuthorizations: vi.fn(async ({ authorizations }) => {
+        events.push(`hydrate:${authorizations[0]?.lifecycleGeneration}`);
+      }),
+      revokeBrowserProfileGeneration: vi.fn(async ({ lifecycleGeneration }) => {
+        events.push(`revoke:${lifecycleGeneration}`);
+      }),
+    };
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        browserProfileRuntimeBridge: bridge,
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async ({ token }) => {
+            return {
+              projection: {
+                principalType: "human",
+                principalId: "usr_aaaaaaaaaaaaaaaa",
+                organizationId: "org_aaaaaaaaaaaaaaaa",
+                nodeId: "nod_aaaaaaaaaaaaaaaa",
+                paseoServerId: host.serverId,
+                displayName: "Test",
+                grantVersion: token === "pat-a" ? "grant-a" : "grant-b",
+                navigation: [],
+                allowedOperations: [],
+              },
+              sessionBindingKey: token === "pat-a" ? "binding-a" : "binding-b",
+              teardownAttempt: async () => {},
+            };
+          },
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {
+              events.push("stop");
+            },
+            disposeRuntimeAndCachePartition: async () => {
+              events.push("dispose");
+            },
+            destroyDaemonClient: async () => {
+              events.push("destroy");
+            },
+            startNewClient: async () => {
+              events.push("start");
+            },
+            hydrateScope: async () => {
+              events.push("scope");
+            },
+          },
+          remoteLogout: {
+            logoutAll: async () => {
+              events.push("remote-logout");
+            },
+          },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_browser_runtime",
+      },
+    });
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-a" });
+    const generationA = controller.getEnterpriseScopeGeneration();
+    expect(generationA).toEqual(expect.any(String));
+    const authorizationA: BrowserProfileRuntimeAuthorization = {
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      homeNodeId: "nod_aaaaaaaaaaaaaaaa",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+      bindingRevision: "revision-a",
+      lifecycleGeneration: generationA!,
+    };
+    await controller.hydrateBrowserProfileAuthorizations({
+      authorizations: [authorizationA],
+      lifecycleGeneration: generationA!,
+    });
+    expect(events).toContain(`hydrate:${generationA}`);
+    expect(
+      Object.isFrozen(
+        (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
+          .authorizations,
+      ),
+    ).toBe(true);
+    expect(
+      (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
+        .lifecycleGeneration,
+    ).toBe(generationA);
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, browserProfileId: "brw_invalid" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, organizationId: "org_invalid" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, homeNodeId: "nod_invalid" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, workspaceId: "" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    expect(bridge.hydrateBrowserProfileAuthorizations).toHaveBeenCalledTimes(1);
+
+    await lifecycle!.logoutCurrent(host.serverId);
+    expect(events).toContain(`revoke:${generationA}`);
+    expect(events.indexOf(`revoke:${generationA}`)).toBeLessThan(events.lastIndexOf("stop"));
+    expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
+    await lifecycle!.logoutCurrent(host.serverId);
+    expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-b" });
+    const generationB = controller.getEnterpriseScopeGeneration();
+    expect(generationB).toEqual(expect.any(String));
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [authorizationA],
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("generation");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, lifecycleGeneration: generationB! }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow("generation");
+    await controller.hydrateBrowserProfileAuthorizations({
+      authorizations: [{ ...authorizationA, lifecycleGeneration: generationB! }],
+      lifecycleGeneration: generationB!,
+    });
+    expect(bridge.hydrateBrowserProfileAuthorizations).toHaveBeenCalledTimes(2);
+  });
+
+  it("seals browser capability when generation revoke fails", async () => {
+    const host = makeHost({ serverId: "server-browser-sealed" });
+    const revoke = vi.fn(async () => {
+      throw new Error("browser revoke failed");
+    });
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        browserProfileRuntimeBridge: {
+          hydrateBrowserProfileAuthorizations: vi.fn(async () => {}),
+          revokeBrowserProfileGeneration: revoke,
+        },
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async () => ({
+            projection: {
+              principalType: "human",
+              principalId: "usr_aaaaaaaaaaaaaaaa",
+              organizationId: "org_aaaaaaaaaaaaaaaa",
+              nodeId: "nod_aaaaaaaaaaaaaaaa",
+              paseoServerId: host.serverId,
+              displayName: "Test",
+              grantVersion: "grant-v1",
+              navigation: [],
+              allowedOperations: [],
+            },
+            sessionBindingKey: "binding-a",
+            teardownAttempt: async () => {},
+          }),
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {},
+            disposeRuntimeAndCachePartition: async () => {},
+            destroyDaemonClient: async () => {},
+            startNewClient: async () => {},
+            hydrateScope: async () => {},
+          },
+          remoteLogout: { logoutAll: async () => {} },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_browser_sealed",
+      },
+    });
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    await expect(lifecycle!.logoutCurrent(host.serverId)).rejects.toThrow("teardown failed");
+    expect(revoke).toHaveBeenCalledTimes(1);
+    expect(controller.getEnterpriseIdentitySnapshot()?.state).toBe("unavailable");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [
+          {
+            organizationId: "org_aaaaaaaaaaaaaaaa",
+            homeNodeId: "nod_aaaaaaaaaaaaaaaa",
+            workspaceId: "wks_aaaaaaaaaaaaaaaa",
+            browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+            bindingRevision: "revision-a",
+            lifecycleGeneration: controller.getEnterpriseScopeGeneration() ?? "generation-a",
+          },
+        ],
+        lifecycleGeneration: controller.getEnterpriseScopeGeneration() ?? "generation-a",
+      }),
+    ).rejects.toThrow("unavailable");
   });
 
   it("keeps browser client lifecycle tied to the active host runtime client", async () => {
