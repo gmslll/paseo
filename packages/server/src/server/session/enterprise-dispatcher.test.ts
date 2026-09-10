@@ -32,7 +32,8 @@ describe("enterprise session dispatcher seam", () => {
       "enterprise.identity.logout_all.response",
     ]);
     const dispatcher: EnterpriseSessionDispatcher = { handle: vi.fn(() => false) };
-    expect(registerEnterpriseIdentitySelfPolicy(dispatcher)).toBe(dispatcher);
+    const registered = registerEnterpriseIdentitySelfPolicy(dispatcher);
+    expect(registered).not.toBe(dispatcher);
   });
   test("passes the server-bound context to the registered dispatcher", async () => {
     const handle = vi.fn(() => message);

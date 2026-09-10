@@ -36,8 +36,6 @@ import {
   ENTERPRISE_UNAVAILABLE_ERROR,
   dispatchEnterpriseRequest,
   isEnterpriseRequest,
-  isIdentitySelfRequest,
-  isIdentitySelfResponse,
   type EnterpriseSessionDispatcher,
 } from "./session/enterprise-dispatcher.js";
 import type {
@@ -2252,36 +2250,6 @@ export class Session {
             },
           });
         }
-        return;
-      }
-      if (
-        isEnterpriseRequest(msg) &&
-        isIdentitySelfRequest(msg) &&
-        this.enterpriseDispatcher &&
-        this.enterpriseContext
-      ) {
-        const response = await dispatchEnterpriseRequest(
-          this.enterpriseDispatcher,
-          {
-            sessionId: this.sessionId,
-            clientId: this.clientId,
-            credentialId: this.enterpriseContext.principal.credentialId,
-            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
-            enterpriseContext: this.enterpriseContext,
-          },
-          msg,
-        );
-        if (response !== false && isIdentitySelfResponse(response)) this.emit(response);
-        else if (sessionRequestId(msg))
-          this.onMessage({
-            type: "rpc_error",
-            payload: {
-              requestId: sessionRequestId(msg)!,
-              requestType: msg.type,
-              error: ENTERPRISE_UNAVAILABLE_ERROR,
-              code: "unavailable",
-            },
-          });
         return;
       }
       if (

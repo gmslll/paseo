@@ -38,7 +38,13 @@ export const ENTERPRISE_IDENTITY_SELF_POLICY: EnterpriseIdentitySelfPolicyDescri
 export function registerEnterpriseIdentitySelfPolicy(
   dispatcher: EnterpriseSessionDispatcher,
 ): EnterpriseSessionDispatcher {
-  return dispatcher;
+  return {
+    handle: async (input) => {
+      const result = await dispatcher.handle(input);
+      if (result === false) return false;
+      return isIdentitySelfResponse(result) ? result : false;
+    },
+  };
 }
 export function isIdentitySelfRequest(message: SessionInboundMessage): boolean {
   return (
