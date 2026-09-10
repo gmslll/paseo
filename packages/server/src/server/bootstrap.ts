@@ -222,6 +222,7 @@ import {
   createEnterpriseSessionDispatcherRegistration,
 } from "./enterprise/dispatcher-registry.js";
 import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
+import { createEnterpriseContentReadDispatcherRegistration } from "./enterprise/access/enterprise-content-read-dispatcher.js";
 import {
   bindProductionAgentOwners,
   type ProductionAgentOwnerBinder,
@@ -1359,6 +1360,11 @@ export async function createPaseoDaemon(
         agentRecords,
         nodeId: enterpriseRuntime.node.nodeId,
       });
+      const contentRegistration = createEnterpriseContentReadDispatcherRegistration({
+        provider: authorizationRuntimeProvider,
+        audit: enterpriseRuntime.audit,
+        agents: agentManager,
+      });
       const auditRegistration = createProductionAuditDispatcherRegistration({
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
@@ -1407,13 +1413,20 @@ export async function createPaseoDaemon(
           leaseTtlMs: 60_000,
         }),
       });
-      if (!identityRegistration || !resourceBundle || !auditRegistration || !browserRegistration) {
+      if (
+        !identityRegistration ||
+        !resourceBundle ||
+        !contentRegistration ||
+        !auditRegistration ||
+        !browserRegistration
+      ) {
         throw new Error("enterprise dispatcher production bundle unavailable");
       }
       productionEnterpriseDispatcherRegistration =
         createEnterpriseSessionDispatcherRegistration([
           identityRegistration,
           resourceBundle.dispatcherFactory,
+          contentRegistration,
           browserRegistration,
           auditRegistration,
         ]) ?? undefined;
