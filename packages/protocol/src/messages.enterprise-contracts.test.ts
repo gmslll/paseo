@@ -30,6 +30,8 @@ import {
   EnterpriseAgentContentReadRequestSchema,
   EnterpriseBrowserProfileContentReadRequestSchema,
   EnterpriseAppSlotContentReadRequestSchema,
+  EnterpriseResourceOwnershipTransferRequestSchema,
+  EnterpriseResourceOwnershipTransferResponseSchema,
   EnterpriseResourceOwnerWireSchema,
   EnterpriseResourceStatusProjectionSchema,
   EnterpriseSessionBindingSchema,
@@ -86,6 +88,7 @@ describe("enterprise feature compatibility", () => {
       enterpriseAgentContentReadV1: false,
       enterpriseBrowserProfileContentReadV1: false,
       enterpriseAppSlotContentReadV1: false,
+      enterpriseResourceOwnershipTransferV1: false,
     });
   });
 
@@ -136,6 +139,75 @@ describe("enterprise feature compatibility", () => {
       serverId: "enterprise-server",
       features: { providersSnapshot: true },
     });
+  });
+});
+
+describe("enterprise ownership-transfer contract", () => {
+  const request = {
+    type: "enterprise.resource.ownership.transfer.request" as const,
+    requestId: "transfer-1",
+    resource: {
+      organizationId: "org_1111111111111111",
+      nodeId: "nod_2222222222222222",
+      resourceKind: "workspace" as const,
+      localResourceId: "workspace-1",
+    },
+    expectedOwnerPrincipalId: "usr_3333333333333333",
+    expectedRevision: "rev-1",
+    newPrincipalId: "usr_4444444444444444",
+  };
+
+  test("accepts workspace and agent requests and correlated receipt response", () => {
+    expect(EnterpriseResourceOwnershipTransferRequestSchema.parse(request)).toEqual(request);
+    expect(
+      EnterpriseResourceOwnershipTransferRequestSchema.parse({
+        ...request,
+        resource: { ...request.resource, resourceKind: "agent" },
+      }),
+    ).toBeTruthy();
+    expect(
+      EnterpriseResourceOwnershipTransferResponseSchema.parse({
+        type: "enterprise.resource.ownership.transfer.response",
+        payload: {
+          requestId: request.requestId,
+          resource: request.resource,
+          ownerPrincipalId: request.newPrincipalId,
+          revision: "rev-2",
+          receiptId: "receipt-1",
+        },
+      }),
+    ).toBeTruthy();
+  });
+
+  test("rejects non-resource families and unknown fields", () => {
+    expect(() =>
+      EnterpriseResourceOwnershipTransferRequestSchema.parse({
+        ...request,
+        resource: { ...request.resource, resourceKind: "browser_profile" },
+      }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseResourceOwnershipTransferRequestSchema.parse({ ...request, extra: true }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseResourceOwnershipTransferRequestSchema.parse({
+        ...request,
+        resource: { ...request.resource, extra: true },
+      }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseResourceOwnershipTransferResponseSchema.parse({
+        type: "enterprise.resource.ownership.transfer.response",
+        payload: {
+          requestId: request.requestId,
+          resource: request.resource,
+          ownerPrincipalId: request.newPrincipalId,
+          revision: "rev-2",
+          receiptId: "receipt-1",
+          extra: true,
+        },
+      }),
+    ).toThrow();
   });
 });
 

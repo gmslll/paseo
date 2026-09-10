@@ -6,7 +6,10 @@ import {
   type DaemonTransport,
   type Logger,
 } from "./daemon-client";
-import type { EnterpriseWorkspaceContentReadResponse } from "@getpaseo/protocol/messages";
+import type {
+  EnterpriseResourceOwnershipTransferResponse,
+  EnterpriseWorkspaceContentReadResponse,
+} from "@getpaseo/protocol/messages";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
@@ -76,6 +79,48 @@ test("enterprise content wrapper preserves dotted type and request correlation",
       page: { limit: 10 },
     },
     "content-request-1",
+  );
+});
+
+test("enterprise ownership transfer wrapper preserves strict dotted type and correlation", async () => {
+  const client = Object.create(DaemonClient.prototype) as DaemonClient;
+  const response: EnterpriseResourceOwnershipTransferResponse = {
+    type: "enterprise.resource.ownership.transfer.response",
+    payload: {
+      requestId: "transfer-request-1",
+      resource: {
+        organizationId: "org_1111111111111111",
+        nodeId: "nod_2222222222222222",
+        resourceKind: "workspace",
+        localResourceId: "workspace-1",
+      },
+      ownerPrincipalId: "usr_4444444444444444",
+      revision: "rev-2",
+      receiptId: "receipt-1",
+    },
+  };
+  const requestEnterprise = vi
+    .spyOn(client, "requestEnterprise")
+    .mockResolvedValue(response as unknown as Readonly<Record<string, unknown>>);
+
+  await expect(
+    client.transferResourceOwnership({
+      requestId: response.payload.requestId,
+      resource: response.payload.resource,
+      expectedOwnerPrincipalId: "usr_3333333333333333",
+      expectedRevision: "rev-1",
+      newPrincipalId: response.payload.ownerPrincipalId,
+    }),
+  ).resolves.toEqual(response);
+  expect(requestEnterprise).toHaveBeenCalledWith(
+    "enterprise.resource.ownership.transfer.request",
+    {
+      resource: response.payload.resource,
+      expectedOwnerPrincipalId: "usr_3333333333333333",
+      expectedRevision: "rev-1",
+      newPrincipalId: response.payload.ownerPrincipalId,
+    },
+    response.payload.requestId,
   );
 });
 

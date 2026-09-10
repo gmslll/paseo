@@ -171,6 +171,8 @@ import type {
   EnterpriseBrowserProfileContentReadResponse,
   EnterpriseAppSlotContentReadRequest,
   EnterpriseAppSlotContentReadResponse,
+  EnterpriseResourceOwnershipTransferRequest,
+  EnterpriseResourceOwnershipTransferResponse,
 } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
@@ -1246,6 +1248,19 @@ export class DaemonClient {
       payload,
       requestId,
     ) as Promise<EnterpriseAppSlotContentReadResponse>;
+  }
+
+  public transferResourceOwnership(
+    input: Omit<EnterpriseResourceOwnershipTransferRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseResourceOwnershipTransferResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.resource.ownership.transfer.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseResourceOwnershipTransferResponse>;
   }
 
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({

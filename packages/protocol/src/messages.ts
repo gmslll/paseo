@@ -118,6 +118,7 @@ export const ENTERPRISE_FEATURE_FLAGS = [
   "enterpriseAgentContentReadV1",
   "enterpriseBrowserProfileContentReadV1",
   "enterpriseAppSlotContentReadV1",
+  "enterpriseResourceOwnershipTransferV1",
 ] as const;
 
 export const EnterpriseFeatureFlagsWireSchema = z
@@ -131,6 +132,7 @@ export const EnterpriseFeatureFlagsWireSchema = z
     enterpriseAgentContentReadV1: z.boolean().optional(),
     enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
     enterpriseAppSlotContentReadV1: z.boolean().optional(),
+    enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
   })
   .passthrough();
 
@@ -150,6 +152,7 @@ export function normalizeEnterpriseFeatureFlags(
     enterpriseAgentContentReadV1: flags?.enterpriseAgentContentReadV1 === true,
     enterpriseBrowserProfileContentReadV1: flags?.enterpriseBrowserProfileContentReadV1 === true,
     enterpriseAppSlotContentReadV1: flags?.enterpriseAppSlotContentReadV1 === true,
+    enterpriseResourceOwnershipTransferV1: flags?.enterpriseResourceOwnershipTransferV1 === true,
   };
 }
 
@@ -4210,6 +4213,39 @@ export const EnterpriseAppSlotContentReadResponseSchema = enterpriseContentReadR
   EnterpriseAppSlotContentItemSchema,
 );
 
+const EnterpriseOwnershipTransferResourceSchema = z.union([
+  z.strictObject({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("workspace"),
+    localResourceId: z.string().min(1),
+  }),
+  z.strictObject({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("agent"),
+    localResourceId: z.string().min(1),
+  }),
+]);
+
+export const EnterpriseResourceOwnershipTransferRequestSchema = z.strictObject({
+  type: z.literal("enterprise.resource.ownership.transfer.request"),
+  requestId: z.string().min(1),
+  resource: EnterpriseOwnershipTransferResourceSchema,
+  expectedOwnerPrincipalId: PrincipalIdSchema,
+  expectedRevision: z.string().min(1),
+  newPrincipalId: PrincipalIdSchema,
+});
+
+export const EnterpriseResourceOwnershipTransferResponseSchema = z.strictObject({
+  type: z.literal("enterprise.resource.ownership.transfer.response"),
+  payload: z.strictObject({
+    requestId: z.string().min(1),
+    resource: EnterpriseOwnershipTransferResourceSchema,
+    ownerPrincipalId: PrincipalIdSchema,
+    revision: z.string().min(1),
+    receiptId: z.string().min(1),
+  }),
+});
+
 export const EnterpriseAccessListGrantsRequestSchema = z.object({
   type: z.literal("enterprise.access.list_grants.request"),
   requestId: z.string().min(1),
@@ -4472,6 +4508,12 @@ export type EnterpriseAppSlotContentReadRequest = z.infer<
 export type EnterpriseAppSlotContentReadResponse = z.infer<
   typeof EnterpriseAppSlotContentReadResponseSchema
 >;
+export type EnterpriseResourceOwnershipTransferRequest = z.infer<
+  typeof EnterpriseResourceOwnershipTransferRequestSchema
+>;
+export type EnterpriseResourceOwnershipTransferResponse = z.infer<
+  typeof EnterpriseResourceOwnershipTransferResponseSchema
+>;
 export type EnterpriseAccessListGrantsRequest = z.infer<
   typeof EnterpriseAccessListGrantsRequestSchema
 >;
@@ -4568,6 +4610,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseAgentContentReadRequestSchema,
   EnterpriseBrowserProfileContentReadRequestSchema,
   EnterpriseAppSlotContentReadRequestSchema,
+  EnterpriseResourceOwnershipTransferRequestSchema,
   EnterpriseAccessListGrantsRequestSchema,
   EnterpriseAccessUpdateGrantsRequestSchema,
   EnterpriseAuditListEventsRequestSchema,
@@ -5125,6 +5168,9 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(enterpriseAppSlotContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
         // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
         enterpriseAppSlotContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseResourceOwnershipTransferV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the strict transfer schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
       })
       .optional(),
   })
@@ -8008,6 +8054,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseAgentContentReadResponseSchema,
   EnterpriseBrowserProfileContentReadResponseSchema,
   EnterpriseAppSlotContentReadResponseSchema,
+  EnterpriseResourceOwnershipTransferResponseSchema,
   EnterpriseAccessListGrantsResponseSchema,
   EnterpriseAccessUpdateGrantsResponseSchema,
   EnterpriseAuditListEventsResponseSchema,
