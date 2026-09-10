@@ -1430,6 +1430,7 @@ export async function createPaseoDaemon(
         audit: enterpriseRuntime.audit,
         agents: agentManager,
         createBrowserProfileSource,
+        pageIdentityVerifier: browserBundle.pageIdentityVerifier,
       });
       const browserRegistration = createProductionBrowserLeaseDispatcherRegistration({
         provider: authorizationRuntimeProvider,
@@ -1458,6 +1459,8 @@ export async function createPaseoDaemon(
           contentRegistration,
           browserRegistration,
           auditRegistration,
+          browserBundle.pageIdentityObservationRegistration,
+          browserBundle.pageIdentityInvalidationRegistration,
         ]) ?? undefined;
       if (!productionEnterpriseDispatcherRegistration) {
         throw new Error("enterprise dispatcher production registration unavailable");
