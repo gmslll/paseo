@@ -45,6 +45,7 @@ import {
   type EnterpriseSessionDispatcherFactory,
   type EnterpriseSessionDispatcherFactoryRegistration,
   type EnterpriseDispatcherLease,
+  type EnterpriseDispatchContext,
 } from "./session/enterprise-dispatcher.js";
 import type {
   TerminalManager,
@@ -1063,15 +1064,41 @@ export class Session {
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = sessionId ?? uuidv4();
-    if (!enterpriseDispatcher && enterpriseDispatcherRegistration && this.enterpriseContext) {
-      this.enterpriseDispatcherLease = enterpriseDispatcherRegistration.open({
+    if (enterpriseDispatcherRegistration && this.enterpriseContext) {
+      const registrationLease = enterpriseDispatcherRegistration.open({
         sessionId: this.sessionId,
         clientId,
         context: this.enterpriseContext,
         authorizationRuntime: enterpriseAuthorizationRuntime,
         filesRuntime: enterpriseWorkspaceFilesRuntime,
       });
-      this.enterpriseDispatcher = this.enterpriseDispatcherLease.dispatcher;
+      this.enterpriseDispatcherLease = registrationLease;
+      const registeredDispatcher = registrationLease.dispatcher;
+      const registeredOperations = new Set(enterpriseDispatcherRegistration.manifest.operations);
+      const existingDispatcher = enterpriseDispatcher;
+      this.enterpriseDispatcher = existingDispatcher
+        ? Object.freeze({
+            requestPolicyForType: (type: string) =>
+              registeredOperations.has(type)
+                ? (registeredDispatcher.requestPolicyForType?.(type) ?? null)
+                : (existingDispatcher.requestPolicyForType?.(type) ?? null),
+            handle: (input: {
+              readonly sessionContext: EnterpriseDispatchContext;
+              readonly message: SessionInboundMessage;
+            }) =>
+              registeredOperations.has(input.message.type)
+                ? registeredDispatcher.handle(input)
+                : existingDispatcher.handle(input),
+            consumeResponse: (input: {
+              readonly sessionContext: EnterpriseDispatchContext;
+              readonly message: SessionInboundMessage;
+              readonly response: SessionOutboundMessage;
+            }) =>
+              registeredOperations.has(input.message.type)
+                ? (registeredDispatcher.consumeResponse?.(input) ?? null)
+                : (existingDispatcher.consumeResponse?.(input) ?? null),
+          })
+        : registeredDispatcher;
     }
     if (!this.enterpriseDispatcher && this.enterpriseDispatcherFactory && this.enterpriseContext) {
       this.enterpriseDispatcher = this.enterpriseDispatcherFactory.create({

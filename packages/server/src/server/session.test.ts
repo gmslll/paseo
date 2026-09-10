@@ -786,6 +786,84 @@ test("passes the per-session workspace files runtime through dispatcher registra
   expect(close).toHaveBeenCalledTimes(1);
 });
 
+test("routes registered content requests through the per-session lease beside the global registry", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = parseContentRequest(
+    {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "content-production-lease",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { limit: 20 },
+    },
+    "enterprise.workspace.content.read.request",
+  );
+  const response = parseContentResponse(
+    {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: request.requestId,
+        resource: request.resource,
+        selector: request.selector,
+        page: { items: [], nextCursor: null },
+      },
+    },
+    "enterprise.workspace.content.read.response",
+  );
+  const primary = {
+    requestPolicyForType: vi.fn(() => null),
+    handle: vi.fn(() => false),
+  };
+  const registeredHandle = vi.fn(() => response);
+  const registeredConsume = vi.fn(() => ({
+    response,
+    authorizationContext: { kind: "resources" as const, resources: [request.resource] },
+    receiptClassification: "resources" as const,
+  }));
+  const registration: EnterpriseSessionDispatcherFactoryRegistration = {
+    manifest: { operations: [request.type] },
+    open: vi.fn(() => ({
+      dispatcher: {
+        requestPolicyForType: (type: string) =>
+          type === request.type ? ("resources" as const) : null,
+        handle: registeredHandle,
+        consumeResponse: registeredConsume,
+      },
+      close: vi.fn(),
+    })),
+  };
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces: (_ctx, rows) => [...rows],
+    assertWorkspace: vi.fn(),
+    assertAgent: vi.fn(),
+    assertBrowserProfile: vi.fn(),
+    assertAppSlot: vi.fn(),
+    resolveWorkspacePath: vi.fn(),
+    canEmit: vi.fn(async () => true),
+  };
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    resourceAuthorization,
+    enterpriseDispatcher: primary,
+    enterpriseDispatcherRegistration: registration,
+    enterpriseWorkspaceFilesRuntime: makeEnterpriseRuntime(async () => {}),
+  });
+
+  await session.handleMessage(request);
+
+  expect(primary.handle).not.toHaveBeenCalled();
+  expect(registeredHandle).toHaveBeenCalledTimes(1);
+  expect(registeredConsume).toHaveBeenCalledTimes(1);
+  expect(messages).toContainEqual(response);
+});
+
 test("reserves a content request id until the outbound tail settles", async () => {
   const messages: SessionOutboundMessage[] = [];
   const request = parseContentRequest(
