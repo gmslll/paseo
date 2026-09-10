@@ -16,8 +16,10 @@ import {
 import {
   BrowserProfileLeaseManager,
   type BrowserLeaseScheduler,
+  type BrowserProfileLeaseContextualWaitingNotice,
   type BrowserProfileLeaseGenerationStorage,
   type BrowserProfileLeaseManagerOptions,
+  type BrowserProfileLeaseWaitingNotice,
 } from "./lease-manager.js";
 import { readSecureJsonFile, writeSecureJsonFile } from "./secure-json-file.js";
 import type { EnterpriseAgentContextHandle } from "../../session/enterprise-agent-session-context-registry.js";
@@ -45,7 +47,11 @@ export class JsonFileBrowserProfileLeaseGenerationStorage implements BrowserProf
 
 export interface ProductionBrowserLeaseBundleOptions extends Omit<
   BrowserProfileLeaseManagerOptions,
-  "generationStorage" | "clock" | "isCurrentHandle" | "resolveAuthorization"
+  | "generationStorage"
+  | "clock"
+  | "isCurrentHandle"
+  | "resolveAuthorization"
+  | "onWaitingWithContext"
 > {
   paseoHome: string;
   nodeId: string;
@@ -56,6 +62,82 @@ export interface ProductionBrowserLeaseBundleOptions extends Omit<
   quarantine?: BrowserProfileBindingQuarantineSink;
   createId?: () => string;
   profiles?: BrowserProfileRegistry;
+}
+
+declare const productionBrowserLeaseWaitingContextBrand: unique symbol;
+
+/** Nominal, server-minted route identity; it contains no credential or filesystem authority. */
+export interface ProductionBrowserLeaseWaitingContext {
+  readonly [productionBrowserLeaseWaitingContextBrand]: never;
+  readonly sessionId: string;
+  readonly clientId: string;
+  readonly sessionBindingGeneration: string;
+}
+
+export interface ProductionBrowserLeaseWaitingNotice extends BrowserProfileLeaseWaitingNotice {
+  readonly context: ProductionBrowserLeaseWaitingContext;
+}
+
+const productionWaitingContexts = new WeakMap<
+  object,
+  (notice: ProductionBrowserLeaseWaitingNotice) => void | Promise<void>
+>();
+
+/**
+ * W3 creates one context from its canonical Session callback and passes it as the dispatcher open
+ * requestLifecycle. The production factory accepts it only for that exact open Session tuple.
+ */
+export function createProductionBrowserLeaseWaitingContext(input: {
+  readonly sessionId: string;
+  readonly clientId: string;
+  readonly sessionBindingGeneration: string;
+  readonly onWaiting: (notice: ProductionBrowserLeaseWaitingNotice) => void | Promise<void>;
+}): ProductionBrowserLeaseWaitingContext {
+  const sessionId = input.sessionId;
+  const clientId = input.clientId;
+  const sessionBindingGeneration = input.sessionBindingGeneration;
+  const onWaiting = input.onWaiting;
+  if (
+    typeof sessionId !== "string" ||
+    sessionId.length === 0 ||
+    typeof clientId !== "string" ||
+    clientId.length === 0 ||
+    typeof sessionBindingGeneration !== "string" ||
+    sessionBindingGeneration.length === 0 ||
+    typeof onWaiting !== "function"
+  ) {
+    throw new Error("Production Browser lease waiting context is invalid.");
+  }
+  const context = Object.freeze({
+    sessionId,
+    clientId,
+    sessionBindingGeneration,
+  }) as ProductionBrowserLeaseWaitingContext;
+  productionWaitingContexts.set(context, onWaiting);
+  return context;
+}
+
+export function isProductionBrowserLeaseWaitingContext(
+  value: unknown,
+): value is ProductionBrowserLeaseWaitingContext {
+  return typeof value === "object" && value !== null && productionWaitingContexts.has(value);
+}
+
+export function isProductionBrowserLeaseWaitingContextForSession(
+  value: unknown,
+  session: {
+    readonly sessionId: string;
+    readonly clientId: string;
+    readonly sessionBindingGeneration: string;
+  },
+): value is ProductionBrowserLeaseWaitingContext {
+  if (typeof value !== "object" || value === null) return false;
+  return (
+    productionWaitingContexts.has(value) &&
+    Reflect.get(value, "sessionId") === session.sessionId &&
+    Reflect.get(value, "clientId") === session.clientId &&
+    Reflect.get(value, "sessionBindingGeneration") === session.sessionBindingGeneration
+  );
 }
 
 export async function prepareProductionBrowserProfileRegistry(input: {
@@ -95,6 +177,7 @@ export interface ProductionBrowserLeaseBundle {
       handle: EnterpriseAgentContextHandle,
       profileId: string,
     ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
+    waitingContext?: ProductionBrowserLeaseWaitingContext;
   }) => () => void;
   readonly runtimeForSession: (generation: string) => ProductionBrowserLeaseRuntime;
   readonly browserToolsRuntime: ProductionBrowserToolsRuntime;
@@ -125,6 +208,7 @@ interface SessionAuthority {
     handle: EnterpriseAgentContextHandle,
     profileId: string,
   ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
+  readonly waitingContext?: ProductionBrowserLeaseWaitingContext;
 }
 
 /** Builds the non-memory W4 runtime at the canonical paseoHome paths. */
@@ -162,10 +246,26 @@ export function createProductionBrowserLeaseBundle(
     }
     throw new Error("No current browser authority for session.");
   };
+  const legacyOnWaiting = options.onWaiting;
   const leases = new BrowserProfileLeaseManager({
     ...options,
     isCurrentHandle: current,
     resolveAuthorization: resolve,
+    onWaitingWithContext: async (notice) => {
+      const generation = notice.context.context.sessionBindingGeneration;
+      const authority = authorities.get(generation);
+      if (!authority || !authority.isCurrentHandle(notice.context)) {
+        throw new Error("Browser lease waiting Session is stale.");
+      }
+      if (authority.waitingContext) {
+        await notifyProductionBrowserLeaseWaitingContext(authority.waitingContext, notice);
+      } else {
+        await legacyOnWaiting?.(legacyWaitingNotice(notice));
+      }
+      if (authorities.get(generation) !== authority || !authority.isCurrentHandle(notice.context)) {
+        throw new Error("Browser lease waiting Session changed during notification.");
+      }
+    },
     generationStorage: new JsonFileBrowserProfileLeaseGenerationStorage(
       path.join(browserRoot, "lease-generation.json"),
     ),
@@ -208,12 +308,24 @@ export function createProductionBrowserLeaseBundle(
     invalidateHost: (hostClientId) => leases.invalidateHost(hostClientId),
     invalidateSession: (generation) => leases.invalidateSession(generation),
     bindSessionAuthority: (input) => {
-      authorities.set(input.generation, input);
+      if (
+        input.waitingContext !== undefined &&
+        (!isProductionBrowserLeaseWaitingContext(input.waitingContext) ||
+          input.waitingContext.sessionBindingGeneration !== input.generation)
+      ) {
+        throw new Error("Browser lease waiting context does not match the Session generation.");
+      }
+      const authority: SessionAuthority = Object.freeze({
+        isCurrentHandle: input.isCurrentHandle,
+        resolveAuthorization: input.resolveAuthorization,
+        waitingContext: input.waitingContext,
+      });
+      authorities.set(input.generation, authority);
       let active = true;
       return () => {
         if (!active) return;
         active = false;
-        if (authorities.get(input.generation) === input) authorities.delete(input.generation);
+        if (authorities.get(input.generation) === authority) authorities.delete(input.generation);
       };
     },
     runtimeForSession,
@@ -224,5 +336,32 @@ export function createProductionBrowserLeaseBundle(
       authorities.clear();
       await leases.close();
     },
+  };
+}
+
+async function notifyProductionBrowserLeaseWaitingContext(
+  context: ProductionBrowserLeaseWaitingContext,
+  notice: BrowserProfileLeaseContextualWaitingNotice,
+): Promise<void> {
+  const onWaiting = productionWaitingContexts.get(context);
+  if (!onWaiting) throw new Error("Browser lease waiting context is unavailable.");
+  await onWaiting(
+    Object.freeze({
+      ...legacyWaitingNotice(notice),
+      context,
+    }),
+  );
+}
+
+function legacyWaitingNotice(
+  notice: BrowserProfileLeaseWaitingNotice,
+): BrowserProfileLeaseWaitingNotice {
+  return {
+    requestId: notice.requestId,
+    agentId: notice.agentId,
+    workspaceId: notice.workspaceId,
+    resourceId: notice.resourceId,
+    mode: notice.mode,
+    position: notice.position,
   };
 }

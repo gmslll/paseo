@@ -110,6 +110,11 @@ export interface BrowserProfileLeaseWaitingNotice {
   position: number;
 }
 
+export interface BrowserProfileLeaseContextualWaitingNotice extends BrowserProfileLeaseWaitingNotice {
+  /** Existing registry-minted nominal handle; never forwarded to a client or Session sink. */
+  readonly context: EnterpriseAgentContextHandle;
+}
+
 export interface BrowserProfileLeaseManagerOptions {
   generationStorage: BrowserProfileLeaseGenerationStorage;
   clock?: BrowserLeaseScheduler;
@@ -123,6 +128,9 @@ export interface BrowserProfileLeaseManagerOptions {
     browserProfileId: string,
   ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
   onWaiting?: (notice: BrowserProfileLeaseWaitingNotice) => void | Promise<void>;
+  onWaitingWithContext?: (
+    notice: BrowserProfileLeaseContextualWaitingNotice,
+  ) => void | Promise<void>;
   onError?: (error: Error) => void;
   waitingErrorLimit?: number;
   initialLeaseRevision?: number;
@@ -498,17 +506,26 @@ export class BrowserProfileLeaseManager {
         () => this.failWaitingRequest(key, request, "Lease wait status timed out."),
         2_000,
       );
+      const notice: BrowserProfileLeaseWaitingNotice = {
+        requestId,
+        agentId: input.agent.agentId,
+        workspaceId: input.workspace.workspaceId,
+        resourceId: input.profile.browserProfileId,
+        mode: input.mode,
+        position,
+      };
       const notification = Promise.resolve()
-        .then(() =>
-          this.options.onWaiting?.({
-            requestId,
-            agentId: input.agent.agentId,
-            workspaceId: input.workspace.workspaceId,
-            resourceId: input.profile.browserProfileId,
-            mode: input.mode,
-            position,
-          }),
-        )
+        .then(() => {
+          if (this.options.onWaitingWithContext) {
+            return this.options.onWaitingWithContext(
+              Object.freeze({
+                ...notice,
+                context: input.handle,
+              }),
+            );
+          }
+          return this.options.onWaiting?.(notice);
+        })
         .then(() => {
           if (this.closed || this.queues.get(key)?.includes(request) !== true) return undefined;
           request.waitingReady = true;

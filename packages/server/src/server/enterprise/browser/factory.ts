@@ -10,7 +10,11 @@ import {
   resolveCurrentProductionRuntimeAuthority,
 } from "../access/production-runtime-authority.js";
 import type { ProductionAuthorizationRuntimeProvider } from "../access/production-authorization-runtime-provider.js";
-import type { ProductionBrowserLeaseBundle } from "./production-bundle.js";
+import {
+  isProductionBrowserLeaseWaitingContextForSession,
+  type ProductionBrowserLeaseBundle,
+  type ProductionBrowserLeaseWaitingContext,
+} from "./production-bundle.js";
 import {
   EnterpriseBrowserLeaseHandler,
   type EnterpriseBrowserLeaseAuthorityPort,
@@ -74,6 +78,8 @@ export interface EnterpriseBrowserLeaseDispatcherFactoryOptions {
   readonly authority: EnterpriseBrowserLeaseAuthorityPort;
   readonly isCurrentAuthorizationRuntime?: (authorizationRuntime: unknown) => boolean;
   readonly authorityForSessionRuntime?: (input: {
+    readonly sessionId: string;
+    readonly clientId: string;
     readonly authorizationRuntime: unknown;
     readonly requestLifecycle: unknown;
     readonly context: EnterpriseSessionContext;
@@ -116,6 +122,8 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
       assertOpenInput(input);
       const authority = captured.authorityForSessionRuntime
         ? captured.authorityForSessionRuntime({
+            sessionId: input.sessionId,
+            clientId: input.clientId,
             authorizationRuntime: input.authorizationRuntime,
             requestLifecycle: input.requestLifecycle,
             context: input.context,
@@ -159,18 +167,40 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
     authority: createUnavailableAuthority(),
     isCurrentAuthorizationRuntime: (authorizationRuntime) =>
       resolveCurrentProductionRuntimeAuthority(authorizationRuntime, provider) !== null,
-    authorityForSessionRuntime: ({ authorizationRuntime, context: sessionContext }) => {
+    authorityForSessionRuntime: ({
+      sessionId,
+      clientId,
+      authorizationRuntime,
+      requestLifecycle,
+      context: sessionContext,
+    }) => {
       const authority = resolveCurrentProductionRuntimeAuthority(authorizationRuntime, provider);
       if (!authority) return null;
+      let waitingContext: ProductionBrowserLeaseWaitingContext | undefined;
+      if (requestLifecycle !== undefined) {
+        if (
+          !isProductionBrowserLeaseWaitingContextForSession(requestLifecycle, {
+            sessionId,
+            clientId,
+            sessionBindingGeneration: sessionContext.sessionBindingGeneration,
+          })
+        ) {
+          return null;
+        }
+        waitingContext = requestLifecycle;
+      }
+      const isCurrentHandle: EnterpriseBrowserLeaseAuthorityPort["isCurrentHandle"] = (handle) =>
+        handle.context.sessionBindingGeneration === sessionContext.sessionBindingGeneration &&
+        input.registry.isCurrentHandle(handle);
       const resolvedAuthority: EnterpriseBrowserLeaseAuthorityPort = {
         assertWorkspace: (principalContext, action, workspaceId) =>
           authority.resourceAuthorization.assertWorkspace(principalContext, action, workspaceId),
         assertBrowserProfile: (principalContext, action, profileId) =>
           authority.resourceAuthorization.assertBrowserProfile(principalContext, action, profileId),
         resolveAgentHandle: ({ agentId }) => input.registry.resolve(agentId),
-        isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
+        isCurrentHandle,
         resolveLeaseAuthorization: async (handle) => {
-          if (!input.registry.isCurrentHandle(handle)) throw new Error("Stale agent handle.");
+          if (!isCurrentHandle(handle)) throw new Error("Stale agent handle.");
           const agent = resolveAuthoritativeAgent(authority.owners, handle.agentId);
           if (!agent) throw new Error("Agent is not authoritative.");
           const workspace = await authority.resourceAuthorization.assertWorkspace(
@@ -187,7 +217,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
           );
           const currentBinding = await input.bundle.bindings.resolveForAgent({ workspace, agent });
           if (
-            !input.registry.isCurrentHandle(handle) ||
+            !isCurrentHandle(handle) ||
             !currentBinding ||
             binding.organizationId !== workspace.organizationId ||
             binding.nodeId !== workspace.nodeId ||
@@ -204,6 +234,7 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
         generation: sessionContext.sessionBindingGeneration,
         isCurrentHandle: resolvedAuthority.isCurrentHandle,
         resolveAuthorization: resolvedAuthority.resolveLeaseAuthorization,
+        waitingContext,
       });
       unbindByGeneration.set(sessionContext.sessionBindingGeneration, { unbind });
       return resolvedAuthority;
