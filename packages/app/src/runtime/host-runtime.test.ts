@@ -32,6 +32,7 @@ import {
   type HostRuntimeStorage,
 } from "./host-runtime";
 import type { ReplicaRow, ReplicaRowStore } from "./replica-cache/row-store";
+import { createEnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
 
 class FakeDaemonClient {
   private state: ConnectionState = { status: "idle" };
@@ -811,6 +812,8 @@ describe("HostRuntimeController", () => {
   it("revokes browser authorizations before lifecycle teardown and rejects late generations", async () => {
     const host = makeHost({ serverId: "server-browser-runtime" });
     const events: string[] = [];
+    const residueReset = vi.fn((scope) => events.push(`residue:${scope.lifecycleGeneration}`));
+    const residueAdapter = createEnterpriseResidueResetAdapter({ reset: residueReset });
     let lifecycle!: MemoryEnterpriseIdentityLifecycle;
     const bridge: BrowserProfileRuntimeBridge = {
       hydrateBrowserProfileAuthorizations: vi.fn(async ({ authorizations }) => {
@@ -824,6 +827,7 @@ describe("HostRuntimeController", () => {
       host,
       deps: {
         browserProfileRuntimeBridge: bridge,
+        enterpriseResidueResetAdapter: residueAdapter,
         createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
           lifecycle = new MemoryEnterpriseIdentityLifecycle(
             vault,
@@ -959,6 +963,10 @@ describe("HostRuntimeController", () => {
 
     await lifecycle!.logoutCurrent(host.serverId);
     expect(events).toContain(`revoke:${generationA}`);
+    expect(events).toContain(`residue:${generationA}`);
+    expect(events.indexOf(`residue:${generationA}`)).toBeLessThan(
+      events.indexOf(`revoke:${generationA}`),
+    );
     expect(events.indexOf(`revoke:${generationA}`)).toBeLessThan(events.lastIndexOf("stop"));
     expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
     await lifecycle!.logoutCurrent(host.serverId);
@@ -975,6 +983,10 @@ describe("HostRuntimeController", () => {
     await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-b" });
     const generationB = controller.getEnterpriseScopeGeneration();
     expect(generationB).toEqual(expect.any(String));
+    expect(residueAdapter.getActiveScope()).toEqual({
+      serverId: host.serverId,
+      lifecycleGeneration: generationB,
+    });
     await expect(
       enterpriseFileRequest!({
         serverId: host.serverId,
@@ -1118,6 +1130,10 @@ describe("HostRuntimeController", () => {
     const revoke = vi.fn(async () => {
       throw new Error("browser revoke failed");
     });
+    const residueReset = vi.fn(() => {
+      throw new Error("residue reset failed");
+    });
+    const residueAdapter = createEnterpriseResidueResetAdapter({ reset: residueReset });
     let lifecycle!: MemoryEnterpriseIdentityLifecycle;
     const controller = new HostRuntimeController({
       host,
@@ -1126,6 +1142,7 @@ describe("HostRuntimeController", () => {
           hydrateBrowserProfileAuthorizations: vi.fn(async () => {}),
           revokeBrowserProfileGeneration: revoke,
         },
+        enterpriseResidueResetAdapter: residueAdapter,
         createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
           lifecycle = new MemoryEnterpriseIdentityLifecycle(
             vault,
@@ -1170,6 +1187,7 @@ describe("HostRuntimeController", () => {
 
     await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
     await expect(lifecycle!.logoutCurrent(host.serverId)).rejects.toThrow("teardown failed");
+    expect(residueReset).toHaveBeenCalledTimes(1);
     expect(revoke).toHaveBeenCalledTimes(1);
     expect(controller.getEnterpriseIdentitySnapshot()?.state).toBe("unavailable");
     await expect(

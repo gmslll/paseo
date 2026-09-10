@@ -76,6 +76,7 @@ import type { TurnLivenessTransition } from "@/timeline/turn-liveness";
 import { useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
 import { invalidateCheckoutGitQueriesForServer } from "@/git/query-keys";
 import { queryClient } from "@/data/query-client";
+import type { EnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
 import {
   invalidateServerDataQueriesAfterReconnect,
   mountServerDataPushRouter,
@@ -207,6 +208,8 @@ export interface HostRuntimeControllerDeps {
   }) => EnterpriseIdentityLifecyclePorts;
   /** W3-owned bridge to the W4 browser runtime authorization registry. */
   browserProfileRuntimeBridge?: BrowserProfileRuntimeBridge;
+  /** Root/W6 adapter for clearing enterprise-scoped app residue. */
+  enterpriseResidueResetAdapter?: EnterpriseResidueResetAdapter;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -824,6 +827,7 @@ export class HostRuntimeController {
   private readonly enterpriseCredentialVault: ProcessCredentialVault | null;
   private readonly enterpriseIdentityLifecycle: EnterpriseIdentityLifecycle | null;
   private readonly browserProfileRuntimeBridge: BrowserProfileRuntimeBridge | null;
+  private readonly enterpriseResidueResetAdapter: EnterpriseResidueResetAdapter | null;
   private browserProfileLifecycleGeneration: string | null = null;
   private lastRevokedBrowserProfileGeneration: string | null = null;
   private browserProfileRevocationInFlight: {
@@ -848,6 +852,7 @@ export class HostRuntimeController {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
     this.browserProfileRuntimeBridge = this.deps.browserProfileRuntimeBridge ?? null;
+    this.enterpriseResidueResetAdapter = this.deps.enterpriseResidueResetAdapter ?? null;
     this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
       ? createProcessCredentialVault()
       : null;
@@ -857,17 +862,48 @@ export class HostRuntimeController {
         }) ?? createUnavailableEnterpriseIdentityLifecyclePorts(this.host.serverId))
       : null;
     const lifecyclePorts =
-      identityPorts && this.browserProfileRuntimeBridge
+      identityPorts && (this.browserProfileRuntimeBridge || this.enterpriseResidueResetAdapter)
         ? {
             ...identityPorts,
             teardown: {
               ...identityPorts.teardown,
               stopNetworkAndSubscriptions: async () => {
+                const errors: unknown[] = [];
                 const generation = this.browserProfileLifecycleGeneration;
-                if (generation) {
-                  await this.revokeBrowserProfileGeneration(generation);
+                if (generation && this.enterpriseResidueResetAdapter) {
+                  const active = this.enterpriseResidueResetAdapter.getActiveScope();
+                  if (
+                    active?.serverId === this.host.serverId &&
+                    active.lifecycleGeneration === generation
+                  ) {
+                    try {
+                      this.enterpriseResidueResetAdapter.reset({
+                        serverId: this.host.serverId,
+                        lifecycleGeneration: generation,
+                      });
+                    } catch (error) {
+                      errors.push(error);
+                    }
+                  }
                 }
-                await identityPorts.teardown.stopNetworkAndSubscriptions();
+                if (generation) {
+                  try {
+                    await this.revokeBrowserProfileGeneration(generation);
+                  } catch (error) {
+                    errors.push(error);
+                  }
+                }
+                try {
+                  await identityPorts.teardown.stopNetworkAndSubscriptions();
+                } catch (error) {
+                  errors.push(error);
+                }
+                if (errors.length === 1) throw errors[0];
+                if (errors.length > 1) {
+                  throw new AggregateError(errors, "Enterprise lifecycle teardown failed", {
+                    cause: errors[0],
+                  });
+                }
               },
             },
           }
@@ -884,6 +920,10 @@ export class HostRuntimeController {
       this.enterpriseIdentityLifecycle.subscribe((snapshot) => {
         if (snapshot.state === "signed_in" && snapshot.generation) {
           this.browserProfileLifecycleGeneration = snapshot.generation;
+          this.enterpriseResidueResetAdapter?.activate({
+            serverId: this.host.serverId,
+            lifecycleGeneration: snapshot.generation,
+          });
         }
       });
     }
