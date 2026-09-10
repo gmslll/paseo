@@ -11,6 +11,7 @@ import {
   createPersistedWorkspaceRecord,
   FileBackedProjectRegistry,
   FileBackedWorkspaceRegistry,
+  type PersistedWorkspaceRecord,
   resolveWorkspaceDisplayName,
   resolveWorkspaceName,
 } from "./workspace-registry.js";
@@ -566,5 +567,353 @@ describe("workspace registries", () => {
       title: "Payments work",
       pinnedAt: "2026-03-03T00:00:00.000Z",
     });
+  });
+
+  test("ownership CAS rejects stale and callback failures without mutation", async () => {
+    await workspaceRegistry.initialize();
+    await workspaceRegistry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-cas",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    });
+    await expect(
+      workspaceRegistry.transferOwnership({
+        workspaceId: "missing",
+        expectedOwnerPrincipalId: "usr_0123456789abcdef",
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      workspaceRegistry.transferOwnership({
+        workspaceId: "ws-cas",
+        expectedOwnerPrincipalId: "usr_ffffffffffffffff",
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      workspaceRegistry.transferOwnership({
+        workspaceId: "ws-cas",
+        expectedOwnerPrincipalId: "usr_0123456789abcdef",
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+        beforeCommit: async () => {
+          throw new Error("reject");
+        },
+      }),
+    ).rejects.toThrow("reject");
+    expect((await workspaceRegistry.get("ws-cas"))?.ownerPrincipalId).toBe("usr_0123456789abcdef");
+  });
+
+  test("ownership CAS succeeds, persists across restart, and notifies once", async () => {
+    await workspaceRegistry.initialize();
+    await workspaceRegistry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-success",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    });
+    let notifications = 0;
+    workspaceRegistry.subscribeToMutations?.(() => {
+      notifications += 1;
+    });
+    const result = await workspaceRegistry.transferOwnership({
+      workspaceId: "ws-success",
+      expectedOwnerPrincipalId: "usr_0123456789abcdef",
+      expectedOwnershipRevision: "0",
+      newOwnerPrincipalId: "usr_1111111111111111",
+    });
+    expect(result?.ownershipRevision).toBe("1");
+    expect(notifications).toBe(1);
+    const restarted = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    await restarted.initialize();
+    expect((await restarted.get("ws-success"))?.ownerPrincipalId).toBe("usr_1111111111111111");
+  });
+
+  test("ownership notification permits reentrant reads", async () => {
+    await workspaceRegistry.initialize();
+    const record = {
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-reentrant",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    };
+    await workspaceRegistry.upsert(record);
+    let observed: PersistedWorkspaceRecord | null = null;
+    workspaceRegistry.subscribeToMutations?.(async () => {
+      observed = await workspaceRegistry.get(record.workspaceId);
+    });
+    await workspaceRegistry.transferOwnership({
+      workspaceId: record.workspaceId,
+      expectedOwnerPrincipalId: record.ownerPrincipalId,
+      expectedOwnershipRevision: "0",
+      newOwnerPrincipalId: "usr_1111111111111111",
+    });
+    expect(observed?.ownershipRevision).toBe("1");
+  });
+
+  test("ownership CAS has one concurrent winner and callback snapshot is detached", async () => {
+    await workspaceRegistry.initialize();
+    await workspaceRegistry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-race",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    });
+    let callbackRecord: PersistedWorkspaceRecord | undefined;
+    let notifications = 0;
+    workspaceRegistry.subscribeToMutations?.(() => {
+      notifications += 1;
+    });
+    const input = {
+      workspaceId: "ws-race",
+      expectedOwnerPrincipalId: "usr_0123456789abcdef",
+      expectedOwnershipRevision: "0",
+      newOwnerPrincipalId: "usr_1111111111111111",
+    };
+    const [first, second] = await Promise.all([
+      workspaceRegistry.transferOwnership({
+        ...input,
+        beforeCommit: async (record) => {
+          callbackRecord = record;
+          expect(Object.isFrozen(record)).toBe(true);
+        },
+      }),
+      workspaceRegistry.transferOwnership({
+        ...input,
+        newOwnerPrincipalId: "usr_2222222222222222",
+      }),
+    ]);
+    expect([first, second].filter(Boolean)).toHaveLength(1);
+    expect(callbackRecord?.ownerPrincipalId).toBe("usr_0123456789abcdef");
+    expect(notifications).toBe(1);
+    expect((await workspaceRegistry.get("ws-race"))?.ownershipRevision).toBe("1");
+  });
+
+  test("ownership CAS rejects overflow and beforeCommit without writes or notifications", async () => {
+    await workspaceRegistry.initialize();
+    await workspaceRegistry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-reject",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+      ownershipRevision: "9007199254740991",
+    });
+    let notifications = 0;
+    workspaceRegistry.subscribeToMutations?.(() => {
+      notifications += 1;
+    });
+    await expect(
+      workspaceRegistry.transferOwnership({
+        workspaceId: "ws-reject",
+        expectedOwnerPrincipalId: "usr_0123456789abcdef",
+        expectedOwnershipRevision: "9007199254740991",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toBeNull();
+    await workspaceRegistry.upsert({
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-callback",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    });
+    notifications = 0;
+    await expect(
+      workspaceRegistry.transferOwnership({
+        workspaceId: "ws-callback",
+        expectedOwnerPrincipalId: "usr_0123456789abcdef",
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+        beforeCommit: async () => {
+          throw new Error("reject");
+        },
+      }),
+    ).rejects.toThrow("reject");
+    expect(notifications).toBe(0);
+  });
+
+  test("ownership CAS failure matrix has no writes/notifications and retries after write rejection", async () => {
+    let writes = 0;
+    let rejectWrite = false;
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "counted.json"),
+      logger,
+      {
+        writeRecords: async (filePath, records) => {
+          writes += 1;
+          if (rejectWrite) {
+            rejectWrite = false;
+            throw new Error("write");
+          }
+          await writeJsonFileAtomic(filePath, records);
+        },
+      },
+    );
+    await registry.initialize();
+    const record = {
+      ...createPersistedWorkspaceRecord({
+        workspaceId: "ws-counted",
+        projectId: "proj-1",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      ownerPrincipalId: "usr_0123456789abcdef",
+      createdByPrincipalId: "usr_0123456789abcdef",
+    };
+    await registry.upsert(record);
+    let notifications = 0;
+    registry.subscribeToMutations?.(() => {
+      notifications += 1;
+    });
+    const before = writes;
+    rejectWrite = true;
+    await expect(
+      registry.transferOwnership({
+        workspaceId: record.workspaceId,
+        expectedOwnerPrincipalId: record.ownerPrincipalId,
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).rejects.toThrow("write");
+    expect((await registry.get(record.workspaceId))?.ownerPrincipalId).toBe(
+      record.ownerPrincipalId,
+    );
+    expect((await registry.get(record.workspaceId))?.ownershipRevision).toBeUndefined();
+    expect(notifications).toBe(0);
+    rejectWrite = false;
+    await expect(
+      registry.transferOwnership({
+        workspaceId: "missing",
+        expectedOwnerPrincipalId: record.ownerPrincipalId,
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      registry.transferOwnership({
+        workspaceId: record.workspaceId,
+        expectedOwnerPrincipalId: "usr_ffffffffffffffff",
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      registry.transferOwnership({
+        workspaceId: record.workspaceId,
+        expectedOwnerPrincipalId: record.ownerPrincipalId,
+        expectedOwnershipRevision: "9",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toBeNull();
+    expect(writes).toBe(before + 1);
+    expect(notifications).toBe(0);
+    await expect(
+      registry.transferOwnership({
+        workspaceId: record.workspaceId,
+        expectedOwnerPrincipalId: record.ownerPrincipalId,
+        expectedOwnershipRevision: "0",
+        newOwnerPrincipalId: "usr_1111111111111111",
+      }),
+    ).resolves.toMatchObject({ ownershipRevision: "1" });
+    expect(notifications).toBe(1);
+  });
+
+  test("invalid persisted revisions are isolated", async () => {
+    const filePath = path.join(tmpDir, "projects", "invalid.json");
+    const record = createPersistedWorkspaceRecord({
+      workspaceId: "ws-invalid",
+      projectId: "proj-1",
+      cwd: "/tmp/repo",
+      kind: "local_checkout",
+      displayName: "main",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await writeJsonFileAtomic(filePath, [
+      {
+        ...record,
+        organizationId: "org_0123456789abcdef",
+        nodeId: "nod_0123456789abcdef",
+        ownerPrincipalId: "usr_0123456789abcdef",
+        createdByPrincipalId: "usr_0123456789abcdef",
+        ownershipRevision: "01",
+      },
+      {
+        ...record,
+        workspaceId: "ws-overflow",
+        organizationId: "org_0123456789abcdef",
+        nodeId: "nod_0123456789abcdef",
+        ownerPrincipalId: "usr_0123456789abcdef",
+        createdByPrincipalId: "usr_0123456789abcdef",
+        ownershipRevision: "9007199254740992",
+      },
+    ]);
+    const invalid = new FileBackedWorkspaceRegistry(filePath, logger);
+    await invalid.initialize();
+    expect(await invalid.list()).toEqual([]);
   });
 });
