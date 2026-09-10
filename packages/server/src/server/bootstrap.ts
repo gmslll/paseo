@@ -204,6 +204,7 @@ import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/ru
 import type {
   EnterpriseSessionDispatcher,
   EnterpriseSessionDispatcherFactory,
+  EnterpriseSessionDispatcherFactoryRegistration,
 } from "./session/enterprise-dispatcher.js";
 import type { SessionOptions } from "./session.js";
 import type {
@@ -511,6 +512,7 @@ export interface PaseoDaemonDependencies {
   enterpriseDispatcherRegistrations?: readonly EnterpriseDispatcherRegistration[];
   enterpriseDispatcher?: EnterpriseSessionDispatcher;
   enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
+  enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
   enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
   createEnterpriseWorkspaceFilesProvider?: (input: {
@@ -2122,6 +2124,7 @@ export async function createPaseoDaemon(
                 dependencies.enterpriseIdentitySelfAuthorization,
                 enterpriseDispatcherRegistry?.features ?? dependencies.enterpriseFeatureFlags,
                 dependencies.enterpriseDispatcherFactory,
+                dependencies.enterpriseDispatcherRegistration,
               );
               requireStartAudit();
               pluginRuntime.bindPaseoSessionHost(wsServer);

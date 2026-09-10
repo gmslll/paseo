@@ -41,6 +41,7 @@ import {
 import type {
   EnterpriseSessionDispatcher,
   EnterpriseSessionDispatcherFactory,
+  EnterpriseSessionDispatcherFactoryRegistration,
 } from "./session/enterprise-dispatcher.js";
 import type { EnterpriseFeatureAdvertisement } from "./enterprise/dispatcher-registry.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
@@ -878,6 +879,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
   private readonly enterpriseDispatcher?: EnterpriseSessionDispatcher;
   private readonly enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
+  private readonly enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
   private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 
@@ -933,6 +935,7 @@ export class VoiceAssistantWebSocketServer {
     enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"],
     enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement,
     enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory,
+    enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -942,6 +945,7 @@ export class VoiceAssistantWebSocketServer {
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
     this.enterpriseFeatureFlags = enterpriseFeatureFlags;
     this.enterpriseDispatcherFactory = enterpriseDispatcherFactory;
+    this.enterpriseDispatcherRegistration = enterpriseDispatcherRegistration;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -1932,6 +1936,7 @@ export class VoiceAssistantWebSocketServer {
     return connection;
   }
 
+  // oxlint-disable-next-line complexity -- Session constructor wiring is intentionally explicit.
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
       clientId: options.clientId,
@@ -1957,6 +1962,9 @@ export class VoiceAssistantWebSocketServer {
         : {}),
       ...(this.enterpriseDispatcherFactory
         ? { enterpriseDispatcherFactory: this.enterpriseDispatcherFactory }
+        : {}),
+      ...(this.enterpriseDispatcherRegistration
+        ? { enterpriseDispatcherRegistration: this.enterpriseDispatcherRegistration }
         : {}),
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
