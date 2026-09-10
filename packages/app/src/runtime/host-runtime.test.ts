@@ -741,15 +741,16 @@ describe("HostRuntimeController", () => {
     expect(String(url)).not.toContain("opaque");
   });
 
-  it("creates and retains a lifecycle with a process-only vault", () => {
+  it("creates and exposes lifecycle generation changes without exposing credentials", async () => {
     const host = makeHost({ serverId: "server-lifecycle" });
     let receivedVault: ProcessCredentialVault | null = null;
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
     const controller = new HostRuntimeController({
       host,
       deps: {
         createEnterpriseIdentityLifecycle: ({ vault }) => {
           receivedVault = vault;
-          return new MemoryEnterpriseIdentityLifecycle(
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
             vault,
             async () => ({
               projection: {
@@ -775,6 +776,7 @@ describe("HostRuntimeController", () => {
             },
             { logoutAll: async () => {} },
           );
+          return lifecycle;
         },
         createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
         connectToDaemon: async () => {
@@ -788,6 +790,20 @@ describe("HostRuntimeController", () => {
     expect(JSON.stringify(receivedVault)).toBe("{}");
     expect(controller.getEnterpriseIdentitySnapshot()?.state).toBe("booting");
     expect(controller.getEnterpriseScopeGeneration()).toBeNull();
+
+    const identity = lifecycle;
+    const generations: Array<string | undefined> = [];
+    const unsubscribe = controller.subscribeEnterpriseIdentity((snapshot) => {
+      generations.push(snapshot.generation);
+    });
+    await identity!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    const firstGeneration = controller.getEnterpriseScopeGeneration();
+    expect(firstGeneration).toEqual(expect.any(String));
+    expect(generations.at(-1)).toBe(firstGeneration);
+    await identity!.logoutCurrent(host.serverId);
+    expect(controller.getEnterpriseScopeGeneration()).toBeNull();
+    expect(generations.at(-1)).toBeUndefined();
+    unsubscribe();
   });
 
   it("keeps browser client lifecycle tied to the active host runtime client", async () => {

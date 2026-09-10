@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from "react";
-import { useHosts } from "@/runtime/host-runtime";
+import { useHostEnterpriseIdentitySnapshot, useHosts } from "@/runtime/host-runtime";
 import { useDownloadStore } from "@/stores/download-store";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
 import { useHostFeature } from "@/runtime/host-features";
@@ -8,8 +8,6 @@ interface UseFileDownloadParams {
   serverId: string;
   workspaceId?: string | null;
   workspaceRoot: string;
-  /** Identity lifecycle generation; required when the enterprise feature is enabled. */
-  enterpriseScopeGeneration?: string;
 }
 
 /**
@@ -22,9 +20,10 @@ export function useFileDownload({
   serverId,
   workspaceId,
   workspaceRoot,
-  enterpriseScopeGeneration,
 }: UseFileDownloadParams): (input: { fileName: string; path: string }) => void {
   const daemons = useHosts();
+  const enterpriseIdentitySnapshot = useHostEnterpriseIdentitySnapshot(serverId);
+  const enterpriseScopeGeneration = enterpriseIdentitySnapshot?.generation;
   const enterpriseResourceAuthorizationEnabled = useHostFeature(
     serverId,
     "enterpriseResourceAuthorizationV1",

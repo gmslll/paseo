@@ -11,6 +11,7 @@ import {
 import type {
   EnterpriseFileRequestTransport,
   EnterpriseIdentityLifecycle,
+  EnterpriseIdentitySnapshot,
   ProcessCredentialVault,
 } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import { createProcessCredentialVault } from "@getpaseo/client/internal/enterprise-identity-lifecycle";
@@ -2390,6 +2391,21 @@ export class HostRuntimeStore {
     return this.controllers.get(serverId)?.getClient() ?? null;
   }
 
+  getEnterpriseIdentitySnapshot(serverId: string): EnterpriseIdentitySnapshot | null {
+    return this.controllers.get(serverId)?.getEnterpriseIdentitySnapshot() ?? null;
+  }
+
+  subscribeEnterpriseIdentity(
+    serverId: string,
+    listener: (snapshot: EnterpriseIdentitySnapshot) => void,
+  ): () => void {
+    return this.controllers.get(serverId)?.subscribeEnterpriseIdentity(listener) ?? (() => {});
+  }
+
+  getEnterpriseScopeGeneration(serverId: string): string | null {
+    return this.controllers.get(serverId)?.getEnterpriseScopeGeneration() ?? null;
+  }
+
   subscribe(serverId: string, listener: () => void): () => void {
     const existing = this.serverListeners.get(serverId) ?? new Set<() => void>();
     existing.add(listener);
@@ -2659,6 +2675,17 @@ export function useHosts(): HostProfile[] {
     (onStoreChange) => store.subscribeHostList(onStoreChange),
     () => store.getHosts(),
     () => store.getHosts(),
+  );
+}
+
+export function useHostEnterpriseIdentitySnapshot(
+  serverId: string,
+): EnterpriseIdentitySnapshot | null {
+  const store = getHostRuntimeStore();
+  return useSyncExternalStore(
+    (onStoreChange) => store.subscribeEnterpriseIdentity(serverId, () => onStoreChange()),
+    () => store.getEnterpriseIdentitySnapshot(serverId),
+    () => store.getEnterpriseIdentitySnapshot(serverId),
   );
 }
 
