@@ -73,15 +73,29 @@ export async function createProductionRuntimeFixture(name: string) {
     grantFilePath: path.join(root, `${name}.json`),
   });
   if (!provider) throw new Error("provider");
+  const workspaceId = "wks_0123456789abcdef";
+  const grants = [
+    {
+      action: "workspace.content.read" as const,
+      selector: { kind: "workspace" as const, workspaceIds: [workspaceId] },
+    },
+  ];
   await provider.grantStore.update({
     organizationId: principal.organizationId,
     principalId: principal.principalId,
     expectedVersion: null,
-    grants: [],
+    grants,
     actor: principal,
   });
   const record = await provider.grantStore.get(principal.principalId);
   if (!record) throw new Error("grant");
+  provider.owners.registerWorkspace({
+    id: workspaceId,
+    organizationId: principal.organizationId,
+    nodeId: node.nodeId,
+    ownerPrincipalId: principal.principalId,
+    createdByPrincipalId: principal.principalId,
+  });
   const issuer = createEnterpriseAdmissionAuthorizationIssuer(secret);
   const evidence = issueEnterpriseAdmissionEvidence(
     issuer,
