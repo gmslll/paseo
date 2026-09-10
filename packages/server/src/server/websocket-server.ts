@@ -1961,6 +1961,12 @@ export class VoiceAssistantWebSocketServer {
       ...(options.enterpriseAuthorizationRuntime
         ? { enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime }
         : {}),
+      ...(options.admissionAuthorizationIssuer
+        ? { admissionAuthorizationIssuer: options.admissionAuthorizationIssuer }
+        : {}),
+      ...(options.admissionAuthorizationHandle
+        ? { admissionAuthorizationHandle: options.admissionAuthorizationHandle }
+        : {}),
       ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
       ...(this.enterpriseIdentitySelfAuthorization
         ? { enterpriseIdentitySelfAuthorization: this.enterpriseIdentitySelfAuthorization }
