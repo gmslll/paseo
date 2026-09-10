@@ -1055,19 +1055,19 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     });
     expect(sessionLease).toBeDefined();
     if (!sessionLease) throw new Error("factory did not open a session lease");
-    expect(() =>
-      registration?.open({
-        sessionId: "session-foreign",
-        clientId: "client-1",
-        context: sessionContext(),
-        authorizationRuntime: createEnterpriseBrowserLeaseSessionRuntime({
-          profiles,
-          bindings,
-          leases,
-          leaseTtlMs: 60_000,
-        }),
+    const foreignRuntimeLease = registration?.open({
+      sessionId: "session-foreign",
+      clientId: "client-1",
+      context: sessionContext(),
+      authorizationRuntime: createEnterpriseBrowserLeaseSessionRuntime({
+        profiles,
+        bindings,
+        leases,
+        leaseTtlMs: 60_000,
       }),
-    ).toThrow(/does not match registration/);
+    });
+    expect(foreignRuntimeLease).toBeDefined();
+    await foreignRuntimeLease?.close();
     await sessionLease.dispatcher.handle({
       sessionContext: dispatchContext(),
       message: {

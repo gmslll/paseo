@@ -75,12 +75,6 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
       readonly requestLifecycle?: unknown;
     }): EnterpriseDispatcherLease {
       assertOpenInput(input);
-      if (
-        input.authorizationRuntime !== undefined &&
-        input.authorizationRuntime !== captured.runtime
-      ) {
-        throw new Error("Enterprise browser authorization runtime does not match registration.");
-      }
       const dispatcher = new EnterpriseBrowserLeaseHandler(captured.options);
       return Object.freeze({
         dispatcher,
@@ -94,7 +88,6 @@ function captureFactoryOptions(
   options: EnterpriseBrowserLeaseDispatcherFactoryOptions | null | undefined,
 ): {
   readonly options: EnterpriseBrowserLeaseHandlerOptions;
-  readonly runtime: EnterpriseBrowserLeaseSessionRuntime;
 } | null {
   try {
     if (!options) return null;
@@ -123,7 +116,6 @@ function captureFactoryOptions(
       resolveLeaseAuthorization: authorityResolveLease.bind(authority),
     });
     return Object.freeze({
-      runtime,
       options: Object.freeze({
         ...runtime,
         authority: capturedAuthority,
