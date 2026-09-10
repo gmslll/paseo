@@ -226,8 +226,13 @@ class FaultFiles implements AuditFileSystem {
   private readonly node: NodeAuditFileSystem;
   private readonly delegateNoFollowFlag: number;
   private readonly counts = new Map<string, number>();
+  private readonly projectedDirectoryIdentitiesByPath = new Map<
+    string,
+    { readonly dev: number; readonly ino: number }
+  >();
   private readonly projectedModesByPath = new Map<string, number>();
   private nextHandleId = 0;
+  private nextProjectedDirectoryIno = 1;
 
   constructor(
     private readonly faults: readonly FileFault[] = [],
@@ -324,7 +329,7 @@ class FaultFiles implements AuditFileSystem {
         this.throwBefore(fault, "directory.stat");
         const value = await handle.stat();
         this.throwAfter(fault, "directory.stat");
-        return this.projectStat(value, directory);
+        return this.projectStat(value, directory, true);
       },
       chmod: async (mode) => {
         const fault = this.record("directory.chmod", `${label}:chmod`);
@@ -418,13 +423,27 @@ class FaultFiles implements AuditFileSystem {
   private projectStat<T extends Awaited<ReturnType<AuditFileHandle["stat"]>>>(
     value: T,
     filePath: string,
+    isDirectory = false,
   ): T {
     if (process.platform !== "win32") return value;
     const mode = this.projectedModesByPath.get(filePath);
-    if (mode === undefined) return value;
+    const identity = isDirectory ? this.projectedDirectoryIdentity(filePath) : undefined;
+    if (mode === undefined && identity === undefined) return value;
     return Object.assign(Object.create(value), {
-      mode: (value.mode & ~0o7777) | mode,
+      ...(mode === undefined ? {} : { mode: (value.mode & ~0o7777) | mode }),
+      ...identity,
     }) as T;
+  }
+
+  private projectedDirectoryIdentity(filePath: string): {
+    readonly dev: number;
+    readonly ino: number;
+  } {
+    const existing = this.projectedDirectoryIdentitiesByPath.get(filePath);
+    if (existing) return existing;
+    const identity = Object.freeze({ dev: 1, ino: this.nextProjectedDirectoryIno++ });
+    this.projectedDirectoryIdentitiesByPath.set(filePath, identity);
+    return identity;
   }
 
   private async chmod(
