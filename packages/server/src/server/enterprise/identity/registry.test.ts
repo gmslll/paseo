@@ -151,7 +151,9 @@ class FaultFs implements IdentityRegistryFsPort {
 
   open(filePath: string, flags: number, mode?: number): number {
     this.visit({ operation: "open", path: filePath, flags });
-    const fd = this.delegate.open(filePath, flags, mode);
+    const synthetic = this.delegate.noFollowFlag === 0 && this.noFollowFlag !== 0;
+    const delegateFlags = synthetic ? flags & ~this.noFollowFlag : flags;
+    const fd = this.delegate.open(filePath, delegateFlags, mode);
     this.pathsByFd.set(fd, filePath);
     return fd;
   }
