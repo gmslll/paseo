@@ -105,6 +105,17 @@ export function createEnterpriseContentReadDispatcherRegistration(
       const reservations = new Set<string>();
       const issued = new WeakMap<object, Pending>();
       const pending = new Set<Pending>();
+      const issuePending = (
+        context: EnterpriseDispatchContext,
+        message: SessionInboundMessage,
+        response: SessionOutboundMessage,
+        resource: GlobalResourceRef,
+      ): SessionOutboundMessage => {
+        const capability: Pending = Object.freeze({ context, message, response, resource });
+        issued.set(response, capability);
+        pending.add(capability);
+        return response;
+      };
       const current = (ctx: {
         sessionId: string;
         clientId: string;
@@ -190,15 +201,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
                     payload: { requestId, resource: canonical, selector, page },
                   }),
                 );
-                const capability: Pending = Object.freeze({
-                  context: sessionContext,
-                  message,
-                  response,
-                  resource: canonical,
-                });
-                issued.set(response, capability);
-                pending.add(capability);
-                return response;
+                return issuePending(sessionContext, message, response, canonical);
               }
               if (!parsed.success) return false;
               const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
@@ -249,15 +252,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
                   },
                 }),
               );
-              const capability: Pending = Object.freeze({
-                context: sessionContext,
-                message,
-                response,
-                resource: canonical,
-              });
-              issued.set(response, capability);
-              pending.add(capability);
-              return response;
+              return issuePending(sessionContext, message, response, canonical);
             } catch {
               return false;
             } finally {
