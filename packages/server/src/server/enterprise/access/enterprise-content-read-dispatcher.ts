@@ -7,6 +7,11 @@ import type { ProductionAuditCapability } from "../audit/production-audit-runtim
 import type { EnterpriseContentAgentProductionSource } from "../runtime/enterprise-content-read.js";
 import type { EnterpriseBrowserProfileContentReadSource } from "../browser/content-source.js";
 import {
+  EnterpriseBrowserProfileContentReadRequestSchema,
+  EnterpriseBrowserProfileContentReadResponseSchema,
+  EnterpriseBrowserProfileContentSelectorSchema,
+} from "@getpaseo/protocol/messages";
+import {
   createEnterpriseWorkspaceContentReadSource,
   createEnterpriseAppSlotContentReadSource,
   createEnterpriseAgentContentReadSource,
@@ -71,10 +76,12 @@ function requestIdOf(
   workspace: ReturnType<typeof EnterpriseWorkspaceContentReadRequestSchema.safeParse>,
   app: ReturnType<typeof EnterpriseAppSlotContentReadRequestSchema.safeParse>,
   agent: ReturnType<typeof EnterpriseAgentContentReadRequestSchema.safeParse>,
+  browser: ReturnType<typeof EnterpriseBrowserProfileContentReadRequestSchema.safeParse>,
 ): string {
   if (workspace.success) return workspace.data.requestId;
   if (app.success) return app.data.requestId;
   if (agent.success) return agent.data.requestId;
+  if (browser.success) return browser.data.requestId;
   return "";
 }
 
@@ -164,9 +171,14 @@ export function createEnterpriseContentReadDispatcherRegistration(
             const parsed = EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
             const parsedApp = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
             const parsedAgent = EnterpriseAgentContentReadRequestSchema.safeParse(message);
-            const requestId = requestIdOf(parsed, parsedApp, parsedAgent);
+            const parsedBrowser =
+              EnterpriseBrowserProfileContentReadRequestSchema.safeParse(message);
+            const requestId = requestIdOf(parsed, parsedApp, parsedAgent, parsedBrowser);
             if (
-              (!parsed.success && !parsedApp.success && !parsedAgent.success) ||
+              (!parsed.success &&
+                !parsedApp.success &&
+                !parsedAgent.success &&
+                !parsedBrowser.success) ||
               !current(sessionContext) ||
               reservations.has(requestId)
             )
@@ -264,6 +276,60 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 const response = deepFreeze(
                   EnterpriseAgentContentReadResponseSchema.parse({
                     type: "enterprise.agent.content.read.response",
+                    payload: { requestId, resource: canonical, selector, page },
+                  }),
+                );
+                return issuePending(sessionContext, message, response, canonical);
+              }
+              if (
+                !parsed.success &&
+                !parsedApp.success &&
+                !parsedAgent.success &&
+                parsedBrowser.success
+              ) {
+                if (!browserSource) return false;
+                const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
+                if (!authority) return false;
+                const principal = sessionContext.enterpriseContext.principal;
+                const profile = await authority.resourceAuthorization.assertBrowserProfile(
+                  principal,
+                  "browser.use",
+                  parsedBrowser.data.resource.localResourceId,
+                );
+                if (!current(sessionContext)) return false;
+                const canonical = GlobalResourceRefSchema.parse({
+                  organizationId: profile.organizationId,
+                  nodeId: profile.homeNodeId,
+                  resourceKind: "browser_profile",
+                  localResourceId: profile.browserProfileId,
+                });
+                if (!equal(parsedBrowser.data.resource, canonical)) return false;
+                const selector = EnterpriseBrowserProfileContentSelectorSchema.parse(
+                  parsedBrowser.data.selector,
+                );
+                const page = await browserSource.read({
+                  profile,
+                  selector,
+                  cursor: parsedBrowser.data.page.cursor,
+                  limit: parsedBrowser.data.page.limit,
+                });
+                if (!current(sessionContext)) return false;
+                await currentAudit.append(
+                  {
+                    organizationId: principal.organizationId,
+                    actorPrincipalId: principal.principalId,
+                    actorCredentialId: principal.credentialId,
+                    sessionId: sessionContext.sessionId,
+                    action: "browser.use",
+                    resource: { kind: "browser_profile", id: profile.browserProfileId },
+                    outcome: "allowed",
+                  },
+                  { durability: "required" },
+                );
+                if (!current(sessionContext)) return false;
+                const response = deepFreeze(
+                  EnterpriseBrowserProfileContentReadResponseSchema.parse({
+                    type: "enterprise.browser_profile.content.read.response",
                     payload: { requestId, resource: canonical, selector, page },
                   }),
                 );
