@@ -7,6 +7,7 @@ import type { EnterpriseContentAgentProductionSource } from "../runtime/enterpri
 import { createEnterpriseWorkspaceContentReadSource } from "../runtime/enterprise-content-read.js";
 import { isCurrentProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
+import type { EnterpriseDispatchContext } from "../../session/enterprise-dispatcher.js";
 import {
   EnterpriseWorkspaceContentReadRequestSchema,
   GlobalResourceRefSchema,
@@ -22,6 +23,7 @@ export interface EnterpriseContentReadFactoryInput {
   readonly agents: EnterpriseContentAgentProductionSource;
 }
 export interface Pending {
+  readonly context: EnterpriseDispatchContext;
   message: SessionInboundMessage;
   response: SessionOutboundMessage;
   resource: GlobalResourceRef;
@@ -82,6 +84,8 @@ export function createEnterpriseContentReadDispatcherRegistration(
       let closed = false;
       let closePromise: Promise<void> | null = null;
       const reservations = new Set<string>();
+      const issued = new WeakMap<object, Pending>();
+      const pending = new Set<Pending>();
       const current = (ctx: {
         sessionId: string;
         clientId: string;
@@ -173,6 +177,8 @@ export function createEnterpriseContentReadDispatcherRegistration(
           if (closePromise) return closePromise;
           closed = true;
           reservations.clear();
+          for (const item of pending) if (isObject(item.response)) issued.delete(item.response);
+          pending.clear();
           closePromise = source.close();
           return closePromise;
         },
