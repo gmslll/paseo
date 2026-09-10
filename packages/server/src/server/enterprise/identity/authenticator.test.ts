@@ -59,6 +59,7 @@ describe("EnterprisePrincipalAuthenticator", () => {
     ).toBe(true);
     expect(events[0]?.action).toBe("identity.break_glass.use");
     expect(events[0]?.outcome).toBe("allowed");
+    expect(events[0]?.priority).toBe("high");
     expect(
       await authenticator.authenticateBearer("break-glass-password", {
         node,

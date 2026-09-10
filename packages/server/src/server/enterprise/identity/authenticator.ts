@@ -74,6 +74,7 @@ export class EnterprisePrincipalAuthenticator implements PrincipalAuthenticator 
           actorCredentialId: credentialId,
           action: "identity.break_glass.use",
           outcome: "allowed",
+          priority: "high",
           resource: { kind: "daemon", id: this.node.nodeId },
         },
         { durability: "required" },
