@@ -5,17 +5,63 @@ import type { ProductionAuditCapability } from "../audit/production-audit-runtim
 import type { EnterpriseContentAgentProductionSource } from "../runtime/enterprise-content-read.js";
 import { createEnterpriseWorkspaceContentReadSource } from "../runtime/enterprise-content-read.js";
 import { isCurrentProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
+import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
+import {
+  EnterpriseWorkspaceContentReadRequestSchema,
+  EnterpriseWorkspaceContentReadResponseSchema,
+  type GlobalResourceRef,
+} from "@getpaseo/protocol/messages";
+import { productionAuditCapabilityIssuer } from "../audit/production-audit-runtime.js";
 
 export interface EnterpriseContentReadFactoryInput {
   readonly provider: ProductionAuthorizationRuntimeProvider;
   readonly audit: ProductionAuditCapability;
   readonly agents: EnterpriseContentAgentProductionSource;
 }
+export interface Pending {
+  message: SessionInboundMessage;
+  response: SessionOutboundMessage;
+  resource: GlobalResourceRef;
+}
+function isObject(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+function deepFreeze<T>(value: T): T {
+  if (isObject(value)) {
+    for (const key of Reflect.ownKeys(value)) {
+      const child = Reflect.get(value, key);
+      if (isObject(child)) deepFreeze(child);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+function equal(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (!isObject(a) || !isObject(b)) return false;
+  const ak = Reflect.ownKeys(a),
+    bk = Reflect.ownKeys(b);
+  return (
+    ak.length === bk.length &&
+    ak.every((k) => bk.includes(k) && equal(Reflect.get(a, k), Reflect.get(b, k)))
+  );
+}
 
 export function createEnterpriseContentReadDispatcherRegistration(
   input: EnterpriseContentReadFactoryInput,
 ): EnterpriseSessionDispatcherFactoryRegistration | null {
   const { provider, audit, agents } = input;
+  let currentAudit: ProductionAuditCapability;
+  try {
+    currentAudit = productionAuditCapabilityIssuer.requireCurrent(audit);
+  } catch {
+    return null;
+  }
+  void currentAudit;
+  void EnterpriseWorkspaceContentReadRequestSchema;
+  void EnterpriseWorkspaceContentReadResponseSchema;
+  void equal;
+  void deepFreeze;
   if (!isCurrentProductionAuthorizationRuntimeProvider(provider) || !audit || !agents) return null;
   return {
     manifest: { operations: ["enterprise.workspace.content.read.request"] },
