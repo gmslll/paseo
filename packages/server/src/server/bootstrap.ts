@@ -220,6 +220,10 @@ import { createEnterpriseDispatcherRegistry } from "./enterprise/dispatcher-regi
 import { createEnterpriseSessionDispatcherRegistration } from "./enterprise/dispatcher-registry.js";
 import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
 import {
+  bindProductionAgentOwners,
+  type ProductionAgentOwnerBinder,
+} from "./enterprise/access/production-agent-owner-binder.js";
+import {
   createProductionAuditDispatcherRegistration,
   createProductionIdentityDispatcherRegistration,
 } from "./enterprise/production-runtime-factory.js";
@@ -753,6 +757,7 @@ export async function createPaseoDaemon(
     | EnterpriseSessionDispatcherFactoryRegistration
     | undefined;
   let productionEnterpriseFeatureFlags: EnterpriseFeatureAdvertisement | undefined;
+  let productionAgentOwnerBinder: ProductionAgentOwnerBinder | undefined;
   const logger = rootLogger.child({ module: "bootstrap" });
   const capturedPaseoHome = structuredClone(config.paseoHome);
   if (typeof capturedPaseoHome !== "string" || capturedPaseoHome.length === 0) {
@@ -1179,41 +1184,6 @@ export async function createPaseoDaemon(
       if (!enterpriseWorkspaceFilesProvider || !enterpriseWorkspaceFilesProvider.releaseReady) {
         throw new Error("enterprise workspace files provider unavailable");
       }
-      const authorizationRuntimeProvider = enterpriseRuntime.authorizationRuntimeProvider;
-      if (!authorizationRuntimeProvider) {
-        throw new Error("enterprise authorization provider unavailable");
-      }
-      const resourceBundle = await createProductionResourceBundle({
-        provider: authorizationRuntimeProvider,
-        workspaceRegistry,
-        nodeId: enterpriseRuntime.node.nodeId,
-      });
-      const auditRegistration = createProductionAuditDispatcherRegistration({
-        audit: enterpriseRuntime.audit,
-        provider: authorizationRuntimeProvider,
-      });
-      const identityRegistration = createProductionIdentityDispatcherRegistration({
-        admission: enterpriseRuntime.admission,
-        audit: enterpriseRuntime.audit,
-        provider: authorizationRuntimeProvider,
-      });
-      if (!identityRegistration || !resourceBundle || !auditRegistration) {
-        throw new Error("enterprise dispatcher production bundle unavailable");
-      }
-      productionEnterpriseDispatcherRegistration =
-        createEnterpriseSessionDispatcherRegistration([
-          identityRegistration,
-          resourceBundle.dispatcherFactory,
-          auditRegistration,
-        ]) ?? undefined;
-      if (!productionEnterpriseDispatcherRegistration) {
-        throw new Error("enterprise dispatcher production registration unavailable");
-      }
-      productionEnterpriseFeatureFlags = Object.freeze({
-        enterpriseIdentityV1: true,
-        enterpriseResourceAuthorizationV1: true,
-        enterpriseAuditV1: true,
-      });
     }
     const workspaceLabelService = createWorkspaceLabelService({
       paseoHome: capturedPaseoHome,
@@ -1304,11 +1274,20 @@ export async function createPaseoDaemon(
       pluginRuntime.subscribeProviderRegistrations(syncPluginProviders);
     constructionCleanupStack.push(() => unsubscribePluginProviders());
 
-    const detachAgentStoragePersistence = attachAgentStoragePersistence(
-      logger,
-      agentManager,
-      agentStorage,
-    );
+    const detachAgentStoragePersistence = attachAgentStoragePersistence(logger, agentManager, {
+      list: () => agentStorage.list(),
+      applySnapshot: async (agent) => {
+        await agentStorage.applySnapshot(agent);
+        const record = await agentStorage.get(agent.id);
+        if (
+          record &&
+          productionAgentOwnerBinder &&
+          !productionAgentOwnerBinder.onPersisted(record)
+        ) {
+          throw new Error("enterprise agent owner binding failed after persistence");
+        }
+      },
+    });
     constructionCleanupStack.push(() => detachAgentStoragePersistence());
     await agentStorage.initialize();
     requireConstructionAudit();
@@ -1326,6 +1305,55 @@ export async function createPaseoDaemon(
     await workspaceLabelService.initialize();
     requireConstructionAudit();
     logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
+    if (enterpriseRuntime) {
+      const authorizationRuntimeProvider = enterpriseRuntime.authorizationRuntimeProvider;
+      if (!authorizationRuntimeProvider) {
+        throw new Error("enterprise authorization provider unavailable");
+      }
+      const initialAgentRecords = await agentStorage.list();
+      productionAgentOwnerBinder =
+        bindProductionAgentOwners({
+          provider: authorizationRuntimeProvider,
+          records: initialAgentRecords,
+          nodeId: enterpriseRuntime.node.nodeId,
+        }) ?? undefined;
+      if (!productionAgentOwnerBinder) {
+        throw new Error("enterprise agent owner binding unavailable");
+      }
+      const agentRecords = Object.freeze({ list: () => agentStorage.list() });
+      const resourceBundle = await createProductionResourceBundle({
+        provider: authorizationRuntimeProvider,
+        workspaceRegistry,
+        agentRecords,
+        nodeId: enterpriseRuntime.node.nodeId,
+      });
+      const auditRegistration = createProductionAuditDispatcherRegistration({
+        audit: enterpriseRuntime.audit,
+        provider: authorizationRuntimeProvider,
+      });
+      const identityRegistration = createProductionIdentityDispatcherRegistration({
+        admission: enterpriseRuntime.admission,
+        audit: enterpriseRuntime.audit,
+        provider: authorizationRuntimeProvider,
+      });
+      if (!identityRegistration || !resourceBundle || !auditRegistration) {
+        throw new Error("enterprise dispatcher production bundle unavailable");
+      }
+      productionEnterpriseDispatcherRegistration =
+        createEnterpriseSessionDispatcherRegistration([
+          identityRegistration,
+          resourceBundle.dispatcherFactory,
+          auditRegistration,
+        ]) ?? undefined;
+      if (!productionEnterpriseDispatcherRegistration) {
+        throw new Error("enterprise dispatcher production registration unavailable");
+      }
+      productionEnterpriseFeatureFlags = Object.freeze({
+        enterpriseIdentityV1: true,
+        enterpriseResourceAuthorizationV1: true,
+        enterpriseAuditV1: true,
+      });
+    }
     const teardownArchivedWorkspaceRuntime = (workspaceId: string): void => {
       scriptRuntimeStore.removeForWorkspace(workspaceId);
       releaseWorkspaceServicePortPlan(workspaceId);
