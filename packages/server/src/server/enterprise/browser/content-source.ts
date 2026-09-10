@@ -148,20 +148,7 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
     readProfile: async ({ profile, view, cursor, limit }) => {
       const root = await workspaceFs.openWorkspaceRoot(profile.downloadRoot);
       try {
-        if (view === "state") {
-          return {
-            items: [
-              {
-                itemId: profile.browserProfileId,
-                occurredAt: profile.updatedAt,
-                kind: "state",
-                label: profile.label,
-                status: profile.status,
-              },
-            ],
-            nextCursor: null,
-          };
-        }
+        if (view === "state") return statePage(profile);
         let snapshot: readonly string[] | null = null;
         if (cursor) {
           const record = cursorRecords.get(cursor);
@@ -177,41 +164,9 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
             throw new Error("Invalid cursor.");
           snapshot = record.remainingNames;
         }
-        let validNames = snapshot;
-        if (!validNames) {
-          const names = (await workspaceFs.listRoot(root))
-            .filter((name) => !name.includes("/"))
-            .sort();
-          const filtered: string[] = [];
-          for (const name of names) {
-            try {
-              if ((await workspaceFs.stat(root, [name])).kind === "file") filtered.push(name);
-            } catch (error) {
-              if (!["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? ""))
-                throw error;
-            }
-          }
-          validNames = filtered;
-        }
+        const validNames = snapshot ?? (await resolveValidNames(workspaceFs, root));
         const selected = validNames.slice(0, limit);
-        const items = [];
-        for (const name of selected) {
-          try {
-            const stat = await workspaceFs.stat(root, [name]);
-            if (stat.kind !== "file") continue;
-            items.push({
-              itemId: name,
-              occurredAt: new Date(stat.mtimeMs).toISOString(),
-              kind: "artifact" as const,
-              reference: name,
-              label: name,
-              size: stat.size,
-            });
-          } catch (error) {
-            if (["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? "")) continue;
-            throw error;
-          }
-        }
+        const items = await projectArtifactItems(workspaceFs, root, selected);
         return {
           items,
           nextCursor:
@@ -225,6 +180,60 @@ export function createProductionEnterpriseBrowserProfileContentReadSource(input:
     },
     onClose: () => cursorRecords.clear(),
   });
+}
+
+function statePage(profile: AuthorizedBrowserProfile): EnterpriseBrowserProfileContentPage {
+  return {
+    items: [
+      {
+        itemId: profile.browserProfileId,
+        occurredAt: profile.updatedAt,
+        kind: "state",
+        label: profile.label,
+        status: profile.status,
+      },
+    ],
+    nextCursor: null,
+  };
+}
+async function resolveValidNames(
+  workspaceFs: DarwinWorkspaceFileSystem,
+  root: Awaited<ReturnType<DarwinWorkspaceFileSystem["openWorkspaceRoot"]>>,
+): Promise<readonly string[]> {
+  const names = (await workspaceFs.listRoot(root)).filter((name) => !name.includes("/")).sort();
+  const valid: string[] = [];
+  for (const name of names) {
+    try {
+      if ((await workspaceFs.stat(root, [name])).kind === "file") valid.push(name);
+    } catch (error) {
+      if (!["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? "")) throw error;
+    }
+  }
+  return valid;
+}
+async function projectArtifactItems(
+  workspaceFs: DarwinWorkspaceFileSystem,
+  root: Awaited<ReturnType<DarwinWorkspaceFileSystem["openWorkspaceRoot"]>>,
+  selected: readonly string[],
+) {
+  const items = [];
+  for (const name of selected) {
+    try {
+      const stat = await workspaceFs.stat(root, [name]);
+      if (stat.kind === "file")
+        items.push({
+          itemId: name,
+          occurredAt: new Date(stat.mtimeMs).toISOString(),
+          kind: "artifact" as const,
+          reference: name,
+          label: name,
+          size: stat.size,
+        });
+    } catch (error) {
+      if (!["ENOENT", "ELOOP"].includes((error as { code?: string }).code ?? "")) throw error;
+    }
+  }
+  return items;
 }
 
 function issueCursor(
