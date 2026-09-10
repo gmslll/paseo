@@ -150,6 +150,13 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
   private closed = false;
   private closePromise: Promise<void> | null = null;
 
+  public requestPolicyForType(type: string): "resources" | null {
+    return type === "enterprise.browser.list_profiles.request" ||
+      type === "enterprise.browser.bind_profile.request"
+      ? "resources"
+      : null;
+  }
+
   public constructor(options: EnterpriseBrowserLeaseHandlerOptions) {
     const profiles = options.profiles;
     const bindings = options.bindings;
