@@ -17,7 +17,7 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       const filesRuntime = { list: async () => [], cleanup: async () => {} };
       const registration = createEnterpriseContentReadDispatcherRegistration({
         provider: fixture.provider,
-        audit: undefined as never,
+        audit: fixture.audit,
         agents,
       });
       expect(registration?.manifest.operations).toEqual([

@@ -101,7 +101,7 @@ export async function createProductionRuntimeFixture(name: string) {
       authorityState: new EmptyAuthorityState(),
     }));
   if (!runtime) throw new Error("runtime");
-  return { provider, runtime };
+  return { provider, runtime, audit };
 }
 export async function closeProductionRuntimeFixture() {
   if (audit) await audit.close();
