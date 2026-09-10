@@ -180,4 +180,77 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       await closeProductionRuntimeFixture();
     }
   });
+
+  test("denies workspace content without a grant", async () => {
+    const fixture = await createProductionRuntimeFixture("content-no-grant", { grants: [] });
+    try {
+      let listCount = 0;
+      const unused = async (..._args: never[]): Promise<never> => {
+        throw new Error("unused");
+      };
+      const filesRuntime: EnterpriseWorkspaceFilesRuntime = {
+        stat: unused,
+        list: async () => {
+          listCount += 1;
+          return [];
+        },
+        openRead: unused,
+        write: unused,
+        create: unused,
+        rename: unused,
+        copy: unused,
+        delete: unused,
+        watch: unused,
+        issueDownloadToken: unused,
+        createUploadStore: () => {
+          throw new Error("unused");
+        },
+        cleanup: async () => {},
+      };
+      const registration = createEnterpriseContentReadDispatcherRegistration({
+        provider: fixture.provider,
+        audit: fixture.audit,
+        agents: {
+          listAgents: async () => [],
+          getAgent: async () => null,
+          getTimelineRows: async () => [],
+        },
+      });
+      if (!registration) throw new Error("registration");
+      const lease = registration.open({
+        sessionId: fixture.context.sessionId,
+        clientId: fixture.context.clientId,
+        context: fixture.context.enterpriseContext,
+        authorizationRuntime: fixture.runtime,
+        filesRuntime,
+      });
+      const response = await lease.dispatcher.handle({
+        sessionContext: fixture.context,
+        message: {
+          type: "enterprise.workspace.content.read.request",
+          requestId: "r-no-grant",
+          resource: {
+            organizationId: fixture.context.enterpriseContext.principal.organizationId,
+            nodeId: fixture.context.enterpriseContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: "wks_0123456789abcdef",
+          },
+          selector: { kind: "workspace", view: "files" },
+          page: { limit: 1 },
+        },
+      });
+      expect(response).toBe(false);
+      expect(listCount).toBe(0);
+      expect(
+        (await fixture.audit.snapshotEvents()).some(
+          (event) => event.action === "workspace.content.read" && event.outcome === "allowed",
+        ),
+      ).toBe(false);
+      await lease.close();
+      await lease.close();
+      await fixture.runtime.release();
+    } finally {
+      await closeProductionRuntimeFixture();
+    }
+  });
 });

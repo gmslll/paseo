@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import type { NodeContext, PrincipalContext } from "@getpaseo/protocol/messages";
+import type { NodeContext, PrincipalContext, ResourceGrant } from "@getpaseo/protocol/messages";
 import { SessionAuthorization } from "../../authorization/index.js";
 import { createProductionAuditRuntime } from "../audit/production-audit-runtime.js";
 import {
@@ -53,7 +53,10 @@ const execFileAsync = promisify(execFile);
 let root = "";
 let audit: Awaited<ReturnType<typeof createProductionAuditRuntime>> | undefined;
 const secret = Object.freeze({});
-export async function createProductionRuntimeFixture(name: string) {
+export async function createProductionRuntimeFixture(
+  name: string,
+  options: { readonly grants?: readonly ResourceGrant[] } = {},
+) {
   if (!audit) {
     root = await mkdtemp(path.join(os.tmpdir(), "paseo-w2-fixture-"));
     const addon = path.join(root, "audit.node");
@@ -74,7 +77,7 @@ export async function createProductionRuntimeFixture(name: string) {
   });
   if (!provider) throw new Error("provider");
   const workspaceId = "wks_0123456789abcdef";
-  const grants = [
+  const grants: readonly ResourceGrant[] = options.grants ?? [
     {
       action: "workspace.content.read" as const,
       selector: { kind: "workspace" as const, workspaceIds: [workspaceId] },
