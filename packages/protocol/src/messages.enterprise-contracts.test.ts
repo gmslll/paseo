@@ -415,6 +415,43 @@ describe("enterprise resource contracts", () => {
     }
   });
 
+  test("keeps priority optional for old events and round-trips high priority", () => {
+    const legacy = AuditEventSchema.parse({
+      eventId: "evt-legacy",
+      occurredAt: "2026-09-09T00:00:00.000Z",
+      organizationId: ORGANIZATION_ID,
+      nodeId: NODE_ID,
+      nodeEventSeq: 1,
+      actorPrincipalId: OWNER_ID,
+      action: "identity.break_glass.use",
+      resource: { kind: "organization", id: ORGANIZATION_ID },
+      outcome: "allowed",
+    });
+    expect(legacy.priority).toBeUndefined();
+
+    const highInput = AuditEventInputSchema.parse({
+      organizationId: ORGANIZATION_ID,
+      actorPrincipalId: OWNER_ID,
+      action: "identity.break_glass.use",
+      resource: { kind: "organization", id: ORGANIZATION_ID },
+      outcome: "allowed",
+      priority: "high",
+    });
+    expect(highInput.priority).toBe("high");
+    expect(
+      AuditEventSchema.parse({
+        ...highInput,
+        eventId: "evt-high",
+        occurredAt: "2026-09-09T00:00:00.000Z",
+        nodeId: NODE_ID,
+        nodeEventSeq: 2,
+      }),
+    ).toMatchObject({ priority: "high" });
+    expect(AuditEventInputSchema.safeParse({ ...highInput, priority: "urgent" }).success).toBe(
+      false,
+    );
+  });
+
   test("the Local AuditSink contract returns one finalized event for explicit durability", async () => {
     const node = { nodeId: NODE_ID, paseoServerId: "srv_local", mode: "standalone" } as const;
     const input: AuditEventInput = AuditEventInputSchema.parse({

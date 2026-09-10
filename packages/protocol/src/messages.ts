@@ -512,6 +512,7 @@ export const AuditEventSchema = z.object({
   workspaceId: z.string().min(1).optional(),
   agentId: z.string().min(1).optional(),
   outcome: z.enum(["allowed", "denied", "failed"]),
+  priority: z.enum(["normal", "high"]).optional(),
   reasonCode: z.string().min(1).optional(),
   metadata: z.record(z.string(), AuditMetadataValueSchema).optional(),
   previousHash: z.string().min(1).optional(),

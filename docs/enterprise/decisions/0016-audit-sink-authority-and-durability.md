@@ -53,7 +53,8 @@ already-finalized event so restart recovery and buffered replay cannot regenerat
 
 ## Boundary
 
-- `AuditEventSchema` and `enterprise.audit.list_events.response` keep their current wire shape.
+- `AuditEventSchema` and `enterprise.audit.list_events.response` keep their current wire shape,
+  with the backward-compatible optional `priority: "normal" | "high"` field.
 - This decision adds no Session RPC and no UI receipt field.
 - The returned `AuditEvent` is the finalized record. For `buffered`, it does not claim that durable
   storage has completed.
