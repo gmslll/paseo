@@ -1,6 +1,7 @@
 /// <reference lib="dom" />
 import { EventEmitter } from "node:events";
 import { WebSocket } from "ws";
+import { randomBytes } from "node:crypto";
 import type pino from "pino";
 import {
   createDaemonChannel,
@@ -19,6 +20,7 @@ export interface RelayTransportOptions {
   serverId: string;
   daemonKeyPair?: KeyPair;
   createWebSocket?: RelayWebSocketFactory;
+  authenticateEnterprise?: (input: { token: string; challenge: string }) => Promise<boolean>;
 }
 
 export interface RelayTransportController {
@@ -114,6 +116,7 @@ export function startRelayTransport({
   serverId,
   daemonKeyPair,
   createWebSocket = createDefaultRelayWebSocket,
+  authenticateEnterprise,
 }: RelayTransportOptions): RelayTransportController {
   const relayLogger = logger.child({ module: "relay-transport" });
 
@@ -386,6 +389,7 @@ export function startRelayTransport({
           relayLogger.child({ connectionId }),
           attachSocket,
           externalMetadata,
+          authenticateEnterprise,
         );
       } else {
         void attachSocket(socket, externalMetadata);
@@ -419,6 +423,7 @@ async function attachEncryptedSocket(
   logger: pino.Logger,
   attachSocket: (ws: RelaySocketLike, metadata?: ExternalSocketMetadata) => Promise<void>,
   metadata?: ExternalSocketMetadata,
+  authenticateEnterprise?: (input: { token: string; challenge: string }) => Promise<boolean>,
 ): Promise<void> {
   try {
     const relayTransport = createRelayTransportAdapter(socket, logger);
@@ -432,14 +437,81 @@ async function attachEncryptedSocket(
       }
       pendingMessages.push(data);
     };
-    const channel = await createDaemonChannel(relayTransport, daemonKeyPair, {
-      onmessage: emitMessage,
-      onclose: (code, reason) => emitter.emit("close", code, reason),
-      onerror: (error) => {
-        logger.warn({ err: error }, "relay_e2ee_error");
-        emitter.emit("error", error);
+    const challenge = randomBytes(32).toString("base64url");
+    let authenticated = !authenticateEnterprise;
+    let authResolve: (() => void) | undefined;
+    let authReject: ((error: Error) => void) | undefined;
+    const authPromise = authenticated
+      ? Promise.resolve()
+      : new Promise<void>((resolve, reject) => {
+          authResolve = resolve;
+          authReject = reject;
+        });
+    const channel = await createDaemonChannel(
+      relayTransport,
+      daemonKeyPair,
+      {
+        onmessage: (data) => {
+          if (!authenticated) {
+            try {
+              const parsed = JSON.parse(
+                typeof data === "string" ? data : new TextDecoder().decode(data),
+              );
+              if (
+                parsed?.type !== "encrypted_auth_preface_v1" ||
+                parsed.challenge !== challenge ||
+                typeof parsed.token !== "string"
+              ) {
+                throw new Error("invalid encrypted auth preface");
+              }
+              void authenticateEnterprise!({ token: parsed.token, challenge })
+                .then(
+                  (ok) => {
+                    if (!ok) throw new Error("enterprise authentication failed");
+                    authenticated = true;
+                    void channel.send(JSON.stringify({ type: "auth_ok", challenge }));
+                    authResolve?.();
+                    return undefined;
+                  },
+                  (error: unknown) => {
+                    const failure = error instanceof Error ? error : new Error(String(error));
+                    authReject?.(failure);
+                    try {
+                      socket.close(1008, "enterprise authentication failed");
+                    } catch {
+                      // ignore
+                    }
+                  },
+                )
+                .catch((error: unknown) => {
+                  const failure = error instanceof Error ? error : new Error(String(error));
+                  authReject?.(failure);
+                  try {
+                    socket.close(1008, "enterprise authentication failed");
+                  } catch {
+                    // ignore
+                  }
+                });
+            } catch {
+              try {
+                socket.close(1008, "enterprise authentication failed");
+              } catch {
+                // ignore
+              }
+            }
+            return;
+          }
+          emitMessage(data);
+        },
+        onclose: (code, reason) => emitter.emit("close", code, reason),
+        onerror: (error) => {
+          logger.warn({ err: error }, "relay_e2ee_error");
+          emitter.emit("error", error);
+        },
       },
-    });
+      { authPreface: { challenge } },
+    );
+    await authPromise;
     const encryptedSocket = createEncryptedRelaySocket({
       channel,
       emitter,

@@ -644,6 +644,17 @@ export class IdentityRegistry {
     expiresAt?: string;
   }): Promise<InitialCredentialResult> {
     return this.serial(async () => {
+      const actor = PrincipalContextSchema.parse(input.actor);
+      if (actor.organizationId !== input.organizationId) {
+        throw new Error("initial credential actor organization mismatch");
+      }
+      const projection = await this.options.principalSource.resolvePrincipal(
+        input.principalId,
+        input.organizationId,
+      );
+      if (!projection || projection.principalId !== input.principalId) {
+        throw new Error("initial credential principal is not active");
+      }
       const now = this.captureClock();
       const existing = Object.values(this.document.credentials)
         .filter(
@@ -656,10 +667,7 @@ export class IdentityRegistry {
         .map((credential) => credential.credentialId);
       if (existing.length > 0)
         return { status: "already_provisioned", credentialIds: Object.freeze(existing) };
-      const issued = await this.issueTokenUnlocked({
-        ...input,
-        actor: PrincipalContextSchema.parse(input.actor),
-      });
+      const issued = await this.issueTokenUnlocked({ ...input, actor });
       return { status: "issued", token: issued.token, credentialId: issued.credentialId };
     });
   }

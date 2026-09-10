@@ -51,6 +51,7 @@ interface EncryptedChannelOptions {
    */
   daemonKeyPair?: KeyPair;
   binaryCiphertext?: boolean;
+  authPreface?: { challenge: string };
 }
 
 interface E2EEHelloMessage {
@@ -66,6 +67,8 @@ interface E2EEReadyMessage {
 
 interface E2EECapabilities {
   binaryCiphertext?: boolean;
+  encryptedAuthPrefaceV1?: boolean;
+  admissionChallenge?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -228,6 +231,7 @@ export async function createDaemonChannel(
   transport: Transport,
   daemonKeyPair: KeyPair,
   events: EncryptedChannelEvents = {},
+  options: EncryptedChannelOptions = {},
 ): Promise<EncryptedChannel> {
   return new Promise((resolve, reject) => {
     const bufferedMessages: TransportMessage[] = [];
@@ -275,18 +279,23 @@ export async function createDaemonChannel(
         const sharedKey = deriveSharedKey(daemonKeyPair.secretKey, clientPublicKey);
 
         const binaryCiphertext = supportsBinaryCiphertext(msg);
+        const capabilities: E2EECapabilities = {
+          ...(binaryCiphertext ? { binaryCiphertext: true } : {}),
+          ...(options.authPreface
+            ? { encryptedAuthPrefaceV1: true, admissionChallenge: options.authPreface.challenge }
+            : {}),
+        };
         await transport.send(
           JSON.stringify({
             type: "e2ee_ready",
-            ...(binaryCiphertext
-              ? { capabilities: { binaryCiphertext: true } satisfies E2EECapabilities }
-              : {}),
+            ...(Object.keys(capabilities).length > 0 ? { capabilities } : {}),
           } satisfies E2EEReadyMessage),
         );
 
         const channel = new EncryptedChannel(transport, sharedKey, events, {
           daemonKeyPair,
           binaryCiphertext,
+          authPreface: options.authPreface,
         });
         channel.setState("open");
         events.onopen?.();
