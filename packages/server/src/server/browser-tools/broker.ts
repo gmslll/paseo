@@ -132,6 +132,7 @@ interface EnterpriseHandleAuthoritySnapshot {
   readonly organizationId: string;
   readonly nodeId: string;
   readonly principalId: string;
+  readonly sessionBindingGeneration: string;
 }
 
 interface EnterprisePageIdentityExecution {
@@ -450,10 +451,7 @@ export class BrowserToolsBroker {
         });
       }
       const handleAuthority = this.snapshotCurrentHandle(runtime, snapshot.handle);
-      const pageIdentity = await this.preparePageIdentityExecution(
-        snapshot,
-        handleAuthority.nodeId,
-      );
+      const pageIdentity = await this.preparePageIdentityExecution(snapshot);
       const authorization = await this.resolveCurrentAuthorization(
         runtime,
         snapshot.handle,
@@ -465,6 +463,7 @@ export class BrowserToolsBroker {
         {
           command: snapshot.command,
           requestId,
+          bootstrapAuthority: handleAuthority,
         },
         authorization,
       );
@@ -672,7 +671,6 @@ export class BrowserToolsBroker {
 
   private async preparePageIdentityExecution(
     input: ReturnType<typeof snapshotEnterpriseExecuteInput>,
-    homeNodeId: string,
   ): Promise<EnterprisePageIdentityExecution | null> {
     if (!this.pageIdentity) {
       throw new Error("Enterprise Browser page identity is unavailable.");
@@ -681,9 +679,6 @@ export class BrowserToolsBroker {
     // that atomically combines with authenticated provisional page evidence. Neither operation
     // grants page proof by itself.
     if (input.command.command === "list_tabs" || input.command.command === "new_tab") {
-      if (this.listEnterpriseHostsForNode(homeNodeId).length === 0) {
-        throw new Error("An authenticated Enterprise Browser host Session is required.");
-      }
       return null;
     }
     const verification = input.pageIdentityVerification;
@@ -1071,6 +1066,7 @@ export class BrowserToolsBroker {
     input: {
       readonly command: BrowserAutomationCommand;
       readonly requestId: string;
+      readonly bootstrapAuthority?: EnterpriseHandleAuthoritySnapshot;
     },
     authorization: BrowserProfileLeaseAuthorization,
   ):
@@ -1092,15 +1088,19 @@ export class BrowserToolsBroker {
       if (host) {
         return { ok: true, value: host };
       }
-      if (eligibleHosts.length === 0) {
-        return { ok: false, payload: this.noBrowserHostFailure(requestId) };
+      const bootstrapHosts = input.bootstrapAuthority
+        ? this.listEnterpriseBootstrapHosts(input.bootstrapAuthority, homeNodeId)
+        : [];
+      if (bootstrapHosts.length === 1) {
+        return { ok: true, value: bootstrapHosts[0] };
       }
       return {
         ok: false,
         payload: browserToolsFailure({
           requestId,
           code: "browser_denied",
-          message: "This Browser Profile is not registered to an authorized Desktop host.",
+          message:
+            "This Browser Profile does not have a unique authorized Desktop host for the current Agent Session.",
         }),
       };
     }
@@ -1155,6 +1155,23 @@ export class BrowserToolsBroker {
     return Array.from(this.clients.values()).filter(
       (host) => this.readyHosts.has(host) && this.isEnterpriseHostForNode(host, nodeId),
     );
+  }
+
+  private listEnterpriseBootstrapHosts(
+    authority: EnterpriseHandleAuthoritySnapshot,
+    profileHomeNodeId: string,
+  ): RegisteredBrowserHost[] {
+    if (authority.nodeId !== profileHomeNodeId) return [];
+    return Array.from(this.clients.values()).filter((host) => {
+      const session = host.authenticatedSession;
+      return (
+        session !== undefined &&
+        this.isEnterpriseHostForNode(host, authority.nodeId) &&
+        session.homeNodeId === authority.nodeId &&
+        session.sessionBindingGeneration === authority.sessionBindingGeneration &&
+        !this.failedPageIdentitySessions.has(session)
+      );
+    });
   }
 
   private isEnterpriseHostForNode(host: RegisteredBrowserHost, nodeId: string): boolean {
@@ -1563,6 +1580,7 @@ function snapshotEnterpriseHandleAuthority(
     organizationId: principal.organizationId,
     nodeId: node.nodeId,
     principalId: principal.principalId,
+    sessionBindingGeneration: context.sessionBindingGeneration,
   };
   if (Object.values(values).some((value) => typeof value !== "string" || value.length === 0)) {
     throw new Error("Invalid Enterprise Agent context authority.");

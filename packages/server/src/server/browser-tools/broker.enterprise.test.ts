@@ -124,6 +124,7 @@ interface EnterpriseFixture {
   workspaces: Record<"a" | "b" | "c", AuthorizedWorkspace>;
   manager: BrowserProfileLeaseManager;
   acquired: FencedLease[];
+  getAuditCallCount(): number;
   getResolverCalls(): number;
   setAuthorization(
     handle: EnterpriseAgentContextHandle,
@@ -218,6 +219,7 @@ async function createEnterpriseFixture(
     [handles.c, makeAuthorization(handles.c, workspaces.c, PROFILE_A)],
   ]);
   let leaseSequence = 0;
+  let auditCallCount = 0;
   const manager = new BrowserProfileLeaseManager({
     generationStorage: {
       read: async () => null,
@@ -225,7 +227,12 @@ async function createEnterpriseFixture(
     },
     createLeaseId: () => `lea_11111111-1111-4111-8111-${String(++leaseSequence).padStart(12, "0")}`,
     createRequestId: () => `wait-${leaseSequence + 1}`,
-    auditSink: { append: async () => ({}) as never },
+    auditSink: {
+      append: async () => {
+        auditCallCount += 1;
+        return {} as never;
+      },
+    },
     maxLeaseTtlMs: 30_000,
     isCurrentHandle: (handle) => registry.isCurrentHandle(handle),
     resolveAuthorization: (handle, browserProfileId) => {
@@ -291,6 +298,7 @@ async function createEnterpriseFixture(
     workspaces,
     manager,
     acquired,
+    getAuditCallCount: () => auditCallCount,
     getResolverCalls: () => resolverCalls,
     setAuthorization: (handle, authorization) => authorizations.set(handle, authorization),
     getAuthorization: (handle) => {
@@ -380,7 +388,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
   });
 
   test.each(["list_tabs", "new_tab"] as const)(
-    "denies %s before authorization when the Enterprise host has no authenticated Session",
+    "denies %s after authorization when the Enterprise host has no authenticated Session",
     async (command) => {
       const fixture = await createEnterpriseFixture();
       const host = new EnterpriseHost("desktop-client-untrusted", {
@@ -395,7 +403,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
           command: { command, args: {} },
         }),
       ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
-      expect(fixture.getResolverCalls()).toBe(resolverCalls);
+      expect(fixture.getResolverCalls()).toBe(resolverCalls + 1);
       expect(fixture.acquired).toEqual([]);
       expect(host.receivedRequests).toEqual([]);
       expect(fixture.broker.getPendingRequestCount()).toBe(0);
@@ -721,7 +729,13 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       invalidateHost: () => invalidation.promise,
     });
     const profileAHost = new EnterpriseHost("profile-a-host");
-    const profileBHost = new EnterpriseHost("profile-b-host");
+    const profileBHost = new EnterpriseHost("profile-b-host", {
+      authenticatedSession: createAuthenticatedBrowserHostSession({
+        clientId: "profile-b-host",
+        homeNodeId: NODE_ID,
+        sessionBindingGeneration: "session-b",
+      }),
+    });
     await registerProfileHost(fixture, profileAHost, fixture.handles.a);
     await registerProfileHost(fixture, profileBHost, fixture.handles.b);
     const profileAReplacement = new EnterpriseHost(profileAHost.id);
@@ -763,7 +777,13 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       onHostTeardownError: (error, hostClientId) => teardownErrors.push({ error, hostClientId }),
     });
     const profileAHost = new EnterpriseHost("profile-a-host");
-    const profileBHost = new EnterpriseHost("profile-b-host");
+    const profileBHost = new EnterpriseHost("profile-b-host", {
+      authenticatedSession: createAuthenticatedBrowserHostSession({
+        clientId: "profile-b-host",
+        homeNodeId: NODE_ID,
+        sessionBindingGeneration: "session-b",
+      }),
+    });
     await registerProfileHost(fixture, profileAHost, fixture.handles.a);
     await registerProfileHost(fixture, profileBHost, fixture.handles.b);
     const profileAReplacement = new EnterpriseHost(profileAHost.id);
@@ -802,10 +822,79 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     ]);
   });
 
-  test("does not fall back to an eligible host for an unregistered Profile", async () => {
+  test.each(["list_tabs", "new_tab"] as const)(
+    "bootstraps first %s through the unique authenticated host for the Agent Session generation",
+    async (command) => {
+      const fixture = await createEnterpriseFixture();
+      const host = new EnterpriseHost("unique-bootstrap-host");
+      fixture.broker.registerClient(host);
+
+      const execution = fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command, args: {} },
+      });
+      await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(1));
+      const request = host.receivedRequests[0];
+      expect(
+        host.respond(
+          fixture.broker,
+          request,
+          command === "list_tabs"
+            ? {
+                ok: true,
+                enterpriseContext: request.enterpriseContext,
+                result: { command: "list_tabs", tabs: [] },
+              }
+            : newTabSuccess(request),
+        ),
+      ).toBe(true);
+      await expect(execution).resolves.toMatchObject({ ok: true });
+
+      const ambiguousHost = new EnterpriseHost("later-bootstrap-host");
+      fixture.broker.registerClient(ambiguousHost);
+      const followup = fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+      });
+      await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(2));
+      expect(ambiguousHost.receivedRequests).toEqual([]);
+      const followupRequest = host.receivedRequests[1];
+      expect(
+        host.respond(fixture.broker, followupRequest, {
+          ok: true,
+          enterpriseContext: followupRequest.enterpriseContext,
+          result: { command: "list_tabs", tabs: [] },
+        }),
+      ).toBe(true);
+      await expect(followup).resolves.toMatchObject({ ok: true });
+    },
+  );
+
+  test("denies bootstrap with no matching host after resolution and before lease, audit, send, or pending state", async () => {
     const fixture = await createEnterpriseFixture();
-    const host = new EnterpriseHost("eligible-host");
-    fixture.broker.registerClient(host);
+    const resolverCalls = fixture.getResolverCalls();
+    const auditCalls = fixture.getAuditCallCount();
+
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(resolverCalls + 1);
+    expect(fixture.acquired).toEqual([]);
+    expect(fixture.getAuditCallCount()).toBe(auditCalls);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
+  });
+
+  test("denies bootstrap when more than one exact authenticated host is current", async () => {
+    const fixture = await createEnterpriseFixture();
+    const first = new EnterpriseHost("ambiguous-bootstrap-host-a");
+    const second = new EnterpriseHost("ambiguous-bootstrap-host-b");
+    fixture.broker.registerClient(first);
+    fixture.broker.registerClient(second);
+    const resolverCalls = fixture.getResolverCalls();
+    const auditCalls = fixture.getAuditCallCount();
 
     await expect(
       fixture.broker.executeEnterprise({
@@ -813,7 +902,57 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
         command: { command: "new_tab", args: {} },
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(resolverCalls + 1);
+    expect(fixture.acquired).toEqual([]);
+    expect(fixture.getAuditCallCount()).toBe(auditCalls);
+    expect(first.receivedRequests).toEqual([]);
+    expect(second.receivedRequests).toEqual([]);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
+  });
+
+  test("denies bootstrap when the authenticated host Session generation differs from the Agent handle", async () => {
+    const fixture = await createEnterpriseFixture();
+    const host = new EnterpriseHost("wrong-generation-bootstrap-host", {
+      authenticatedSession: createAuthenticatedBrowserHostSession({
+        clientId: "desktop-client-wrong-generation",
+        homeNodeId: NODE_ID,
+        sessionBindingGeneration: "session-b",
+      }),
+    });
+    fixture.broker.registerClient(host);
+    const resolverCalls = fixture.getResolverCalls();
+    const auditCalls = fixture.getAuditCallCount();
+
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(resolverCalls + 1);
+    expect(fixture.acquired).toEqual([]);
+    expect(fixture.getAuditCallCount()).toBe(auditCalls);
     expect(host.receivedRequests).toEqual([]);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
+  });
+
+  test("rejects caller-supplied bootstrap route authority", async () => {
+    const fixture = await createEnterpriseFixture();
+    const host = new EnterpriseHost("caller-selected-bootstrap-host");
+    fixture.broker.registerClient(host);
+
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "list_tabs", args: {} },
+        routeId: host.id,
+        clientId: host.authenticatedSession?.clientId,
+      } as never),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    expect(fixture.getResolverCalls()).toBe(0);
+    expect(fixture.acquired).toEqual([]);
+    expect(host.receivedRequests).toEqual([]);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
   });
 
   test("keeps legacy and enterprise request IDs collision-free", async () => {
@@ -960,7 +1099,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     await expect(Promise.all([first, second])).resolves.toMatchObject([{ ok: true }, { ok: true }]);
   });
 
-  test("does not reuse Profile ownership or tab affinity after a binding revision changes", async () => {
+  test("rebuilds Profile ownership without reusing tab affinity after a binding revision changes", async () => {
     const fixture = await createEnterpriseFixture();
     const host = new EnterpriseHost("profile-host");
     await registerProfileHost(fixture, host);
@@ -978,20 +1117,21 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       ...original,
       bindingRevision: "binding-updated",
     });
-    await expect(
-      fixture.broker.executeEnterprise({
-        handle: fixture.handles.a,
-        command: { command: "list_tabs", args: {} },
+    const rebound = fixture.broker.executeEnterprise({
+      handle: fixture.handles.a,
+      command: { command: "list_tabs", args: {} },
+    });
+    await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(2));
+    const reboundRequest = host.receivedRequests[1];
+    expect(
+      host.respond(fixture.broker, reboundRequest, {
+        ok: true,
+        enterpriseContext: reboundRequest.enterpriseContext,
+        result: { command: "list_tabs", tabs: [] },
       }),
-    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
-    expect(host.receivedRequests).toHaveLength(1);
+    ).toBe(true);
+    await expect(rebound).resolves.toMatchObject({ ok: true });
 
-    await expect(
-      fixture.broker.bindEnterpriseProfileHost({
-        handle: fixture.handles.a,
-        hostClientId: host.id,
-      }),
-    ).resolves.toBe(true);
     await expect(
       fixture.broker.executeEnterprise({
         handle: fixture.handles.a,
@@ -1001,7 +1141,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       ok: false,
       error: { code: "browser_denied" },
     });
-    expect(host.receivedRequests).toHaveLength(1);
+    expect(host.receivedRequests).toHaveLength(2);
   });
 
   test("does not publish tab affinity until post-response authorization is current", async () => {
@@ -1745,7 +1885,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
         command: { command: "list_tabs", args: {} },
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
-    expect(fixture.getResolverCalls()).toBe(postFailureResolverCalls);
+    expect(fixture.getResolverCalls()).toBe(postFailureResolverCalls + 1);
     expect(fixture.acquired).toHaveLength(postFailureAcquireCount);
     expect(host.receivedRequests).toHaveLength(1);
 
@@ -1764,7 +1904,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
         command: { command: "new_tab", args: {} },
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
-    expect(fixture.getResolverCalls()).toBe(failedSessionResolverCalls);
+    expect(fixture.getResolverCalls()).toBe(failedSessionResolverCalls + 1);
     expect(host.receivedRequests).toHaveLength(1);
     unregisterFailedSession();
 
