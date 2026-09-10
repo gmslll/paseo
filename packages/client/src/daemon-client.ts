@@ -1424,6 +1424,7 @@ export class DaemonClient {
           baseFactory: baseTransportFactory,
           daemonPublicKeyB64,
           logger: this.logger,
+          ...(password ? { authPreface: { getToken: () => password } } : {}),
         });
       }
       const transportUrl = this.resolveTransportUrlForAttempt();

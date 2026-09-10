@@ -56,6 +56,7 @@ interface EncryptedChannelOptions {
   daemonKeyPair?: KeyPair;
   binaryCiphertext?: boolean;
   authPreface?: { challenge: string };
+  clientAuthPreface?: { getToken(): string | Promise<string> };
 }
 
 interface E2EEHelloMessage {
@@ -162,13 +163,15 @@ export async function createClientChannel(
   transport: Transport,
   daemonPublicKeyB64: string,
   events: EncryptedChannelEvents = {},
-  _options: ClientEncryptedChannelOptions = {},
+  options: ClientEncryptedChannelOptions = {},
 ): Promise<EncryptedChannel> {
   const keyPair = generateKeyPair();
   const daemonPublicKey = importPublicKey(daemonPublicKeyB64);
   const sharedKey = deriveSharedKey(keyPair.secretKey, daemonPublicKey);
 
-  const channel = new EncryptedChannel(transport, sharedKey, events);
+  const channel = new EncryptedChannel(transport, sharedKey, events, {
+    clientAuthPreface: options.authPreface,
+  });
 
   // Send e2ee_hello with our public key
   const ourPublicKeyB64 = exportPublicKey(keyPair.publicKey);
@@ -340,6 +343,9 @@ export class EncryptedChannel {
   private pendingSends: Array<string | ArrayBuffer> = [];
   private onOpenCallbacks: Array<() => void> = [];
   private onCloseCallbacks: Array<() => void> = [];
+  private clientAuthChallenge: string | null = null;
+  private acceptedClientAuthChallenge: string | null = null;
+  private clientAuthFailed = false;
 
   constructor(
     transport: Transport,
@@ -376,8 +382,7 @@ export class EncryptedChannel {
         const text = decodeTransportText(message.data);
         const parsed: unknown = JSON.parse(text);
         if (isE2EEReadyMessage(parsed)) {
-          this.options.binaryCiphertext = supportsBinaryCiphertext(parsed);
-          await this.transitionToOpen();
+          await this.handleReadyMessage(parsed);
         }
       } catch {
         // ignore non-ready handshake traffic
@@ -385,7 +390,7 @@ export class EncryptedChannel {
       return;
     }
 
-    if (this.state !== "open") return;
+    if (this.state !== "open" && this.state !== "authenticating") return;
 
     try {
       const ciphertext = await (async () => {
@@ -447,6 +452,19 @@ export class EncryptedChannel {
       if (ciphertext) {
         const plaintextBytes = decrypt(this.sharedKey, ciphertext.data);
         const plaintext = decodePlaintext(plaintextBytes, ciphertext.isBinary);
+        if (this.state === "authenticating") {
+          if (!(await this.acceptClientAuthResponse(plaintext))) {
+            this.failClientAuth(new Error("Relay encrypted auth response mismatch"));
+          }
+          return;
+        }
+        if (
+          this.acceptedClientAuthChallenge &&
+          isAuthOkForChallenge(plaintext, this.acceptedClientAuthChallenge)
+        ) {
+          this.failClientAuth(new Error("Duplicate relay encrypted auth response"));
+          return;
+        }
         this.events.onmessage?.(plaintext);
       }
     } catch (error) {
@@ -460,6 +478,64 @@ export class EncryptedChannel {
       } catch {
         // ignore
       }
+    }
+  }
+
+  private async handleReadyMessage(message: E2EEReadyMessage): Promise<void> {
+    this.options.binaryCiphertext = supportsBinaryCiphertext(message);
+    if (!this.options.clientAuthPreface) {
+      await this.transitionToOpen();
+      return;
+    }
+    const challenge = message.capabilities?.admissionChallenge;
+    if (
+      message.capabilities?.encryptedAuthPrefaceV1 !== true ||
+      typeof challenge !== "string" ||
+      !hasExactly32DecodedBytes(challenge)
+    ) {
+      this.failClientAuth(new Error("Relay encrypted auth preface is unavailable"));
+      return;
+    }
+    this.clientAuthChallenge = challenge;
+    this.state = "authenticating";
+    await this.sendClientAuthPreface(challenge);
+  }
+
+  private async sendClientAuthPreface(challenge: string): Promise<void> {
+    let token: string | undefined;
+    try {
+      token = await this.options.clientAuthPreface?.getToken();
+      if (typeof token !== "string" || token.length === 0) {
+        throw new Error("Relay encrypted auth token is unavailable");
+      }
+      await this.sendEncrypted(
+        JSON.stringify({ type: "encrypted_auth_preface_v1", challenge, token }),
+      );
+    } catch (error) {
+      this.failClientAuth(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      token = undefined;
+    }
+  }
+
+  private async acceptClientAuthResponse(plaintext: string | ArrayBuffer): Promise<boolean> {
+    if (typeof plaintext !== "string" || !this.clientAuthChallenge) return false;
+    if (!isAuthOkForChallenge(plaintext, this.clientAuthChallenge)) return false;
+    this.acceptedClientAuthChallenge = this.clientAuthChallenge;
+    this.clientAuthChallenge = null;
+    await this.transitionToOpen();
+    return true;
+  }
+
+  private failClientAuth(error: Error): void {
+    if (this.clientAuthFailed || this.state === "closed") return;
+    this.clientAuthFailed = true;
+    this.state = "closed";
+    this.events.onerror?.(error);
+    try {
+      this.transport.close(1008, error.message);
+    } catch {
+      // The transport is already closing; the auth failure remains observable.
     }
   }
 
@@ -478,7 +554,7 @@ export class EncryptedChannel {
   }
 
   async send(data: string | ArrayBuffer): Promise<void> {
-    if (this.state === "handshaking") {
+    if (this.state === "handshaking" || this.state === "authenticating") {
       if (this.pendingSends.length >= MAX_PENDING_SENDS) {
         this.pendingSends.shift();
       }
@@ -490,6 +566,10 @@ export class EncryptedChannel {
       throw new Error("Channel not open");
     }
 
+    await this.sendEncrypted(data);
+  }
+
+  private async sendEncrypted(data: string | ArrayBuffer): Promise<void> {
     const ciphertext = encrypt(this.sharedKey, data);
     if (this.options.binaryCiphertext && data instanceof ArrayBuffer) {
       await this.transport.send(ciphertext);
@@ -594,4 +674,31 @@ function keysEqual(a: Uint8Array, b: Uint8Array): boolean {
     difference |= a[i] ^ b[i];
   }
   return difference === 0;
+}
+
+function hasExactly32DecodedBytes(value: string): boolean {
+  try {
+    return base64ToArrayBuffer(value).byteLength === 32;
+  } catch {
+    return false;
+  }
+}
+
+function isAuthOkForChallenge(value: string | ArrayBuffer, challenge: string): boolean {
+  if (typeof value !== "string") return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) return false;
+    const keys = Reflect.ownKeys(parsed);
+    if (keys.length !== 2 || !keys.every((key) => key === "type" || key === "challenge")) {
+      return false;
+    }
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(parsed, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+    }
+    return parsed.type === "auth_ok" && parsed.challenge === challenge;
+  } catch {
+    return false;
+  }
 }

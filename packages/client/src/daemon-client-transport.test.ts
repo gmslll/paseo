@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { describe, expect, test, vi } from "vitest";
 import {
   createEncryptedTransport,
+  createRelayE2eeTransportFactory,
   createWebSocketTransportFactory,
   decodeMessageData,
   describeTransportClose,
@@ -17,6 +18,47 @@ vi.mock("@getpaseo/relay/e2ee", () => ({
 }));
 
 describe("daemon-client transport helpers", () => {
+  test("relay E2EE keeps PAT in the auth preface closure and off outer headers", async () => {
+    createClientChannelMock.mockReset();
+    createClientChannelMock.mockResolvedValue({
+      send: vi.fn(),
+      close: vi.fn(),
+    });
+    let openHandler: (() => void) | null = null;
+    const baseFactory = vi.fn(() => ({
+      send: vi.fn(),
+      close: vi.fn(),
+      onOpen: (handler: () => void) => {
+        openHandler = handler;
+        return () => undefined;
+      },
+      onClose: () => () => undefined,
+      onError: () => () => undefined,
+      onMessage: () => () => undefined,
+    }));
+    const authPreface = { getToken: vi.fn(() => "pat-secret") };
+    const factory = createRelayE2eeTransportFactory({
+      baseFactory,
+      daemonPublicKeyB64: "daemon-public-key",
+      logger: { warn: vi.fn() },
+      authPreface,
+    });
+
+    factory({
+      url: "wss://relay.example",
+      headers: { Authorization: "Bearer pat-secret", "X-Relay-Route": "edge-a" },
+      protocols: ["paseo.bearer.pat-secret", "paseo.route.v1"],
+    });
+    expect(baseFactory).toHaveBeenCalledWith({
+      url: "wss://relay.example",
+      headers: { "X-Relay-Route": "edge-a" },
+      protocols: ["paseo.route.v1"],
+    });
+    openHandler?.();
+    await vi.waitFor(() => expect(createClientChannelMock).toHaveBeenCalledTimes(1));
+    expect(createClientChannelMock.mock.calls[0]?.[3]).toEqual({ authPreface });
+  });
+
   test("createEncryptedTransport closes handshake failures with browser-safe code", async () => {
     createClientChannelMock.mockReset();
     createClientChannelMock.mockRejectedValueOnce(new Error("handshake failed"));
