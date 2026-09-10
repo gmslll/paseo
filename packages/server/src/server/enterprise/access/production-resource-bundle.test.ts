@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { NodeContext } from "@getpaseo/protocol/messages";
+import type { StoredAgentRecord } from "../../agent/agent-storage.js";
 import { describe, expect, test } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import {
@@ -120,9 +121,11 @@ describe("production resource bundle ports", () => {
           ownerPrincipalId: "usr_0123456789abcdef",
           createdByPrincipalId: "usr_0123456789abcdef",
         });
+        const agentRecords: StoredAgentRecord[] = [];
         const bundle = await createProductionResourceBundle({
           provider,
           workspaceRegistry: registry,
+          agentRecords: { list: () => agentRecords },
           nodeId,
         });
         expect(bundle).not.toBeNull();
@@ -136,6 +139,31 @@ describe("production resource bundle ports", () => {
             resourceKinds: ["workspace"],
           }),
         ).resolves.toMatchObject({ resources: [{ workspaceId: "workspace-bundle" }] });
+        agentRecords.push({
+          id: "agent-bundle",
+          provider: "test",
+          cwd: "/tmp/workspace-bundle",
+          workspaceId: "workspace-bundle",
+          organizationId,
+          nodeId,
+          ownerPrincipalId: "usr_0123456789abcdef",
+          createdByPrincipalId: "usr_0123456789abcdef",
+          createdAt: "2026-09-10T00:00:00.000Z",
+          updatedAt: "2026-09-10T00:01:00.000Z",
+          lastStatus: "running",
+          config: null,
+          labels: {},
+          persistence: null,
+        } as StoredAgentRecord);
+        await expect(
+          bundle?.organizationResources.list({
+            organizationId,
+            nodeId,
+            resourceKinds: ["agent"],
+          }),
+        ).resolves.toMatchObject({
+          resources: [{ agentId: "agent-bundle", workspaceId: "workspace-bundle" }],
+        });
       } finally {
         await audit.close();
         await rm(root, { recursive: true, force: true });

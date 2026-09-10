@@ -1,6 +1,7 @@
 import {
   EnterpriseOrganizationResourceProjectionSchema,
   GlobalResourceRefSchema,
+  NodeIdSchema,
   type EnterpriseOrganizationResourceProjection,
   type GlobalResourceRef,
   type NodeId,
@@ -14,11 +15,12 @@ import type {
   EnterpriseOrganizationResourcePage,
   EnterpriseOrganizationResourceSource,
 } from "./enterprise-resource-handlers.js";
+import type { StoredAgentRecord } from "../../agent/agent-storage.js";
 import {
   createEnterpriseResourceDispatcherFactory,
   type EnterpriseResourceDispatcherFactory,
 } from "./enterprise-resource-dispatcher-factory.js";
-import { getAuthoritativeWorkspace } from "./owner-registry.js";
+import { getAuthoritativeAgent, getAuthoritativeWorkspace } from "./owner-registry.js";
 import {
   isCurrentProductionAuthorizationRuntimeProvider,
   type ProductionAuthorizationRuntimeProvider,
@@ -27,7 +29,12 @@ import {
 export interface ProductionResourceBundleOptions {
   readonly provider: ProductionAuthorizationRuntimeProvider;
   readonly workspaceRegistry: FileBackedWorkspaceRegistry;
+  readonly agentRecords: ProductionAgentRecordSource;
   readonly nodeId: NodeId;
+}
+
+export interface ProductionAgentRecordSource {
+  readonly list: () => Promise<readonly StoredAgentRecord[]> | readonly StoredAgentRecord[];
 }
 
 export interface ProductionResourceBundle {
@@ -36,7 +43,7 @@ export interface ProductionResourceBundle {
   readonly organizationResources: EnterpriseOrganizationResourceSource;
 }
 
-const BUNDLE_KEYS = new Set(["provider", "workspaceRegistry", "nodeId"]);
+const BUNDLE_KEYS = new Set(["provider", "workspaceRegistry", "agentRecords", "nodeId"]);
 const PLACEMENT_KEYS = new Set(["workspaceRegistry", "nodeId"]);
 
 export async function createProductionResourceBundle(
@@ -48,19 +55,26 @@ export async function createProductionResourceBundle(
       return null;
     }
     if (!(captured.workspaceRegistry instanceof FileBackedWorkspaceRegistry)) return null;
-    if (typeof captured.nodeId !== "string" || captured.nodeId.length === 0) return null;
+    if (!isAgentRecordSource(captured.agentRecords)) return null;
+    if (!NodeIdSchema.safeParse(captured.nodeId).success) return null;
+    const bundle = captured as unknown as {
+      provider: ProductionAuthorizationRuntimeProvider;
+      workspaceRegistry: FileBackedWorkspaceRegistry;
+      agentRecords: ProductionAgentRecordSource;
+      nodeId: NodeId;
+    };
 
-    await captured.workspaceRegistry.initialize();
-    const records = await captured.workspaceRegistry.list();
-    if (!isCurrentProductionAuthorizationRuntimeProvider(captured.provider)) return null;
+    await bundle.workspaceRegistry.initialize();
+    const records = await bundle.workspaceRegistry.list();
+    if (!isCurrentProductionAuthorizationRuntimeProvider(bundle.provider)) return null;
     for (const record of records) {
-      if (record.nodeId !== captured.nodeId || record.archivedAt !== null) continue;
-      const existing = getAuthoritativeWorkspace(captured.provider.owners, record.workspaceId);
+      if (record.nodeId !== bundle.nodeId || record.archivedAt !== null) continue;
+      const existing = getAuthoritativeWorkspace(bundle.provider.owners, record.workspaceId);
       if (existing) {
         if (!sameOwner(existing, record)) return null;
         continue;
       }
-      captured.provider.owners.registerWorkspace({
+      bundle.provider.owners.registerWorkspace({
         id: record.workspaceId,
         organizationId: record.organizationId,
         nodeId: record.nodeId,
@@ -68,19 +82,21 @@ export async function createProductionResourceBundle(
         createdByPrincipalId: record.createdByPrincipalId,
       });
     }
+    await registerAgentRecords(bundle.provider, bundle.agentRecords, bundle.nodeId);
 
     const placement = createProductionPlacementResolver({
-      workspaceRegistry: captured.workspaceRegistry,
-      nodeId: captured.nodeId,
+      workspaceRegistry: bundle.workspaceRegistry,
+      nodeId: bundle.nodeId,
     });
     const organizationResources = createProductionOrganizationResourceSource({
-      provider: captured.provider,
-      workspaceRegistry: captured.workspaceRegistry,
-      nodeId: captured.nodeId,
+      provider: bundle.provider,
+      workspaceRegistry: bundle.workspaceRegistry,
+      agentRecords: bundle.agentRecords,
+      nodeId: bundle.nodeId,
     });
     if (!placement || !organizationResources) return null;
     const dispatcherFactory = createEnterpriseResourceDispatcherFactory({
-      provider: captured.provider,
+      provider: bundle.provider,
       placement,
       organizationResources,
     });
@@ -130,7 +146,20 @@ export function createProductionOrganizationResourceSource(
         if (!isCurrentProductionAuthorizationRuntimeProvider(captured.provider)) {
           throw new Error("production resource source is unavailable");
         }
-        const records = (await captured.workspaceRegistry.list())
+        const [workspaceRecords, agentRecords] = await Promise.all([
+          captured.workspaceRegistry.list(),
+          captured.agentRecords.list(),
+        ]);
+        await registerAgentRecords(
+          captured.provider,
+          captured.agentRecords,
+          captured.nodeId,
+          agentRecords,
+        );
+        if (!isCurrentProductionAuthorizationRuntimeProvider(captured.provider)) {
+          throw new Error("production resource source is unavailable");
+        }
+        const workspaceRows = workspaceRecords
           .filter(
             (record) =>
               record.archivedAt === null &&
@@ -138,18 +167,31 @@ export function createProductionOrganizationResourceSource(
               record.nodeId === captured.nodeId &&
               (request.resourceKinds.length === 0 || request.resourceKinds.includes("workspace")),
           )
-          .sort((left, right) => left.workspaceId.localeCompare(right.workspaceId));
+          .map((record) => workspaceProjection(record, captured.nodeId));
+        const agentRows = agentRecords
+          .filter(
+            (record) =>
+              record.archivedAt == null &&
+              record.organizationId === request.organizationId &&
+              record.nodeId === captured.nodeId &&
+              (request.resourceKinds.length === 0 || request.resourceKinds.includes("agent")),
+          )
+          .map((record) => agentProjection(captured.provider, record, captured.nodeId))
+          .filter((row): row is EnterpriseOrganizationResourceProjection => row !== null);
+        const resources = [...workspaceRows, ...agentRows].sort((left, right) =>
+          resourceId(left).localeCompare(resourceId(right)),
+        );
         const afterCursor = request.cursor
-          ? records.filter((record) => record.workspaceId > request.cursor!)
-          : records;
+          ? resources.filter((row) => resourceId(row) > request.cursor!)
+          : resources;
         const limit = Math.min(request.limit ?? 100, 500);
         const page = afterCursor.slice(0, limit);
-        const resources = page.map((record) => workspaceProjection(record, captured.nodeId));
         const hasMore = afterCursor.length > page.length;
+        const last = page.at(-1);
         return Object.freeze({
           principals: Object.freeze([]),
           resources: Object.freeze(resources),
-          nextCursor: hasMore ? (page.at(-1)?.workspaceId ?? null) : null,
+          nextCursor: hasMore && last ? resourceId(last) : null,
         });
       },
     });
@@ -182,8 +224,7 @@ function capturePlacementInput(value: unknown): {
   if (
     !captured ||
     !(captured.workspaceRegistry instanceof FileBackedWorkspaceRegistry) ||
-    typeof captured.nodeId !== "string" ||
-    captured.nodeId.length === 0
+    !NodeIdSchema.safeParse(captured.nodeId).success
   )
     return null;
   return captured as unknown as { workspaceRegistry: FileBackedWorkspaceRegistry; nodeId: NodeId };
@@ -192,6 +233,7 @@ function capturePlacementInput(value: unknown): {
 function captureOrganizationInput(value: unknown): {
   provider: ProductionAuthorizationRuntimeProvider;
   workspaceRegistry: FileBackedWorkspaceRegistry;
+  agentRecords: ProductionAgentRecordSource;
   nodeId: NodeId;
 } | null {
   const captured = captureExactRecord(value, BUNDLE_KEYS);
@@ -199,15 +241,76 @@ function captureOrganizationInput(value: unknown): {
     !captured ||
     !isCurrentProductionAuthorizationRuntimeProvider(captured.provider) ||
     !(captured.workspaceRegistry instanceof FileBackedWorkspaceRegistry) ||
-    typeof captured.nodeId !== "string" ||
-    captured.nodeId.length === 0
+    !NodeIdSchema.safeParse(captured.nodeId).success
   )
     return null;
   return captured as unknown as {
     provider: ProductionAuthorizationRuntimeProvider;
     workspaceRegistry: FileBackedWorkspaceRegistry;
+    agentRecords: ProductionAgentRecordSource;
     nodeId: NodeId;
   };
+}
+
+async function registerAgentRecords(
+  provider: ProductionAuthorizationRuntimeProvider,
+  source: ProductionAgentRecordSource,
+  nodeId: NodeId,
+  records?: readonly StoredAgentRecord[],
+): Promise<void> {
+  const current = records ?? (await source.list());
+  for (const record of current) {
+    if (record.nodeId === nodeId && record.archivedAt == null) {
+      provider.owners.registerAgent({
+        id: record.id,
+        workspaceId: record.workspaceId,
+        organizationId: record.organizationId,
+        nodeId: record.nodeId,
+        ownerPrincipalId: record.ownerPrincipalId,
+        createdByPrincipalId: record.createdByPrincipalId,
+      });
+    }
+  }
+}
+
+function isAgentRecordSource(value: unknown): value is ProductionAgentRecordSource {
+  return isObject(value) && typeof (value as { list?: unknown }).list === "function";
+}
+
+function agentProjection(
+  provider: ProductionAuthorizationRuntimeProvider,
+  record: StoredAgentRecord,
+  nodeId: NodeId,
+): EnterpriseOrganizationResourceProjection | null {
+  const owner = getAuthoritativeAgent(provider.owners, record.id);
+  if (
+    !owner ||
+    owner.nodeId !== nodeId ||
+    owner.organizationId !== record.organizationId ||
+    owner.workspaceId !== record.workspaceId
+  )
+    return null;
+  return EnterpriseOrganizationResourceProjectionSchema.parse({
+    organizationId: owner.organizationId,
+    nodeId,
+    resourceKind: "agent",
+    agentId: record.id,
+    workspaceId: owner.workspaceId,
+    ownerPrincipalId: owner.ownerPrincipalId,
+    label: record.title ?? record.id,
+    status: record.lastStatus,
+    provider: record.provider,
+    model: record.config?.model ?? null,
+    startedAt: record.createdAt,
+    lastActivityAt: record.lastActivityAt ?? record.updatedAt,
+    durationMs: 0,
+  });
+}
+
+function resourceId(row: EnterpriseOrganizationResourceProjection): string {
+  if (row.resourceKind === "workspace") return row.workspaceId;
+  if (row.resourceKind === "agent") return row.agentId;
+  return row.resourceKind === "browser_profile" ? row.browserProfileId : row.appSlotId;
 }
 
 function captureExactRecord(
