@@ -59,6 +59,7 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       });
       expect(registration?.manifest.operations).toEqual([
         "enterprise.workspace.content.read.request",
+        "enterprise.app_slot.content.read.request",
       ]);
       const registrationReady = registration;
       if (!registrationReady) throw new Error("registration");

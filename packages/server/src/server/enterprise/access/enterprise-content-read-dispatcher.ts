@@ -4,7 +4,10 @@ import { resolveCurrentProductionRuntimeAuthority } from "./production-runtime-a
 import { isCurrentProductionAuthorizationRuntimeForAuthoritySources } from "./production-authorization-runtime.js";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
 import type { EnterpriseContentAgentProductionSource } from "../runtime/enterprise-content-read.js";
-import { createEnterpriseWorkspaceContentReadSource } from "../runtime/enterprise-content-read.js";
+import {
+  createEnterpriseWorkspaceContentReadSource,
+  createEnterpriseAppSlotContentReadSource,
+} from "../runtime/enterprise-content-read.js";
 import { isCurrentProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import type {
@@ -16,6 +19,9 @@ import {
   GlobalResourceRefSchema,
   EnterpriseWorkspaceContentSelectorSchema,
   EnterpriseWorkspaceContentReadResponseSchema,
+  EnterpriseAppSlotContentReadRequestSchema,
+  EnterpriseAppSlotContentReadResponseSchema,
+  EnterpriseAppSlotContentSelectorSchema,
   type GlobalResourceRef,
 } from "@getpaseo/protocol/messages";
 import { productionAuditCapabilityIssuer } from "../audit/production-audit-runtime.js";
@@ -67,7 +73,12 @@ export function createEnterpriseContentReadDispatcherRegistration(
   }
   if (!isCurrentProductionAuthorizationRuntimeProvider(provider) || !audit || !agents) return null;
   return {
-    manifest: { operations: ["enterprise.workspace.content.read.request"] },
+    manifest: {
+      operations: [
+        "enterprise.workspace.content.read.request",
+        "enterprise.app_slot.content.read.request",
+      ],
+    },
     open(openInput) {
       if (!openInput.authorizationRuntime || !openInput.filesRuntime)
         throw new Error("content runtime unavailable");
@@ -78,6 +89,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
         filesRuntime: openInput.filesRuntime,
         agents,
       });
+      const appSlotSource = createEnterpriseAppSlotContentReadSource();
       if (!source) throw new Error("workspace source unavailable");
       let closed = false;
       let closePromise: Promise<void> | null = null;
@@ -107,17 +119,81 @@ export function createEnterpriseContentReadDispatcherRegistration(
       return {
         dispatcher: {
           requestPolicyForType: (type: string) =>
-            type === "enterprise.workspace.content.read.request" ? ("resources" as const) : null,
+            type === "enterprise.workspace.content.read.request" ||
+            type === "enterprise.app_slot.content.read.request"
+              ? ("resources" as const)
+              : null,
+          // oxlint-disable-next-line complexity
           handle: async ({ sessionContext, message }): Promise<SessionOutboundMessage | false> => {
             const parsed = EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
+            const parsedApp = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
+            let requestId = "";
+            if (parsed.success) requestId = parsed.data.requestId;
+            else if (parsedApp.success) requestId = parsedApp.data.requestId;
             if (
-              !parsed.success ||
+              (!parsed.success && !parsedApp.success) ||
               !current(sessionContext) ||
-              reservations.has(parsed.data.requestId)
+              reservations.has(requestId)
             )
               return false;
-            reservations.add(parsed.data.requestId);
+            reservations.add(requestId);
             try {
+              if (!parsed.success && parsedApp.success) {
+                const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
+                if (!authority) return false;
+                const principal = sessionContext.enterpriseContext.principal;
+                const slot = await authority.resourceAuthorization.assertAppSlot(
+                  principal,
+                  "app.use",
+                  parsedApp.data.resource.localResourceId,
+                );
+                if (!current(sessionContext)) return false;
+                const canonical = GlobalResourceRefSchema.parse({
+                  organizationId: slot.organizationId,
+                  nodeId: slot.nodeId,
+                  resourceKind: "app_slot",
+                  localResourceId: slot.appSlotId,
+                });
+                if (!equal(parsedApp.data.resource, canonical)) return false;
+                const selector = EnterpriseAppSlotContentSelectorSchema.parse(
+                  parsedApp.data.selector,
+                );
+                const page = await appSlotSource.read({
+                  resource: slot,
+                  selector,
+                  page: parsedApp.data.page,
+                });
+                if (!current(sessionContext)) return false;
+                await currentAudit.append(
+                  {
+                    organizationId: principal.organizationId,
+                    actorPrincipalId: principal.principalId,
+                    actorCredentialId: principal.credentialId,
+                    sessionId: sessionContext.sessionId,
+                    action: "app.use",
+                    resource: { kind: "app_slot", id: slot.appSlotId },
+                    outcome: "allowed",
+                  },
+                  { durability: "required" },
+                );
+                if (!current(sessionContext)) return false;
+                const response = deepFreeze(
+                  EnterpriseAppSlotContentReadResponseSchema.parse({
+                    type: "enterprise.app_slot.content.read.response",
+                    payload: { requestId, resource: canonical, selector, page },
+                  }),
+                );
+                const capability: Pending = Object.freeze({
+                  context: sessionContext,
+                  message,
+                  response,
+                  resource: canonical,
+                });
+                issued.set(response, capability);
+                pending.add(capability);
+                return response;
+              }
+              if (!parsed.success) return false;
               const authority = resolveCurrentProductionRuntimeAuthority(runtime, provider);
               if (!authority) return false;
               const workspace = await authority.resourceAuthorization.assertWorkspace(
@@ -178,7 +254,7 @@ export function createEnterpriseContentReadDispatcherRegistration(
             } catch {
               return false;
             } finally {
-              reservations.delete(parsed.data.requestId);
+              reservations.delete(requestId);
             }
           },
           consumeResponse: ({
@@ -192,8 +268,18 @@ export function createEnterpriseContentReadDispatcherRegistration(
             issued.delete(response);
             pending.delete(capability);
             try {
-              const request = EnterpriseWorkspaceContentReadRequestSchema.parse(message);
-              const parsedResponse = EnterpriseWorkspaceContentReadResponseSchema.parse(response);
+              const workspaceRequest =
+                EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
+              const appRequest = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
+              if (!workspaceRequest.success && !appRequest.success) return null;
+              const request = workspaceRequest.success ? workspaceRequest.data : appRequest.data;
+              const workspaceResponse =
+                EnterpriseWorkspaceContentReadResponseSchema.safeParse(response);
+              const appResponse = EnterpriseAppSlotContentReadResponseSchema.safeParse(response);
+              if (!workspaceResponse.success && !appResponse.success) return null;
+              const parsedResponse = workspaceResponse.success
+                ? workspaceResponse.data
+                : appResponse.data;
               if (capability.context !== sessionContext) return null;
               if (capability.message !== message) return null;
               if (capability.response !== response) return null;
@@ -220,7 +306,16 @@ export function createEnterpriseContentReadDispatcherRegistration(
           reservations.clear();
           for (const item of pending) if (isObject(item.response)) issued.delete(item.response);
           pending.clear();
-          closePromise = source.close();
+          closePromise = Promise.allSettled([source.close(), appSlotSource.close()]).then(
+            (results) => {
+              const errors = results.flatMap((result) =>
+                result.status === "rejected" ? [result.reason] : [],
+              );
+              if (errors.length > 0)
+                throw new AggregateError(errors, "content source close failed");
+              return undefined;
+            },
+          );
           return closePromise;
         },
       };
