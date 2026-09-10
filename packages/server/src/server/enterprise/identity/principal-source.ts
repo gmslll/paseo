@@ -78,6 +78,57 @@ function readIdentityDocument(
   }
 }
 
+export interface ProductionPrincipalProvisioning {
+  ensurePrincipal(input: PrincipalMetadataRecord): Promise<PrincipalMetadataRecord>;
+}
+
+export function createProductionPrincipalProvisioning(input: {
+  readonly filePath: string;
+  readonly fs?: IdentityRegistryFsPort;
+  readonly audit: ProductionAuditCapability;
+}): ProductionPrincipalProvisioning {
+  const fs = input.fs ?? nodeIdentityRegistryFs;
+  return {
+    async ensurePrincipal(record) {
+      productionAuditCapabilityIssuer.requireCurrent(input.audit);
+      if (record.principalId === "owner" || !record.principalId || !record.organizationId)
+        throw new Error("invalid durable principal");
+      let document: z.infer<typeof IdentityDocumentSchema> = { version: 1, principals: {} };
+      try {
+        const fd = fs.open(input.filePath, fs.noFollowFlag);
+        try {
+          document = IdentityDocumentSchema.parse(JSON.parse(fs.read(fd)));
+        } finally {
+          fs.close(fd);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      const existing = document.principals[record.principalId];
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(record))
+          throw new Error("principal conflict");
+        return Object.freeze({ ...existing });
+      }
+      const next = {
+        version: 1 as const,
+        principals: { ...document.principals, [record.principalId]: record },
+      };
+      const tmp = `${input.filePath}.tmp-${Date.now()}`;
+      const fd = fs.open(tmp, 0x241, 0o600);
+      try {
+        fs.write(fd, JSON.stringify(next));
+        fs.fsync(fd);
+      } finally {
+        fs.close(fd);
+      }
+      fs.rename(tmp, input.filePath);
+      productionAuditCapabilityIssuer.requireCurrent(input.audit);
+      return Object.freeze({ ...record });
+    },
+  };
+}
+
 export function createFilePrincipalGrantSource(input: {
   readonly filePath: string;
   readonly fs: IdentityRegistryFsPort;
