@@ -5,6 +5,17 @@ const path = require("node:path");
 const { isDeepStrictEqual } = require("node:util");
 const { app, BrowserWindow, ipcMain, Menu, nativeImage, screen, session } = require("electron");
 
+const {
+  BrowserProfileRuntimeAuthorizationRegistry,
+  getEnterpriseBrowserProfilePartition,
+} = require("../dist/features/browser-profile.js");
+const {
+  createBrowserProfileAuthorizationHandler,
+} = require("../dist/features/browser-webviews/profile-authorizations-handler.js");
+const {
+  PaseoBrowserWebviewRegistry: EnterpriseBrowserWebviewRegistry,
+} = require("../dist/features/browser-webviews/registry.js");
+
 const ROOT = __dirname;
 const OUT_DIR = process.env.PASEO_CAPTURE_HARNESS_OUT_DIR || path.join(ROOT, "out");
 const PRODUCTION_BROWSER_KEYBOARD_DIR = path.join(
@@ -41,6 +52,13 @@ const HARNESS_GROUP = process.env.PASEO_CAPTURE_HARNESS_GROUP || "permanent-park
 const BROWSER_PROFILE_PHASE = process.env.PASEO_CAPTURE_HARNESS_PHASE || "";
 const BROWSER_PROFILE_ORIGIN_FILE = path.join(OUT_DIR, "browser-profile-origin.txt");
 const BROWSER_PROFILE_VALUE_FILE = path.join(OUT_DIR, "browser-profile-value.txt");
+const ENTERPRISE_BROWSER_PROFILE_VALUES_FILE = path.join(
+  OUT_DIR,
+  "enterprise-browser-profile-values.json",
+);
+const HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL =
+  "paseo:browser-profile:hydrate-authorizations";
+const REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL = "paseo:browser-profile:revoke-generation";
 const PERMANENT_STATE_FILTER = new Set(
   (process.env.PASEO_CAPTURE_HARNESS_STATES || "P1")
     .split(",")
@@ -2506,6 +2524,143 @@ async function createBrowserProfileHarnessWindow(partition, sourceUrl) {
   return { handle, guests, identities };
 }
 
+const ENTERPRISE_PROFILE_NODE_ID = "nod_0123456789abcdef";
+const ENTERPRISE_PROFILE_ORGANIZATION_ID = "org_0123456789abcdef";
+const ENTERPRISE_PROFILE_WORKSPACE_ID = "workspace-enterprise-browser-profiles";
+const ENTERPRISE_PROFILE_GENERATION = "generation-enterprise-browser-profiles";
+const ENTERPRISE_PROFILE_IDS = [
+  "brp_0123456789abcdef",
+  "brp_1111111111111111",
+  "brp_2222222222222222",
+];
+
+function createEnterpriseProfileAuthorizations() {
+  return ENTERPRISE_PROFILE_IDS.map((browserProfileId, index) => ({
+    organizationId: ENTERPRISE_PROFILE_ORGANIZATION_ID,
+    homeNodeId: ENTERPRISE_PROFILE_NODE_ID,
+    workspaceId: ENTERPRISE_PROFILE_WORKSPACE_ID,
+    browserProfileId,
+    bindingRevision: `binding-${index + 1}`,
+    lifecycleGeneration: ENTERPRISE_PROFILE_GENERATION,
+  }));
+}
+
+async function createEnterpriseBrowserProfilesHarnessWindow(authorizations, sourceUrl) {
+  const handle = createInactiveHarnessWindow({
+    width: 640,
+    height: 480,
+    backgroundColor: "#202020",
+    webPreferences: {
+      preload: path.join(ROOT, "..", "dist", "preload.js"),
+      webviewTag: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+  const { win } = handle;
+  const registry = new EnterpriseBrowserWebviewRegistry();
+  const authorizationRegistry = new BrowserProfileRuntimeAuthorizationRegistry(
+    ENTERPRISE_PROFILE_NODE_ID,
+  );
+  const authorizationByBrowserId = new Map();
+  const pendingBrowserIdsByPartition = new Map();
+  const guestsByProfile = new Map();
+  const hostWebContentsId = win.webContents.id;
+  for (const authorization of authorizations) {
+    authorizationByBrowserId.set(authorization.browserProfileId, authorization);
+  }
+  const handler = createBrowserProfileAuthorizationHandler({
+    registry: authorizationRegistry,
+    hostWebContentsId,
+    cleanup: {
+      unregisterProfile(authorization) {
+        const guestIds = registry.unregisterProfile({ hostWebContentsId, authorization });
+        guestsByProfile.set(authorization.browserProfileId, guestIds);
+      },
+      findGuests(profileId) {
+        const guestIds = guestsByProfile.get(profileId) || [];
+        guestsByProfile.delete(profileId);
+        return guestIds;
+      },
+      destroyGuest(guestId) {
+        const guest = require("electron").webContents.fromId(guestId);
+        if (guest && !guest.isDestroyed()) guest.close({ waitForBeforeUnload: false });
+      },
+    },
+  });
+  ipcMain.handle(HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL, async (event, input) => {
+    if (event.sender.id !== hostWebContentsId) throw new Error("foreign browser profile host");
+    return await handler.hydrate(input.authorizations, input.lifecycleGeneration);
+  });
+  ipcMain.handle(REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL, async (event, input) => {
+    if (event.sender.id !== hostWebContentsId) throw new Error("foreign browser profile host");
+    return await handler.revoke(input.lifecycleGeneration);
+  });
+  win.webContents.on("will-attach-webview", (_event, webPreferences, params) => {
+    const authorization = [...authorizationByBrowserId.values()].find(
+      (candidate) =>
+        getEnterpriseBrowserProfilePartition(candidate.browserProfileId) === params.partition,
+    );
+    if (!authorization)
+      throw new Error(`unknown enterprise browser profile partition ${params.partition}`);
+    const browserId = authorization.browserProfileId;
+    const expectedPartition = getEnterpriseBrowserProfilePartition(browserId);
+    if (params.partition !== expectedPartition)
+      throw new Error(`enterprise profile partition mismatch for ${browserId}`);
+    const pending = pendingBrowserIdsByPartition.get(params.partition) || [];
+    pending.push(browserId);
+    pendingBrowserIdsByPartition.set(params.partition, pending);
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = false;
+  });
+  win.webContents.on("did-attach-webview", (_event, contents) => {
+    const browserId = [...pendingBrowserIdsByPartition.values()]
+      .find((pending) => pending.length)
+      ?.shift();
+    const authorization = authorizationByBrowserId.get(browserId);
+    if (!authorization || !browserId) throw new Error(`unmapped enterprise guest ${browserId}`);
+    registry.registerWebContents({
+      webContentsId: contents.id,
+      browserId,
+      hostWebContentsId,
+      workspaceId: authorization.workspaceId,
+      profileAuthorization: authorization,
+    });
+  });
+  const specs = authorizations.map((authorization) => ({
+    browserId: authorization.browserProfileId,
+    partition: getEnterpriseBrowserProfilePartition(authorization.browserProfileId),
+    sourceUrl,
+  }));
+  const guestsPromise = new Promise((resolve) => {
+    const guests = [];
+    const onAttach = (_event, contents) => {
+      guests.push(contents);
+      if (guests.length === specs.length) {
+        win.webContents.off("did-attach-webview", onAttach);
+        resolve(guests);
+      }
+    };
+    win.webContents.on("did-attach-webview", onAttach);
+  });
+  await withTimeout(
+    win.loadFile(path.join(ROOT, "index.html"), {
+      query: {
+        webviewCount: "0",
+        enterpriseProfileSpecs: JSON.stringify(specs),
+        enterpriseAuthorizations: JSON.stringify(authorizations),
+        enterpriseLifecycleGeneration: ENTERPRISE_PROFILE_GENERATION,
+      },
+    }),
+    "enterprise browser profile window loadFile",
+  );
+  await waitForInactiveReveal(handle, "enterprise browser profile window");
+  const guests = await withTimeout(guestsPromise, "enterprise browser profile attach", 15_000);
+  return { handle, guests, registry, authorizationRegistry, hostWebContentsId };
+}
+
 async function readBrowserProfileFixture(guest) {
   return await guest.executeJavaScript(`({
     cookie: document.cookie,
@@ -2633,12 +2788,114 @@ async function runBrowserProfileGroup() {
   }
 }
 
+async function runEnterpriseBrowserProfilesGroup() {
+  if (!["write", "read"].includes(BROWSER_PROFILE_PHASE)) {
+    fail(`unknown enterprise browser profile phase ${BROWSER_PROFILE_PHASE}`);
+  }
+  const authorizations = createEnterpriseProfileAuthorizations();
+  const fixture = await startBrowserProfileServer();
+  const values = Object.fromEntries(
+    authorizations.map((authorization) => [
+      authorization.browserProfileId,
+      `profile-${authorization.browserProfileId}`,
+    ]),
+  );
+  if (BROWSER_PROFILE_PHASE === "read") {
+    Object.assign(
+      values,
+      JSON.parse(await fsp.readFile(ENTERPRISE_BROWSER_PROFILE_VALUES_FILE, "utf8")),
+    );
+  }
+  const profileWindow = await createEnterpriseBrowserProfilesHarnessWindow(
+    authorizations,
+    fixture.origin,
+  );
+  try {
+    if (profileWindow.guests.length !== authorizations.length) {
+      fail("enterprise browser profile harness did not attach three guests");
+    }
+    await Promise.all(profileWindow.guests.map((guest) => waitForGuestLoad(guest)));
+    for (let index = 0; index < profileWindow.guests.length; index += 1) {
+      const guest = profileWindow.guests[index];
+      const profileId = authorizations[index].browserProfileId;
+      if (BROWSER_PROFILE_PHASE === "write") {
+        await guest.executeJavaScript(`(() => {
+          const value = ${JSON.stringify(values[profileId])};
+          localStorage.setItem("paseo-enterprise-profile", value);
+          document.cookie = "paseo-enterprise-profile=" + value + "; Max-Age=86400; SameSite=Lax";
+        })()`);
+      }
+    }
+    for (let index = 0; index < profileWindow.guests.length; index += 1) {
+      const guest = profileWindow.guests[index];
+      const profileId = authorizations[index].browserProfileId;
+      const state = await guest.executeJavaScript(
+        `({ cookie: document.cookie, localStorage: localStorage.getItem("paseo-enterprise-profile") })`,
+      );
+      if (state.localStorage !== values[profileId]) {
+        fail(`enterprise profile ${profileId} localStorage mismatch ${JSON.stringify(state)}`);
+      }
+      if (!state.cookie.split("; ").includes(`paseo-enterprise-profile=${values[profileId]}`)) {
+        fail(`enterprise profile ${profileId} cookie mismatch ${JSON.stringify(state)}`);
+      }
+      const registration = profileWindow.registry.getRegistrationForWebContents(guest.id);
+      if (registration?.profileAuthorization?.browserProfileId !== profileId) {
+        fail(`enterprise profile registry mismatch for ${profileId}`);
+      }
+      if (
+        getEnterpriseBrowserProfilePartition(profileId) !== `persist:paseo-enterprise-${profileId}`
+      ) {
+        fail(`enterprise profile partition mismatch for ${profileId}`);
+      }
+    }
+    if (BROWSER_PROFILE_PHASE === "write") {
+      await fsp.writeFile(
+        ENTERPRISE_BROWSER_PROFILE_VALUES_FILE,
+        `${JSON.stringify(values, null, 2)}\n`,
+      );
+    }
+    if (BROWSER_PROFILE_PHASE === "read") {
+      await renderer(
+        profileWindow.handle.win,
+        `window.paseoDesktop.browser.revokeBrowserProfileGeneration({ lifecycleGeneration: ${JSON.stringify(ENTERPRISE_PROFILE_GENERATION)} })`,
+      );
+      for (const guest of profileWindow.guests) {
+        if (!guest.isDestroyed()) fail(`revoked enterprise guest ${guest.id} remained alive`);
+      }
+    }
+    const results = [
+      {
+        group: "enterprise-browser-profiles",
+        check: "three-profile-partition-isolation",
+        pass: true,
+      },
+      { group: "enterprise-browser-profiles", check: "renderer-hydrate-before-attach", pass: true },
+    ];
+    if (BROWSER_PROFILE_PHASE === "read") {
+      results.push({
+        group: "enterprise-browser-profiles",
+        check: "restart-hydrate-and-generation-revoke",
+        pass: true,
+      });
+    }
+    return results;
+  } finally {
+    await closeHarnessWindow(profileWindow.handle.win);
+    await closeServer(fixture.server);
+  }
+}
+
 async function main() {
   ensureDirSync(OUT_DIR);
   if (
-    !["all", "existing", "permanent-parking", "automation", "browser-profile"].includes(
-      HARNESS_GROUP,
-    )
+    ![
+      "all",
+      "existing",
+      "permanent-parking",
+      "automation",
+      "browser-profile",
+      "enterprise-browser-profiles",
+    ].includes(HARNESS_GROUP)
   ) {
     fail(`unknown harness group ${HARNESS_GROUP}`);
   }
@@ -2654,6 +2911,15 @@ async function main() {
       )}\n`,
     );
     pass(`capture harness browser-profile complete output=${OUT_DIR}`);
+    return;
+  }
+  if (HARNESS_GROUP === "enterprise-browser-profiles") {
+    const results = await runEnterpriseBrowserProfilesGroup();
+    await fsp.writeFile(
+      path.join(OUT_DIR, "results.json"),
+      `${JSON.stringify({ generatedAt: new Date().toISOString(), enterpriseBrowserProfileResults: results }, null, 2)}\n`,
+    );
+    pass(`capture harness enterprise-browser-profiles complete output=${OUT_DIR}`);
     return;
   }
 
