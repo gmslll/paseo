@@ -1,6 +1,7 @@
 import type pino from "pino";
 import type { KeyPair } from "@getpaseo/relay/e2ee";
 import type { ExternalSocketMetadata } from "./websocket-server.js";
+import type { EnterpriseAdmissionAuthenticationEvidence } from "./enterprise/identity/admission-authorization.js";
 import {
   startRelayTransport,
   type RelaySocketLike,
@@ -18,11 +19,18 @@ export interface RelayRuntimeConfig {
 interface RelayRuntimeOptions {
   config: RelayRuntimeConfig;
   logger: pino.Logger;
-  attachSocket(ws: RelaySocketLike, metadata?: ExternalSocketMetadata): Promise<void>;
+  attachSocket(
+    ws: RelaySocketLike,
+    metadata?: ExternalSocketMetadata,
+    evidence?: EnterpriseAdmissionAuthenticationEvidence,
+  ): Promise<void>;
   serverId: string;
   daemonKeyPair: KeyPair;
   startTransport?: typeof startRelayTransport;
-  authenticateEnterprise?: (input: { token: string; challenge: string }) => Promise<boolean>;
+  authenticateEnterprise?: (input: {
+    token: string;
+    challenge: string;
+  }) => Promise<EnterpriseAdmissionAuthenticationEvidence | null>;
   requireEnterpriseAuth?: boolean;
 }
 

@@ -10,17 +10,25 @@ import {
 } from "@getpaseo/relay/e2ee";
 import { buildRelayWebSocketUrl } from "@getpaseo/protocol/daemon-endpoints";
 import type { ExternalSocketMetadata } from "./websocket-server.js";
+import type { EnterpriseAdmissionAuthenticationEvidence } from "./enterprise/identity/admission-authorization.js";
 import { createEncryptedRelaySocket } from "./websocket/encrypted-relay-socket.js";
 
 export interface RelayTransportOptions {
   logger: pino.Logger;
-  attachSocket: (ws: RelaySocketLike, metadata?: ExternalSocketMetadata) => Promise<void>;
+  attachSocket: (
+    ws: RelaySocketLike,
+    metadata?: ExternalSocketMetadata,
+    evidence?: EnterpriseAdmissionAuthenticationEvidence,
+  ) => Promise<void>;
   relayEndpoint: string; // "host:port"
   relayUseTls: boolean;
   serverId: string;
   daemonKeyPair?: KeyPair;
   createWebSocket?: RelayWebSocketFactory;
-  authenticateEnterprise?: (input: { token: string; challenge: string }) => Promise<boolean>;
+  authenticateEnterprise?: (input: {
+    token: string;
+    challenge: string;
+  }) => Promise<EnterpriseAdmissionAuthenticationEvidence | null>;
 }
 
 export interface RelayTransportController {
@@ -421,9 +429,16 @@ async function attachEncryptedSocket(
   socket: RelayWebSocketLike,
   daemonKeyPair: KeyPair,
   logger: pino.Logger,
-  attachSocket: (ws: RelaySocketLike, metadata?: ExternalSocketMetadata) => Promise<void>,
+  attachSocket: (
+    ws: RelaySocketLike,
+    metadata?: ExternalSocketMetadata,
+    evidence?: EnterpriseAdmissionAuthenticationEvidence,
+  ) => Promise<void>,
   metadata?: ExternalSocketMetadata,
-  authenticateEnterprise?: (input: { token: string; challenge: string }) => Promise<boolean>,
+  authenticateEnterprise?: (input: {
+    token: string;
+    challenge: string;
+  }) => Promise<EnterpriseAdmissionAuthenticationEvidence | null>,
 ): Promise<void> {
   try {
     const relayTransport = createRelayTransportAdapter(socket, logger);
@@ -439,6 +454,7 @@ async function attachEncryptedSocket(
     };
     const challenge = authenticateEnterprise ? randomBytes(32).toString("base64url") : null;
     let authenticated = !authenticateEnterprise;
+    let authenticationEvidence: EnterpriseAdmissionAuthenticationEvidence | undefined;
     let authenticating = false;
     let authSettled = authenticated;
     let authResolve: (() => void) | undefined;
@@ -479,6 +495,7 @@ async function attachEncryptedSocket(
               void authenticateEnterprise!({ token: parsed.token, challenge })
                 .then(async (ok) => {
                   if (!ok) throw new Error("enterprise authentication failed");
+                  authenticationEvidence = ok;
                   await channel.send(JSON.stringify({ type: "auth_ok", challenge }));
                   authenticated = true;
                   authSettled = true;
@@ -524,7 +541,7 @@ async function attachEncryptedSocket(
       getTransportBufferedAmount: () => socket.bufferedAmount,
       terminateTransport: () => socket.terminate(),
     });
-    await attachSocket(encryptedSocket, metadata);
+    await attachSocket(encryptedSocket, metadata, authenticationEvidence);
     attached = true;
     for (const message of pendingMessages) {
       emitter.emit("message", message);

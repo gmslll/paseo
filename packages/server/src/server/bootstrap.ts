@@ -2328,9 +2328,13 @@ export async function createPaseoDaemon(
                   publicUseTls: relayPublicUseTls,
                 },
                 logger,
-                attachSocket: async (ws, metadata) => {
+                attachSocket: async (ws, metadata, evidence) => {
                   if (!wsServer) throw new Error("WebSocket server is not ready");
-                  await wsServer.attachExternalSocket(ws, metadata);
+                  if (evidence) {
+                    await wsServer.attachRelayAuthenticatedSocket(ws, metadata, evidence);
+                  } else {
+                    await wsServer.attachExternalSocket(ws, metadata);
+                  }
                 },
                 serverId,
                 daemonKeyPair: daemonKeyPair.keyPair,
@@ -2350,7 +2354,7 @@ export async function createPaseoDaemon(
                         },
                       );
                       productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit);
-                      return evidence !== null;
+                      return evidence;
                     }
                   : undefined,
               });

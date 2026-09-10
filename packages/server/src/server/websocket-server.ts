@@ -1345,6 +1345,26 @@ export class VoiceAssistantWebSocketServer {
     );
   }
 
+  public async attachRelayAuthenticatedSocket(
+    ws: WebSocketLike,
+    metadata: ExternalSocketMetadata | undefined,
+    authorizationEvidence: EnterpriseAdmissionAuthenticationEvidence,
+  ): Promise<void> {
+    if (!this.enterpriseRuntime || metadata?.transport !== "relay") {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise relay admission required");
+      return;
+    }
+    await this.attachSocket(
+      ws,
+      undefined,
+      metadata,
+      false,
+      { kind: "enterprise", authorizationEvidence },
+      undefined,
+      authorizationEvidence,
+    );
+  }
+
   public async attachPluginSocket(
     pluginId: string,
     ws: WebSocketLike,
