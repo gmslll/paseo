@@ -38,7 +38,11 @@ export interface EncryptedChannelEvents {
   onerror?: (error: Error) => void;
 }
 
-type ChannelState = "connecting" | "handshaking" | "open" | "closed";
+type ChannelState = "connecting" | "handshaking" | "authenticating" | "open" | "closed";
+
+export interface ClientEncryptedChannelOptions {
+  authPreface?: { getToken(): string | Promise<string> };
+}
 
 interface EncryptedChannelOptions {
   /**
@@ -158,6 +162,7 @@ export async function createClientChannel(
   transport: Transport,
   daemonPublicKeyB64: string,
   events: EncryptedChannelEvents = {},
+  _options: ClientEncryptedChannelOptions = {},
 ): Promise<EncryptedChannel> {
   const keyPair = generateKeyPair();
   const daemonPublicKey = importPublicKey(daemonPublicKeyB64);
