@@ -33,6 +33,12 @@ Every handler receives a server-bound current Principal/session context and
 reuses the W1/W2/W3 current guards and authority receipts. Domain policy stays
 in its owning family; the registry only routes already-resolved requests.
 
+Organization resource enumeration may return an empty page. Its internal
+resources authorization context may therefore be empty only when both
+`principals` and `resources` are empty and `nextCursor` is `null`, with the
+current organization and node binding still verified. Wire schemas and all
+other resource operations continue to reject empty authorization contexts.
+
 The same enterprise runtime state must drive the four P0/P1 feature
 advertisements:
 `enterpriseIdentityV1`, `enterpriseResourceAuthorizationV1`,
