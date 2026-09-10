@@ -146,13 +146,20 @@ export function createProductionBrowserLeaseDispatcherRegistration(input: {
             "browser.use",
             binding.browserProfileId,
           );
+          const currentBinding = await input.bundle.bindings.resolveForAgent({ workspace, agent });
           if (
             !input.registry.isCurrentHandle(handle) ||
+            !currentBinding ||
             binding.organizationId !== workspace.organizationId ||
             binding.nodeId !== workspace.nodeId ||
             binding.workspaceId !== workspace.workspaceId ||
             binding.workspaceId !== agent.workspaceId ||
-            binding.browserProfileId !== profile.browserProfileId
+            binding.browserProfileId !== profile.browserProfileId ||
+            currentBinding.organizationId !== binding.organizationId ||
+            currentBinding.nodeId !== binding.nodeId ||
+            currentBinding.workspaceId !== binding.workspaceId ||
+            currentBinding.browserProfileId !== binding.browserProfileId ||
+            currentBinding.boundAt !== binding.boundAt
           )
             throw new Error("Binding changed while resolving authorization.");
           return { workspace, agent, profile, bindingRevision: binding.boundAt };
