@@ -665,6 +665,34 @@ describe("HostRuntimeController", () => {
     expect(controller.getSnapshot().connectionStatus).toBe("online");
   });
 
+  it("injects the host-owned enterprise file request closure into new clients", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const enterpriseFileRequest = vi.fn(async () => new Response(null, { status: 200 }));
+    let received: Parameters<HostRuntimeControllerDeps["createClient"]>[0] | null = null;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createEnterpriseFileRequest: (enterpriseFileRequestFactoryInput) => {
+          expect(enterpriseFileRequestFactoryInput.host.serverId).toBe(host.serverId);
+          return enterpriseFileRequest;
+        },
+        createClient: (input) => {
+          received = input;
+          return new FakeDaemonClient() as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_enterprise_file",
+      },
+    });
+
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+
+    expect(received).not.toBeNull();
+    expect(received!.enterpriseFileRequest).toBe(enterpriseFileRequest);
+  });
+
   it("keeps browser client lifecycle tied to the active host runtime client", async () => {
     const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
     const fakeClient = makeConnectedProbeClient(12);

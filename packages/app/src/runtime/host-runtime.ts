@@ -3,6 +3,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import equal from "fast-deep-equal/es6";
 import {
   DaemonClient,
+  type EnterpriseFileRequest,
   type DaemonClientConfig,
   type ConnectionState,
   type FetchAgentsOptions,
@@ -163,7 +164,15 @@ export interface HostRuntimeControllerDeps {
     connection: HostConnection;
     clientId: string;
     runtimeGeneration: number;
+    enterpriseFileRequest?: EnterpriseFileRequest;
   }) => DaemonClient;
+  /** Injected host-owned closure; credentials and scope state remain private to its owner. */
+  createEnterpriseFileRequest?: (input: {
+    host: HostProfile;
+    connection: HostConnection;
+    clientId: string;
+    runtimeGeneration: number;
+  }) => EnterpriseFileRequest | undefined;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -1235,6 +1244,12 @@ export class HostRuntimeController {
         connection,
         clientId,
         runtimeGeneration: nextGeneration,
+        enterpriseFileRequest: this.deps.createEnterpriseFileRequest?.({
+          host: this.host,
+          connection,
+          clientId,
+          runtimeGeneration: nextGeneration,
+        }),
       });
     client.setReconnectEnabled(true);
 

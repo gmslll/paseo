@@ -359,14 +359,18 @@ export type DaemonEventHandler = (event: DaemonEvent) => void;
 export type BrowserAutomationExecuteRequestMessage = BrowserAutomationExecuteRequest;
 export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteResponse;
 
+export interface EnterpriseFileRequestInput {
+  readonly serverId: string;
+  readonly workspaceId: string;
+  readonly relativePath: string;
+  readonly signal?: AbortSignal;
+  readonly scopeGeneration?: string;
+}
+export type EnterpriseFileRequest = (input: EnterpriseFileRequestInput) => Promise<Response>;
+
 export interface DaemonClientConfig {
-  enterpriseFileRequest?: (input: {
-    readonly serverId: string;
-    readonly workspaceId: string;
-    readonly relativePath: string;
-    readonly signal?: AbortSignal;
-    readonly scopeGeneration?: string;
-  }) => Promise<Response>;
+  /** Host-runtime-owned authenticated transport. Bearer credentials never cross this seam. */
+  enterpriseFileRequest?: EnterpriseFileRequest;
   /** Deliver compact bodies/hash references to a caller-owned snapshot cache.
    * The default keeps public SDK snapshot entries expanded. */
   providerSnapshots?: "wire";
@@ -1126,22 +1130,35 @@ interface PingProbe {
 }
 
 export class DaemonClient {
-  public enterpriseFileDownload(input: {
-    readonly serverId: string;
-    readonly workspaceId: string;
-    readonly relativePath: string;
-    readonly signal?: AbortSignal;
-    readonly scopeGeneration?: string;
-  }): Promise<Response> {
+  public enterpriseFileDownload(input: EnterpriseFileRequestInput): Promise<Response> {
     if (!this.config.enterpriseFileRequest) {
       return Promise.reject(new Error("Enterprise file download unavailable"));
     }
-    const snapshot = structuredClone({
-      serverId: input.serverId,
-      workspaceId: input.workspaceId,
-      relativePath: input.relativePath,
-      scopeGeneration: input.scopeGeneration,
-    });
+    if (
+      typeof input.serverId !== "string" ||
+      input.serverId.length === 0 ||
+      typeof input.workspaceId !== "string" ||
+      input.workspaceId.length === 0 ||
+      typeof input.relativePath !== "string" ||
+      input.relativePath.length === 0 ||
+      input.relativePath.includes("\0") ||
+      input.relativePath.startsWith("/") ||
+      typeof input.scopeGeneration !== "string" ||
+      input.scopeGeneration.length === 0
+    ) {
+      return Promise.reject(new Error("Invalid enterprise file download scope"));
+    }
+    let snapshot: Omit<EnterpriseFileRequestInput, "signal">;
+    try {
+      snapshot = structuredClone({
+        serverId: input.serverId,
+        workspaceId: input.workspaceId,
+        relativePath: input.relativePath,
+        scopeGeneration: input.scopeGeneration,
+      });
+    } catch {
+      return Promise.reject(new Error("Invalid enterprise file download scope"));
+    }
     return this.config.enterpriseFileRequest({ ...snapshot, signal: input.signal });
   }
   /**
