@@ -39,6 +39,7 @@ import {
   type SessionRuntimeMetrics,
 } from "./session.js";
 import type { EnterpriseSessionDispatcher } from "./session/enterprise-dispatcher.js";
+import type { EnterpriseFeatureAdvertisement } from "./enterprise/dispatcher-registry.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
@@ -873,6 +874,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseRuntime?: EnterpriseAdmissionRuntime;
   private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
   private readonly enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
   private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 
   constructor(
@@ -925,6 +927,7 @@ export class VoiceAssistantWebSocketServer {
     enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider,
     enterpriseDispatcher?: EnterpriseSessionDispatcher,
     enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"],
+    enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -932,6 +935,7 @@ export class VoiceAssistantWebSocketServer {
     this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
     this.enterpriseDispatcher = enterpriseDispatcher;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
+    this.enterpriseFeatureFlags = enterpriseFeatureFlags;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -2514,6 +2518,7 @@ export class VoiceAssistantWebSocketServer {
         providersSnapshot: true,
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: true,
+        ...this.enterpriseFeatureFlags,
         // COMPAT(checkoutForgeSetAutoMerge): added in v0.2.0-beta.1. Remove the
         // feature gate and legacy fallback after 2027-01-17 once the supported
         // daemon floor is >= v0.2.0.
