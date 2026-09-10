@@ -1209,14 +1209,6 @@ export class DaemonClient {
     ) as Promise<EnterpriseWorkspaceContentReadResponse>;
   }
 
-  public enterpriseWorkspaceContentRead(
-    input: Omit<EnterpriseWorkspaceContentReadRequest, "type" | "requestId"> & {
-      requestId?: string;
-    },
-  ): Promise<EnterpriseWorkspaceContentReadResponse> {
-    return this.readWorkspaceContent(input);
-  }
-
   public readAgentContent(
     input: Omit<EnterpriseAgentContentReadRequest, "type" | "requestId"> & {
       requestId?: string;
@@ -1228,14 +1220,6 @@ export class DaemonClient {
       payload,
       requestId,
     ) as Promise<EnterpriseAgentContentReadResponse>;
-  }
-
-  public enterpriseAgentContentRead(
-    input: Omit<EnterpriseAgentContentReadRequest, "type" | "requestId"> & {
-      requestId?: string;
-    },
-  ): Promise<EnterpriseAgentContentReadResponse> {
-    return this.readAgentContent(input);
   }
 
   public readBrowserProfileContent(
@@ -1251,14 +1235,6 @@ export class DaemonClient {
     ) as Promise<EnterpriseBrowserProfileContentReadResponse>;
   }
 
-  public enterpriseBrowserProfileContentRead(
-    input: Omit<EnterpriseBrowserProfileContentReadRequest, "type" | "requestId"> & {
-      requestId?: string;
-    },
-  ): Promise<EnterpriseBrowserProfileContentReadResponse> {
-    return this.readBrowserProfileContent(input);
-  }
-
   public readAppSlotContent(
     input: Omit<EnterpriseAppSlotContentReadRequest, "type" | "requestId"> & {
       requestId?: string;
@@ -1272,13 +1248,6 @@ export class DaemonClient {
     ) as Promise<EnterpriseAppSlotContentReadResponse>;
   }
 
-  public enterpriseAppSlotContentRead(
-    input: Omit<EnterpriseAppSlotContentReadRequest, "type" | "requestId"> & {
-      requestId?: string;
-    },
-  ): Promise<EnterpriseAppSlotContentReadResponse> {
-    return this.readAppSlotContent(input);
-  }
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({
     fetch: (cwd) => this.requestProvidersSnapshot({ cwd }),
     emit: (message) => this.deliverSessionMessage(message),

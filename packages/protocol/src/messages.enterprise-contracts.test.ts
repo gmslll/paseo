@@ -163,9 +163,7 @@ describe("enterprise content-read contracts", () => {
           resource: base.resource,
           selector: base.selector,
           page: {
-            items: [
-              { itemId: "item-1", occurredAt: "2026-01-01", content: "safe", kind: "message" },
-            ],
+            items: [{ itemId: "item-1", occurredAt: "2026-01-01", text: "safe", kind: "message" }],
             nextCursor: null,
           },
         },
@@ -213,6 +211,22 @@ describe("enterprise content-read contracts", () => {
       EnterpriseWorkspaceContentReadRequestSchema.parse({
         ...base,
         resource: { ...base.resource, resourceKind: "agent" },
+      }),
+    ).toThrow();
+    expect(() =>
+      EnterpriseWorkspaceContentReadResponseSchema.parse({
+        type: "enterprise.workspace.content.read.response",
+        payload: {
+          requestId: "content-1",
+          resource: base.resource,
+          selector: base.selector,
+          page: {
+            items: [
+              { itemId: "item-1", occurredAt: "2026-01-01", content: "secret", kind: "message" },
+            ],
+            nextCursor: null,
+          },
+        },
       }),
     ).toThrow();
   });

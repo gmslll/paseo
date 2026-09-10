@@ -6,6 +6,7 @@ import {
   type DaemonTransport,
   type Logger,
 } from "./daemon-client";
+import type { EnterpriseWorkspaceContentReadResponse } from "@getpaseo/protocol/messages";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
@@ -38,6 +39,45 @@ function createMockLogger() {
     error: vi.fn(),
   };
 }
+
+test("enterprise content wrapper preserves dotted type and request correlation", async () => {
+  const client = Object.create(DaemonClient.prototype) as DaemonClient;
+  const response: EnterpriseWorkspaceContentReadResponse = {
+    type: "enterprise.workspace.content.read.response",
+    payload: {
+      requestId: "content-request-1",
+      resource: {
+        organizationId: "org_1111111111111111",
+        nodeId: "nod_2222222222222222",
+        resourceKind: "workspace",
+        localResourceId: "workspace-1",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { items: [], nextCursor: null },
+    },
+  };
+  const requestEnterprise = vi
+    .spyOn(client, "requestEnterprise")
+    .mockResolvedValue(response as unknown as Readonly<Record<string, unknown>>);
+
+  await expect(
+    client.readWorkspaceContent({
+      requestId: "content-request-1",
+      resource: response.payload.resource,
+      selector: response.payload.selector,
+      page: { limit: 10 },
+    }),
+  ).resolves.toEqual(response);
+  expect(requestEnterprise).toHaveBeenCalledWith(
+    "enterprise.workspace.content.read.request",
+    {
+      resource: response.payload.resource,
+      selector: response.payload.selector,
+      page: { limit: 10 },
+    },
+    "content-request-1",
+  );
+});
 
 interface TraceRecord {
   phase: "begin" | "end";

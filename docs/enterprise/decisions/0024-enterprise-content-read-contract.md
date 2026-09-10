@@ -46,8 +46,13 @@ with its exact wire shape defined and versioned by W0 (never delegated to an ada
 - `browser_profile`: `{ kind: "browser_profile", view: "state" | "artifacts" }`;
 - `app_slot`: `{ kind: "app_slot", view: "state" | "artifacts" }`.
 
-W0 likewise owns one strict canonical item projection per family; adapters implement those shapes
-but may not add wire fields. Each selector rejects fields from the other three families.
+W0 likewise owns one strict discriminated item projection per family; adapters implement those
+shapes but may not add wire fields. Workspace and Agent `message` items may contain `text`; their
+`file`/`artifact` items contain only `reference`, `label`, optional `mimeType`, and optional `size`.
+Browser Profile and App Slot `state` items contain only redacted `label`, `status`, and optional
+`origin`; their `artifact` items use the same metadata-only shape. No item has a generic `content`
+field, and cookies, prompts, credentials, tokens, and secrets are never wire fields. Each selector
+rejects fields from the other three families.
 `page.cursor` is opaque, is scoped to the exact Principal, resource, selector, and
 Session, and `page.limit` is bounded by the server. No batch, arbitrary path, or unbounded page is
 part of P0.

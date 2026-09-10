@@ -4049,27 +4049,69 @@ export const EnterpriseAppSlotContentSelectorSchema = z.strictObject({
   view: z.enum(["state", "artifacts"]),
 });
 
-const EnterpriseContentItemSharedShape = {
+const EnterpriseContentItemIdentityShape = {
   itemId: z.string().min(1),
   occurredAt: z.string().min(1),
-  content: z.string(),
 };
-export const EnterpriseWorkspaceContentItemSchema = z.strictObject({
-  ...EnterpriseContentItemSharedShape,
-  kind: z.enum(["message", "file"]),
-});
-export const EnterpriseAgentContentItemSchema = z.strictObject({
-  ...EnterpriseContentItemSharedShape,
-  kind: z.enum(["message", "artifact"]),
-});
-export const EnterpriseBrowserProfileContentItemSchema = z.strictObject({
-  ...EnterpriseContentItemSharedShape,
-  kind: z.enum(["state", "artifact"]),
-});
-export const EnterpriseAppSlotContentItemSchema = z.strictObject({
-  ...EnterpriseContentItemSharedShape,
-  kind: z.enum(["state", "artifact"]),
-});
+const EnterpriseContentMetadataShape = {
+  reference: z.string().min(1),
+  label: z.string().min(1),
+  mimeType: z.string().min(1).optional(),
+  size: z.number().int().nonnegative().optional(),
+};
+export const EnterpriseWorkspaceContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    kind: z.literal("message"),
+    text: z.string(),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("file"),
+  }),
+]);
+export const EnterpriseAgentContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    kind: z.literal("message"),
+    text: z.string(),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("artifact"),
+  }),
+]);
+const EnterpriseRedactedStateShape = {
+  label: z.string().min(1),
+  status: z.string().min(1),
+  origin: z.string().min(1).optional(),
+};
+export const EnterpriseBrowserProfileContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseRedactedStateShape,
+    kind: z.literal("state"),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("artifact"),
+  }),
+]);
+export const EnterpriseAppSlotContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseRedactedStateShape,
+    kind: z.literal("state"),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("artifact"),
+  }),
+]);
 
 function enterpriseContentReadRequestSchema<
   const Type extends `enterprise.${string}.request`,
@@ -5070,17 +5112,17 @@ export const ServerInfoStatusPayloadSchema = z
         enterpriseAuditV1: z.boolean().optional(),
         // COMPAT(enterpriseDistributedNodeV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires distributed Node V1.
         enterpriseDistributedNodeV1: z.boolean().optional(),
-        // COMPAT(enterpriseWorkspaceContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
-        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        // COMPAT(enterpriseWorkspaceContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
         enterpriseWorkspaceContentReadV1: z.boolean().optional(),
-        // COMPAT(enterpriseAgentContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
-        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        // COMPAT(enterpriseAgentContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
         enterpriseAgentContentReadV1: z.boolean().optional(),
-        // COMPAT(enterpriseBrowserProfileContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
-        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        // COMPAT(enterpriseBrowserProfileContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
         enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
-        // COMPAT(enterpriseAppSlotContentReadV1): added in v0.9.0, remove gate after 2027-03-09;
-        // keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        // COMPAT(enterpriseAppSlotContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
         enterpriseAppSlotContentReadV1: z.boolean().optional(),
       })
       .optional(),
