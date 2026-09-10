@@ -2256,6 +2256,38 @@ test("identity-self requests fail closed when the current grant is stale", async
   await session.cleanup();
 });
 
+test("denied enterprise principal receives an immediate access-denied envelope", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const handle = vi.fn(() => false);
+  const session = createSessionForTest({
+    messages,
+    permissions: ["workspace.read"],
+    enterpriseContext: enterpriseContext("generation-denied-status"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: { handle },
+  });
+
+  await session.handleMessage({
+    type: "daemon.get_status.request",
+    requestId: "global-denied",
+  });
+
+  expect(handle).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: "global-denied",
+        requestType: "daemon.get_status.request",
+        error: "Session is not authorized for daemon.get_status.request",
+        code: "access_denied",
+      },
+    },
+  ]);
+  expect(JSON.stringify(messages)).not.toContain("canary");
+  await session.cleanup();
+});
+
 test("each authority emission mints fresh state and post-first Grant revoke drops later output", async () => {
   let current = true;
   const messages: unknown[] = [];

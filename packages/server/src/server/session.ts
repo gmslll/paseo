@@ -2306,7 +2306,7 @@ export class Session {
       if (!daemonDecision) {
         const requestId = sessionRequestId(msg);
         if (requestId) {
-          this.emit({
+          this.onMessage({
             type: "rpc_error",
             payload: {
               requestId,
