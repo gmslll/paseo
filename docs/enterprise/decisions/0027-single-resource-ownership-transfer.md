@@ -14,8 +14,8 @@ ownership change.
 
 ## Decision
 
-Add one typed, single-resource ownership-transfer operation for the existing Workspace and Agent
-resource kinds. The request contains exactly the existing canonical `GlobalResourceRef`,
+Add one typed, single-resource ownership-transfer operation for Workspace resources. The request
+contains exactly the existing canonical `GlobalResourceRef`,
 `requestId`, `expectedOwnerPrincipalId`, `expectedRevision`, and `newPrincipalId`. The server
 resolves the current resource and owner; the client cannot choose an organization, node, owner,
 revision source, or alternate resource path.
@@ -35,7 +35,11 @@ receipt, subscription, cache, or event is reusable.
 ## Production and compatibility rule
 
 This decision does not add a generic mutation fallback or reinterpret existing Workspace/Agent
-requests. Until the operation has a W0 strict schema, W2 inventory and current-owner/revision
+requests. `enterpriseWorkspaceOwnershipTransferV1` is an optional capability for the same strict
+transfer RPC and remains absent until the Workspace production chain is ready. The existing
+`enterpriseResourceOwnershipTransferV1` flag remains optional and absent; its Agent branch is kept
+on the wire for backward compatibility only and is fail-closed in enterprise production. Until the
+operation has a W0 strict schema, W2 inventory and current-owner/revision
 resolver, W3 receipt and subscription-generation consumer, required audit, and W7 real two-Principal
 evidence, enterprise mode must keep the transfer capability absent and reject attempted transfer
 requests fail-closed. Legacy single-user behavior remains unchanged.
@@ -47,9 +51,12 @@ requests fail-closed. Legacy single-user behavior remains unchanged.
   revision checks, Grant admission, and uniform denial.
 - W3 owns Session receipt consumption, subscription/cache teardown, generation fencing, and late-event
   rejection.
-- W7 owns the real two-Principal Workspace/Agent transfer E2E, including required audit and no-leak
+- W7 owns the real two-Principal Workspace transfer E2E, including required audit and no-leak
   assertions; integration owns final production wiring.
 
-Acceptance requires A→B transfer for one Workspace and one Agent, proving atomic owner/source update,
-old subscription/cache/event invalidation, B access under a new Grant, correlated required audit,
-and identical zero-side-effect denial for foreign, stale, and guessed references.
+Acceptance requires A→B transfer for one Workspace, proving atomic owner/source update, old
+subscription/cache/event invalidation, B access under a new Grant, correlated required audit, and
+identical zero-side-effect denial for foreign, stale, and guessed references. Agent ownership remains
+derived from its Workspace by `OwnerRegistry`; standalone Agent transfer conflicts with that
+invariant and is therefore a production denial. A future compound Workspace+Agent transaction may
+revisit this only with a new ADR and atomic owner/source semantics.

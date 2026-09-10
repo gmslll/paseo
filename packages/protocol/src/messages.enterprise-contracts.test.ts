@@ -93,6 +93,7 @@ describe("enterprise feature compatibility", () => {
       enterpriseBrowserProfileContentReadV1: false,
       enterpriseAppSlotContentReadV1: false,
       enterpriseResourceOwnershipTransferV1: false,
+      enterpriseWorkspaceOwnershipTransferV1: false,
       enterpriseBrowserPageIdentityObservationV1: false,
       enterpriseBrowserPageIdentityInvalidationV1: false,
     });

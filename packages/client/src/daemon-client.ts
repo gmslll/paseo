@@ -173,6 +173,7 @@ import type {
   EnterpriseAppSlotContentReadResponse,
   EnterpriseResourceOwnershipTransferRequest,
   EnterpriseResourceOwnershipTransferResponse,
+  EnterpriseWorkspaceOwnershipTransferRequest,
   EnterpriseBrowserPageIdentityObservationRequest,
   EnterpriseBrowserPageIdentityObservationResponse,
   EnterpriseBrowserPageIdentityInvalidationRequest,
@@ -1256,6 +1257,19 @@ export class DaemonClient {
 
   public transferResourceOwnership(
     input: Omit<EnterpriseResourceOwnershipTransferRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseResourceOwnershipTransferResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.resource.ownership.transfer.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseResourceOwnershipTransferResponse>;
+  }
+
+  public transferWorkspaceOwnership(
+    input: Omit<EnterpriseWorkspaceOwnershipTransferRequest, "type" | "requestId"> & {
       requestId?: string;
     },
   ): Promise<EnterpriseResourceOwnershipTransferResponse> {
