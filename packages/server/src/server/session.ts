@@ -2906,15 +2906,16 @@ export class Session {
             registeredRequestId = requestId;
             // oxlint-disable-next-line max-depth -- dispatcher runs inside receipt transaction.
             if (this.enterpriseDispatcher && this.enterpriseContext && isEnterpriseRequest(msg)) {
+              const dispatchContext = Object.freeze({
+                sessionId: this.sessionId,
+                clientId: this.clientId,
+                credentialId: this.enterpriseContext.principal.credentialId,
+                sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                enterpriseContext: this.enterpriseContext,
+              });
               const response = await dispatchEnterpriseRequest(
                 this.enterpriseDispatcher,
-                {
-                  sessionId: this.sessionId,
-                  clientId: this.clientId,
-                  credentialId: this.enterpriseContext.principal.credentialId,
-                  sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
-                  enterpriseContext: this.enterpriseContext,
-                },
+                dispatchContext,
                 msg,
               );
               // oxlint-disable-next-line max-depth -- unavailable response remains in transaction.
@@ -2930,13 +2931,7 @@ export class Session {
                 });
               } else {
                 const contextual = this.enterpriseDispatcher.consumeResponse?.({
-                  sessionContext: {
-                    sessionId: this.sessionId,
-                    clientId: this.clientId,
-                    credentialId: this.enterpriseContext.principal.credentialId,
-                    sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
-                    enterpriseContext: this.enterpriseContext,
-                  },
+                  sessionContext: dispatchContext,
                   message: msg,
                   response,
                 });

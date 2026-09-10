@@ -3497,6 +3497,65 @@ test("identity-self requests register and emit through the current session bindi
   await session.cleanup();
 });
 
+test("reuses the exact dispatch context when consuming an enterprise authority response", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const context = enterpriseContext("generation-authority-dispatch-context", {
+    grants: [
+      {
+        action: "identity.manage",
+        selector: { kind: "organization", organizationId: "org_aaaaaaaaaaaaaaaa" },
+      },
+    ],
+  });
+  const request = {
+    type: "enterprise.access.list_grants.request",
+    requestId: "authority-dispatch-context",
+    principalId: context.principal.principalId,
+  } as const satisfies SessionInboundMessage;
+  const response = {
+    type: "enterprise.access.list_grants.response",
+    payload: {
+      requestId: request.requestId,
+      principalId: context.principal.principalId,
+      grants: context.principal.grants,
+      revision: context.principal.grantVersion,
+    },
+  } as const satisfies SessionOutboundMessage;
+  let dispatchContext: EnterpriseDispatchContext | undefined;
+  const handle = vi.fn((input: { sessionContext: EnterpriseDispatchContext }) => {
+    dispatchContext = input.sessionContext;
+    return response;
+  });
+  const consumeResponse = vi.fn((input: { sessionContext: EnterpriseDispatchContext }) =>
+    input.sessionContext === dispatchContext
+      ? { response, receiptClassification: "authority" as const }
+      : null,
+  );
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) => (type === request.type ? "authority" : null),
+      handle,
+      consumeResponse,
+    },
+  });
+
+  await session.handleMessage(request);
+
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(consumeResponse).toHaveBeenCalledTimes(1);
+  expect(messages).toContainEqual(response);
+  expect(messages).not.toContainEqual(
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: request.requestId }),
+    }),
+  );
+  await session.cleanup();
+});
+
 test("identity-self requests fail closed when the current grant is stale", async () => {
   const messages: SessionOutboundMessage[] = [];
   const handle = vi.fn(() => false);
