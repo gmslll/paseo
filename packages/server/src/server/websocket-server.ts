@@ -585,6 +585,7 @@ function createNoopWorkspaceRegistry(): WorkspaceRegistry {
     get: async () => null,
     update: async () => null,
     upsert: async () => {},
+    transferOwnership: async () => null,
     archive: async () => {},
     remove: async () => {},
   };
