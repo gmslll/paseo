@@ -136,6 +136,7 @@ import {
   type EnterpriseAdmissionAuthenticationEvidence,
   type EnterpriseAdmissionAuthorizationHandle,
 } from "./enterprise/identity/admission-authorization.js";
+import { createAuthenticatedBrowserHostSession } from "./browser-tools/page-identity-registry.js";
 import {
   DaemonPermissionSchema,
   NodeContextSchema,
@@ -714,6 +715,7 @@ interface PluginSessionConnection extends SessionConnectionBase {
 type SessionConnection = ReconnectableSessionConnection | PluginSessionConnection;
 
 interface BrowserToolsRegistration {
+  routeId: string;
   capabilitySignature: string;
   unregister: () => void;
 }
@@ -3040,7 +3042,30 @@ export class VoiceAssistantWebSocketServer {
       this.unregisterBrowserToolsClient(registrationKey);
       return;
     }
-    const capabilitySignature = JSON.stringify(browserHostCapability);
+    const authenticatedSession =
+      connection.enterpriseAuthorizationHandle && this.enterpriseRuntime
+        ? (() => {
+            const resolved = resolveCurrentEnterpriseAdmissionAuthorization(
+              this.enterpriseRuntime.admission.authorizationIssuer,
+              connection.enterpriseAuthorizationHandle,
+            );
+            return resolved
+              ? createAuthenticatedBrowserHostSession({
+                  clientId: resolved.clientId,
+                  homeNodeId: resolved.node.nodeId,
+                  sessionBindingGeneration: resolved.sessionBindingGeneration,
+                })
+              : undefined;
+          })()
+        : undefined;
+    if (connection.enterpriseAuthorizationHandle && !authenticatedSession) {
+      this.unregisterBrowserToolsClient(registrationKey);
+      return;
+    }
+    const capabilitySignature = JSON.stringify({
+      capability: browserHostCapability,
+      generation: authenticatedSession?.sessionBindingGeneration ?? null,
+    });
     const existing = this.browserToolsRegistrations.get(registrationKey);
     if (existing?.capabilitySignature === capabilitySignature) {
       return;
@@ -3050,15 +3075,31 @@ export class VoiceAssistantWebSocketServer {
       existing.unregister();
     }
 
+    let routeId: string;
+    if (authenticatedSession) {
+      routeId = `${registrationKey}:${randomUUID()}`;
+    } else if (connection.principalId === "owner") {
+      routeId = connection.clientId;
+    } else {
+      routeId = registrationKey;
+    }
     const unregister = this.browserToolsBroker.registerClient({
-      id: connection.principalId === "owner" ? connection.clientId : registrationKey,
+      id: routeId,
       hostKind: browserHostCapability.hostKind,
       supportedCommands: browserHostCapability.supportedCommands,
+      ...(authenticatedSession
+        ? {
+            authenticatedSession,
+            enterpriseProfiles: { version: 1 as const },
+            homeNodeId: authenticatedSession.homeNodeId,
+          }
+        : {}),
       sendBrowserAutomationRequest: (request) => {
         this.sendToConnection(connection, wrapSessionMessage(request));
       },
     });
     this.browserToolsRegistrations.set(registrationKey, {
+      routeId,
       capabilitySignature,
       unregister,
     });
@@ -3392,7 +3433,14 @@ export class VoiceAssistantWebSocketServer {
         await activeConnection.session.handleMessage(message.message, ws);
         return;
       }
-      this.browserToolsBroker?.receiveResponse(message.message as BrowserAutomationExecuteResponse);
+      const registration = this.browserToolsRegistrations.get(activeConnection.sessionKey);
+      if (!registration) {
+        return;
+      }
+      this.browserToolsBroker?.receiveResponse(
+        registration.routeId,
+        message.message as BrowserAutomationExecuteResponse,
+      );
       return;
     }
 
