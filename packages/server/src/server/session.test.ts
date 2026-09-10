@@ -2353,6 +2353,30 @@ test("coarse workspace access denies missing enterprise actions without receipt 
   await session.cleanup();
 });
 
+test("policy-null list terminals bypasses receipt lifecycle and reaches terminal handler", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(authorityReceiptState, "register");
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-terminal-policy-null"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+
+  await session.handleMessage({
+    type: "list_terminals_request",
+    cwd: "/workspace",
+    requestId: "terminal-policy-null",
+  });
+
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(register).not.toHaveBeenCalled();
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
 test("each authority emission mints fresh state and post-first Grant revoke drops later output", async () => {
   let current = true;
   const messages: unknown[] = [];
