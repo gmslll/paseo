@@ -161,6 +161,13 @@ export interface EnterpriseSessionDispatcherFactoryRegistration {
     readonly requestLifecycle?: unknown;
   }): EnterpriseDispatcherLease;
 }
+/** Opaque W1 admission-to-Session invalidation signal; no domain policy lives here. */
+export interface CredentialInvalidationSink {
+  invalidate(input: {
+    readonly sessionBindingKey: string;
+    readonly sessionBindingGeneration: string;
+  }): Promise<void> | void;
+}
 
 export const ENTERPRISE_UNAVAILABLE_ERROR = "Enterprise operation unavailable";
 

@@ -9076,6 +9076,18 @@ export class Session {
   public getEnterpriseSessionBindingKey(): string | undefined {
     return this.enterpriseSessionBindingKey;
   }
+  /** W1 admission invalidation hook; exact binding match only, no policy logic. */
+  public async invalidateFromAdmission(input: {
+    readonly sessionBindingKey: string;
+    readonly sessionBindingGeneration: string;
+  }): Promise<void> {
+    if (
+      input.sessionBindingKey !== this.enterpriseSessionBindingKey ||
+      input.sessionBindingGeneration !== this.enterpriseContext?.sessionBindingGeneration
+    )
+      return;
+    await this.cleanup();
+  }
   public bindAgentPrincipalContext(agentId: string): EnterpriseAgentContextHandle | null {
     if (
       this.isCleanedUp ||
