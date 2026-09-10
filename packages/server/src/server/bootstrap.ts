@@ -593,6 +593,7 @@ async function resolveEnterpriseRuntime(
     const capturedReceiptState = runtime.authorityReceiptState;
     const capturedGrantGuard = runtime.grantVersionGuard;
     const capturedResourceAuthorization = runtime.resourceAuthorization;
+    const capturedPrincipalSource = runtime.principalSource;
     const capturedClose = runtime.close?.bind(runtime);
     const authorizationRuntimeProvider = resolveAuthorizationRuntimeProvider(
       runtime,
@@ -628,6 +629,7 @@ async function resolveEnterpriseRuntime(
       nextSessionBindingGeneration: generation,
       resourceAuthorization: capturedResourceAuthorization,
       authorizationRuntimeProvider,
+      ...(capturedPrincipalSource ? { principalSource: capturedPrincipalSource } : {}),
       ...(runtime.admissionInvalidationSink
         ? { admissionInvalidationSink: runtime.admissionInvalidationSink }
         : {}),
