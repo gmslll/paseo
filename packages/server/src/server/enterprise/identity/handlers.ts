@@ -126,8 +126,39 @@ export function createProductionEnterpriseIdentityDispatcherRegistration(input: 
           return result;
         },
       });
+      const guardedDispatcher: EnterpriseSessionDispatcher = {
+        handle: async (request) => {
+          if (!active) return false;
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          const result = await dispatcher.handle(request);
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          return active ? result : false;
+        },
+        consumeResponse: dispatcher.consumeResponse
+          ? (value) => {
+              if (!active) return null;
+              try {
+                productionAuditCapabilityIssuer.requireCurrent(input.audit);
+                return dispatcher.consumeResponse?.(value) ?? null;
+              } catch {
+                return null;
+              }
+            }
+          : undefined,
+        requestPolicyForType: dispatcher.requestPolicyForType
+          ? (type) => {
+              if (!active) return null;
+              try {
+                productionAuditCapabilityIssuer.requireCurrent(input.audit);
+                return dispatcher.requestPolicyForType?.(type) ?? null;
+              } catch {
+                return null;
+              }
+            }
+          : undefined,
+      };
       return {
-        dispatcher,
+        dispatcher: guardedDispatcher,
         close: () => {
           active = false;
         },
