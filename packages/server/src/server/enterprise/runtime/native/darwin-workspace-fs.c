@@ -20,7 +20,7 @@
 #endif
 
 #ifndef WORKSPACE_ABI_VERSION
-#define WORKSPACE_ABI_VERSION 1
+#define WORKSPACE_ABI_VERSION 2
 #endif
 
 static const char *errno_code(int value) {
@@ -95,6 +95,25 @@ static bool get_boolean(napi_env env, napi_value value, const char *subject,
     napi_throw_type_error(env, "EINVAL", message);
     return false;
   }
+  return true;
+}
+
+static bool get_file_offset(napi_env env, napi_value value, off_t *output) {
+  napi_valuetype value_type;
+  double number;
+  if (napi_typeof(env, value, &value_type) != napi_ok ||
+      value_type != napi_number ||
+      napi_get_value_double(env, value, &number) != napi_ok ||
+      !isfinite(number) || number < 0 || number > 9007199254740991.0) {
+    napi_throw_type_error(env, "EINVAL", "offset must be a non-negative safe integer");
+    return false;
+  }
+  off_t converted = (off_t)number;
+  if ((double)converted != number) {
+    napi_throw_type_error(env, "EINVAL", "offset must be a non-negative safe integer");
+    return false;
+  }
+  *output = converted;
   return true;
 }
 
@@ -327,6 +346,66 @@ static napi_value fsync_fd(napi_env env, napi_callback_info info) {
   return output;
 }
 
+static napi_value write_at(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  int32_t descriptor = -1;
+  off_t offset = 0;
+  napi_typedarray_type array_type;
+  size_t byte_length = 0;
+  void *bytes = NULL;
+  napi_value array_buffer;
+  size_t byte_offset = 0;
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok ||
+      argc != 3) {
+    napi_throw_type_error(env, "EINVAL", "writeAt requires fd, bytes, and offset");
+    return NULL;
+  }
+  if (!get_bounded_int32(env, argv[0], 0, INT32_MAX, "fd", &descriptor))
+    return NULL;
+  if (napi_get_typedarray_info(env, argv[1], &array_type, &byte_length,
+                               &bytes, &array_buffer, &byte_offset) != napi_ok ||
+      array_type != napi_uint8_array) {
+    napi_throw_type_error(env, "EINVAL", "bytes must be a Uint8Array");
+    return NULL;
+  }
+  if (!get_file_offset(env, argv[2], &offset))
+    return NULL;
+  if (byte_length > (size_t)INT32_MAX) {
+    napi_throw_range_error(env, "EINVAL", "writeAt byte length is too large");
+    return NULL;
+  }
+  ssize_t written;
+  do {
+    written = pwrite(descriptor, bytes, byte_length, offset);
+  } while (written < 0 && errno == EINTR);
+  if (written < 0)
+    return throw_errno(env, errno, "pwrite");
+  napi_value output;
+  if (napi_create_int32(env, (int32_t)written, &output) != napi_ok) {
+    napi_throw_error(env, "EIO", "failed to return write count");
+    return NULL;
+  }
+  return output;
+}
+
+#ifndef WORKSPACE_OMIT_UPLOAD_CLOSE
+static napi_value close_fd(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  int32_t descriptor = -1;
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok ||
+      argc != 1 ||
+      !get_bounded_int32(env, argv[0], 0, INT32_MAX, "fd", &descriptor))
+    return NULL;
+  if (close(descriptor) != 0)
+    return throw_errno(env, errno, "close");
+  napi_value output;
+  napi_get_undefined(env, &output);
+  return output;
+}
+#endif
+
 static napi_value unlink_at(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
@@ -481,6 +560,10 @@ static napi_value initialize(napi_env env, napi_value exports) {
       {"mkdirAt", NULL, mkdir_at, NULL, NULL, NULL, napi_default, NULL},
       {"renameAt", NULL, rename_at, NULL, NULL, NULL, napi_default, NULL},
       {"fsync", NULL, fsync_fd, NULL, NULL, NULL, napi_default, NULL},
+      {"writeAt", NULL, write_at, NULL, NULL, NULL, napi_default, NULL},
+#ifndef WORKSPACE_OMIT_UPLOAD_CLOSE
+      {"close", NULL, close_fd, NULL, NULL, NULL, napi_default, NULL},
+#endif
       {"unlinkAt", NULL, unlink_at, NULL, NULL, NULL, napi_default, NULL},
       {"readDirectory", NULL, read_directory, NULL, NULL, NULL, napi_default,
        NULL},

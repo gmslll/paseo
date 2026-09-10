@@ -25,8 +25,9 @@ function readVariantArguments(argv) {
   const variantIndex = argv.indexOf("--test-variant");
   if (variantIndex === -1) return [];
   const variant = argv[variantIndex + 1];
-  if (variant === "wrong-abi") return ["-DWORKSPACE_ABI_VERSION=2"];
+  if (variant === "wrong-abi") return ["-DWORKSPACE_ABI_VERSION=1"];
   if (variant === "missing-symbol") return ["-DWORKSPACE_OMIT_STAT_AT=1"];
+  if (variant === "missing-upload-symbols") return ["-DWORKSPACE_OMIT_UPLOAD_CLOSE=1"];
   if (variant === "sparse-directory") return ["-DWORKSPACE_SPARSE_DIRECTORY=1"];
   throw new Error("unsupported Darwin workspace test variant");
 }

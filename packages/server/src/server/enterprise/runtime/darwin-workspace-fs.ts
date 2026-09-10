@@ -12,7 +12,7 @@ import type {
 } from "./workspace-path-policy.js";
 
 const DARWIN_WORKSPACE_BINDING_API_VERSION = 1;
-const DARWIN_WORKSPACE_BINDING_ABI_VERSION = 1;
+const DARWIN_WORKSPACE_BINDING_ABI_VERSION = 2;
 const MAX_IO_BYTES = 8 * 1024 * 1024;
 const COPY_BUFFER_BYTES = 256 * 1024;
 const FILE_TYPE_MASK = 0o170000;
@@ -34,7 +34,7 @@ interface NativeEntryStat {
   readonly mtimeMs: number;
 }
 
-interface DarwinWorkspaceBinding {
+export interface DarwinWorkspaceBinding {
   readonly apiVersion: number;
   readonly abiVersion: number;
   readonly platform: "darwin";
@@ -54,6 +54,8 @@ interface DarwinWorkspaceBinding {
   readDirectory(dirfd: number): unknown;
   duplicateDescriptor(descriptor: number): number;
   fsync(descriptor: number): void;
+  writeAt(descriptor: number, bytes: Uint8Array, offset: number): number;
+  close(descriptor: number): void;
   statAt(dirfd: number, name: string): unknown;
 }
 
@@ -907,7 +909,7 @@ type OperationOutcome<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: unknown };
 
-function loadDarwinWorkspaceBinding(addonPath: string): DarwinWorkspaceBinding | null {
+export function loadDarwinWorkspaceBinding(addonPath: string): DarwinWorkspaceBinding | null {
   if (process.platform !== "darwin" || !addonPath.endsWith(".node")) return null;
   const napiVersion = Number(process.versions.napi);
   if (!Number.isSafeInteger(napiVersion) || napiVersion < 10) return null;
@@ -937,6 +939,8 @@ function captureBinding(value: unknown): DarwinWorkspaceBinding | null {
     const duplicateDescriptor = source.duplicateDescriptor;
     const statAt = source.statAt;
     const fsync = source.fsync;
+    const writeAt = source.writeAt;
+    const close = source.close;
     const validMetadata =
       apiVersion === DARWIN_WORKSPACE_BINDING_API_VERSION &&
       abiVersion === DARWIN_WORKSPACE_BINDING_ABI_VERSION &&
@@ -952,7 +956,9 @@ function captureBinding(value: unknown): DarwinWorkspaceBinding | null {
       typeof nativeReadDirectory === "function" &&
       typeof duplicateDescriptor === "function" &&
       typeof statAt === "function" &&
-      typeof fsync === "function";
+      typeof fsync === "function" &&
+      typeof writeAt === "function" &&
+      typeof close === "function";
     if (!validMetadata || !validSymbols) return null;
     return Object.freeze({
       apiVersion,
@@ -969,6 +975,8 @@ function captureBinding(value: unknown): DarwinWorkspaceBinding | null {
       duplicateDescriptor: duplicateDescriptor.bind(source),
       statAt: statAt.bind(source),
       fsync: fsync.bind(source),
+      writeAt: writeAt.bind(source),
+      close: close.bind(source),
     });
   } catch {
     return null;

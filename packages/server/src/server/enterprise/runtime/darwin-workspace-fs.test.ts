@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { constants as fileConstants } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -16,7 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { DarwinWorkspaceFileSystem } from "./darwin-workspace-fs.js";
+import { DarwinWorkspaceFileSystem, loadDarwinWorkspaceBinding } from "./darwin-workspace-fs.js";
 
 const executeFile = promisify(execFile);
 const descriptorSyncTrace = vi.hoisted(() => [] as number[]);
@@ -134,6 +135,7 @@ describe.runIf(process.platform === "darwin")(
     let addonPath = "";
     let wrongAbiAddonPath = "";
     let missingSymbolAddonPath = "";
+    let missingUploadSymbolsAddonPath = "";
     let sparseDirectoryAddonPath = "";
 
     beforeAll(async () => {
@@ -159,6 +161,17 @@ describe.runIf(process.platform === "darwin")(
         missingSymbolAddonPath,
         "--test-variant",
         "missing-symbol",
+      ]);
+      missingUploadSymbolsAddonPath = path.join(
+        buildDirectory,
+        "darwin-workspace-fs-missing-upload-symbols.node",
+      );
+      await executeFile(process.execPath, [
+        fileURLToPath(new URL("./native/build-darwin-workspace-fs.mjs", import.meta.url)),
+        "--output",
+        missingUploadSymbolsAddonPath,
+        "--test-variant",
+        "missing-upload-symbols",
       ]);
       sparseDirectoryAddonPath = path.join(
         buildDirectory,
@@ -193,6 +206,49 @@ describe.runIf(process.platform === "darwin")(
       }
     });
 
+    it("writes and closes opened descriptors and commits with no-replace rename plus parent fsync", async () => {
+      const rootPath = await realpath(
+        await mkdtemp(path.join(tmpdir(), "paseo-workspace-native-upload-")),
+      );
+      const binding = loadDarwinWorkspaceBinding(addonPath);
+      if (!binding) throw new Error("expected native upload binding");
+      const parentDescriptor = binding.openRoot(rootPath);
+      const sourceDescriptor = binding.openAt(
+        parentDescriptor,
+        "staging.part",
+        fileConstants.O_RDWR | fileConstants.O_CREAT | fileConstants.O_EXCL,
+        0o600,
+      );
+      let sourceOpen = true;
+      try {
+        const bytes = new TextEncoder().encode("opened-descriptor-upload");
+        expect(binding.writeAt(sourceDescriptor, bytes, 0)).toBe(bytes.byteLength);
+        binding.fsync(sourceDescriptor);
+        binding.close(sourceDescriptor);
+        sourceOpen = false;
+        expect(() => binding.close(sourceDescriptor)).toThrow();
+
+        binding.renameAt(parentDescriptor, "staging.part", parentDescriptor, "upload.bin", 1);
+        binding.fsync(parentDescriptor);
+        expect(await readFile(path.join(rootPath, "upload.bin"), "utf8")).toBe(
+          "opened-descriptor-upload",
+        );
+
+        await writeFile(path.join(rootPath, "second.part"), "second");
+        expect(() =>
+          binding.renameAt(parentDescriptor, "second.part", parentDescriptor, "upload.bin", 1),
+        ).toThrow();
+        expect(await readFile(path.join(rootPath, "upload.bin"), "utf8")).toBe(
+          "opened-descriptor-upload",
+        );
+        expect(await readFile(path.join(rootPath, "second.part"), "utf8")).toBe("second");
+      } finally {
+        if (sourceOpen) binding.close(sourceDescriptor);
+        binding.close(parentDescriptor);
+        await rm(rootPath, { recursive: true, force: true });
+      }
+    });
+
     it("fails closed before workspace access when the binding is missing", async () => {
       const files = new DarwinWorkspaceFileSystem({
         addonPath: path.join(buildDirectory, "missing-workspace-fs.node"),
@@ -207,6 +263,7 @@ describe.runIf(process.platform === "darwin")(
     it.each([
       ["ABI", () => wrongAbiAddonPath],
       ["symbol", () => missingSymbolAddonPath],
+      ["upload symbols", () => missingUploadSymbolsAddonPath],
     ])("fails closed when the native %s contract is wrong", async (_label, selectAddon) => {
       const files = new DarwinWorkspaceFileSystem({ addonPath: selectAddon() });
       expect(files.releaseReady).toBe(false);
