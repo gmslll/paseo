@@ -4,7 +4,10 @@ import type {
   ResourceAuthorization,
   SessionEventSubscription,
 } from "@getpaseo/protocol/messages";
-import { GlobalResourceRefSchema } from "@getpaseo/protocol/messages";
+import {
+  GlobalResourceRefSchema,
+  normalizeEnterpriseResourceOwner,
+} from "@getpaseo/protocol/messages";
 import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
@@ -3717,6 +3720,36 @@ export class Session {
     else this.onMessage(message);
   }
 
+  private async filterLegacyAgentSnapshots(
+    agents: readonly AgentSnapshotPayload[],
+  ): Promise<AgentSnapshotPayload[]> {
+    if (!this.enterpriseContext) return [...agents];
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    const originals = new Map(agents.map((agent) => [agent.id, agent] as const));
+    const rows = agents.flatMap((agent) => {
+      if (!agent.workspaceId) return [];
+      try {
+        const owner = normalizeEnterpriseResourceOwner(agent);
+        return owner ? [{ ...agent, ...owner, id: agent.id, workspaceId: agent.workspaceId }] : [];
+      } catch {
+        // A malformed persisted row is quarantined without making the whole
+        // directory distinguishable from an empty, authorized result.
+        return [];
+      }
+    });
+    const authorized = await authorization.filterAgents("workspace.content.read", rows);
+    if (!authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    return authorized.flatMap((row) => {
+      const original = originals.get(row.id);
+      return original ? [original] : [];
+    });
+  }
+
   private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
     if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
       this.emitLegacyResourceDenied(requestId, "archive_agent_request");
@@ -5440,7 +5473,16 @@ export class Session {
           filter?.includeUnavailablePersisted === true ||
           isStoredAgentProviderAvailable(record, registeredProviderIds),
       )
-      .map((record) => this.buildStoredAgentPayload(record, registeredProviderIds));
+      .flatMap((record) => {
+        try {
+          return [this.buildStoredAgentPayload(record, registeredProviderIds)];
+        } catch (error) {
+          // Enterprise directory reads quarantine malformed ownership rows. Legacy
+          // projections retain their historical failure behavior.
+          if (this.enterpriseContext) return [];
+          throw error;
+        }
+      });
 
     let agents = [...liveAgents, ...persistedAgents];
 
@@ -5657,6 +5699,7 @@ export class Session {
           activePlacementsByWorkspaceId.has(agent.workspaceId),
       );
     }
+    agents = await this.filterLegacyAgentSnapshots(agents);
 
     const placementByWorkspaceId = new Map<string, Promise<ProjectPlacementPayload | null>>();
     const getPlacement = (
@@ -6436,6 +6479,10 @@ export class Session {
   private async handleFetchAgents(
     request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
   ): Promise<void> {
+    if (this.enterpriseContext && !this.enterpriseLegacyResourceAuthorization?.isCurrent()) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
     const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
 
@@ -6493,6 +6540,10 @@ export class Session {
   private async handleFetchAgentHistory(
     request: Extract<SessionInboundMessage, { type: "fetch_agent_history_request" }>,
   ): Promise<void> {
+    if (this.enterpriseContext && !this.enterpriseLegacyResourceAuthorization?.isCurrent()) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     try {
       const payload = await this.listFetchAgentsEntries(request);
       this.emit({
