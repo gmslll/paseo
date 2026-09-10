@@ -46,6 +46,11 @@ export type EnterpriseBrowserLeaseSessionRuntimeInput = Omit<
 export interface EnterpriseBrowserLeaseDispatcherFactoryOptions {
   readonly runtime: EnterpriseBrowserLeaseSessionRuntime;
   readonly authority: EnterpriseBrowserLeaseAuthorityPort;
+  readonly authorityForSessionRuntime?: (input: {
+    readonly authorizationRuntime: unknown;
+    readonly requestLifecycle: unknown;
+    readonly context: EnterpriseSessionContext;
+  }) => EnterpriseBrowserLeaseAuthorityPort | null;
 }
 
 const MANIFEST: EnterpriseDispatcherManifest = Object.freeze({
@@ -82,7 +87,18 @@ export function createEnterpriseBrowserLeaseDispatcherRegistration(
       readonly requestLifecycle?: unknown;
     }): EnterpriseDispatcherLease {
       assertOpenInput(input);
-      const dispatcher = new EnterpriseBrowserLeaseHandler(captured.options);
+      const authority = captured.authorityForSessionRuntime
+        ? captured.authorityForSessionRuntime({
+            authorizationRuntime: input.authorizationRuntime,
+            requestLifecycle: input.requestLifecycle,
+            context: input.context,
+          })
+        : captured.options.authority;
+      if (!authority) throw new Error("Enterprise browser session authority is unavailable.");
+      const dispatcher = new EnterpriseBrowserLeaseHandler({
+        ...captured.options,
+        authority,
+      });
       return Object.freeze({
         dispatcher,
         close: () => dispatcher.close(),
@@ -156,12 +172,14 @@ function captureFactoryOptions(
   options: EnterpriseBrowserLeaseDispatcherFactoryOptions | null | undefined,
 ): {
   readonly options: EnterpriseBrowserLeaseHandlerOptions;
+  readonly authorityForSessionRuntime?: EnterpriseBrowserLeaseDispatcherFactoryOptions["authorityForSessionRuntime"];
 } | null {
   try {
     if (!options) return null;
     const runtime = options.runtime;
     if (runtime[sessionRuntimeBrand] !== "EnterpriseBrowserLeaseSessionRuntime") return null;
     const authority = options.authority;
+    const authorityForSessionRuntime = options.authorityForSessionRuntime;
     const authorityAssertWorkspace = authority.assertWorkspace;
     const authorityAssertProfile = authority.assertBrowserProfile;
     const authorityResolveHandle = authority.resolveAgentHandle;
@@ -183,7 +201,14 @@ function captureFactoryOptions(
       isCurrentHandle: authorityIsCurrent.bind(authority),
       resolveLeaseAuthorization: authorityResolveLease.bind(authority),
     });
+    if (
+      authorityForSessionRuntime !== undefined &&
+      typeof authorityForSessionRuntime !== "function"
+    ) {
+      return null;
+    }
     return Object.freeze({
+      authorityForSessionRuntime,
       options: Object.freeze({
         ...runtime,
         authority: capturedAuthority,
