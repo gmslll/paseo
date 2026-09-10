@@ -73,6 +73,16 @@ export interface ProductionBrowserLeaseBundle {
     ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
   }) => () => void;
   readonly runtimeForSession: (generation: string) => ProductionBrowserLeaseRuntime;
+  readonly browserToolsRuntime: ProductionBrowserToolsRuntime;
+}
+
+export interface ProductionBrowserToolsRuntime {
+  readonly isCurrentHandle: (handle: EnterpriseAgentContextHandle) => boolean;
+  readonly resolveAuthorization: (
+    handle: EnterpriseAgentContextHandle,
+  ) => BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
+  readonly leases: BrowserProfileLeaseManager;
+  readonly leaseTtlMs: number;
 }
 
 export interface ProductionBrowserLeaseRuntime {
@@ -150,6 +160,21 @@ export function createProductionBrowserLeaseBundle(
     leases,
     leaseTtlMs: options.maxLeaseTtlMs,
   });
+  const browserToolsRuntime: ProductionBrowserToolsRuntime = {
+    isCurrentHandle: (handle) => {
+      const generation = handle.context.sessionBindingGeneration;
+      return runtimeForSession(generation).isCurrentHandle(handle);
+    },
+    resolveAuthorization: (handle) => {
+      const generation = handle.context.sessionBindingGeneration;
+      const authority = authorities.get(generation);
+      if (!authority || !authority.isCurrentHandle(handle))
+        throw new Error("Browser session authority is stale.");
+      return authority.resolveAuthorization(handle, "");
+    },
+    leases,
+    leaseTtlMs: options.maxLeaseTtlMs,
+  };
   return {
     profiles,
     bindings,
@@ -166,6 +191,7 @@ export function createProductionBrowserLeaseBundle(
       };
     },
     runtimeForSession,
+    browserToolsRuntime,
     close: async () => {
       if (closed) return;
       closed = true;
