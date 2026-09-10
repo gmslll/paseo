@@ -423,17 +423,16 @@ export class EnterpriseBrowserLeaseHandler implements EnterpriseSessionDispatche
     const visibleProfiles: AuthorizedBrowserProfile[] = [];
     for (const record of records) {
       if (!profileMatchesWorkspace(record, workspace)) continue;
-      try {
-        const authorized = snapshotProfile(
-          await this.runtime.assertBrowserProfile(
-            principal,
-            "browser.use",
-            record.browserProfileId,
-          ),
-        );
-        if (sameProfile(record, authorized)) visibleProfiles.push(authorized);
-      } catch {
-        // List authorization is a filter; one invisible record cannot reveal itself.
+      for (const action of ["browser.use", "browser.profile.manage"] as const) {
+        try {
+          const authorized = snapshotProfile(
+            await this.runtime.assertBrowserProfile(principal, action, record.browserProfileId),
+          );
+          if (sameProfile(record, authorized)) visibleProfiles.push(authorized);
+          break;
+        } catch {
+          // Discovery is a filter; one invisible record cannot reveal itself.
+        }
       }
     }
     visibleProfiles.sort((left, right) =>

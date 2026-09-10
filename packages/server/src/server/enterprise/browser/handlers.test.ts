@@ -418,6 +418,25 @@ describe("EnterpriseBrowserLeaseHandler", () => {
     });
   });
 
+  test("lists a manage-only profile while content permissions remain separate", async () => {
+    const authority = new MemoryAuthority();
+    const original = authority.assertBrowserProfile.bind(authority);
+    authority.assertBrowserProfile = async (context, action, profileId) => {
+      if (action === "browser.use") throw new Error("use denied");
+      return original(context, action, profileId);
+    };
+    const { handler } = createHandler({ authority });
+    const response = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.browser.list_profiles.request",
+        requestId: "request-manage-only-list",
+        workspaceId: WORKSPACE_ID,
+      },
+    });
+    expect(response).toMatchObject({ type: "enterprise.browser.list_profiles.response" });
+  });
+
   test("denies an unavailable Workspace before reading Profile registries", async () => {
     const { handler, profiles, bindings } = createHandler();
 
