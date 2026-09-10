@@ -8,7 +8,7 @@ import type {
 import type { EnterpriseAgentAuthorizationRecord } from "./owner-registry.js";
 import { isCurrentProductionAuthorizationRuntime } from "./production-authorization-runtime.js";
 
-declare const legacyBrand: unique symbol;
+const legacyBrand = Symbol("enterprise-legacy-resource-authorization");
 export interface EnterpriseLegacyResourceAuthorization {
   readonly [legacyBrand]: never;
   isCurrent(): boolean;
@@ -23,6 +23,12 @@ export interface EnterpriseLegacyResourceAuthorization {
 }
 
 const branded = new WeakSet<object>();
+
+export function isEnterpriseLegacyResourceAuthorization(
+  value: unknown,
+): value is EnterpriseLegacyResourceAuthorization {
+  return typeof value === "object" && value !== null && branded.has(value);
+}
 
 export function createEnterpriseLegacyResourceAuthorization(
   input: unknown,
@@ -109,7 +115,7 @@ export function createEnterpriseLegacyResourceAuthorization(
       ),
     );
     branded.add(record);
-    return record;
+    return isEnterpriseLegacyResourceAuthorization(record) ? record : null;
   } catch {
     return null;
   }
