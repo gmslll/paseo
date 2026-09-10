@@ -134,6 +134,16 @@ export interface EnterpriseSessionDispatcher {
   }): Promise<EnterpriseDispatchResult> | EnterpriseDispatchResult;
   readonly consumeResponse?: EnterpriseResponseContextConsumer["consumeResponse"];
 }
+export interface EnterpriseSessionDispatcherFactory {
+  create(input: {
+    readonly sessionId: string;
+    readonly clientId: string;
+    readonly context: EnterpriseSessionContext;
+    readonly runtime?: unknown;
+    readonly filesRuntime?: unknown;
+  }): EnterpriseSessionDispatcher;
+  dispose?(dispatcher: EnterpriseSessionDispatcher): Promise<void> | void;
+}
 
 export const ENTERPRISE_UNAVAILABLE_ERROR = "Enterprise operation unavailable";
 
