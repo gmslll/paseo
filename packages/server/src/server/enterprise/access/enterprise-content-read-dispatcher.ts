@@ -407,7 +407,14 @@ export function createEnterpriseContentReadDispatcherRegistration(
                 EnterpriseWorkspaceContentReadRequestSchema.safeParse(message);
               const appRequest = EnterpriseAppSlotContentReadRequestSchema.safeParse(message);
               const agentRequest = EnterpriseAgentContentReadRequestSchema.safeParse(message);
-              if (!workspaceRequest.success && !appRequest.success && !agentRequest.success)
+              const browserRequest =
+                EnterpriseBrowserProfileContentReadRequestSchema.safeParse(message);
+              if (
+                !workspaceRequest.success &&
+                !appRequest.success &&
+                !agentRequest.success &&
+                !browserRequest.success
+              )
                 return null;
               const request = workspaceRequest.success
                 ? workspaceRequest.data
@@ -415,13 +422,22 @@ export function createEnterpriseContentReadDispatcherRegistration(
                   ? appRequest.data
                   : agentRequest.success
                     ? agentRequest.data
-                    : null;
+                    : browserRequest.success
+                      ? browserRequest.data
+                      : null;
               if (!request) return null;
               const workspaceResponse =
                 EnterpriseWorkspaceContentReadResponseSchema.safeParse(response);
               const appResponse = EnterpriseAppSlotContentReadResponseSchema.safeParse(response);
               const agentResponse = EnterpriseAgentContentReadResponseSchema.safeParse(response);
-              if (!workspaceResponse.success && !appResponse.success && !agentResponse.success)
+              const browserResponse =
+                EnterpriseBrowserProfileContentReadResponseSchema.safeParse(response);
+              if (
+                !workspaceResponse.success &&
+                !appResponse.success &&
+                !agentResponse.success &&
+                !browserResponse.success
+              )
                 return null;
               const parsedResponse = workspaceResponse.success
                 ? workspaceResponse.data
@@ -429,7 +445,9 @@ export function createEnterpriseContentReadDispatcherRegistration(
                   ? appResponse.data
                   : agentResponse.success
                     ? agentResponse.data
-                    : null;
+                    : browserResponse.success
+                      ? browserResponse.data
+                      : null;
               if (!parsedResponse) return null;
               if (capability.context !== sessionContext) return null;
               if (capability.message !== message) return null;
