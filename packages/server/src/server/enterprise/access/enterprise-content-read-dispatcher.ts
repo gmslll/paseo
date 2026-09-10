@@ -163,7 +163,8 @@ export function createEnterpriseContentReadDispatcherRegistration(
           requestPolicyForType: (type: string) =>
             type === "enterprise.workspace.content.read.request" ||
             type === "enterprise.app_slot.content.read.request" ||
-            type === "enterprise.agent.content.read.request"
+            type === "enterprise.agent.content.read.request" ||
+            (type === "enterprise.browser_profile.content.read.request" && browserSource !== null)
               ? ("resources" as const)
               : null,
           // oxlint-disable-next-line complexity

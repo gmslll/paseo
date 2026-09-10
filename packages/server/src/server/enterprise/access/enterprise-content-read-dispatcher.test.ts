@@ -81,6 +81,9 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
         authorizationRuntime: fixture.runtime,
         filesRuntime,
       });
+      expect(
+        lease.dispatcher.requestPolicyForType("enterprise.browser_profile.content.read.request"),
+      ).toBeNull();
       const message = {
         type: "enterprise.workspace.content.read.request",
         requestId: "r-content",
@@ -670,6 +673,9 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
         authorizationRuntime: fixture.runtime,
         filesRuntime,
       });
+      expect(
+        lease.dispatcher.requestPolicyForType("enterprise.browser_profile.content.read.request"),
+      ).toBe("resources");
       const message = {
         type: "enterprise.browser_profile.content.read.request" as const,
         requestId: "r-browser",
