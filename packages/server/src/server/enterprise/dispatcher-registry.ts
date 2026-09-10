@@ -32,7 +32,9 @@ export type EnterpriseFeatureAdvertisement = Readonly<
       | "enterpriseAgentContentReadV1"
       | "enterpriseBrowserProfileContentReadV1"
       | "enterpriseAppSlotContentReadV1"
-      | "enterpriseWorkspaceOwnershipTransferV1",
+      | "enterpriseWorkspaceOwnershipTransferV1"
+      | "enterpriseBrowserPageIdentityObservationV1"
+      | "enterpriseBrowserPageIdentityInvalidationV1",
       true
     >
   >
@@ -71,6 +73,26 @@ export function workspaceOwnershipTransferFeatureForManifest(
   return manifest?.operations.includes("enterprise.resource.ownership.transfer.request")
     ? Object.freeze({ enterpriseWorkspaceOwnershipTransferV1: true as const })
     : Object.freeze({});
+}
+
+const pageIdentityFeatureOperations = Object.freeze({
+  enterpriseBrowserPageIdentityObservationV1: "enterprise.browser.page_identity.observe.request",
+  enterpriseBrowserPageIdentityInvalidationV1:
+    "enterprise.browser.page_identity.invalidate.request",
+});
+
+export function pageIdentityFeaturesForEnterpriseManifest(
+  manifest: EnterpriseDispatcherManifest | undefined,
+): EnterpriseFeatureAdvertisement {
+  const operations = new Set(manifest?.operations ?? []);
+  return Object.freeze({
+    ...(operations.has(pageIdentityFeatureOperations.enterpriseBrowserPageIdentityObservationV1)
+      ? { enterpriseBrowserPageIdentityObservationV1: true as const }
+      : {}),
+    ...(operations.has(pageIdentityFeatureOperations.enterpriseBrowserPageIdentityInvalidationV1)
+      ? { enterpriseBrowserPageIdentityInvalidationV1: true as const }
+      : {}),
+  });
 }
 
 const familyFlags: Readonly<Record<EnterpriseFeatureFamily, keyof EnterpriseFeatureAdvertisement>> =

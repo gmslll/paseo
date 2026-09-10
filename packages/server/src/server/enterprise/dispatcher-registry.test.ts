@@ -4,6 +4,7 @@ import {
   contentFeaturesForEnterpriseManifest,
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
+  pageIdentityFeaturesForEnterpriseManifest,
   workspaceOwnershipTransferFeatureForManifest,
 } from "./dispatcher-registry.js";
 
@@ -15,6 +16,35 @@ const response = {
 } as never;
 
 describe("enterprise dispatcher registry", () => {
+  it("advertises page identity operations independently and ignores unknown operations", () => {
+    expect(
+      pageIdentityFeaturesForEnterpriseManifest({
+        operations: ["enterprise.browser.page_identity.observe.request"],
+      }),
+    ).toEqual({ enterpriseBrowserPageIdentityObservationV1: true });
+    expect(
+      pageIdentityFeaturesForEnterpriseManifest({
+        operations: ["enterprise.browser.page_identity.invalidate.request"],
+      }),
+    ).toEqual({ enterpriseBrowserPageIdentityInvalidationV1: true });
+    expect(
+      pageIdentityFeaturesForEnterpriseManifest({
+        operations: [
+          "enterprise.browser.page_identity.observe.request",
+          "enterprise.browser.page_identity.invalidate.request",
+        ],
+      }),
+    ).toEqual({
+      enterpriseBrowserPageIdentityObservationV1: true,
+      enterpriseBrowserPageIdentityInvalidationV1: true,
+    });
+    expect(pageIdentityFeaturesForEnterpriseManifest({ operations: ["unknown.request"] })).toEqual(
+      {},
+    );
+    expect(pageIdentityFeaturesForEnterpriseManifest({ operations: [] })).toEqual({});
+    expect(pageIdentityFeaturesForEnterpriseManifest(undefined)).toEqual({});
+  });
+
   it("advertises workspace ownership transfer only for the exact operation", () => {
     expect(
       workspaceOwnershipTransferFeatureForManifest({
