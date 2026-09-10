@@ -342,6 +342,9 @@ class FaultFiles implements AuditFileSystem {
       sync: async () => {
         const fault = this.record("directory.sync", `${label}:sync`);
         this.throwBefore(fault, "directory.sync");
+        // Windows rejects fsync on directory handles; keep injected faults real,
+        // but model successful directory durability in this test fixture.
+        if (process.platform === "win32" && !fault) return;
         await handle.sync();
         this.throwAfter(fault, "directory.sync");
       },
