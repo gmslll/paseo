@@ -528,8 +528,6 @@ export const ALL_OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
 
 export const OUTBOUND_SELF_LIFECYCLE_EVENTS = [
   "enterprise.identity.credential_revoked",
-  "enterprise.identity.get_current.response",
-  "enterprise.identity.logout_all.response",
   "enterprise.identity.scope_refreshed",
 ] as const satisfies readonly SessionOutboundMessage["type"][];
 
