@@ -114,6 +114,11 @@ import {
 } from "./websocket/physical-socket.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
 import {
+  resolveCurrentEnterpriseAdmissionAuthorization,
+  type EnterpriseAdmissionAuthenticationEvidence,
+  type EnterpriseAdmissionAuthorizationHandle,
+} from "./enterprise/identity/admission-authorization.js";
+import {
   DaemonPermissionSchema,
   NodeContextSchema,
   PrincipalContextSchema,
@@ -331,6 +336,7 @@ interface PendingConnection {
   helloTimeout: ReturnType<typeof setTimeout> | null;
   identity: WebSocketConnectionIdentity;
   admission: SessionAdmission;
+  authorizationEvidence?: EnterpriseAdmissionAuthenticationEvidence;
 }
 interface PendingMessageItem {
   readonly message: WSInboundMessage;
@@ -652,6 +658,7 @@ interface SessionConnectionBase {
   clientCapabilities: Record<string, unknown> | null;
   connectionLogger: pino.Logger;
   sockets: Set<WebSocketLike>;
+  enterpriseAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
 }
 
 interface ReconnectableSessionConnection extends SessionConnectionBase {
@@ -1127,29 +1134,30 @@ export class VoiceAssistantWebSocketServer {
         ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication required");
         return;
       }
-      const principal = await this.enterpriseRuntime.admission.authenticate(token, {
-        node: this.enterpriseRuntime.node,
-        transport: "direct",
-        peer: resolveConnectionPeer(extractSocketRequestMetadata(request), undefined),
-        ...(metadata.origin ? { origin: metadata.origin } : {}),
-        ...(metadata.remoteAddress ? { remoteAddress: metadata.remoteAddress } : {}),
-        ...(metadata.userAgent ? { userAgent: metadata.userAgent } : {}),
-      });
-      if (!principal) {
+      const authorizationEvidence = await this.enterpriseRuntime.admission.authenticateEvidence(
+        token,
+        {
+          node: this.enterpriseRuntime.node,
+          transport: "direct",
+          peer: resolveConnectionPeer(extractSocketRequestMetadata(request), undefined),
+          ...(metadata.origin ? { origin: metadata.origin } : {}),
+          ...(metadata.remoteAddress ? { remoteAddress: metadata.remoteAddress } : {}),
+          ...(metadata.userAgent ? { userAgent: metadata.userAgent } : {}),
+        },
+      );
+      if (!authorizationEvidence) {
         ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication failed");
         return;
       }
-      await this.attachSocket(ws, request, undefined, false, {
-        kind: "enterprise",
-        principalId: principal.principalId,
-        permissions: OWNER_PERMISSIONS,
-        enterprise: {
-          principal,
-          node: this.enterpriseRuntime.node,
-          runtime: this.enterpriseRuntime,
-          grantVersionGuard: this.enterpriseRuntime.grantVersionGuard,
-        },
-      });
+      await this.attachSocket(
+        ws,
+        request,
+        undefined,
+        false,
+        OWNER_SESSION_ADMISSION,
+        undefined,
+        authorizationEvidence,
+      );
       return;
     }
     if (password) {
@@ -1344,6 +1352,8 @@ export class VoiceAssistantWebSocketServer {
         clearTimeout(connection.externalDisconnectCleanupTimeout);
         connection.externalDisconnectCleanupTimeout = null;
       }
+
+      this.releaseEnterpriseAuthorization(connection);
 
       cleanupPromises.push(
         Promise.resolve()
@@ -1555,7 +1565,16 @@ export class VoiceAssistantWebSocketServer {
     allowDuringStartup = false,
     admission: SessionAdmission = OWNER_SESSION_ADMISSION,
     initialHello?: WSHelloMessage,
+    authorizationEvidence?: EnterpriseAdmissionAuthenticationEvidence,
   ): Promise<void> {
+    if (
+      (this.enterpriseRuntime &&
+        (!authorizationEvidence || admission !== OWNER_SESSION_ADMISSION)) ||
+      (!this.enterpriseRuntime && authorizationEvidence)
+    ) {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Invalid enterprise admission");
+      return;
+    }
     try {
       admission = freezeAdmission(admission);
       if (admission.enterprise && admission.enterprise.runtime !== this.enterpriseRuntime)
@@ -1606,6 +1625,7 @@ export class VoiceAssistantWebSocketServer {
       helloTimeout: null,
       identity,
       admission,
+      ...(authorizationEvidence ? { authorizationEvidence } : {}),
     };
     const timeout = setTimeout(() => {
       if (this.pendingConnections.get(ws) !== pending) {
@@ -1654,6 +1674,7 @@ export class VoiceAssistantWebSocketServer {
     connectionLogger: pino.Logger;
     lifecycle: { kind: "reconnectable" } | { kind: "ephemeral-plugin"; pluginId: string };
     admission: SessionAdmission;
+    enterpriseAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
   }): SessionConnection {
     const { ws, clientId, appVersion, clientCapabilities, connectionLogger, lifecycle, admission } =
       params;
@@ -1726,6 +1747,9 @@ export class VoiceAssistantWebSocketServer {
       clientCapabilities,
       connectionLogger,
       sockets: new Set([ws]),
+      ...(params.enterpriseAuthorizationHandle
+        ? { enterpriseAuthorizationHandle: params.enterpriseAuthorizationHandle }
+        : {}),
     };
     connection =
       lifecycle.kind === "ephemeral-plugin"
@@ -1905,62 +1929,94 @@ export class VoiceAssistantWebSocketServer {
     if (message.appVersion) {
       pending.identity.appVersion = message.appVersion;
     }
-    if (pending.admission.enterprise) {
-      const current =
-        await pending.admission.enterprise.runtime.admission.isCurrentPrincipalContext(
-          pending.admission.enterprise.principal,
-        );
-      if (!current) {
-        ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise credential is no longer current");
+    let admission = pending.admission;
+    let enterpriseAuthorizationHandle: EnterpriseAdmissionAuthorizationHandle | undefined;
+    let sessionKey: string;
+    let existing: ReconnectableSessionConnection | undefined;
+    if (pending.authorizationEvidence) {
+      const runtime = this.enterpriseRuntime;
+      if (!runtime) {
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise runtime unavailable");
         return;
       }
-    }
-    const sessionKey = sessionConnectionKey(
-      pending.admission.principalId,
-      clientId,
-      pending.admission.enterprise?.principal,
-    );
-    const existing = pluginId
-      ? undefined
-      : (this.externalSessionsByKey.get(sessionKey) ??
-        this.externalSessionsByBaseKey.get(
-          sessionConnectionBaseKey(pending.admission.principalId, clientId),
-        ));
-    if (existing) {
-      if (pending.admission.enterprise) {
-        const current = existing.session.getEnterpriseSessionContext();
-        const next = pending.admission.enterprise.principal;
-        const matches =
-          !!current &&
-          current.node.nodeId === pending.admission.enterprise.node.nodeId &&
-          current.node.paseoServerId === pending.admission.enterprise.node.paseoServerId &&
-          current.node.mode === pending.admission.enterprise.node.mode &&
-          [...existing.session.getPermissions()].sort().join("\u0000") ===
-            [...pending.admission.permissions].sort().join("\u0000") &&
-          current.principal.principalType === next.principalType &&
-          current.principal.principalId === next.principalId &&
-          current.principal.organizationId === next.organizationId &&
-          current.principal.credentialId === next.credentialId &&
-          current.principal.grantVersion === next.grantVersion;
-        if (!matches) {
-          try {
-            await this.cleanupConnection(existing, "Enterprise admission changed");
-          } catch (error) {
-            this.externalSessionsByKey.delete(existing.sessionKey);
-            this.externalSessionsByBaseKey.delete(
-              sessionConnectionBaseKey(existing.principalId, existing.clientId),
-            );
-            safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise session cleanup failed");
-            throw error;
-          }
-        } else {
-          await this.resumeSession({ ws, message, pending, existing });
-          return;
-        }
+      const candidates = pluginId
+        ? []
+        : [...new Set(this.externalSessionsByKey.values())].filter(
+            (connection) =>
+              connection.clientId === clientId && connection.enterpriseAuthorizationHandle,
+          );
+      if (candidates.length > 1) {
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Ambiguous enterprise session");
+        return;
+      }
+      existing = candidates[0];
+      let handle: EnterpriseAdmissionAuthorizationHandle | null;
+      if (existing?.enterpriseAuthorizationHandle) {
+        handle = runtime.admission.replaceSession(
+          existing.enterpriseAuthorizationHandle,
+          pending.authorizationEvidence,
+          clientId,
+        );
       } else {
+        handle = runtime.admission.bindSession(pending.authorizationEvidence, clientId);
+      }
+      const resolved = handle
+        ? resolveCurrentEnterpriseAdmissionAuthorization(
+            runtime.admission.authorizationIssuer,
+            handle,
+          )
+        : null;
+      if (!handle || !resolved) {
+        safeCloseSocket(
+          ws,
+          WS_CLOSE_DAEMON_AUTH_FAILED,
+          "Enterprise admission is no longer current",
+        );
+        return;
+      }
+      enterpriseAuthorizationHandle = handle;
+      sessionKey = sessionConnectionKey(
+        resolved.principal.principalId,
+        clientId,
+        resolved.principal,
+      );
+      if (existing && existing.sessionKey !== sessionKey) {
+        runtime.admission.releaseSession(handle);
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission changed");
+        return;
+      }
+      admission = Object.freeze({
+        kind: "enterprise",
+        principalId: resolved.principal.principalId,
+        permissions: OWNER_PERMISSIONS,
+        enterprise: Object.freeze({
+          principal: resolved.principal as PrincipalContext,
+          node: resolved.node as NodeContext,
+          runtime,
+          grantVersionGuard: runtime.grantVersionGuard,
+        }),
+      });
+      if (existing) {
+        existing.enterpriseAuthorizationHandle = handle;
         await this.resumeSession({ ws, message, pending, existing });
         return;
       }
+    } else {
+      sessionKey = sessionConnectionKey(
+        admission.principalId,
+        clientId,
+        admission.enterprise?.principal,
+      );
+      existing = pluginId
+        ? undefined
+        : (this.externalSessionsByKey.get(sessionKey) ??
+          this.externalSessionsByBaseKey.get(
+            sessionConnectionBaseKey(admission.principalId, clientId),
+          ));
+    }
+    if (existing) {
+      await this.resumeSession({ ws, message, pending, existing });
+      return;
     }
 
     const connectionLogger = pending.connectionLogger.child({ clientId });
@@ -1972,13 +2028,15 @@ export class VoiceAssistantWebSocketServer {
       clientCapabilities: message.capabilities ?? null,
       connectionLogger,
       lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
-      admission: pending.admission,
+      admission,
+      ...(enterpriseAuthorizationHandle ? { enterpriseAuthorizationHandle } : {}),
     });
     const initialInfo = this.sendServerInfoToClient(ws, connection.session);
     let initialAllowed: boolean;
     try {
       initialAllowed = initialInfo instanceof Promise ? await initialInfo : initialInfo;
     } catch (primary) {
+      this.releaseEnterpriseAuthorization(connection);
       try {
         await connection.session.cleanup();
       } catch (cleanupError) {
@@ -1990,6 +2048,7 @@ export class VoiceAssistantWebSocketServer {
       throw primary;
     }
     if (!initialAllowed) {
+      this.releaseEnterpriseAuthorization(connection);
       await connection.session.cleanup();
       return;
     }
@@ -1997,7 +2056,7 @@ export class VoiceAssistantWebSocketServer {
     if (connection.lifecycle === "reconnectable") {
       this.externalSessionsByKey.set(sessionKey, connection);
       this.externalSessionsByBaseKey.set(
-        sessionConnectionBaseKey(pending.admission.principalId, clientId),
+        sessionConnectionBaseKey(admission.principalId, clientId),
         connection,
       );
     }
@@ -2448,12 +2507,20 @@ export class VoiceAssistantWebSocketServer {
         this.externalSessionsByBaseKey.delete(baseKey);
     }
     this.unregisterBrowserToolsClient(connection);
+    this.releaseEnterpriseAuthorization(connection);
 
     connection.connectionLogger.trace(
       { clientId: connection.clientId, totalSessions: this.sessions.size },
       logMessage,
     );
     await connection.session.cleanup();
+  }
+
+  private releaseEnterpriseAuthorization(connection: SessionConnection): void {
+    const handle = connection.enterpriseAuthorizationHandle;
+    if (!handle) return;
+    connection.enterpriseAuthorizationHandle = undefined;
+    this.enterpriseRuntime?.admission.releaseSession(handle);
   }
 
   private syncBrowserToolsClientRegistration(connection: SessionConnection): void {
