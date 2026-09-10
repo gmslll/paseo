@@ -8139,6 +8139,42 @@ describe("enterprise dispatcher integration seam", () => {
     });
   });
 
+  test.each([
+    {
+      name: "workspaces",
+      request: {
+        type: "fetch_workspaces_request",
+        requestId: "legacy-fetch-workspaces-empty",
+      } as const,
+      responseType: "fetch_workspaces_response",
+    },
+    {
+      name: "agents",
+      request: { type: "fetch_agents_request", requestId: "legacy-fetch-agents-empty" } as const,
+      responseType: "fetch_agents_response",
+    },
+    {
+      name: "agent history",
+      request: {
+        type: "fetch_agent_history_request",
+        requestId: "legacy-fetch-agent-history-empty",
+      } as const,
+      responseType: "fetch_agent_history_response",
+    },
+  ])("legacy $name empty-page delivery remains unchanged", async ({ request, responseType }) => {
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({ messages });
+
+    await session.handleMessage(request);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: responseType,
+      payload: { requestId: request.requestId, entries: [] },
+    });
+    await session.cleanup();
+  });
+
   test("enterprise legacy archive fails closed before manager access without a current runtime", async () => {
     const messages: SessionOutboundMessage[] = [];
     const getAgent = vi.fn();
@@ -8528,6 +8564,223 @@ describe("enterprise dispatcher integration seam", () => {
         }),
       }),
     );
+    await session.cleanup();
+  });
+
+  test("enterprise fetch-workspaces delivers an authorized empty page", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-workspaces-empty", [
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+    ]);
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "fetch-workspaces-empty",
+    });
+
+    await vi.waitFor(() =>
+      expect(messages).toContainEqual({
+        type: "fetch_workspaces_response",
+        payload: {
+          requestId: "fetch-workspaces-empty",
+          entries: [],
+          emptyProjects: [],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    const context = canEmit.mock.calls.find(
+      ([, event]) => event.type === "fetch_workspaces_response",
+    )?.[2];
+    expect(context).toEqual({ kind: "resources", resources: [] });
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(Object.isFrozen(context?.kind === "resources" ? context.resources : null)).toBe(true);
+    await session.cleanup();
+  });
+
+  test("enterprise fetch-agents delivers an authorized empty page", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-empty");
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-empty",
+    });
+
+    await vi.waitFor(() =>
+      expect(messages).toContainEqual({
+        type: "fetch_agents_response",
+        payload: {
+          requestId: "fetch-agents-empty",
+          entries: [],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    const context = canEmit.mock.calls.find(
+      ([, event]) => event.type === "fetch_agents_response",
+    )?.[2];
+    expect(context).toEqual({ kind: "resources", resources: [] });
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(Object.isFrozen(context?.kind === "resources" ? context.resources : null)).toBe(true);
+    await session.cleanup();
+  });
+
+  test("enterprise fetch-agent-history delivers an authorized empty page", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agent-history-empty");
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-agent-history-empty",
+    });
+
+    await vi.waitFor(() =>
+      expect(messages).toContainEqual({
+        type: "fetch_agent_history_response",
+        payload: {
+          requestId: "fetch-agent-history-empty",
+          entries: [],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    const context = canEmit.mock.calls.find(
+      ([, event]) => event.type === "fetch_agent_history_response",
+    )?.[2];
+    expect(context).toEqual({ kind: "resources", resources: [] });
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(Object.isFrozen(context?.kind === "resources" ? context.resources : null)).toBe(true);
+    await session.cleanup();
+  });
+
+  test("enterprise agent directory drops a nonempty page without a canonical workspace id", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-malformed-page");
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+    vi.spyOn(asSessionInternals(session), "listFetchAgentsEntries").mockResolvedValue({
+      entries: [
+        {
+          agent: {
+            id: "agt_malformed",
+            provider: "codex",
+            cwd: "/repo/malformed",
+            model: null,
+            features: [],
+            thinkingOptionId: null,
+            effectiveThinkingOptionId: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            lastUserMessageAt: null,
+            status: "idle",
+            capabilities: {
+              supportsStreaming: true,
+              supportsSessionPersistence: true,
+              supportsDynamicModes: true,
+              supportsMcpServers: true,
+              supportsReasoningStream: true,
+              supportsToolInvocations: true,
+            },
+            currentModeId: null,
+            availableModes: [],
+            pendingPermissions: [],
+            persistence: null,
+            title: "Malformed",
+            labels: {},
+            requiresAttention: false,
+            attentionReason: null,
+          },
+          project: {
+            projectKey: "project-malformed",
+            projectName: "malformed",
+            checkout: {
+              cwd: "/repo/malformed",
+              isGit: false,
+              currentBranch: null,
+              remoteUrl: null,
+              isPaseoOwnedWorktree: false,
+              mainRepoRoot: null,
+            },
+          },
+        },
+      ],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-malformed-page",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(canEmit).not.toHaveBeenCalled();
+    expect(messages).toEqual([]);
     await session.cleanup();
   });
 

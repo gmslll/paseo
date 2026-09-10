@@ -492,6 +492,22 @@ type WorkspaceUpdatePayload = Extract<
   SessionOutboundMessage,
   { type: "workspace_update" }
 >["payload"];
+
+function isSafeEmptyLegacyDirectoryResponse(
+  event: SessionOutboundMessage,
+  context: OutboundAuthorizationContext,
+): boolean {
+  if (context.kind !== "resources" || context.resources.length !== 0) return false;
+  switch (event.type) {
+    case "fetch_workspaces_response":
+    case "fetch_agents_response":
+    case "fetch_agent_history_response":
+      return event.payload.entries.length === 0;
+    default:
+      return false;
+  }
+}
+
 interface WorkspaceUpdatesSubscriptionState {
   subscriptionId: string;
   syncEnabled?: boolean;
@@ -6607,9 +6623,7 @@ export class Session {
           },
         },
         this.createWorkspaceOutboundContextForIds(
-          payload.entries
-            .map((entry) => entry.agent.workspaceId)
-            .filter((id): id is string => Boolean(id)),
+          payload.entries.map((entry) => entry.agent.workspaceId),
         ),
       );
 
@@ -6653,9 +6667,7 @@ export class Session {
           },
         },
         this.createWorkspaceOutboundContextForIds(
-          payload.entries
-            .map((entry) => entry.agent.workspaceId)
-            .filter((id): id is string => Boolean(id)),
+          payload.entries.map((entry) => entry.agent.workspaceId),
         ),
       );
     } catch (error) {
@@ -8988,11 +9000,15 @@ export class Session {
             })) ?? undefined;
           if (!resolvedContext) return undefined;
         }
-        const allowed = await this.resourceAuthorization?.canEmit(
+        const allowedByResourceAuthorization = await this.resourceAuthorization?.canEmit(
           this.enterpriseContext.principal,
           event,
           resolvedContext,
         );
+        const allowed =
+          allowedByResourceAuthorization ||
+          (this.isEnterpriseLegacyResourceCurrent() &&
+            isSafeEmptyLegacyDirectoryResponse(event, resolvedContext));
         if (allowed && !this.isCleanedUp) this.deliverForSource(event, source);
         return undefined;
       })
@@ -9126,14 +9142,25 @@ export class Session {
   }
 
   private createWorkspaceOutboundContextForIds(
-    workspaceIds: readonly string[],
+    workspaceIds: readonly (string | undefined)[],
   ): OutboundAuthorizationContext | undefined {
-    const resources = [...new Set(workspaceIds)]
-      .map((workspaceId) => this.createWorkspaceResource(workspaceId))
-      .filter((resource): resource is Extract<GlobalResourceRef, { resourceKind: "workspace" }> =>
-        Boolean(resource),
-      );
-    if (resources.length === 0) return undefined;
+    if (workspaceIds.length === 0) {
+      const resources: GlobalResourceRef[] = [];
+      Object.freeze(resources);
+      return Object.freeze({ kind: "resources", resources });
+    }
+    const resourcesByWorkspaceId = new Map<
+      string,
+      Extract<GlobalResourceRef, { resourceKind: "workspace" }>
+    >();
+    for (const workspaceId of workspaceIds) {
+      if (!workspaceId) return undefined;
+      if (resourcesByWorkspaceId.has(workspaceId)) continue;
+      const resource = this.createWorkspaceResource(workspaceId);
+      if (!resource) return undefined;
+      resourcesByWorkspaceId.set(workspaceId, resource);
+    }
+    const resources = [...resourcesByWorkspaceId.values()];
     Object.freeze(resources);
     return Object.freeze({ kind: "resources", resources });
   }
