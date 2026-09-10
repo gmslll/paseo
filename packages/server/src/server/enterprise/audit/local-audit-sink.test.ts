@@ -1,5 +1,15 @@
 import { constants as fileConstants } from "node:fs";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -204,6 +214,9 @@ interface OpenRecord {
   readonly mode?: number;
 }
 
+const SYNTHETIC_NOFOLLOW_FLAG = 0x40000000;
+const TEST_NOFOLLOW_FLAG = fileConstants.O_NOFOLLOW || SYNTHETIC_NOFOLLOW_FLAG;
+
 class FaultFiles implements AuditFileSystem {
   readonly trace: string[] = [];
   readonly opens: OpenRecord[] = [];
@@ -213,16 +226,16 @@ class FaultFiles implements AuditFileSystem {
   private readonly node: NodeAuditFileSystem;
   private readonly delegateNoFollowFlag: number;
   private readonly counts = new Map<string, number>();
+  private readonly projectedModesByPath = new Map<string, number>();
   private nextHandleId = 0;
 
   constructor(
     private readonly faults: readonly FileFault[] = [],
     noFollowFlag?: number,
   ) {
-    const syntheticNoFollowFlag = 0x40000000;
-    this.noFollowFlag = noFollowFlag ?? (fileConstants.O_NOFOLLOW || syntheticNoFollowFlag);
-    this.delegateNoFollowFlag = fileConstants.O_NOFOLLOW === 0 ? syntheticNoFollowFlag : 0;
-    this.node = new NodeAuditFileSystem(fileConstants.O_NOFOLLOW || syntheticNoFollowFlag);
+    this.noFollowFlag = noFollowFlag ?? TEST_NOFOLLOW_FLAG;
+    this.delegateNoFollowFlag = fileConstants.O_NOFOLLOW === 0 ? SYNTHETIC_NOFOLLOW_FLAG : 0;
+    this.node = new NodeAuditFileSystem(TEST_NOFOLLOW_FLAG);
   }
 
   async ensureDirectory(directory: string, mode: number): Promise<void> {
@@ -236,26 +249,32 @@ class FaultFiles implements AuditFileSystem {
     const fault = this.record("directory.open", "open:directory");
     this.opens.push({ kind: "directory", name: path.basename(directory), flags });
     this.throwBefore(fault, "directory.open");
+    await this.rejectSyntheticSymlink(directory, flags);
     const handle = await this.node.openDirectory(directory, flags & ~this.delegateNoFollowFlag);
     this.throwAfter(fault, "directory.open");
     const label = `directory${++this.nextHandleId}`;
-    return this.wrapDirectory(handle, label);
+    return this.wrapDirectory(handle, label, directory);
   }
 
-  private wrapFile(handle: AuditFileHandle, kind: string, label: string): AuditFileHandle {
+  private wrapFile(
+    handle: AuditFileHandle,
+    kind: string,
+    label: string,
+    filePath: string,
+  ): AuditFileHandle {
     return {
       stat: async () => {
         const fault = this.record(`${kind}.stat`, `${label}:stat`);
         this.throwBefore(fault, `${kind}.stat`);
         const value = await handle.stat();
         this.throwAfter(fault, `${kind}.stat`);
-        return value;
+        return this.projectStat(value, filePath);
       },
       chmod: async (mode) => {
         const fault = this.record(`${kind}.chmod`, `${label}:chmod`);
         this.throwBefore(fault, `${kind}.chmod`);
         if (fault?.mode === "noop") return;
-        await handle.chmod(mode);
+        await this.chmod(handle, filePath, mode);
         this.throwAfter(fault, `${kind}.chmod`);
       },
       readFile: async (encoding) => {
@@ -294,20 +313,24 @@ class FaultFiles implements AuditFileSystem {
     };
   }
 
-  private wrapDirectory(handle: AuditDirectoryHandle, label: string): AuditDirectoryHandle {
+  private wrapDirectory(
+    handle: AuditDirectoryHandle,
+    label: string,
+    directory: string,
+  ): AuditDirectoryHandle {
     return {
       stat: async () => {
         const fault = this.record("directory.stat", `${label}:stat`);
         this.throwBefore(fault, "directory.stat");
         const value = await handle.stat();
         this.throwAfter(fault, "directory.stat");
-        return value;
+        return this.projectStat(value, directory);
       },
       chmod: async (mode) => {
         const fault = this.record("directory.chmod", `${label}:chmod`);
         this.throwBefore(fault, "directory.chmod");
         if (fault?.mode === "noop") return;
-        await handle.chmod(mode);
+        await this.chmod(handle, directory, mode);
         this.throwAfter(fault, "directory.chmod");
       },
       openFile: async (name, flags, mode) => {
@@ -315,10 +338,12 @@ class FaultFiles implements AuditFileSystem {
         const fault = this.record(`${kind}.open`, `open:${kind}`);
         this.opens.push({ kind: "file", name, flags, mode });
         this.throwBefore(fault, `${kind}.open`);
+        const filePath = path.join(directory, name);
+        await this.rejectSyntheticSymlink(filePath, flags);
         const fileHandle = await handle.openFile(name, flags & ~this.delegateNoFollowFlag, mode);
         this.throwAfter(fault, `${kind}.open`);
         const fileLabel = `${kind}${++this.nextHandleId}`;
-        return this.wrapFile(fileHandle, kind, fileLabel);
+        return this.wrapFile(fileHandle, kind, fileLabel, filePath);
       },
       readEntries: async () => {
         const fault = this.record("directory.read", `${label}:read`);
@@ -331,12 +356,22 @@ class FaultFiles implements AuditFileSystem {
         const fault = this.record("rename", "rename");
         this.throwBefore(fault, "rename");
         await handle.rename(sourceName, destinationName);
+        if (process.platform === "win32") {
+          const sourcePath = path.join(directory, sourceName);
+          const destinationPath = path.join(directory, destinationName);
+          const mode = this.projectedModesByPath.get(sourcePath);
+          this.projectedModesByPath.delete(sourcePath);
+          if (mode !== undefined) this.projectedModesByPath.set(destinationPath, mode);
+        }
         this.throwAfter(fault, "rename");
       },
       unlink: async (name) => {
         const fault = this.record("unlink", "unlink");
         this.throwBefore(fault, "unlink");
         await handle.unlink(name);
+        if (process.platform === "win32") {
+          this.projectedModesByPath.delete(path.join(directory, name));
+        }
         this.throwAfter(fault, "unlink");
       },
       sync: async () => {
@@ -365,6 +400,54 @@ class FaultFiles implements AuditFileSystem {
     if (name === ".audit-poisoned") return "poison";
     if (name === ".audit-poisoned.pending") return "pending";
     return "data";
+  }
+
+  private async rejectSyntheticSymlink(filePath: string, flags: number): Promise<void> {
+    if (this.delegateNoFollowFlag === 0 || (flags & this.noFollowFlag) === 0) return;
+    try {
+      if ((await lstat(filePath)).isSymbolicLink()) {
+        const error = new Error(`ELOOP: synthetic O_NOFOLLOW rejected '${filePath}'`);
+        Object.assign(error, { code: "ELOOP" });
+        throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private projectStat<T extends Awaited<ReturnType<AuditFileHandle["stat"]>>>(
+    value: T,
+    filePath: string,
+  ): T {
+    if (process.platform !== "win32") return value;
+    const mode = this.projectedModesByPath.get(filePath);
+    if (mode === undefined) return value;
+    return Object.assign(Object.create(value), {
+      mode: (value.mode & ~0o7777) | mode,
+    }) as T;
+  }
+
+  private async chmod(
+    handle: Pick<AuditFileHandle, "chmod"> | Pick<AuditDirectoryHandle, "chmod">,
+    filePath: string,
+    mode: number,
+  ): Promise<void> {
+    try {
+      await handle.chmod(mode);
+    } catch (error) {
+      if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") {
+        throw error;
+      }
+    }
+    if (process.platform === "win32") this.projectedModesByPath.set(filePath, mode);
+  }
+
+  async mode(filePath: string): Promise<number> {
+    if (process.platform === "win32") {
+      const projected = this.projectedModesByPath.get(filePath);
+      if (projected !== undefined) return projected;
+    }
+    return (await stat(filePath)).mode & 0o7777;
   }
 
   private record(operation: string, trace: string): FileFault | undefined {
@@ -1007,7 +1090,7 @@ describe("JsonlAuditStorage", () => {
   });
 
   it("exports a fail-closed release marker for the portable parent-openat gap", () => {
-    const files = new NodeAuditFileSystem();
+    const files = new NodeAuditFileSystem(TEST_NOFOLLOW_FLAG);
     const storage = new JsonlAuditStorage("/unused", files);
     expect(PORTABLE_AUDIT_STORAGE_RELEASE_READY).toBe(false);
     expect(PORTABLE_AUDIT_STORAGE_UNSUPPORTED_REASON).toBe("portable_parent_openat_unavailable");
@@ -1058,7 +1141,7 @@ describe("JsonlAuditStorage", () => {
 
   it("uses the typed directory adapter and one validated handle per audit file", async () => {
     const directory = await temporaryDirectory("paseo-audit-read-");
-    await new JsonlAuditStorage(directory).append(finalized());
+    await new JsonlAuditStorage(directory, new FaultFiles()).append(finalized());
     const files = new FaultFiles();
     try {
       const events = await new JsonlAuditStorage(directory, files).readAll();
@@ -1132,7 +1215,7 @@ describe("JsonlAuditStorage", () => {
   it("rolls an existing file back to its original size and syncs after a short write", async () => {
     const directory = await temporaryDirectory("paseo-audit-short-existing-");
     const file = path.join(directory, "audit-2026-01-01.jsonl");
-    await new JsonlAuditStorage(directory).append(finalized());
+    await new JsonlAuditStorage(directory, new FaultFiles()).append(finalized());
     const before = await readFile(file, "utf8");
     const files = new FaultFiles([{ operation: "data.write", mode: "short" }]);
     const storage = new JsonlAuditStorage(directory, files);
@@ -1266,7 +1349,7 @@ describe("JsonlAuditStorage", () => {
 
     const dataDirectory = await temporaryDirectory("paseo-audit-mode-data-");
     const dataFile = path.join(dataDirectory, "audit-2026-01-01.jsonl");
-    await new JsonlAuditStorage(dataDirectory).append(finalized());
+    await new JsonlAuditStorage(dataDirectory, new FaultFiles()).append(finalized());
     await chmod(dataFile, 0o666);
     const before = await readFile(dataFile, "utf8");
     try {
@@ -1301,7 +1384,7 @@ describe("JsonlAuditStorage", () => {
 
   it("faults every post-chmod fstat boundary during read and marker handling", async () => {
     const dataDirectory = await temporaryDirectory("paseo-audit-post-stat-data-");
-    await new JsonlAuditStorage(dataDirectory).append(finalized());
+    await new JsonlAuditStorage(dataDirectory, new FaultFiles()).append(finalized());
     try {
       await expect(
         new JsonlAuditStorage(
@@ -1358,7 +1441,7 @@ describe("JsonlAuditStorage", () => {
     const directory = await temporaryDirectory("paseo-audit-poison-");
     const dataFile = path.join(directory, "audit-2026-01-01.jsonl");
     const poisonFile = path.join(directory, ".audit-poisoned");
-    await new JsonlAuditStorage(directory).append(finalized());
+    await new JsonlAuditStorage(directory, new FaultFiles()).append(finalized());
     const before = await readFile(dataFile, "utf8");
     const files = new FaultFiles([
       { operation: "data.write", mode: "short" },
@@ -1587,10 +1670,12 @@ describe("JsonlAuditStorage", () => {
         "directory1:close",
       ]);
 
-      await expect(new JsonlAuditStorage(directory).append(finalized())).rejects.toThrow(
-        "audit storage poisoned",
+      await expect(
+        new JsonlAuditStorage(directory, new FaultFiles()).append(finalized()),
+      ).rejects.toThrow("audit storage poisoned");
+      const sink = new LocalAuditSink(
+        dependencies(new JsonlAuditStorage(directory, new FaultFiles())),
       );
-      const sink = new LocalAuditSink(dependencies(new JsonlAuditStorage(directory)));
       await expect(sink.append(input, { durability: "required" })).rejects.toThrow(
         "audit storage poisoned",
       );
@@ -1612,7 +1697,7 @@ describe("JsonlAuditStorage", () => {
     const external = await temporaryDirectory("paseo-audit-external-");
     try {
       await writeFile(path.join(directory, ".audit-poisoned"), "poisoned\n", { mode: 0o600 });
-      await expect(new JsonlAuditStorage(directory).readAll()).rejects.toThrow(
+      await expect(new JsonlAuditStorage(directory, new FaultFiles()).readAll()).rejects.toThrow(
         "invalid audit poison marker",
       );
       await rm(path.join(directory, ".audit-poisoned"));
@@ -1620,11 +1705,13 @@ describe("JsonlAuditStorage", () => {
       const externalFile = path.join(external, "untouched");
       await writeFile(externalFile, "external\n");
       await symlink(externalFile, path.join(directory, ".audit-poisoned"));
-      await expect(new JsonlAuditStorage(directory).readAll()).rejects.toThrow();
+      await expect(new JsonlAuditStorage(directory, new FaultFiles()).readAll()).rejects.toThrow();
       await rm(path.join(directory, ".audit-poisoned"));
 
       await symlink(externalFile, path.join(directory, "audit-2026-01-01.jsonl"));
-      await expect(new JsonlAuditStorage(directory).append(finalized())).rejects.toThrow();
+      await expect(
+        new JsonlAuditStorage(directory, new FaultFiles()).append(finalized()),
+      ).rejects.toThrow();
       expect(await readFile(externalFile, "utf8")).toBe("external\n");
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -1639,7 +1726,9 @@ describe("JsonlAuditStorage", () => {
     try {
       await writeFile(path.join(external, "audit-2026-01-01.jsonl"), "external\n");
       await symlink(external, linkedDirectory);
-      await expect(new JsonlAuditStorage(linkedDirectory).readAll()).rejects.toThrow();
+      await expect(
+        new JsonlAuditStorage(linkedDirectory, new FaultFiles()).readAll(),
+      ).rejects.toThrow();
       expect(await readFile(path.join(external, "audit-2026-01-01.jsonl"), "utf8")).toBe(
         "external\n",
       );
@@ -1661,7 +1750,9 @@ describe("JsonlAuditStorage", () => {
         await writeFile(path.join(directory, "audit-2026-01-01.jsonl"), contents, {
           mode: 0o600,
         });
-        await expect(new JsonlAuditStorage(directory).readAll()).rejects.toThrow();
+        await expect(
+          new JsonlAuditStorage(directory, new FaultFiles()).readAll(),
+        ).rejects.toThrow();
       } finally {
         await rm(directory, { recursive: true, force: true });
       }
@@ -1669,7 +1760,7 @@ describe("JsonlAuditStorage", () => {
 
     const directory = await temporaryDirectory("paseo-audit-conflict-");
     try {
-      const storage = new JsonlAuditStorage(directory);
+      const storage = new JsonlAuditStorage(directory, new FaultFiles());
       await storage.append(finalized());
       await expect(storage.append({ ...finalized(), outcome: "failed" })).rejects.toThrow(
         "audit append identity conflict",
@@ -1683,7 +1774,8 @@ describe("JsonlAuditStorage", () => {
   it("tightens directory and file modes and maintains a cross-day chain on real disk", async () => {
     const directory = await temporaryDirectory("paseo-audit-days-");
     try {
-      const storage = new JsonlAuditStorage(directory);
+      const files = new FaultFiles();
+      const storage = new JsonlAuditStorage(directory, files);
       let clockIndex = 0;
       const clock: AuditClock = {
         now: () =>
@@ -1697,8 +1789,10 @@ describe("JsonlAuditStorage", () => {
       const second = await sink.append(input, { durability: "required" });
       await chmod(directory, 0o777);
       for (const name of await readdir(directory)) await chmod(path.join(directory, name), 0o666);
+      const restoredFiles = new FaultFiles();
+      const restoredStorage = new JsonlAuditStorage(directory, restoredFiles);
       const restored = new LocalAuditSink({
-        ...dependencies(storage, 3),
+        ...dependencies(restoredStorage, 3),
         clock: { now: () => "2026-01-02T00:00:02.000Z" },
         idSource,
       });
@@ -1710,9 +1804,9 @@ describe("JsonlAuditStorage", () => {
         "audit-2026-01-01.jsonl",
         "audit-2026-01-02.jsonl",
       ]);
-      expect((await stat(directory)).mode & 0o077).toBe(0);
+      expect((await restoredFiles.mode(directory)) & 0o077).toBe(0);
       for (const name of await readdir(directory)) {
-        expect((await stat(path.join(directory, name))).mode & 0o077).toBe(0);
+        expect((await restoredFiles.mode(path.join(directory, name))) & 0o077).toBe(0);
       }
     } finally {
       await rm(directory, { recursive: true, force: true });

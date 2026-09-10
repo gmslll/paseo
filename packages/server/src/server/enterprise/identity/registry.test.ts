@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { statSync } from "node:fs";
+import { lstatSync, statSync } from "node:fs";
 import { describe, expect, test, vi } from "vitest";
 import type {
   AuditEvent,
@@ -106,7 +106,7 @@ class FaultFs implements IdentityRegistryFsPort {
   readonly noFollowFlag: number;
   private readonly delegate: IdentityRegistryFsPort;
   private readonly pathsByFd = new Map<number, string>();
-  private readonly modesByFd = new Map<number, number>();
+  private readonly projectedModesByPath = new Map<string, number>();
   private readonly faults: FsFault[] = [];
 
   constructor(options?: { noFollowFlag?: number; delegate?: IdentityRegistryFsPort }) {
@@ -154,6 +154,7 @@ class FaultFs implements IdentityRegistryFsPort {
   open(filePath: string, flags: number, mode?: number): number {
     this.visit({ operation: "open", path: filePath, flags });
     const synthetic = this.delegate.noFollowFlag === 0 && this.noFollowFlag !== 0;
+    if (synthetic && (flags & this.noFollowFlag) !== 0) this.rejectSymlink(filePath);
     const delegateFlags = synthetic ? flags & ~this.noFollowFlag : flags;
     const fd = this.delegate.open(filePath, delegateFlags, mode);
     this.pathsByFd.set(fd, filePath);
@@ -164,7 +165,6 @@ class FaultFs implements IdentityRegistryFsPort {
     this.visit({ operation: "close", fd, path: this.pathsByFd.get(fd) });
     this.delegate.close(fd);
     this.pathsByFd.delete(fd);
-    this.modesByFd.delete(fd);
   }
 
   read(fd: number): string {
@@ -180,7 +180,8 @@ class FaultFs implements IdentityRegistryFsPort {
   fstat(fd: number): IdentityRegistryFsStat {
     this.visit({ operation: "fstat", fd, path: this.pathsByFd.get(fd) });
     const statValue = this.delegate.fstat(fd);
-    const mode = this.modesByFd.get(fd);
+    const filePath = this.pathsByFd.get(fd);
+    const mode = filePath ? this.projectedModesByPath.get(filePath) : undefined;
     if (mode === undefined) return statValue;
     return Object.assign(Object.create(statValue), {
       mode: (statValue.mode & ~0o777) | mode,
@@ -188,40 +189,60 @@ class FaultFs implements IdentityRegistryFsPort {
   }
 
   fchmod(fd: number, mode: number): void {
-    this.visit({ operation: "fchmod", fd, path: this.pathsByFd.get(fd) });
-    this.modesByFd.set(fd, mode);
+    const filePath = this.pathsByFd.get(fd);
+    this.visit({ operation: "fchmod", fd, path: filePath });
     try {
       this.delegate.fchmod(fd, mode);
     } catch (error) {
       if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM")
         throw error;
     }
+    if (process.platform === "win32" && filePath) {
+      this.projectedModesByPath.set(filePath, mode);
+    }
   }
 
   fsync(fd: number): void {
-    this.visit({ operation: "fsync", fd, path: this.pathsByFd.get(fd) });
-    try {
-      this.delegate.fsync(fd);
-    } catch (error) {
-      const filePath = this.pathsByFd.get(fd);
-      if (
-        process.platform !== "win32" ||
-        !filePath ||
-        (error as NodeJS.ErrnoException).code !== "EPERM" ||
-        !statSync(filePath).isDirectory()
-      )
-        throw error;
-    }
+    const filePath = this.pathsByFd.get(fd);
+    this.visit({ operation: "fsync", fd, path: filePath });
+    if (process.platform === "win32" && filePath && statSync(filePath).isDirectory()) return;
+    this.delegate.fsync(fd);
   }
 
   rename(from: string, to: string): void {
     this.visit({ operation: "rename", from, to });
     this.delegate.rename(from, to);
+    if (process.platform === "win32") {
+      const mode = this.projectedModesByPath.get(from);
+      this.projectedModesByPath.delete(from);
+      if (mode !== undefined) this.projectedModesByPath.set(to, mode);
+    }
   }
 
   unlink(filePath: string): void {
     this.visit({ operation: "unlink", path: filePath });
     this.delegate.unlink(filePath);
+    if (process.platform === "win32") this.projectedModesByPath.delete(filePath);
+  }
+
+  mode(filePath: string): number {
+    if (process.platform === "win32") {
+      const projected = this.projectedModesByPath.get(filePath);
+      if (projected !== undefined) return projected;
+    }
+    return statSync(filePath).mode & 0o7777;
+  }
+
+  private rejectSymlink(filePath: string): void {
+    try {
+      if (lstatSync(filePath).isSymbolicLink()) {
+        const error = new Error(`ELOOP: synthetic O_NOFOLLOW rejected '${filePath}'`);
+        Object.assign(error, { code: "ELOOP" });
+        throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 }
 
@@ -283,7 +304,7 @@ function createTestRegistry(input: {
       node,
       audit: audit.sink,
       invalidation: invalidationRecorder.sink,
-      fs: input.fs,
+      fs: input.fs ?? new FaultFs(),
       clock: input.clock ?? { now: () => TEST_NOW },
       credentialIds: sequenceSource(input.credentialIds ?? TEST_CREDENTIAL_IDS),
       secrets: sequenceSource(input.secrets ?? TEST_SECRETS),
@@ -361,8 +382,10 @@ describe("IdentityRegistry", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-identity-"));
     const filePath = path.join(root, "enterprise", "credentials.json");
     const audit = memoryAudit();
+    const fs = new FaultFs();
     const registry = new IdentityRegistry({
       filePath,
+      fs,
       principalSource: source,
       node,
       audit: audit.sink,
@@ -377,7 +400,7 @@ describe("IdentityRegistry", () => {
     expect((await registry.authenticate(issued.token, node))?.principalId).toBe(
       principal.principalId,
     );
-    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    expect(fs.mode(filePath) & 0o777).toBe(0o600);
     expect(await readFile(filePath, "utf8")).not.toContain(
       parsePersonalAccessToken(issued.token)!.secret,
     );
@@ -396,6 +419,7 @@ describe("IdentityRegistry", () => {
     await writeFile(filePath, JSON.stringify({ version: 1, credentials: { bad: {} } }));
     const corrupt = new IdentityRegistry({
       filePath,
+      fs: new FaultFs(),
       principalSource: source,
       node,
       audit: memoryAudit().sink,
@@ -410,6 +434,7 @@ describe("IdentityRegistry", () => {
     };
     const registry = new IdentityRegistry({
       filePath: auditPath,
+      fs: new FaultFs(),
       principalSource: source,
       node,
       audit: failingAudit,
@@ -429,6 +454,7 @@ describe("IdentityRegistry", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-identity-"));
     const registry = new IdentityRegistry({
       filePath: path.join(root, "credentials.json"),
+      fs: new FaultFs(),
       principalSource: source,
       node,
       audit: memoryAudit().sink,
@@ -453,6 +479,7 @@ describe("IdentityRegistry", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-identity-"));
     const registry = new IdentityRegistry({
       filePath: path.join(root, "credentials.json"),
+      fs: new FaultFs(),
       principalSource: source,
       node,
       audit: memoryAudit().sink,
@@ -482,6 +509,7 @@ describe("IdentityRegistry", () => {
     const audit = memoryAudit();
     const registry = new IdentityRegistry({
       filePath: path.join(root, "credentials.json"),
+      fs: new FaultFs(),
       principalSource: source,
       node,
       audit: audit.sink,
@@ -510,6 +538,7 @@ describe("IdentityRegistry", () => {
     await writeFile(`${filePath}.poison`, "poisoned\n", { mode: 0o600 });
     const registry = new IdentityRegistry({
       filePath,
+      fs: new FaultFs(),
       principalSource: source,
       node,
       audit: memoryAudit().sink,
@@ -549,8 +578,8 @@ describe("IdentityRegistry", () => {
       organizationId: principal.organizationId,
     });
 
-    expect((await stat(directoryPath)).mode & 0o777).toBe(0o700);
-    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    expect(fs.mode(directoryPath) & 0o777).toBe(0o700);
+    expect(fs.mode(filePath) & 0o777).toBe(0o600);
     expect(fs.count("read", (call) => call.path === filePath)).toBe(1);
     expect(fs.count("fchmod", (call) => call.path === filePath)).toBe(1);
     expect(
@@ -978,7 +1007,7 @@ describe("IdentityRegistry", () => {
     expect((failure as AggregateError).errors).toEqual([primaryError, rollbackError]);
     expect((failure as AggregateError).cause).toBe(primaryError);
     expect(await readFile(`${filePath}.poison`, "utf8")).toBe("poisoned\n");
-    expect((await stat(`${filePath}.poison`)).mode & 0o777).toBe(0o600);
+    expect(fs.mode(`${filePath}.poison`) & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toEqual({
       version: 1,
       credentials: {
