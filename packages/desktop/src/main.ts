@@ -997,8 +997,6 @@ async function createWindow(
     },
     onError: (error) => {
       log.error("[browser-page-identity] close barrier failed", error);
-      closeReleased = true;
-      mainWindow.destroy();
     },
   });
   mainWindow.on("close", (event) => {
