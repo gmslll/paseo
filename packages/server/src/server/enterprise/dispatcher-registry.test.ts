@@ -171,32 +171,34 @@ describe("enterprise dispatcher registry", () => {
       type: "enterprise.organization.list_resources.response",
       payload: { requestId: "req_resources", principals: [], resources: [], nextCursor: null },
     } as never;
+    const identityDispatcher = { handle: () => identityResponse };
+    const resourceDispatcher = {
+      handle: () => resourceResponse,
+      requestPolicyForType: () => "resources" as const,
+      consumeResponse: ({ response: messageResponse }: { response: never }) => ({
+        response: messageResponse,
+        receiptClassification: "resources" as const,
+        authorizationContext: {
+          kind: "resources" as const,
+          organizationId: "org",
+          principals: [],
+          resources: [],
+          nextCursor: null,
+        },
+      }),
+    };
     const registration = createEnterpriseSessionDispatcherRegistration([
       {
         manifest: { operations: [request.type] },
         open: vi.fn(() => ({
-          dispatcher: { handle: () => identityResponse },
+          dispatcher: identityDispatcher,
           close: closeIdentity,
         })),
       },
       {
         manifest: { operations: ["enterprise.organization.list_resources.request"] },
         open: vi.fn(() => ({
-          dispatcher: {
-            handle: () => resourceResponse,
-            requestPolicyForType: () => "resources" as const,
-            consumeResponse: ({ response: messageResponse }: { response: never }) => ({
-              response: messageResponse,
-              receiptClassification: "resources" as const,
-              authorizationContext: {
-                kind: "resources",
-                organizationId: "org",
-                principals: [],
-                resources: [],
-                nextCursor: null,
-              },
-            }),
-          },
+          dispatcher: resourceDispatcher,
           close: closeResources,
         })),
       },
@@ -208,6 +210,11 @@ describe("enterprise dispatcher registry", () => {
       context,
       authorizationRuntime: {},
     });
+    expect(lease?.dispatcherForOperation?.(request.type)).toBe(identityDispatcher);
+    expect(lease?.dispatcherForOperation?.("enterprise.organization.list_resources.request")).toBe(
+      resourceDispatcher,
+    );
+    expect(lease?.dispatcherForOperation?.("unknown.request")).toBeNull();
     await expect(
       lease?.dispatcher.handle({ sessionContext: context, message: request }),
     ).resolves.toBe(identityResponse);
@@ -234,6 +241,7 @@ describe("enterprise dispatcher registry", () => {
     expect(consumed?.receiptClassification).toBe("resources");
     await lease?.close();
     await lease?.close();
+    expect(lease?.dispatcherForOperation?.(request.type)).toBeNull();
     expect(closeIdentity).toHaveBeenCalledTimes(1);
     expect(closeResources).toHaveBeenCalledTimes(1);
     await expect(

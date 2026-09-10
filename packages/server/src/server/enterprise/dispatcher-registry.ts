@@ -282,6 +282,8 @@ export function createEnterpriseSessionDispatcherRegistration(
       });
       return Object.freeze({
         dispatcher,
+        dispatcherForOperation: (operation: string) =>
+          active.value ? (requestMap.get(operation) ?? null) : null,
         close: async () => {
           if (!active.value) return;
           active.value = false;

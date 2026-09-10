@@ -1580,7 +1580,10 @@ export class Session {
         this.enterpriseDispatcherLease = registrationLease;
         const registeredDispatcher = registrationLease.dispatcher;
         if (registeredOperations.has("enterprise.resource.ownership.transfer.request")) {
-          this.enterpriseWorkspaceOwnershipTransferDispatcher = registeredDispatcher;
+          this.enterpriseWorkspaceOwnershipTransferDispatcher =
+            registrationLease.dispatcherForOperation?.(
+              "enterprise.resource.ownership.transfer.request",
+            ) ?? registeredDispatcher;
         }
         const existingDispatcher = this.enterpriseDispatcher;
         this.enterpriseDispatcher = existingDispatcher

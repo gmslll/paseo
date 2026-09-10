@@ -263,6 +263,8 @@ export interface EnterpriseDispatcherManifest {
 }
 export interface EnterpriseDispatcherLease {
   readonly dispatcher: EnterpriseSessionDispatcher;
+  /** Internal composite-routing seam for consumers that require the exact issuing dispatcher. */
+  readonly dispatcherForOperation?: (operation: string) => EnterpriseSessionDispatcher | null;
   readonly close: () => Promise<void> | void;
 }
 export interface EnterpriseSessionDispatcherFactoryRegistration {
