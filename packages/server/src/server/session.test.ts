@@ -12,7 +12,10 @@ import {
 } from "../services/github-service.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
-import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
+import type {
+  ResourceAuthorization,
+  WorkspaceDescriptorPayload,
+} from "@getpaseo/protocol/messages";
 import {
   decodeFileTransferFrame,
   encodeFileTransferFrame,
@@ -334,6 +337,7 @@ interface SessionForTestOptions {
   messages?: unknown[];
   targetedMessages?: Array<{ source: object; message: SessionOutboundMessage }>;
   binaryMessages?: Uint8Array[];
+  targetedBinaryMessages?: Array<{ source: object; frame: Uint8Array }>;
   pluginRuntime?: SessionOptions["pluginRuntime"];
   orchestrationSkills?: SessionOptions["orchestrationSkills"];
   workspaceLabelService?: WorkspaceLabelService;
@@ -344,6 +348,7 @@ interface SessionForTestOptions {
   principalGrantVersionGuard?: SessionOptions["principalGrantVersionGuard"];
   autoPrincipalGrantVersionGuard?: boolean;
   resourceAuthorization?: SessionOptions["resourceAuthorization"];
+  enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
 }
 
 // oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
@@ -390,6 +395,12 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
         }
       : {}),
     onBinaryMessage: createBinaryMessageHandler(options.binaryMessages),
+    ...(options.targetedBinaryMessages
+      ? {
+          onBinaryMessageToSource: async (source: object, frame: Uint8Array) =>
+            options.targetedBinaryMessages?.push({ source, frame }),
+        }
+      : {}),
     logger,
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
@@ -466,6 +477,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     resourceAuthorization:
       options.resourceAuthorization ??
       (options.enterpriseContext ? ({ canEmit: vi.fn(async () => true) } as never) : undefined),
+    enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime,
   };
   return new Session(sessionOptions);
 }
@@ -966,6 +978,286 @@ test("resource-scoped request keeps handler behavior without authority receipt r
   expect(register).not.toHaveBeenCalled();
   expect(messages).toHaveLength(0);
   await session.cleanup();
+});
+
+test("enterprise workspace file responses use canonical workspace authorization context", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const canEmit = vi.fn(async () => true);
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces: (_ctx, rows) => [...rows],
+    assertWorkspace: async () => {
+      throw new Error("not used");
+    },
+    assertAgent: async () => {
+      throw new Error("not used");
+    },
+    assertBrowserProfile: async () => {
+      throw new Error("not used");
+    },
+    assertAppSlot: async () => {
+      throw new Error("not used");
+    },
+    resolveWorkspacePath: async () => {
+      throw new Error("not used");
+    },
+    canEmit,
+  };
+  const runtime = {
+    stat: vi.fn(async () => ({ size: 1, mtimeMs: 0, revision: "r1" })),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => ({
+      begin: vi.fn(),
+      beginStaged: vi.fn(),
+      receiveFrame: vi.fn(),
+      cleanup: vi.fn(async () => {}),
+    }),
+    cleanup: vi.fn(async () => {}),
+  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+  const session = createSessionForTest({
+    messages,
+    targetedMessages,
+    enterpriseContext: enterpriseContext("generation-file-context"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    resourceAuthorization,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await session.handleMessage({
+    type: "fs.file.write.request",
+    cwd: "ignored",
+    workspaceId: "workspace-1",
+    path: "notes.txt",
+    content: "hello",
+    expectedModifiedAt: "2026-01-01T00:00:00.000Z",
+    requestId: "file-context-1",
+  });
+  expect(runtime.write).toHaveBeenCalledWith(
+    expect.objectContaining({ workspaceId: "workspace-1" }),
+  );
+  expect(canEmit).toHaveBeenCalled();
+  const context = canEmit.mock.calls.at(-1)?.[2];
+  expect(context).toMatchObject({
+    kind: "resources",
+    resources: [
+      expect.objectContaining({
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "workspace-1",
+      }),
+    ],
+  });
+  expect(Object.isFrozen(context)).toBe(true);
+  expect(Object.isFrozen(context.resources)).toBe(true);
+  expect(Object.isFrozen(context.resources[0])).toBe(true);
+  const canEmitCalls = canEmit.mock.calls.length;
+  const messageCount = messages.length;
+  const targetedCount = targetedMessages.length;
+  await session.handleMessage({
+    type: "fs.file.write.request",
+    cwd: "ignored",
+    workspaceId: "",
+    path: "notes.txt",
+    content: "denied",
+    expectedModifiedAt: "2026-01-01T00:00:00.000Z",
+    requestId: "file-context-invalid",
+  });
+  expect(canEmit).toHaveBeenCalledTimes(canEmitCalls);
+  expect(messages).toHaveLength(messageCount);
+  expect(targetedMessages).toHaveLength(targetedCount);
+  await session.cleanup();
+});
+
+test("enterprise runtime construction failure rolls back registered authority binding", () => {
+  const state = new MemoryAuthorityReceiptState();
+  const release = vi.spyOn(state, "releaseSession");
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const runtime = {
+    stat: vi.fn(),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => {
+      throw new Error("upload store failed");
+    },
+    cleanup: vi.fn(async () => {}),
+  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-runtime-failure"),
+      enterpriseAgentContextRegistry: registry,
+      authorityReceiptState: state,
+      enterpriseWorkspaceFilesRuntime: runtime,
+    }),
+  ).toThrow("Session construction rollback failed");
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("enterprise binary workspace emission fails closed until verifier is available", async () => {
+  const binaryMessages: Uint8Array[] = [];
+  const targetedBinaryMessages: Array<{ source: object; frame: Uint8Array }> = [];
+  const close = vi.fn(async () => {});
+  const runtime = {
+    stat: vi.fn(),
+    list: vi.fn(),
+    openRead: vi.fn(async () => ({
+      workspaceId: "workspace-1",
+      relativePath: "notes.txt",
+      size: 1,
+      mtimeMs: 0,
+      revision: "r1",
+      read: async () => new Uint8Array([1]),
+      close,
+    })),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => ({
+      begin: vi.fn(),
+      beginStaged: vi.fn(),
+      receiveFrame: vi.fn(),
+      cleanup: vi.fn(async () => {}),
+    }),
+    cleanup: vi.fn(async () => {}),
+  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+  const session = createSessionForTest({
+    binaryMessages,
+    targetedBinaryMessages,
+    enterpriseContext: enterpriseContext("generation-binary-blocked"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await session.handleMessage(
+    {
+      type: "file_explorer_request",
+      cwd: "ignored",
+      workspaceId: "workspace-1",
+      path: "notes.txt",
+      mode: "file",
+      acceptBinary: true,
+      requestId: "binary-blocked-1",
+    },
+    {},
+  );
+  expect(binaryMessages).toHaveLength(0);
+  expect(targetedBinaryMessages).toHaveLength(0);
+  expect(close).toHaveBeenCalledTimes(1);
+  await session.cleanup();
+});
+
+function makeEnterpriseRuntime(cleanup: () => Promise<void>) {
+  return {
+    stat: vi.fn(async () => ({ size: 1, mtimeMs: 0, revision: "r1" })),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => ({
+      begin: vi.fn(),
+      beginStaged: vi.fn(),
+      receiveFrame: vi.fn(),
+      cleanup: vi.fn(async () => {}),
+    }),
+    cleanup,
+  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+}
+
+test("cleanup waits for workspace runtime before releasing authority", async () => {
+  let resolveCleanup!: () => void;
+  const cleanupPromise = new Promise<void>((resolve) => {
+    resolveCleanup = resolve;
+  });
+  const runtime = makeEnterpriseRuntime(() => cleanupPromise);
+  const state = new MemoryAuthorityReceiptState();
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const stateRelease = vi.spyOn(state, "releaseSession");
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-blocked"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState: state,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  const cleanup = session.cleanup();
+  await Promise.resolve();
+  expect(stateRelease).not.toHaveBeenCalled();
+  expect(registryRelease).not.toHaveBeenCalled();
+  resolveCleanup();
+  await cleanup;
+  expect(stateRelease).toHaveBeenCalledTimes(1);
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("cleanup continues authority and registry release when workspace runtime rejects", async () => {
+  const disposeError = new Error("workspace dispose failed");
+  const runtime = makeEnterpriseRuntime(async () => {
+    throw disposeError;
+  });
+  const state = new MemoryAuthorityReceiptState();
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const stateRelease = vi.spyOn(state, "releaseSession");
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-reject"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState: state,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await expect(session.cleanup()).rejects.toBe(disposeError);
+  expect(stateRelease).toHaveBeenCalledTimes(1);
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("cleanup aggregates workspace and authority release errors while continuing registry release", async () => {
+  const disposeError = new Error("workspace dispose failed");
+  const authorityError = new Error("authority release failed");
+  const runtime = makeEnterpriseRuntime(async () => {
+    throw disposeError;
+  });
+  const state = new MemoryAuthorityReceiptState();
+  vi.spyOn(state, "releaseSession").mockImplementation(() => {
+    throw authorityError;
+  });
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-double-error"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState: state,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await expect(session.cleanup()).rejects.toMatchObject({
+    cause: disposeError,
+    errors: [disposeError, authorityError],
+  });
+  expect(registryRelease).toHaveBeenCalledTimes(1);
 });
 
 test("identity-self request reaches its handler without authority receipt registration", async () => {

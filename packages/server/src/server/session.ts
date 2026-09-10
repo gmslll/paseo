@@ -3,6 +3,7 @@ import type {
   ResourceAuthorization,
   SessionEventSubscription,
 } from "@getpaseo/protocol/messages";
+import { GlobalResourceRefSchema } from "@getpaseo/protocol/messages";
 import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
@@ -209,6 +210,7 @@ import {
 import { ScheduleSession } from "./session/schedule/schedule-session.js";
 import { ProviderCatalogSession } from "./session/provider/provider-catalog-session.js";
 import { WorkspaceFilesSession } from "./session/files/workspace-files-session.js";
+import type { EnterpriseWorkspaceFilesRuntime } from "./enterprise/runtime/workspace-files-runtime.js";
 import { AgentConfigSession } from "./session/agent-config/agent-config-session.js";
 import { ProjectConfigSession } from "./session/project-config/project-config-session.js";
 import { DaemonSession, type DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
@@ -486,6 +488,7 @@ export interface SessionOptions {
     OutboundAuthorityEmissionStatePort;
   principalGrantVersionGuard?: PrincipalGrantVersionGuard;
   resourceAuthorization?: ResourceAuthorization;
+  enterpriseWorkspaceFilesRuntime?: EnterpriseWorkspaceFilesRuntime;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -829,6 +832,7 @@ export class Session {
       authorityReceiptState,
       principalGrantVersionGuard,
       resourceAuthorization,
+      enterpriseWorkspaceFilesRuntime,
       permissions,
       appVersion,
       clientCapabilities,
@@ -937,16 +941,6 @@ export class Session {
       module: "session",
       clientId: this.clientId,
       sessionId: this.sessionId,
-    });
-    this.workspaceFilesSession = new WorkspaceFilesSession({
-      host: {
-        emit: (msg, source) => this.emitForSource(msg, source),
-        emitBinary: (frame, source) => this.emitBinaryForFileTransfer(frame, source),
-        hasBinaryChannel: () => this.onBinaryMessage !== null,
-      },
-      downloadTokenStore,
-      paseoHome,
-      logger: this.sessionLogger,
     });
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
@@ -1273,6 +1267,27 @@ export class Session {
         throw this.rollbackConstruction(error);
       }
     }
+    try {
+      this.workspaceFilesSession = new WorkspaceFilesSession({
+        host: {
+          emit: (msg, source) => this.emitForSource(msg, source),
+          emitBinary: (frame, source) => this.emitBinaryForFileTransfer(frame, source),
+          emitWorkspace: (msg, workspaceId, source) =>
+            this.emitForSource(msg, source, this.createWorkspaceOutboundContext(workspaceId)),
+          emitBinaryWorkspace: async () => {
+            // Binary authorization has no W2 verifier contract yet; fail closed.
+          },
+          hasBinaryChannel: () => this.onBinaryMessage !== null,
+        },
+        downloadTokenStore,
+        paseoHome,
+        logger: this.sessionLogger,
+        enterpriseRuntime: enterpriseWorkspaceFilesRuntime,
+        enterpriseRequired: Boolean(this.enterpriseContext),
+      });
+    } catch (error) {
+      throw this.rollbackConstruction(error);
+    }
   }
 
   updateAppVersion(appVersion: string | null): void {
@@ -1326,7 +1341,6 @@ export class Session {
     attempt(() => this.terminalController.dispose());
     attempt(() => this.checkoutSession.cleanup());
     attempt(() => this.workspaceGitObserver.dispose());
-    attempt(() => this.workspaceFilesSession.dispose());
     attempt(() =>
       this.enterpriseAgentContextRegistry?.releaseSession(
         this.enterpriseContext?.sessionBindingGeneration ?? "",
@@ -8419,6 +8433,27 @@ export class Session {
     }
   }
 
+  private createWorkspaceOutboundContext(
+    workspaceId: string,
+  ): OutboundAuthorizationContext | undefined {
+    if (!this.enterpriseContext || typeof workspaceId !== "string" || workspaceId.length === 0) {
+      return undefined;
+    }
+    try {
+      const resource = GlobalResourceRefSchema.parse({
+        resourceKind: "workspace",
+        organizationId: this.enterpriseContext.principal.organizationId,
+        nodeId: this.enterpriseContext.node.nodeId,
+        localResourceId: workspaceId,
+      });
+      const resources = [Object.freeze(resource)];
+      Object.freeze(resources);
+      return Object.freeze({ kind: "resources", resources });
+    } catch {
+      return undefined;
+    }
+  }
+
   private async emitBinaryForFileTransfer(frame: Uint8Array, source?: object): Promise<void> {
     if (source && this.onBinaryMessageToSource) {
       await this.onBinaryMessageToSource(source, frame);
@@ -8457,46 +8492,69 @@ export class Session {
         ...this.outboundEmissionTasksWithoutRequest,
       ]);
     }
+    const cleanupErrors: unknown[] = [];
+    try {
+      await this.workspaceFilesSession.dispose();
+    } catch (error) {
+      if (error instanceof AggregateError && error.errors.length === 1) {
+        cleanupErrors.push(error.errors[0]);
+      } else {
+        cleanupErrors.push(error);
+      }
+    }
     if (this.outboundAuthorityEmissionAuthorizer && this.enterpriseContext) {
       for (const correlation of this.pendingAuthorityRequests.values()) {
-        const wasOpen = Boolean(
-          await this.authorityReceiptState?.resolveOpen({
+        let wasOpen = false;
+        try {
+          wasOpen = Boolean(
+            await this.authorityReceiptState?.resolveOpen({
+              handle: correlation.activeRequestHandle,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+            }),
+          );
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        let closed = false;
+        try {
+          closed = await this.outboundAuthorityEmissionAuthorizer.close({
             handle: correlation.activeRequestHandle,
-            sessionBindingKey: correlation.sessionBindingKey,
-            sessionBindingGeneration: correlation.sessionBindingGeneration,
-          }),
-        );
-        const closed = await this.outboundAuthorityEmissionAuthorizer.close({
-          handle: correlation.activeRequestHandle,
-          principal: this.enterpriseContext.principal,
-          binding: {
-            sessionId: this.sessionId,
-            sessionBindingKey: correlation.sessionBindingKey,
-            sessionBindingGeneration: correlation.sessionBindingGeneration,
-            organizationId: this.enterpriseContext.principal.organizationId,
-            principalId: this.enterpriseContext.principal.principalId,
-            principalType: this.enterpriseContext.principal.principalType,
-            credentialId: this.enterpriseContext.principal.credentialId,
-            grantVersion: this.enterpriseContext.principal.grantVersion,
-            nodeId: this.enterpriseContext.node.nodeId,
-            clientId: this.clientId,
-          },
-          reason: "release",
-        });
-        if (!closed && wasOpen) {
-          this.authoritySubsystemFailed = true;
-          await this.authorityReceiptState?.close({
-            handle: correlation.activeRequestHandle,
-            sessionBindingKey: correlation.sessionBindingKey,
-            sessionBindingGeneration: correlation.sessionBindingGeneration,
+            principal: this.enterpriseContext.principal,
+            binding: {
+              sessionId: this.sessionId,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+              organizationId: this.enterpriseContext.principal.organizationId,
+              principalId: this.enterpriseContext.principal.principalId,
+              principalType: this.enterpriseContext.principal.principalType,
+              credentialId: this.enterpriseContext.principal.credentialId,
+              grantVersion: this.enterpriseContext.principal.grantVersion,
+              nodeId: this.enterpriseContext.node.nodeId,
+              clientId: this.clientId,
+            },
             reason: "release",
           });
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        if (!closed && wasOpen) {
+          this.authoritySubsystemFailed = true;
+          try {
+            await this.authorityReceiptState?.close({
+              handle: correlation.activeRequestHandle,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+              reason: "release",
+            });
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
         }
       }
     }
     this.pendingAuthorityRequests.clear();
     this.reservedAuthorityRequestIds.clear();
-    let authorityReleaseError: unknown;
     if (this.enterpriseContext) {
       if (
         !this.authorityBindingReleased &&
@@ -8511,7 +8569,7 @@ export class Session {
           });
           this.authorityBindingReleased = true;
         } catch (error) {
-          authorityReleaseError = error;
+          cleanupErrors.push(error);
         }
       }
       try {
@@ -8519,39 +8577,94 @@ export class Session {
           this.enterpriseContext.sessionBindingGeneration,
         );
       } catch (error) {
-        authorityReleaseError ??= error;
+        cleanupErrors.push(error);
       }
     }
 
     if (this.unsubscribeAgentEvents) {
-      this.unsubscribeAgentEvents();
+      try {
+        this.unsubscribeAgentEvents();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
       this.unsubscribeAgentEvents = null;
     }
-    this.unsubscribeProjectMutations?.();
+    try {
+      this.unsubscribeProjectMutations?.();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.unsubscribeProjectMutations = null;
-    this.unsubscribePluginChanges?.();
+    try {
+      this.unsubscribePluginChanges?.();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.unsubscribePluginChanges = null;
-    this.unsubscribeWorkspaceMutations?.();
+    try {
+      this.unsubscribeWorkspaceMutations?.();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.unsubscribeWorkspaceMutations = null;
-    this.workspaceLabelSubscription?.unsubscribe();
+    try {
+      this.workspaceLabelSubscription?.unsubscribe();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.workspaceLabelSubscription = null;
-    this.agentUpdates.dispose();
-    await this.hubExecutionController?.cleanup();
+    try {
+      this.agentUpdates.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      await this.hubExecutionController?.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     if (this.unsubscribeTerminalWorkspaceContributionEvents) {
-      this.unsubscribeTerminalWorkspaceContributionEvents();
+      try {
+        this.unsubscribeTerminalWorkspaceContributionEvents();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
       this.unsubscribeTerminalWorkspaceContributionEvents = null;
     }
-    this.providerCatalogSession.dispose();
+    try {
+      this.providerCatalogSession.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    await this.voiceSession.cleanup();
+    try {
+      await this.voiceSession.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    this.terminalController.dispose();
+    try {
+      this.terminalController.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    this.checkoutSession.cleanup();
+    try {
+      this.checkoutSession.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    this.workspaceGitObserver.dispose();
-    this.workspaceFilesSession.dispose();
-    if (authorityReleaseError) throw authorityReleaseError;
+    try {
+      this.workspaceGitObserver.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1)
+      throw new AggregateError(cleanupErrors, "Session cleanup failed", {
+        cause: cleanupErrors[0],
+      });
   }
 
   public getEnterpriseSessionContext(): EnterpriseSessionContext | undefined {
