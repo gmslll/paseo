@@ -40,8 +40,10 @@ describe("production App Slot registry", () => {
 
       const filePath = path.join(paseoHome, "enterprise", "app-slots.json");
       expect(JSON.parse(await readFile(filePath, "utf8"))).toEqual({ version: 1, records: [] });
-      expect((await stat(path.dirname(filePath))).mode & 0o777).toBe(0o700);
-      expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect((await stat(path.dirname(filePath))).mode & 0o777).toBe(0o700);
+        expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+      }
       await registry!.close();
       expect(isCurrentProductionAppSlotRegistry(registry)).toBe(false);
     });
