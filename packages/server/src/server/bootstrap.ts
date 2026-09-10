@@ -204,9 +204,11 @@ import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/ru
 import type { EnterpriseSessionDispatcher } from "./session/enterprise-dispatcher.js";
 import type { SessionOptions } from "./session.js";
 import type {
+  EnterpriseDispatcherRegistration,
   EnterpriseDispatcherRegistry,
   EnterpriseFeatureAdvertisement,
 } from "./enterprise/dispatcher-registry.js";
+import { createEnterpriseDispatcherRegistry } from "./enterprise/dispatcher-registry.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -502,6 +504,7 @@ export interface PaseoDaemon {
 
 export interface PaseoDaemonDependencies {
   enterpriseDispatcherRegistry?: EnterpriseDispatcherRegistry;
+  enterpriseDispatcherRegistrations?: readonly EnterpriseDispatcherRegistration[];
   enterpriseDispatcher?: EnterpriseSessionDispatcher;
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
   enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
@@ -2016,6 +2019,13 @@ export async function createPaseoDaemon(
               logDaemonPasswordAuthentication(logger, config.auth?.password);
 
               requireStartAudit();
+              const enterpriseDispatcherRegistry =
+                dependencies.enterpriseDispatcherRegistry ??
+                (dependencies.enterpriseDispatcherRegistrations
+                  ? createEnterpriseDispatcherRegistry(
+                      dependencies.enterpriseDispatcherRegistrations,
+                    )
+                  : undefined);
               wsServer = new VoiceAssistantWebSocketServer(
                 httpServer,
                 logger,
@@ -2090,10 +2100,9 @@ export async function createPaseoDaemon(
                 workspaceLabelService,
                 enterpriseRuntime,
                 enterpriseWorkspaceFilesProvider ?? undefined,
-                dependencies.enterpriseDispatcherRegistry ?? dependencies.enterpriseDispatcher,
+                enterpriseDispatcherRegistry ?? dependencies.enterpriseDispatcher,
                 dependencies.enterpriseIdentitySelfAuthorization,
-                dependencies.enterpriseDispatcherRegistry?.features ??
-                  dependencies.enterpriseFeatureFlags,
+                enterpriseDispatcherRegistry?.features ?? dependencies.enterpriseFeatureFlags,
               );
               requireStartAudit();
               pluginRuntime.bindPaseoSessionHost(wsServer);
