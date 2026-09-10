@@ -198,6 +198,7 @@ import {
   EnterpriseMultiUserSchema,
 } from "./persisted-config.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
+import { createProductionAuthorizationRuntimeProvider } from "./enterprise/access/production-authorization-runtime-provider.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
@@ -534,6 +535,12 @@ async function resolveEnterpriseRuntime(
     const capturedReceiptState = runtime.authorityReceiptState;
     const capturedGrantGuard = runtime.grantVersionGuard;
     const capturedResourceAuthorization = runtime.resourceAuthorization;
+    const authorizationRuntimeProvider = createProductionAuthorizationRuntimeProvider({
+      audit,
+      grantFilePath: path.join(paseoHome, "enterprise", "grants.json"),
+    });
+    if (!authorizationRuntimeProvider)
+      throw new Error("enterprise authorization provider unavailable");
     const capturedGenerationSource = runtime.nextSessionBindingGeneration.bind(runtime);
     if (
       !capturedResourceAuthorization ||
@@ -562,6 +569,7 @@ async function resolveEnterpriseRuntime(
       grantVersionGuard: capturedGrantGuard,
       nextSessionBindingGeneration: generation,
       resourceAuthorization: capturedResourceAuthorization,
+      authorizationRuntimeProvider,
     });
   } catch (primary) {
     try {

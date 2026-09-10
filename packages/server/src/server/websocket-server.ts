@@ -101,7 +101,11 @@ import {
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
-import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
+import {
+  OWNER_PERMISSIONS,
+  SessionAuthorization,
+  type DaemonPermission,
+} from "./authorization/index.js";
 import type { WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
   APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS,
@@ -113,6 +117,8 @@ import {
   sendBoundedPhysicalFrameAndWait,
 } from "./websocket/physical-socket.js";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
+import { createProductionAuthorizationRuntimeForSession } from "./enterprise/access/production-authorization-runtime-provider.js";
+import type { ProductionAuthorizationRuntime } from "./enterprise/access/production-authorization-runtime.js";
 import {
   isCurrentEnterpriseAdmissionAuthorization,
   bindOrReplaceEnterpriseAdmissionSession,
@@ -718,6 +724,11 @@ interface SocketSessionOptions {
   hubRelationships?: HubRelationshipManagement;
   enterprise?: SessionAdmission["enterprise"];
   grantVersionGuard?: EnterpriseAdmissionRuntime["grantVersionGuard"];
+  sessionId?: string;
+  sessionAuthorization?: SessionAuthorization;
+  enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  admissionAuthorizationIssuer?: EnterpriseAdmissionRuntime["admission"]["authorizationIssuer"];
+  admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
 }
 
 interface ClosePhysicalSocketParams {
@@ -1768,9 +1779,22 @@ export class VoiceAssistantWebSocketServer {
     lifecycle: { kind: "reconnectable" } | { kind: "ephemeral-plugin"; pluginId: string };
     admission: Exclude<SessionAdmission, { authorizationEvidence: unknown }>;
     enterpriseAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
+    sessionId?: string;
+    sessionAuthorization?: SessionAuthorization;
+    enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
   }): SessionConnection {
-    const { ws, clientId, appVersion, clientCapabilities, connectionLogger, lifecycle, admission } =
-      params;
+    const {
+      ws,
+      clientId,
+      appVersion,
+      clientCapabilities,
+      connectionLogger,
+      lifecycle,
+      admission,
+      sessionId,
+      sessionAuthorization,
+      enterpriseAuthorizationRuntime,
+    } = params;
     let connection: SessionConnection | null = null;
 
     const session = this.createSocketSession({
@@ -1825,6 +1849,15 @@ export class VoiceAssistantWebSocketServer {
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
       enterprise: admission.enterprise,
+      ...(sessionId ? { sessionId } : {}),
+      ...(sessionAuthorization ? { sessionAuthorization } : {}),
+      ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+      ...(this.enterpriseRuntime && params.enterpriseAuthorizationHandle
+        ? { admissionAuthorizationIssuer: this.enterpriseRuntime.admission.authorizationIssuer }
+        : {}),
+      ...(params.enterpriseAuthorizationHandle
+        ? { admissionAuthorizationHandle: params.enterpriseAuthorizationHandle }
+        : {}),
     });
 
     const base: SessionConnectionBase = {
@@ -2082,6 +2115,9 @@ export class VoiceAssistantWebSocketServer {
     }
     let admission = pending.admission;
     let enterpriseAuthorizationHandle: EnterpriseAdmissionAuthorizationHandle | undefined;
+    let enterpriseAuthorizationRuntime: ProductionAuthorizationRuntime | undefined;
+    let sessionAuthorization: SessionAuthorization | undefined;
+    let sessionId: string | undefined;
     let sessionKey: string;
     let existing: ReconnectableSessionConnection | undefined;
     if (pending.authorizationEvidence) {
@@ -2117,6 +2153,27 @@ export class VoiceAssistantWebSocketServer {
         return;
       }
       enterpriseAuthorizationHandle = handle;
+      if (runtime.authorizationRuntimeProvider) {
+        sessionAuthorization = new SessionAuthorization(OWNER_PERMISSIONS);
+        sessionId = randomUUID();
+        const createdAuthorizationRuntime = await createProductionAuthorizationRuntimeForSession(
+          runtime.authorizationRuntimeProvider,
+          {
+            admissionAuthorizationIssuer: runtime.admission.authorizationIssuer,
+            admissionAuthorizationHandle: handle,
+            sessionAuthorization,
+            sessionId,
+            authorityState: runtime.authorityReceiptState,
+          },
+        );
+        if (!createdAuthorizationRuntime || !this.isHandshakeCurrent(ws, pending)) {
+          runtime.admission.releaseSession(handle);
+          this.handshakeConnections.delete(ws);
+          safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authorization unavailable");
+          return;
+        }
+        enterpriseAuthorizationRuntime = createdAuthorizationRuntime;
+      }
       sessionKey = sessionConnectionKey(
         resolved.principal.principalId,
         clientId,
@@ -2135,7 +2192,27 @@ export class VoiceAssistantWebSocketServer {
         }),
       });
       if (existing) {
-        existing.enterpriseAuthorizationHandle = handle;
+        if (enterpriseAuthorizationRuntime) {
+          // ADR-0021: a replacement gets a new Session/runtime generation.
+          // Retire the old connection before publishing the replacement.
+          try {
+            await this.cleanupConnection(existing, "Enterprise session replaced");
+          } catch (error) {
+            runtime.admission.releaseSession(handle);
+            this.handshakeConnections.delete(ws);
+            safeCloseSocket(
+              ws,
+              WS_CLOSE_DAEMON_AUTH_FAILED,
+              "Enterprise session replacement failed",
+            );
+            throw error;
+          }
+          existing = undefined;
+        } else {
+          existing.enterpriseAuthorizationHandle = handle;
+        }
+      }
+      if (existing) {
         try {
           await this.resumeSession({ ws, message, pending, existing });
         } catch (error) {
@@ -2207,6 +2284,9 @@ export class VoiceAssistantWebSocketServer {
         lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
         admission: activeAdmission,
         ...(enterpriseAuthorizationHandle ? { enterpriseAuthorizationHandle } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(sessionAuthorization ? { sessionAuthorization } : {}),
+        ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
       });
       const initialInfo = this.sendServerInfoToClient(
         ws,
@@ -2268,6 +2348,9 @@ export class VoiceAssistantWebSocketServer {
         }
       } else if (enterpriseAuthorizationHandle && this.enterpriseRuntime) {
         this.enterpriseRuntime.admission.releaseSession(enterpriseAuthorizationHandle);
+        if (enterpriseAuthorizationRuntime) {
+          await enterpriseAuthorizationRuntime.release().catch(() => undefined);
+        }
       }
       throw primary;
     }

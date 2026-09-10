@@ -10,6 +10,7 @@ import type { OutboundAuthorityEmissionStatePort } from "../access/outbound-auth
 import type { PrincipalGrantVersionGuard } from "../access/resource-authorization.js";
 import type { PrincipalContext } from "@getpaseo/protocol/messages";
 import type { ProductionAuditCapability } from "../audit/production-audit-runtime.js";
+import type { ProductionAuthorizationRuntimeProvider } from "../access/production-authorization-runtime-provider.js";
 import type {
   EnterpriseAdmissionAuthenticationEvidence,
   EnterpriseAdmissionAuthorizationHandle,
@@ -53,5 +54,6 @@ export interface EnterpriseAdmissionRuntime {
   readonly authorityReceiptState: EnterpriseAuthorityReceiptState;
   readonly grantVersionGuard: PrincipalGrantVersionGuard;
   readonly resourceAuthorization: ResourceAuthorization;
+  readonly authorizationRuntimeProvider?: ProductionAuthorizationRuntimeProvider;
   nextSessionBindingGeneration(): string;
 }
