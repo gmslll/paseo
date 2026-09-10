@@ -22,6 +22,20 @@ actions. The observation path is not a caller assertion and is not inferred from
 - **W7** owns the real mismatch E2E, including a page-account/Profile mismatch and denial before
   any high-risk Browser action or side effect.
 
+Observation and invalidation are separate protocol contracts. W0 defines the strict
+`enterprise.browser.page_identity.observe.request/response` path and the independent
+`enterprise.browser.page_identity.invalidate.request/response` path, with
+`enterpriseBrowserPageIdentityObservationV1` and `enterpriseBrowserPageIdentityInvalidationV1`
+advertised independently. The overall page-identity capability is ready only when both contracts,
+their production handlers, current-generation checks, required audit, denial evidence, and E2E
+gates are ready; otherwise the capability remains absent.
+
+Every lifecycle boundary must invalidate before replacing or releasing an observation:
+navigation start, navigation replacement, WebView/guest destroy, Browser unregister, exact
+generation revoke or logout, and host teardown. Invalidation is the revocation boundary; an
+observation TTL is freshness metadata only and never substitutes for explicit invalidation or
+generation fencing.
+
 The W4 candidate `aaf0418e4` is not independently mergeable. It must land only with the observer
 transport and bootstrap wiring, W2 authorization gate, capability computation, and W7 mismatch E2E
 as one closed production chain.

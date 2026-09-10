@@ -34,6 +34,8 @@ import {
   EnterpriseResourceOwnershipTransferResponseSchema,
   EnterpriseBrowserPageIdentityObservationRequestSchema,
   EnterpriseBrowserPageIdentityObservationResponseSchema,
+  EnterpriseBrowserPageIdentityInvalidationRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationResponseSchema,
   EnterpriseResourceOwnerWireSchema,
   EnterpriseResourceStatusProjectionSchema,
   EnterpriseSessionBindingSchema,
@@ -92,6 +94,7 @@ describe("enterprise feature compatibility", () => {
       enterpriseAppSlotContentReadV1: false,
       enterpriseResourceOwnershipTransferV1: false,
       enterpriseBrowserPageIdentityObservationV1: false,
+      enterpriseBrowserPageIdentityInvalidationV1: false,
     });
   });
 
@@ -231,6 +234,58 @@ describe("enterprise Browser page identity observation contract", () => {
         hostname: "Account.Example.com",
       }),
     ).toThrow();
+  });
+});
+
+describe("enterprise Browser page identity invalidation contract", () => {
+  const request = {
+    type: "enterprise.browser.page_identity.invalidate.request" as const,
+    requestId: "invalidation-1",
+    browser: {
+      browserId: "1712345678901-abcdef012345",
+      browserProfileId: "brp_3333333333333333",
+    },
+    bindingRevision: "binding-rev-1",
+    lifecycleGeneration: "generation-1",
+    observationRevision: "obs-rev-1",
+  };
+
+  test("accepts strict request and exact correlated revision", () => {
+    expect(EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse(request)).toEqual(request);
+    expect(
+      EnterpriseBrowserPageIdentityInvalidationResponseSchema.parse({
+        type: "enterprise.browser.page_identity.invalidate.response",
+        payload: { requestId: request.requestId, acceptedRevision: request.observationRevision },
+      }),
+    ).toEqual({
+      type: "enterprise.browser.page_identity.invalidate.response",
+      payload: { requestId: request.requestId, acceptedRevision: request.observationRevision },
+    });
+  });
+
+  test("rejects forbidden fields, extras, and empty revisions", () => {
+    for (const extra of [
+      { hostname: "account.example.com" },
+      { accountLabelHash: "opaque" },
+      { clientId: "client-1" },
+      { homeNodeId: "node-1" },
+      { path: "/tmp/profile" },
+      { pat: "token" },
+      { lease: "lease-1" },
+    ]) {
+      expect(() =>
+        EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse({ ...request, ...extra }),
+      ).toThrow();
+    }
+    for (const field of [
+      "bindingRevision",
+      "lifecycleGeneration",
+      "observationRevision",
+    ] as const) {
+      expect(() =>
+        EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse({ ...request, [field]: "" }),
+      ).toThrow();
+    }
   });
 });
 

@@ -9,6 +9,7 @@ import {
 import type {
   EnterpriseResourceOwnershipTransferResponse,
   EnterpriseBrowserPageIdentityObservationResponse,
+  EnterpriseBrowserPageIdentityInvalidationResponse,
   EnterpriseWorkspaceContentReadResponse,
 } from "@getpaseo/protocol/messages";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
@@ -161,6 +162,43 @@ test("enterprise page observation wrapper preserves dotted type and correlation"
       observationRevision: response.payload.acceptedRevision,
       bindingRevision: "binding-rev-1",
       lifecycleGeneration: "generation-1",
+    },
+    response.payload.requestId,
+  );
+});
+
+test("enterprise page invalidation wrapper preserves dotted type and correlation", async () => {
+  const client = Object.create(DaemonClient.prototype) as DaemonClient;
+  const response: EnterpriseBrowserPageIdentityInvalidationResponse = {
+    type: "enterprise.browser.page_identity.invalidate.response",
+    payload: { requestId: "invalidation-request-1", acceptedRevision: "obs-rev-2" },
+  };
+  const requestEnterprise = vi
+    .spyOn(client, "requestEnterprise")
+    .mockResolvedValue(response as unknown as Readonly<Record<string, unknown>>);
+
+  await expect(
+    client.invalidateBrowserPageIdentity({
+      requestId: response.payload.requestId,
+      browser: {
+        browserId: "1712345678901-abcdef012345",
+        browserProfileId: "brp_3333333333333333",
+      },
+      bindingRevision: "binding-rev-1",
+      lifecycleGeneration: "generation-1",
+      observationRevision: response.payload.acceptedRevision,
+    }),
+  ).resolves.toEqual(response);
+  expect(requestEnterprise).toHaveBeenCalledWith(
+    "enterprise.browser.page_identity.invalidate.request",
+    {
+      browser: {
+        browserId: "1712345678901-abcdef012345",
+        browserProfileId: "brp_3333333333333333",
+      },
+      bindingRevision: "binding-rev-1",
+      lifecycleGeneration: "generation-1",
+      observationRevision: response.payload.acceptedRevision,
     },
     response.payload.requestId,
   );

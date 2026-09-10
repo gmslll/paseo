@@ -121,6 +121,7 @@ export const ENTERPRISE_FEATURE_FLAGS = [
   "enterpriseAppSlotContentReadV1",
   "enterpriseResourceOwnershipTransferV1",
   "enterpriseBrowserPageIdentityObservationV1",
+  "enterpriseBrowserPageIdentityInvalidationV1",
 ] as const;
 
 export const EnterpriseFeatureFlagsWireSchema = z
@@ -136,6 +137,7 @@ export const EnterpriseFeatureFlagsWireSchema = z
     enterpriseAppSlotContentReadV1: z.boolean().optional(),
     enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
     enterpriseBrowserPageIdentityObservationV1: z.boolean().optional(),
+    enterpriseBrowserPageIdentityInvalidationV1: z.boolean().optional(),
   })
   .passthrough();
 
@@ -158,6 +160,8 @@ export function normalizeEnterpriseFeatureFlags(
     enterpriseResourceOwnershipTransferV1: flags?.enterpriseResourceOwnershipTransferV1 === true,
     enterpriseBrowserPageIdentityObservationV1:
       flags?.enterpriseBrowserPageIdentityObservationV1 === true,
+    enterpriseBrowserPageIdentityInvalidationV1:
+      flags?.enterpriseBrowserPageIdentityInvalidationV1 === true,
   };
 }
 
@@ -4248,6 +4252,23 @@ export const EnterpriseBrowserPageIdentityObservationResponseSchema = z.strictOb
   }),
 });
 
+export const EnterpriseBrowserPageIdentityInvalidationRequestSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.invalidate.request"),
+  requestId: z.string().min(1),
+  browser: BrowserPageIdentityObservationBrowserSchema,
+  bindingRevision: z.string().min(1),
+  lifecycleGeneration: z.string().min(1),
+  observationRevision: z.string().min(1),
+});
+
+export const EnterpriseBrowserPageIdentityInvalidationResponseSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.invalidate.response"),
+  payload: z.strictObject({
+    requestId: z.string().min(1),
+    acceptedRevision: z.string().min(1),
+  }),
+});
+
 const EnterpriseOwnershipTransferResourceSchema = z.union([
   z.strictObject({
     ...GlobalResourceRefSharedShape,
@@ -4549,6 +4570,12 @@ export type EnterpriseBrowserPageIdentityObservationRequest = z.infer<
 export type EnterpriseBrowserPageIdentityObservationResponse = z.infer<
   typeof EnterpriseBrowserPageIdentityObservationResponseSchema
 >;
+export type EnterpriseBrowserPageIdentityInvalidationRequest = z.infer<
+  typeof EnterpriseBrowserPageIdentityInvalidationRequestSchema
+>;
+export type EnterpriseBrowserPageIdentityInvalidationResponse = z.infer<
+  typeof EnterpriseBrowserPageIdentityInvalidationResponseSchema
+>;
 export type EnterpriseResourceOwnershipTransferRequest = z.infer<
   typeof EnterpriseResourceOwnershipTransferRequestSchema
 >;
@@ -4653,6 +4680,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseAppSlotContentReadRequestSchema,
   EnterpriseResourceOwnershipTransferRequestSchema,
   EnterpriseBrowserPageIdentityObservationRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationRequestSchema,
   EnterpriseAccessListGrantsRequestSchema,
   EnterpriseAccessUpdateGrantsRequestSchema,
   EnterpriseAuditListEventsRequestSchema,
@@ -5216,6 +5244,9 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(enterpriseBrowserPageIdentityObservationV1): added in v0.9.0, remove gate after 2027-03-09.
         // Keep absent until observer transport, bootstrap, W2 verification, publisher, and mismatch evidence are ready.
         enterpriseBrowserPageIdentityObservationV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserPageIdentityInvalidationV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until invalidation transport, bootstrap, W2 verification, publisher, and mismatch evidence are ready.
+        enterpriseBrowserPageIdentityInvalidationV1: z.boolean().optional(),
       })
       .optional(),
   })
@@ -8101,6 +8132,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   EnterpriseAppSlotContentReadResponseSchema,
   EnterpriseResourceOwnershipTransferResponseSchema,
   EnterpriseBrowserPageIdentityObservationResponseSchema,
+  EnterpriseBrowserPageIdentityInvalidationResponseSchema,
   EnterpriseAccessListGrantsResponseSchema,
   EnterpriseAccessUpdateGrantsResponseSchema,
   EnterpriseAuditListEventsResponseSchema,

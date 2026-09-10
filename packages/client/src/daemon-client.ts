@@ -175,6 +175,8 @@ import type {
   EnterpriseResourceOwnershipTransferResponse,
   EnterpriseBrowserPageIdentityObservationRequest,
   EnterpriseBrowserPageIdentityObservationResponse,
+  EnterpriseBrowserPageIdentityInvalidationRequest,
+  EnterpriseBrowserPageIdentityInvalidationResponse,
 } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
@@ -1276,6 +1278,19 @@ export class DaemonClient {
       payload,
       requestId,
     ) as Promise<EnterpriseBrowserPageIdentityObservationResponse>;
+  }
+
+  public invalidateBrowserPageIdentity(
+    input: Omit<EnterpriseBrowserPageIdentityInvalidationRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserPageIdentityInvalidationResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.browser.page_identity.invalidate.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseBrowserPageIdentityInvalidationResponse>;
   }
 
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({
