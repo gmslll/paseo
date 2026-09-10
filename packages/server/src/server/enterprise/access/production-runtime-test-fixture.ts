@@ -101,7 +101,22 @@ export async function createProductionRuntimeFixture(name: string) {
       authorityState: new EmptyAuthorityState(),
     }));
   if (!runtime) throw new Error("runtime");
-  return { provider, runtime, audit };
+  return {
+    provider,
+    runtime,
+    audit,
+    context: {
+      sessionId: runtime.binding.sessionId,
+      clientId: runtime.binding.clientId,
+      credentialId: runtime.principal.credentialId,
+      sessionBindingGeneration: runtime.binding.sessionBindingGeneration,
+      enterpriseContext: {
+        principal: runtime.principal,
+        node: runtime.node,
+        sessionBindingGeneration: runtime.binding.sessionBindingGeneration,
+      },
+    },
+  };
 }
 export async function closeProductionRuntimeFixture() {
   if (audit) await audit.close();

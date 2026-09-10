@@ -23,18 +23,34 @@ describe.runIf(process.platform === "darwin")("content dispatcher lifecycle", ()
       expect(registration?.manifest.operations).toEqual([
         "enterprise.workspace.content.read.request",
       ]);
-      const lease = registration?.open({
+      const registrationReady = registration;
+      if (!registrationReady) throw new Error("registration");
+      const lease = registrationReady.open({
         sessionId: "s",
         clientId: "c",
-        context: {} as never,
+        context: fixture.context,
         authorizationRuntime: fixture.runtime,
         filesRuntime,
       });
       expect(
-        await lease?.dispatcher.handle({ sessionContext: {} as never, message: {} as never }),
+        await lease.dispatcher.handle({
+          sessionContext: fixture.context,
+          message: {
+            type: "enterprise.workspace.content.read.request",
+            requestId: "r",
+            resource: {
+              organizationId: fixture.context.enterpriseContext.principal.organizationId,
+              nodeId: fixture.context.enterpriseContext.node.nodeId,
+              resourceKind: "workspace",
+              localResourceId: "w",
+            },
+            selector: { kind: "workspace", view: "files" },
+            page: { limit: 1 },
+          },
+        }),
       ).toBe(false);
-      await lease?.close();
-      await lease?.close();
+      await lease.close();
+      await lease.close();
       await fixture.runtime.release();
     } finally {
       await closeProductionRuntimeFixture();
