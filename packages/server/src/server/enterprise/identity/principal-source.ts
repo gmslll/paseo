@@ -43,6 +43,33 @@ const IdentityDocumentSchema = z
   });
 type GrantProjectionWithoutType = Omit<PrincipalGrantProjection, "principalType">;
 
+export interface ProductionPrincipalGrantSource extends PrincipalGrantSource {
+  ready(): Promise<void>;
+  validateCurrent(): Promise<boolean>;
+}
+
+function readIdentityDocument(
+  filePath: string,
+  fs: IdentityRegistryFsPort,
+): z.infer<typeof IdentityDocumentSchema> {
+  if (!Number.isInteger(fs.noFollowFlag) || fs.noFollowFlag <= 0) {
+    throw new Error("identity source requires O_NOFOLLOW");
+  }
+  const fd = fs.open(filePath, fs.noFollowFlag);
+  try {
+    const opened = fs.fstat(fd);
+    if (!opened.isFile()) throw new Error("identity source is not a regular file");
+    fs.fchmod(fd, 0o600);
+    const secured = fs.fstat(fd);
+    if (!secured.isFile() || (secured.mode & 0o777) !== 0o600) {
+      throw new Error("identity source is not private");
+    }
+    return IdentityDocumentSchema.parse(JSON.parse(fs.read(fd)));
+  } finally {
+    fs.close(fd);
+  }
+}
+
 export function createFilePrincipalGrantSource(input: {
   readonly filePath: string;
   readonly fs: IdentityRegistryFsPort;
@@ -57,18 +84,7 @@ export function createFilePrincipalGrantSource(input: {
     async resolvePrincipal(principalId, organizationId: OrganizationId) {
       let document: z.infer<typeof IdentityDocumentSchema>;
       try {
-        if (!Number.isInteger(input.fs.noFollowFlag) || input.fs.noFollowFlag <= 0) return null;
-        const fd = input.fs.open(input.filePath, input.fs.noFollowFlag);
-        try {
-          const opened = input.fs.fstat(fd);
-          if (!opened.isFile()) return null;
-          input.fs.fchmod(fd, 0o600);
-          const secured = input.fs.fstat(fd);
-          if (!secured.isFile() || (secured.mode & 0o777) !== 0o600) return null;
-          document = IdentityDocumentSchema.parse(JSON.parse(input.fs.read(fd)));
-        } finally {
-          input.fs.close(fd);
-        }
+        document = readIdentityDocument(input.filePath, input.fs);
       } catch {
         return null;
       }
@@ -88,15 +104,16 @@ export function createProductionPrincipalGrantSource(input: {
   readonly fs?: IdentityRegistryFsPort;
   readonly grantStore: GrantStore;
   readonly audit: ProductionAuditCapability;
-}): PrincipalGrantSource {
+}): ProductionPrincipalGrantSource {
   const audit = productionAuditCapabilityIssuer.requireCurrent(input.audit);
   if (!isAuthoritativeGrantStoreForAudit(input.grantStore, audit)) {
     throw new Error("enterprise principal source requires the audit-bound GrantStore");
   }
   const grantStore = input.grantStore;
+  const fs = input.fs ?? nodeIdentityRegistryFs;
   const source = createFilePrincipalGrantSource({
     filePath: input.filePath,
-    fs: input.fs ?? nodeIdentityRegistryFs,
+    fs,
     grants: {
       async resolvePrincipal(principalId, organizationId) {
         productionAuditCapabilityIssuer.requireCurrent(audit);
@@ -112,5 +129,22 @@ export function createProductionPrincipalGrantSource(input: {
       },
     },
   });
-  return source;
+  return Object.freeze({
+    ...source,
+    async ready() {
+      productionAuditCapabilityIssuer.requireCurrent(audit);
+      readIdentityDocument(input.filePath, fs);
+      productionAuditCapabilityIssuer.requireCurrent(audit);
+    },
+    async validateCurrent() {
+      try {
+        productionAuditCapabilityIssuer.requireCurrent(audit);
+        readIdentityDocument(input.filePath, fs);
+        productionAuditCapabilityIssuer.requireCurrent(audit);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
 }

@@ -210,6 +210,8 @@ describe("file principal grant source", () => {
           grantStore: provider!.grantStore,
           audit,
         });
+        await expect(source.ready()).resolves.toBeUndefined();
+        await expect(source.validateCurrent()).resolves.toBe(true);
         await expect(source.resolvePrincipal(principalId, organizationId)).resolves.toEqual({
           principalId,
           organizationId,
@@ -224,7 +226,23 @@ describe("file principal grant source", () => {
             audit: foreignAudit!,
           }),
         ).toThrow("audit-bound GrantStore");
+        const missing = createProductionPrincipalGrantSource({
+          filePath: path.join(root, "missing-principals.json"),
+          grantStore: provider!.grantStore,
+          audit,
+        });
+        await expect(missing.ready()).rejects.toThrow();
+        await expect(missing.validateCurrent()).resolves.toBe(false);
+        const corruptPath = path.join(root, "corrupt-principals.json");
+        await writeFile(corruptPath, "{", { mode: 0o600 });
+        const corrupt = createProductionPrincipalGrantSource({
+          filePath: corruptPath,
+          grantStore: provider!.grantStore,
+          audit,
+        });
+        await expect(corrupt.ready()).rejects.toThrow();
         await audit.close();
+        await expect(source.validateCurrent()).resolves.toBe(false);
         await expect(source.resolvePrincipal(principalId, organizationId)).rejects.toThrow(
           "current runtime-issued production audit capability required",
         );
