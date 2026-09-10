@@ -14,7 +14,9 @@ import {
   getPaseoBrowserWebContentsForHostWindow,
   getPaseoBrowserWebviewRegistry,
   getPaseoBrowserWorkspaceId,
+  createBrowserPageIdentityPublisherRegistry,
   installPaseoBrowserPageIdentityPublisher,
+  installBrowserPageIdentityTransportRoutes,
   isPaseoBrowserWebviewAttach,
   preparePaseoBrowserWebContents,
   registerAttachedPaseoBrowser,
@@ -23,15 +25,84 @@ import {
   unregisterPaseoBrowserFromHost,
 } from "./index.js";
 import {
-  createBrowserPageIdentityAuthorityTeardownPort,
-  createBrowserPageIdentityPublisher,
-} from "./page-identity-publisher.js";
+  BROWSER_PAGE_IDENTITY_TRANSPORT_MOUNT_CHANNEL,
+  BROWSER_PAGE_IDENTITY_TRANSPORT_REQUEST_CHANNEL,
+  BROWSER_PAGE_IDENTITY_TRANSPORT_RESPONSE_CHANNEL,
+  type BrowserPageIdentityTransportIpcMain,
+  type BrowserPageIdentityTransportIpcMainEvent,
+  type BrowserPageIdentityTransportSender,
+} from "./page-identity-transport.js";
 
-class FakeRenderer {
+interface TestTransportRequest {
+  readonly version: 1;
+  readonly routeId: string;
+  readonly routeGeneration: string;
+  readonly requestId: string;
+  readonly operation: "observe" | "invalidate" | "fatal_teardown";
+  readonly payload?: { readonly observationRevision?: string };
+}
+
+class FakeRenderer implements BrowserPageIdentityTransportSender {
+  public onPageIdentityRequest: (request: TestTransportRequest) => void = () => {};
+  private readonly destroyedListeners = new Set<() => void>();
+
   public constructor(public readonly id: number) {}
 
   public isDestroyed(): boolean {
     return false;
+  }
+
+  public send(channel: string, payload: unknown): void {
+    expect(channel).toBe(BROWSER_PAGE_IDENTITY_TRANSPORT_REQUEST_CHANNEL);
+    this.onPageIdentityRequest(payload as TestTransportRequest);
+  }
+
+  public once(event: "destroyed", listener: () => void): void {
+    expect(event).toBe("destroyed");
+    this.destroyedListeners.add(listener);
+  }
+
+  public removeListener(event: "destroyed", listener: () => void): void {
+    expect(event).toBe("destroyed");
+    this.destroyedListeners.delete(listener);
+  }
+}
+
+type TestIpcHandler = (
+  event: BrowserPageIdentityTransportIpcMainEvent,
+  ...args: unknown[]
+) => unknown;
+
+class FakePageIdentityIpcMain implements BrowserPageIdentityTransportIpcMain {
+  private readonly handlers = new Map<string, TestIpcHandler>();
+  private readonly listeners = new Map<string, Set<TestIpcHandler>>();
+
+  public handle(channel: string, handler: TestIpcHandler): void {
+    this.handlers.set(channel, handler);
+  }
+
+  public removeHandler(channel: string): void {
+    this.handlers.delete(channel);
+  }
+
+  public on(channel: string, listener: TestIpcHandler): void {
+    const listeners = this.listeners.get(channel) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(channel, listeners);
+  }
+
+  public removeListener(channel: string, listener: TestIpcHandler): void {
+    this.listeners.get(channel)?.delete(listener);
+  }
+
+  public async invoke(channel: string, sender: FakeRenderer): Promise<unknown> {
+    const handler = this.handlers.get(channel);
+    if (!handler) throw new Error(`Missing IPC handler for ${channel}`);
+    return handler({ sender });
+  }
+
+  public emit(channel: string, sender: FakeRenderer, payload: unknown): void {
+    for (const listener of this.listeners.get(channel) ?? []) listener({ sender }, payload);
   }
 }
 
@@ -120,6 +191,64 @@ function deferred<T>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+async function installTestPageIdentityAssembly(input: {
+  renderer: FakeRenderer;
+  additionalRenderers?: readonly FakeRenderer[];
+  publish: () => Promise<void>;
+  invalidate: () => Promise<void>;
+  createObservationRevision?: () => string;
+}) {
+  const ipcMain = new FakePageIdentityIpcMain();
+  const publisher = createBrowserPageIdentityPublisherRegistry({
+    registry: getPaseoBrowserWebviewRegistry(),
+    ...(input.createObservationRevision
+      ? { createObservationRevision: input.createObservationRevision }
+      : {}),
+  });
+  let transportId = 0;
+  const controller = installBrowserPageIdentityTransportRoutes({
+    ipcMain,
+    routeLifecycle: publisher.routeLifecycle,
+    createId: () => `index-transport-${++transportId}`,
+  });
+  const renderers = [input.renderer, ...(input.additionalRenderers ?? [])];
+  for (const renderer of renderers) {
+    renderer.onPageIdentityRequest = (request) => {
+      void Promise.resolve()
+        .then(async () => {
+          if (request.operation === "observe") await input.publish();
+          if (request.operation === "invalidate") await input.invalidate();
+          return request.operation === "fatal_teardown"
+            ? { ok: true as const }
+            : {
+                ok: true as const,
+                acceptedRevision: request.payload?.observationRevision,
+              };
+        })
+        .then((result) => {
+          ipcMain.emit(BROWSER_PAGE_IDENTITY_TRANSPORT_RESPONSE_CHANNEL, renderer, {
+            version: 1,
+            routeId: request.routeId,
+            routeGeneration: request.routeGeneration,
+            requestId: request.requestId,
+            operation: request.operation,
+            result,
+          });
+          return undefined;
+        });
+    };
+    await ipcMain.invoke(BROWSER_PAGE_IDENTITY_TRANSPORT_MOUNT_CHANNEL, renderer);
+  }
+  const disposePublisher = await installPaseoBrowserPageIdentityPublisher(publisher);
+  return {
+    publisher,
+    dispose: async () => {
+      await disposePublisher();
+      await controller.close();
+    },
+  };
 }
 
 describe("browser webview attachment", () => {
@@ -282,33 +411,44 @@ describe("browser webview attachment", () => {
     unregisterPaseoBrowser("browser-second");
   });
 
-  test("unregisters the same browser only from its requesting host", () => {
+  test("unregisters the same browser only from its requesting host with the publisher registry enabled", async () => {
     const profileSession = {};
     const firstRenderer = new FakeRenderer(11);
     const secondRenderer = new FakeRenderer(22);
     const firstGuest = new FakeBrowserGuest(501, firstRenderer, profileSession);
     const secondGuest = new FakeBrowserGuest(502, secondRenderer, profileSession);
+    const assembly = await installTestPageIdentityAssembly({
+      renderer: firstRenderer,
+      additionalRenderers: [secondRenderer],
+      publish: async () => {},
+      invalidate: async () => {},
+    });
+    try {
+      for (const [renderer, guest] of [
+        [firstRenderer, firstGuest],
+        [secondRenderer, secondGuest],
+      ] as const) {
+        await expect(
+          registerAttachedPaseoBrowserAfterPageIdentityBarrier({
+            browserId: "browser-shared-hosts",
+            workspaceId: "workspace-shared",
+            webContentsId: guest.id,
+            sender: renderer,
+            profileSession,
+            findWebContents: () => guest,
+          }),
+        ).resolves.toBe(true);
+      }
 
-    for (const [renderer, guest] of [
-      [firstRenderer, firstGuest],
-      [secondRenderer, secondGuest],
-    ] as const) {
-      registerAttachedPaseoBrowser({
-        browserId: "browser-shared-hosts",
-        workspaceId: "workspace-shared",
-        webContentsId: guest.id,
-        sender: renderer,
-        profileSession,
-        findWebContents: () => guest,
-      });
+      await unregisterPaseoBrowserFromHost(firstRenderer.id, "browser-shared-hosts");
+
+      expect(getPaseoBrowserIdForWebContents(firstGuest)).toBeNull();
+      expect(getPaseoBrowserIdForWebContents(secondGuest)).toBe("browser-shared-hosts");
+      expect(getPaseoBrowserWorkspaceId("browser-shared-hosts")).toBe("workspace-shared");
+    } finally {
+      await unregisterPaseoBrowser("browser-shared-hosts");
+      await assembly.dispose();
     }
-
-    unregisterPaseoBrowserFromHost(firstRenderer.id, "browser-shared-hosts");
-
-    expect(getPaseoBrowserIdForWebContents(firstGuest)).toBeNull();
-    expect(getPaseoBrowserIdForWebContents(secondGuest)).toBe("browser-shared-hosts");
-    expect(getPaseoBrowserWorkspaceId("browser-shared-hosts")).toBe("workspace-shared");
-    unregisterPaseoBrowser("browser-shared-hosts");
   });
 
   test("prepares throttling once and removes registration when the guest is destroyed", () => {
@@ -343,15 +483,12 @@ describe("browser webview attachment", () => {
       webContentsId === guest.id ? guest : null,
     );
     const observationAck = deferred<void>();
-    const publisher = createBrowserPageIdentityPublisher({
-      registry: getPaseoBrowserWebviewRegistry(),
-      authorityTeardown: createBrowserPageIdentityAuthorityTeardownPort({
-        teardownAfterAuthorityTransportFailure: async () => {},
-      }),
+    const assembly = await installTestPageIdentityAssembly({
+      renderer,
       publish: async () => observationAck.promise,
       invalidate: async () => undefined,
     });
-    const dispose = await installPaseoBrowserPageIdentityPublisher(publisher);
+    const { dispose } = assembly;
     try {
       preparePaseoBrowserWebContents(guest);
       const attach = registerAttachedPaseoBrowserAfterPageIdentityBarrier({
@@ -422,11 +559,8 @@ describe("browser webview attachment", () => {
     ).toBe(true);
     const invalidations: Array<ReturnType<typeof deferred<void>>> = [];
     let revision = 0;
-    const publisher = createBrowserPageIdentityPublisher({
-      registry: getPaseoBrowserWebviewRegistry(),
-      authorityTeardown: createBrowserPageIdentityAuthorityTeardownPort({
-        teardownAfterAuthorityTransportFailure: async () => {},
-      }),
+    const assembly = await installTestPageIdentityAssembly({
+      renderer,
       publish: async () => {},
       invalidate: async () => {
         const barrier = deferred<void>();
@@ -435,7 +569,7 @@ describe("browser webview attachment", () => {
       },
       createObservationRevision: () => `observation-${++revision}`,
     });
-    const dispose = await installPaseoBrowserPageIdentityPublisher(publisher);
+    const { dispose, publisher } = assembly;
     try {
       publisher.track(oldGuest);
       await publisher.publishCurrent(oldGuest);

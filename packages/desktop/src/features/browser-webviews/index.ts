@@ -11,12 +11,14 @@ import {
   PendingBrowserWindowOpenRequests,
 } from "./window-open.js";
 import { PaseoBrowserWebviewRegistry } from "./registry.js";
-import {
-  isBrowserPageIdentityPublisher,
-  type BrowserPageIdentityExecutionHandle,
-  type BrowserPageIdentityPublisher,
-  type BrowserPageIdentityWebContents,
+import type {
+  BrowserPageIdentityExecutionHandle,
+  BrowserPageIdentityWebContents,
 } from "./page-identity-publisher.js";
+import {
+  isBrowserPageIdentityPublisherRegistry,
+  type BrowserPageIdentityPublisherRegistry,
+} from "./page-identity-publisher-registry.js";
 
 export {
   BROWSER_NEW_TAB_REQUEST_EVENT,
@@ -25,14 +27,20 @@ export {
 };
 export {
   createBrowserPageIdentityTransportPublisherPorts,
+  createBrowserPageIdentityTransportRouteLifecyclePort,
   installBrowserPageIdentityTransportRoutes,
   type BrowserPageIdentityTransportController,
   type BrowserPageIdentityTransportRoute,
+  type BrowserPageIdentityTransportRouteLifecyclePort,
 } from "./page-identity-transport.js";
+export {
+  createBrowserPageIdentityPublisherRegistry,
+  type BrowserPageIdentityPublisherRegistry,
+} from "./page-identity-publisher-registry.js";
 
 const browserRegistry = new PaseoBrowserWebviewRegistry();
-let pageIdentityPublisher: BrowserPageIdentityPublisher | null = null;
-let pageIdentityLifecycleQueue = Promise.resolve();
+let pageIdentityPublisher: BrowserPageIdentityPublisherRegistry | null = null;
+const pageIdentityLifecycleQueues = new Map<number, Promise<void>>();
 
 interface BrowserWebContentsIdentity {
   readonly id: number;
@@ -82,23 +90,23 @@ export function getPaseoBrowserWebviewRegistry(): PaseoBrowserWebviewRegistry {
   return browserRegistry;
 }
 
-/** Root awaits this only with the W0 client publisher and capability gate wired together. */
+/** Root installs one registry with the transport controller; renderer routes mount into it. */
 export async function installPaseoBrowserPageIdentityPublisher(
-  publisher: BrowserPageIdentityPublisher,
+  publisher: BrowserPageIdentityPublisherRegistry,
 ): Promise<() => Promise<void>> {
-  if (!isBrowserPageIdentityPublisher(publisher)) {
-    throw new Error("Invalid Browser page identity publisher.");
+  if (!isBrowserPageIdentityPublisherRegistry(publisher)) {
+    throw new Error("Invalid Browser page identity publisher registry.");
   }
   const previous = pageIdentityPublisher;
   pageIdentityPublisher = null;
   if (previous) await previous.close();
-  await pageIdentityLifecycleQueue;
+  await drainPageIdentityLifecycleQueues();
   pageIdentityPublisher = publisher;
   return async () => {
     if (pageIdentityPublisher !== publisher) return;
     pageIdentityPublisher = null;
     await publisher.close();
-    await pageIdentityLifecycleQueue;
+    await drainPageIdentityLifecycleQueues();
   };
 }
 
@@ -120,7 +128,7 @@ export function registerAttachedPaseoBrowser(input: RegisterAttachedBrowserInput
   return registerAttachedPaseoBrowserNow(input);
 }
 
-/** Root awaits this path once the page-identity publisher is installed. */
+/** Root awaits this path once the page-identity publisher registry is installed. */
 export async function registerAttachedPaseoBrowserAfterPageIdentityBarrier(
   input: RegisterAttachedBrowserInput,
 ): Promise<boolean> {
@@ -140,7 +148,7 @@ export async function registerAttachedPaseoBrowserAfterPageIdentityBarrier(
       publisher.invalidateWebContents(webContentsId),
     ),
   );
-  return enqueuePageIdentityLifecycle(async () => {
+  return enqueuePageIdentityLifecycle(input.sender.id, async () => {
     await invalidation;
     if (pageIdentityPublisher !== publisher) return false;
     const currentGuest = input.findWebContents(input.webContentsId);
@@ -213,9 +221,9 @@ export function unregisterPaseoBrowser(browserId: string): Promise<void> {
     return Promise.resolve();
   }
   const invalidation = publisher.invalidateBrowser(browserId);
-  return enqueuePageIdentityLifecycle(async () => {
-    await invalidation;
+  return invalidation.then(() => {
     browserRegistry.unregisterBrowser(browserId);
+    return undefined;
   });
 }
 
@@ -228,8 +236,13 @@ export function unregisterPaseoBrowserFromHost(
     browserRegistry.unregisterBrowserFromHost(hostWebContentsId, browserId);
     return Promise.resolve();
   }
-  const invalidation = publisher.invalidateBrowser(browserId);
-  return enqueuePageIdentityLifecycle(async () => {
+  const webContentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+    hostWebContentsId,
+    browserId,
+  );
+  const invalidation =
+    webContentsId === null ? Promise.resolve() : publisher.invalidateWebContents(webContentsId);
+  return enqueuePageIdentityLifecycle(hostWebContentsId, async () => {
     await invalidation;
     browserRegistry.unregisterBrowserFromHost(hostWebContentsId, browserId);
   });
@@ -242,7 +255,7 @@ export function unregisterPaseoBrowserHost(hostWebContentsId: number): Promise<v
     return Promise.resolve();
   }
   const invalidation = publisher.invalidateHost(hostWebContentsId);
-  return enqueuePageIdentityLifecycle(async () => {
+  return enqueuePageIdentityLifecycle(hostWebContentsId, async () => {
     await invalidation;
     browserRegistry.unregisterHostWebContents(hostWebContentsId);
   });
@@ -271,9 +284,17 @@ export function unregisterPaseoBrowserProfile(input: {
   const publisher = pageIdentityPublisher;
   if (!publisher) return Promise.resolve(browserRegistry.unregisterProfile(input));
   const invalidation = Promise.all(
-    browserIds.map((browserId) => publisher.invalidateBrowser(browserId)),
+    browserIds.map((browserId) => {
+      const webContentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+        input.hostWebContentsId,
+        browserId,
+      );
+      return webContentsId === null
+        ? Promise.resolve()
+        : publisher.invalidateWebContents(webContentsId);
+    }),
   );
-  return enqueuePageIdentityLifecycle(async () => {
+  return enqueuePageIdentityLifecycle(input.hostWebContentsId, async () => {
     await invalidation;
     return browserRegistry.unregisterProfile(input);
   });
@@ -292,19 +313,39 @@ function invalidateWebContentsBeforeRelease(webContentsId: number): Promise<void
     return Promise.resolve();
   }
   const invalidation = publisher.invalidateWebContents(webContentsId);
-  return enqueuePageIdentityLifecycle(async () => {
+  const hostWebContentsId =
+    browserRegistry.getRegistrationForWebContents(webContentsId)?.hostWebContentsId;
+  if (hostWebContentsId === undefined) return invalidation;
+  return enqueuePageIdentityLifecycle(hostWebContentsId, async () => {
     await invalidation;
     browserRegistry.unregisterWebContents(webContentsId);
   });
 }
 
-function enqueuePageIdentityLifecycle<T>(operation: () => Promise<T>): Promise<T> {
-  const result = pageIdentityLifecycleQueue.then(operation);
-  pageIdentityLifecycleQueue = result.then(
+function enqueuePageIdentityLifecycle<T>(
+  hostWebContentsId: number,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = pageIdentityLifecycleQueues.get(hostWebContentsId) ?? Promise.resolve();
+  const result = previous.then(operation);
+  const settled = result.then(
     () => undefined,
     () => undefined,
   );
+  pageIdentityLifecycleQueues.set(hostWebContentsId, settled);
+  void settled.then(() => {
+    if (pageIdentityLifecycleQueues.get(hostWebContentsId) === settled) {
+      pageIdentityLifecycleQueues.delete(hostWebContentsId);
+    }
+    return undefined;
+  });
   return result;
+}
+
+async function drainPageIdentityLifecycleQueues(): Promise<void> {
+  while (pageIdentityLifecycleQueues.size > 0) {
+    await Promise.all(pageIdentityLifecycleQueues.values());
+  }
 }
 
 export function setWorkspaceActivePaseoBrowserId(input: {
@@ -446,7 +487,7 @@ function guardPageIdentityExecution(
 
 function createGuardedWebContents(
   contents: WebContents,
-  publisher: BrowserPageIdentityPublisher,
+  publisher: BrowserPageIdentityPublisherRegistry,
   handle: BrowserPageIdentityExecutionHandle,
 ): WebContents {
   const guardedDebugger = new Proxy(contents.debugger, {

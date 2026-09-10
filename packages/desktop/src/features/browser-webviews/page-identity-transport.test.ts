@@ -4,6 +4,7 @@ import {
   BROWSER_PAGE_IDENTITY_TRANSPORT_MOUNT_CHANNEL,
   BROWSER_PAGE_IDENTITY_TRANSPORT_REQUEST_CHANNEL,
   BROWSER_PAGE_IDENTITY_TRANSPORT_RESPONSE_CHANNEL,
+  createBrowserPageIdentityTransportRouteLifecyclePort,
   installBrowserPageIdentityTransportRoutes,
   type BrowserPageIdentityTransportIpcMain,
   type BrowserPageIdentityTransportIpcMainEvent,
@@ -120,11 +121,36 @@ function sentPayload(sender: FakeSender, index: number): Record<string, unknown>
   return message!.payload as Record<string, unknown>;
 }
 
+function noOpRouteLifecycle() {
+  return createBrowserPageIdentityTransportRouteLifecyclePort({
+    mounted: () => {},
+    retiring: () => {},
+    retired: () => {},
+  });
+}
+
 describe("Browser page identity renderer transport routes", () => {
+  test("rejects a structurally forged route lifecycle port", () => {
+    const ipcMain = new FakeIpcMain();
+    expect(() =>
+      Reflect.apply(installBrowserPageIdentityTransportRoutes, undefined, [
+        {
+          ipcMain,
+          routeLifecycle: {
+            mounted: () => {},
+            retiring: () => {},
+            retired: () => {},
+          },
+        },
+      ]),
+    ).toThrow(/invalid.*lifecycle port/iu);
+  });
+
   test("binds main-generated routes to the exact sender and correlates canonical operations", async () => {
     const ipcMain = new FakeIpcMain();
     const controller = installBrowserPageIdentityTransportRoutes({
       ipcMain,
+      routeLifecycle: noOpRouteLifecycle(),
       createId: deterministicIds(
         "route-a",
         "generation-a",
@@ -197,6 +223,7 @@ describe("Browser page identity renderer transport routes", () => {
       const ipcMain = new FakeIpcMain();
       const controller = installBrowserPageIdentityTransportRoutes({
         ipcMain,
+        routeLifecycle: noOpRouteLifecycle(),
         timeoutMs: 25,
         createId: deterministicIds(
           "route-old",
@@ -245,6 +272,7 @@ describe("Browser page identity renderer transport routes", () => {
     const ipcMain = new FakeIpcMain();
     const controller = installBrowserPageIdentityTransportRoutes({
       ipcMain,
+      routeLifecycle: noOpRouteLifecycle(),
       createId: deterministicIds("route-a", "generation-a", "request-observe", "request-teardown"),
     });
     const sender = new FakeSender(43);
@@ -299,6 +327,7 @@ describe("Browser page identity renderer transport routes", () => {
     const ipcMain = new FakeIpcMain();
     const controller = installBrowserPageIdentityTransportRoutes({
       ipcMain,
+      routeLifecycle: noOpRouteLifecycle(),
       createId: deterministicIds("route-a", "generation-a", "request-observe"),
     });
     const sender = new FakeSender(44);
