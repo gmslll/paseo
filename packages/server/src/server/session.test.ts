@@ -1019,7 +1019,7 @@ async function createBinaryAuthorizationFixture(name: string) {
     grants: [
       {
         action: "workspace.content.read",
-        selector: { kind: "workspace", workspaceIds: ["workspace-1"] },
+        selector: { kind: "workspace", workspaceIds: ["workspace-1", "wks_aaaaaaaaaaaaaaaa"] },
       },
     ],
   });
@@ -1086,6 +1086,7 @@ async function createBinaryAuthorizationFixture(name: string) {
     sessionId,
     authorityState,
     enterpriseSessionContext,
+    owners,
   };
 }
 
@@ -3645,6 +3646,10 @@ function createStoredAgentRecord(
     provider: overrides.provider ?? "codex",
     cwd: overrides.cwd,
     workspaceId: overrides.workspaceId,
+    organizationId: overrides.organizationId,
+    nodeId: overrides.nodeId,
+    ownerPrincipalId: overrides.ownerPrincipalId,
+    createdByPrincipalId: overrides.createdByPrincipalId,
     createdAt: overrides.createdAt ?? "2026-01-01T00:00:00.000Z",
     updatedAt: overrides.updatedAt ?? "2026-01-01T00:00:00.000Z",
     lastUserMessageAt: overrides.lastUserMessageAt ?? null,
@@ -8055,5 +8060,176 @@ describe("enterprise dispatcher integration seam", () => {
       type: "rpc_error",
       payload: { requestId: "legacy-enterprise", code: "unavailable" },
     });
+  });
+
+  test("enterprise legacy archive fails closed before manager access without a current runtime", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const getAgent = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-legacy-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentManager: { getAgent },
+    });
+
+    await session.handleMessage({
+      type: "archive_agent_request",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      requestId: "legacy-archive-denied",
+    });
+
+    expect(getAgent).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "legacy-archive-denied",
+          requestType: "archive_agent_request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test("enterprise fetch-agent guesses are denied before identifier enumeration", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const listAgents = vi.fn(() => []);
+    const getAgent = vi.fn();
+    const listStorage = vi.fn().mockResolvedValue([]);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-fetch-agent-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentManager: { listAgents, getAgent },
+      agentStorage: { list: listStorage },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_request",
+      agentId: "title-or-prefix",
+      requestId: "fetch-agent-denied",
+    });
+
+    expect(listStorage).not.toHaveBeenCalled();
+    expect(listAgents).not.toHaveBeenCalled();
+    expect(getAgent).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "fetch-agent-denied",
+        requestType: "fetch_agent_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+  });
+
+  test("enterprise timeline denial precedes load and timeline fetch", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const fetchTimeline = vi.fn();
+    const listStorage = vi.fn().mockResolvedValue([]);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-timeline-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentStorage: { list: listStorage },
+      agentManager: { fetchTimeline },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_timeline_request",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      requestId: "timeline-denied",
+      direction: "tail",
+      projection: "projected",
+    });
+
+    expect(listStorage).not.toHaveBeenCalled();
+    expect(fetchTimeline).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "timeline-denied",
+        requestType: "fetch_agent_timeline_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+  });
+
+  test("enterprise fetch-agent success uses the canonical authorized id without enumeration", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agent-success");
+    const agentId = "agt_aaaaaaaaaaaaaaaa";
+    fixture.owners.registerWorkspace({
+      id: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+      nodeId: fixture.enterpriseSessionContext.node.nodeId,
+      ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+      createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    });
+    fixture.owners.registerAgent({
+      id: agentId,
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+      nodeId: fixture.enterpriseSessionContext.node.nodeId,
+      ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+      createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    });
+    const messages: SessionOutboundMessage[] = [];
+    const getAgent = vi.fn(() => null);
+    const listAgents = vi.fn(() => []);
+    const listStorage = vi.fn().mockResolvedValue([]);
+    const storageGet = vi.fn().mockResolvedValue(
+      createStoredAgentRecord({
+        id: agentId,
+        cwd: "/tmp/authorized-agent",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+        nodeId: fixture.enterpriseSessionContext.node.nodeId,
+        ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+        createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+      }),
+    );
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { getAgent, listAgents },
+      agentStorage: { get: storageGet, list: listStorage },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_request",
+      agentId,
+      requestId: "fetch-agent-success",
+    });
+
+    expect(getAgent).toHaveBeenCalledTimes(1);
+    expect(getAgent).toHaveBeenCalledWith(agentId);
+    expect(listAgents).not.toHaveBeenCalled();
+    expect(listStorage).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toEqual(
+      expect.objectContaining({
+        type: "fetch_agent_response",
+        payload: expect.objectContaining({
+          requestId: "fetch-agent-success",
+          agent: expect.objectContaining({ id: agentId }),
+        }),
+      }),
+    );
+    await session.cleanup();
   });
 });

@@ -64,6 +64,10 @@ import {
   type ProductionAuthorizationRuntime,
   type ProductionAuthorizationRuntimeSessionInput,
 } from "./enterprise/access/production-authorization-runtime.js";
+import {
+  createEnterpriseLegacyResourceAuthorization,
+  type EnterpriseLegacyResourceAuthorization,
+} from "./enterprise/access/legacy-resource-authorization.js";
 import type {
   EnterpriseAdmissionAuthorizationHandle,
   EnterpriseAdmissionAuthorizationIssuer,
@@ -762,6 +766,7 @@ export class Session {
   private readonly outboundAuthorityEmissionAuthorizer?: OutboundAuthorityEmissionAuthorizer;
   private readonly enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
   private readonly productionAuthorizationSession?: ProductionAuthorizationRuntimeSessionInput;
+  private readonly enterpriseLegacyResourceAuthorization?: EnterpriseLegacyResourceAuthorization;
   private readonly activeFileBinaryStreams = new Map<
     object | undefined,
     Map<string, FileBinaryStreamEntry>
@@ -1053,6 +1058,11 @@ export class Session {
     this.resourceAuthorization = resourceAuthorization;
     this.enterpriseAuthorizationRuntime = enterpriseAuthorizationRuntime;
     this.productionAuthorizationSession = productionAuthorizationSession;
+    this.enterpriseLegacyResourceAuthorization = enterpriseAuthorizationRuntime
+      ? (createEnterpriseLegacyResourceAuthorization({
+          authorizationRuntime: enterpriseAuthorizationRuntime,
+        }) ?? undefined)
+      : undefined;
     this.clientId = clientId;
     this.authorization = sessionAuthorization ?? new SessionAuthorization(permissions);
     if (this.enterpriseContext && principalGrantVersionGuard)
@@ -3628,6 +3638,10 @@ export class Session {
   }
 
   private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
+      this.emitLegacyResourceDenied(requestId, "delete_agent_request");
+      return;
+    }
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
     const knownWorkspaceId =
@@ -3673,7 +3687,41 @@ export class Session {
     }
   }
 
+  /**
+   * Legacy agent routes do not enter the enterprise dispatcher.  Keep their
+   * manager boundary fail-closed by checking the current owner runtime before
+   * loading or mutating any agent state. Legacy sessions retain their historic
+   * behavior.
+   */
+  private async assertLegacyAgentResource(
+    action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
+    agentId: string,
+  ): Promise<boolean> {
+    if (!this.enterpriseContext) return true;
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return false;
+    return (await authorization.assertAgent(action, agentId)) !== null;
+  }
+
+  private emitLegacyResourceDenied(requestId: string, requestType: string, source?: object): void {
+    const message: SessionOutboundMessage = {
+      type: "rpc_error",
+      payload: {
+        requestId,
+        requestType,
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    };
+    if (source && this.onMessageToSource) this.onMessageToSource(source, message);
+    else this.onMessage(message);
+  }
+
   private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
+      this.emitLegacyResourceDenied(requestId, "archive_agent_request");
+      return;
+    }
     this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
 
     const { archivedAt } = await this.archiveAgentForClose(agentId);
@@ -3846,6 +3894,10 @@ export class Session {
     labels: Record<string, string> | undefined,
     requestId: string,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
+      this.emitLegacyResourceDenied(requestId, "update_agent_request");
+      return;
+    }
     this.sessionLogger.info(
       {
         agentId,
@@ -7886,6 +7938,44 @@ export class Session {
   }
 
   private async handleFetchAgent(agentIdOrIdentifier: string, requestId: string): Promise<void> {
+    if (this.enterpriseContext) {
+      const exactAgentId = agentIdOrIdentifier.trim();
+      const authorization = this.enterpriseLegacyResourceAuthorization;
+      const canonical =
+        authorization && authorization.isCurrent()
+          ? await authorization.assertAgent("workspace.content.read", exactAgentId)
+          : null;
+      if (!canonical) {
+        this.emitLegacyResourceDenied(requestId, "fetch_agent_request");
+        return;
+      }
+      const agent = await this.getAgentPayloadById(canonical.agentId);
+      if (!agent) {
+        this.emit({
+          type: "fetch_agent_response",
+          payload: {
+            requestId,
+            agent: null,
+            project: null,
+            error: `Agent not found: ${canonical.agentId}`,
+          },
+        });
+        return;
+      }
+      const project = agent.workspaceId
+        ? await this.buildProjectPlacementForWorkspaceId(agent.workspaceId)
+        : null;
+      const response: SessionOutboundMessage = {
+        type: "fetch_agent_response",
+        payload: { requestId, agent, project, error: null },
+      };
+      this.emit(
+        response,
+        agent.workspaceId ? this.createWorkspaceOutboundContext(agent.workspaceId) : undefined,
+      );
+      return;
+    }
+
     const resolved = await this.resolveAgentIdentifier(agentIdOrIdentifier);
     if (!resolved.ok) {
       this.emit({
@@ -8015,6 +8105,10 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+      return;
+    }
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     const projection: TimelineProjectionMode = msg.projection ?? "projected";
     const requestedLimit = msg.limit;
@@ -8204,6 +8298,10 @@ export class Session {
   private async handleProviderSubagentListRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
     try {
       await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
         agentManager: this.agentManager,
@@ -8236,6 +8334,10 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.timeline.get.request" }>,
     source?: object,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+      return;
+    }
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     try {
       await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
