@@ -51,6 +51,7 @@ import {
   isCase20AccessDenial,
   isUnexpectedCase20ConnectionTerminal,
   prepareCase20ObservedRpc,
+  recordCase20RpcDiagnosticEvent,
 } from "./part-a.js";
 import {
   CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT,
@@ -803,6 +804,11 @@ describe("Case20 evidence helpers", () => {
             monotonicUnixMs: 105 + index,
           })),
         },
+        crossProcessClock: {
+          calibrated: false,
+          frameOutboundEndToDaemonFrameReceivedMs: 1,
+          daemonResponseDeliverReturnToClientFrameBeginMs: 7,
+        },
       }),
       expect.objectContaining({
         type: "rpc_diagnostic",
@@ -818,7 +824,327 @@ describe("Case20 evidence helpers", () => {
     expect(JSON.stringify(events)).not.toContain("secret");
   });
 
-  test("fails closed on missing, duplicate, out-of-order, cross-clock, and overflow joins", () => {
+  test("joins diagnostics across positive and negative uncalibrated process clock offsets", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const joiner = createCase20RpcDiagnosticJoiner({
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+    });
+    const clientAhead = "case20-rpc-00000000000000000000000000000031";
+    joiner.expect({
+      clientId: "case20-client-01",
+      sequence: 1,
+      baseline: false,
+      name: "fetch_agents",
+      requestId: clientAhead,
+      rpcStartedMonotonicUnixMs: 1_000,
+    });
+    joiner.recordClient(
+      case20TestClientTrace({
+        requestId: clientAhead,
+        rpcStartedMonotonicUnixMs: 1_000,
+        frameBeginMonotonicUnixMs: 1_020,
+      }),
+    );
+    joiner.recordDaemon(
+      case20TestDaemonDiagnostic({
+        requestId: clientAhead,
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        startedAtUnixMs: 105,
+      }),
+    );
+
+    const daemonAhead = "case20-rpc-00000000000000000000000000000032";
+    joiner.expect({
+      clientId: "case20-client-02",
+      sequence: 1,
+      baseline: false,
+      name: "fetch_agents",
+      requestId: daemonAhead,
+      rpcStartedMonotonicUnixMs: 100,
+    });
+    joiner.recordClient(
+      case20TestClientTrace({ requestId: daemonAhead, clientId: "case20-client-02" }),
+    );
+    joiner.recordDaemon(
+      case20TestDaemonDiagnostic({
+        requestId: daemonAhead,
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        startedAtUnixMs: 1_005,
+      }),
+    );
+    joiner.finish();
+
+    expect(failures).toEqual([]);
+    expect(events).toHaveLength(2);
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "rpc_diagnostic",
+        sequence: 1,
+        crossProcessClock: {
+          calibrated: false,
+          frameOutboundEndToDaemonFrameReceivedMs: -899,
+          daemonResponseDeliverReturnToClientFrameBeginMs: 907,
+        },
+      }),
+      expect.objectContaining({
+        type: "rpc_diagnostic",
+        sequence: 1,
+        crossProcessClock: {
+          calibrated: false,
+          frameOutboundEndToDaemonFrameReceivedMs: 901,
+          daemonResponseDeliverReturnToClientFrameBeginMs: -893,
+        },
+      }),
+    ]);
+  });
+
+  test("persists the first rejected join with allowlisted identity, reason, and boundaries", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const joiner = createCase20RpcDiagnosticJoiner({
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      nowIso: () => "2026-09-11T00:00:02.000Z",
+    });
+    const first = "case20-rpc-00000000000000000000000000000033";
+    joiner.expect({
+      clientId: "case20-client-01",
+      sequence: 1,
+      baseline: false,
+      name: "fetch_agents",
+      requestId: first,
+      rpcStartedMonotonicUnixMs: 100,
+    });
+    joiner.recordClient(
+      case20TestClientTrace({
+        requestId: first,
+        messageOutboundBeginMonotonicUnixMs: 102,
+        messageOutboundEndMonotonicUnixMs: 101,
+      }),
+    );
+    const second = "case20-rpc-00000000000000000000000000000034";
+    joiner.expect({
+      clientId: "case20-client-02",
+      sequence: 1,
+      baseline: false,
+      name: "fetch_agents",
+      requestId: second,
+      rpcStartedMonotonicUnixMs: 200,
+    });
+    const invalidDaemon = case20TestDaemonDiagnostic({
+      requestId: second,
+      requestType: "fetch_agents_request",
+      responseType: "fetch_agents_response",
+      startedAtUnixMs: 205,
+    });
+    joiner.recordDaemon({
+      ...invalidDaemon,
+      phases: invalidDaemon.phases.map((sample, index) =>
+        index === 4 ? { phase: sample.phase, monotonicUnixMs: 204 } : sample,
+      ),
+    });
+    joiner.finish();
+
+    expect(failures).toEqual([
+      "rpc_diagnostic_join_out_of_order",
+      "rpc_diagnostic_join_out_of_order",
+    ]);
+    expect(events).toEqual([
+      {
+        type: "rpc_diagnostic_rejected",
+        at: "2026-09-11T00:00:02.000Z",
+        clientId: "case20-client-01",
+        sequence: 1,
+        expectedSequence: 1,
+        name: "fetch_agents",
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        reason: "client_trace_out_of_order",
+        boundaries: {
+          clientRpcStartedMonotonicUnixMs: 100,
+          clientMessageOutboundBeginMonotonicUnixMs: 102,
+          clientMessageOutboundEndMonotonicUnixMs: 101,
+          clientFrameOutboundBeginMonotonicUnixMs: 103,
+          clientFrameOutboundEndMonotonicUnixMs: 104,
+          clientFrameBeginMonotonicUnixMs: 120,
+          clientFrameEndMonotonicUnixMs: 130,
+          clientPromiseResumedMonotonicUnixMs: 131,
+          daemonFrameReceivedMonotonicUnixMs: null,
+          daemonResponseDeliverReturnMonotonicUnixMs: null,
+        },
+      },
+    ]);
+  });
+
+  test("persists daemon internal order and type rejection reasons without unknown fields", () => {
+    const reject = (
+      diagnostic: ReturnType<typeof case20TestDaemonDiagnostic>,
+      expectedReason: string,
+    ) => {
+      const events: Case20RawEvent[] = [];
+      const failures: string[] = [];
+      const joiner = createCase20RpcDiagnosticJoiner({
+        record: (event) => events.push(event),
+        onFailure: (code) => failures.push(code),
+      });
+      joiner.expect({
+        clientId: "case20-client-01",
+        sequence: 1,
+        baseline: false,
+        name: "fetch_agents",
+        requestId: diagnostic.requestId,
+        rpcStartedMonotonicUnixMs: 100,
+      });
+      joiner.recordClient(case20TestClientTrace({ requestId: diagnostic.requestId }));
+      joiner.recordDaemon(diagnostic);
+      joiner.finish();
+      expect(failures).toEqual(["rpc_diagnostic_join_out_of_order"]);
+      expect(events).toEqual([
+        expect.objectContaining({
+          type: "rpc_diagnostic_rejected",
+          sequence: 1,
+          expectedSequence: 1,
+          name: "fetch_agents",
+          requestType: diagnostic.requestType,
+          responseType: diagnostic.responseType,
+          reason: expectedReason,
+          boundaries: expect.objectContaining({
+            clientFrameOutboundEndMonotonicUnixMs: 104,
+            daemonFrameReceivedMonotonicUnixMs: 105,
+            daemonResponseDeliverReturnMonotonicUnixMs: 113,
+          }),
+        }),
+      ]);
+      expect(JSON.stringify(events)).not.toContain("private/");
+      expect(JSON.stringify(events)).not.toContain("secret");
+    };
+
+    const internalOrder = case20TestDaemonDiagnostic({
+      requestId: "case20-rpc-00000000000000000000000000000035",
+      requestType: "fetch_agents_request",
+      responseType: "fetch_agents_response",
+      startedAtUnixMs: 105,
+    });
+    reject(
+      {
+        ...internalOrder,
+        phases: internalOrder.phases.map((sample, index) =>
+          index === 4 ? { phase: sample.phase, monotonicUnixMs: 104 } : sample,
+        ),
+      },
+      "daemon_trace_out_of_order",
+    );
+    reject(
+      {
+        ...case20TestDaemonDiagnostic({
+          requestId: "case20-rpc-00000000000000000000000000000037",
+          requestType: "fetch_agents_request",
+          responseType: "fetch_agents_response",
+          startedAtUnixMs: 105,
+        }),
+        ignoredUnknown: "private/secret-token",
+      } as ReturnType<typeof case20TestDaemonDiagnostic>,
+      "daemon_trace_invalid",
+    );
+    reject(
+      case20TestDaemonDiagnostic({
+        requestId: "case20-rpc-00000000000000000000000000000036",
+        requestType: "fetch_agent_request",
+        responseType: "rpc_error",
+        startedAtUnixMs: 105,
+      }),
+      "request_type_mismatch",
+    );
+    reject(
+      case20TestDaemonDiagnostic({
+        requestId: "case20-rpc-00000000000000000000000000000039",
+        requestType: "fetch_agents_request",
+        responseType: "rpc_error",
+        startedAtUnixMs: 105,
+      }),
+      "response_type_mismatch",
+    );
+  });
+
+  test("persists a true expected sequence mismatch and fails closed", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const joiner = createCase20RpcDiagnosticJoiner({
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+    });
+    joiner.expect({
+      clientId: "case20-client-01",
+      sequence: 2,
+      baseline: false,
+      name: "fetch_agents",
+      requestId: "case20-rpc-00000000000000000000000000000038",
+      rpcStartedMonotonicUnixMs: 100,
+    });
+    joiner.finish();
+
+    expect(failures).toEqual(["rpc_diagnostic_join_out_of_order"]);
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "rpc_diagnostic_rejected",
+        clientId: "case20-client-01",
+        sequence: 2,
+        expectedSequence: 1,
+        name: "fetch_agents",
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        reason: "expected_sequence_mismatch",
+      }),
+    ]);
+  });
+
+  test("reserves raw buffer capacity for the first rejected join", () => {
+    const failures: string[] = [];
+    const buffer = createCase20ObservationBuffer({
+      capacity: 3,
+      reservedFailureEvents: 1,
+      onOverflow: () => failures.push("overflow"),
+    });
+    const ordinaryEvent: Case20RawEvent = {
+      type: "run_started",
+      at: "2026-09-11T00:00:00.000Z",
+      part: "A",
+      mode: "smoke",
+      runId: "clock-contract",
+    };
+    expect(buffer.record(ordinaryEvent)).toBe(true);
+    expect(buffer.record(ordinaryEvent)).toBe(true);
+    const joiner = createCase20RpcDiagnosticJoiner({
+      record: (event) => recordCase20RpcDiagnosticEvent(buffer, event),
+      onFailure: (code) => failures.push(code),
+    });
+    joiner.expect({
+      clientId: "case20-client-01",
+      sequence: 2,
+      baseline: false,
+      name: "fetch_agents",
+      requestId: "case20-rpc-00000000000000000000000000000040",
+      rpcStartedMonotonicUnixMs: 100,
+    });
+
+    expect(failures).toEqual(["rpc_diagnostic_join_out_of_order"]);
+    expect(buffer.drain()).toEqual([
+      ordinaryEvent,
+      ordinaryEvent,
+      expect.objectContaining({
+        type: "rpc_diagnostic_rejected",
+        sequence: 2,
+        expectedSequence: 1,
+        reason: "expected_sequence_mismatch",
+      }),
+    ]);
+  });
+
+  test("fails closed on missing, duplicate, and overflow joins", () => {
     const run = (
       exercise: (joiner: ReturnType<typeof createCase20RpcDiagnosticJoiner>) => void,
       capacity = 4,
@@ -855,49 +1181,27 @@ describe("Case20 evidence helpers", () => {
         joiner.expect(expected(first));
       }),
     ).toEqual(["rpc_diagnostic_join_duplicate", "rpc_diagnostic_join_missing"]);
-    expect(run((joiner) => joiner.expect(expected(first, 2)))).toEqual([
-      "rpc_diagnostic_join_out_of_order",
-    ]);
     expect(
       run((joiner) => {
         joiner.expect(expected(first));
-        joiner.recordClient(case20TestClientTrace({ requestId: first }));
-        joiner.recordDaemon(
-          case20TestDaemonDiagnostic({
-            requestId: first,
-            requestType: "fetch_agents_request",
-            responseType: "fetch_agents_response",
-            startedAtUnixMs: 115,
-          }),
-        );
+        const trace = case20TestClientTrace({ requestId: first });
+        joiner.recordClient(trace);
+        joiner.recordClient(trace);
       }),
-    ).toEqual(["rpc_diagnostic_join_out_of_order"]);
+    ).toEqual(["rpc_diagnostic_join_duplicate"]);
     expect(
       run((joiner) => {
         joiner.expect(expected(first));
-        joiner.recordClient(
-          case20TestClientTrace({
-            requestId: first,
-            messageOutboundBeginMonotonicUnixMs: 102,
-            messageOutboundEndMonotonicUnixMs: 101,
-          }),
-        );
+        const diagnostic = case20TestDaemonDiagnostic({
+          requestId: first,
+          requestType: "fetch_agents_request",
+          responseType: "fetch_agents_response",
+          startedAtUnixMs: 105,
+        });
+        joiner.recordDaemon(diagnostic);
+        joiner.recordDaemon(diagnostic);
       }),
-    ).toEqual(["rpc_diagnostic_join_out_of_order"]);
-    expect(
-      run((joiner) => {
-        joiner.expect(expected(first));
-        joiner.recordClient(case20TestClientTrace({ requestId: first }));
-        joiner.recordDaemon(
-          case20TestDaemonDiagnostic({
-            requestId: first,
-            requestType: "fetch_agents_request",
-            responseType: "fetch_agents_response",
-            startedAtUnixMs: 103,
-          }),
-        );
-      }),
-    ).toEqual(["rpc_diagnostic_join_out_of_order"]);
+    ).toEqual(["rpc_diagnostic_join_duplicate"]);
     expect(
       run((joiner) => {
         joiner.expect(expected(first));

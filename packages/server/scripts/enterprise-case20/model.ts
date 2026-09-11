@@ -429,6 +429,46 @@ export interface Case20RpcDiagnosticEvent {
   readonly daemon: {
     readonly phases: readonly Case20DaemonRpcDiagnosticPhaseSample[];
   };
+  readonly crossProcessClock: {
+    readonly calibrated: false;
+    readonly frameOutboundEndToDaemonFrameReceivedMs: number;
+    readonly daemonResponseDeliverReturnToClientFrameBeginMs: number;
+  };
+}
+
+export type Case20RpcDiagnosticRejectionReason =
+  | "expected_sequence_mismatch"
+  | "client_trace_invalid"
+  | "client_trace_out_of_order"
+  | "client_expectation_mismatch"
+  | "daemon_trace_invalid"
+  | "daemon_trace_out_of_order"
+  | "request_type_mismatch"
+  | "response_type_mismatch"
+  | "joined_sequence_mismatch";
+
+export interface Case20RpcDiagnosticRejectedEvent {
+  readonly type: "rpc_diagnostic_rejected";
+  readonly at: string;
+  readonly clientId: string;
+  readonly sequence: number;
+  readonly expectedSequence: number;
+  readonly name: Case20ObservedRpcName;
+  readonly requestType: Case20DaemonRpcDiagnosticRequestType;
+  readonly responseType: Case20DaemonRpcDiagnosticResponseType;
+  readonly reason: Case20RpcDiagnosticRejectionReason;
+  readonly boundaries: {
+    readonly clientRpcStartedMonotonicUnixMs: number | null;
+    readonly clientMessageOutboundBeginMonotonicUnixMs: number | null;
+    readonly clientMessageOutboundEndMonotonicUnixMs: number | null;
+    readonly clientFrameOutboundBeginMonotonicUnixMs: number | null;
+    readonly clientFrameOutboundEndMonotonicUnixMs: number | null;
+    readonly clientFrameBeginMonotonicUnixMs: number | null;
+    readonly clientFrameEndMonotonicUnixMs: number | null;
+    readonly clientPromiseResumedMonotonicUnixMs: number | null;
+    readonly daemonFrameReceivedMonotonicUnixMs: number | null;
+    readonly daemonResponseDeliverReturnMonotonicUnixMs: number | null;
+  };
 }
 
 export interface Case20RunnerEventLoopDelayEvent {
@@ -483,6 +523,7 @@ export type Case20RawEvent =
     }
   | Case20ClientRuntimeMetricsEvent
   | Case20RpcDiagnosticEvent
+  | Case20RpcDiagnosticRejectedEvent
   | Case20RunnerEventLoopDelayEvent
   | {
       readonly type: "feedback";

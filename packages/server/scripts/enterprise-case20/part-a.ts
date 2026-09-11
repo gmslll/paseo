@@ -34,6 +34,8 @@ import {
   type Case20RawEvent,
   type Case20RpcDiagnosticEvent,
   type Case20RpcDiagnosticJoinFailureCode,
+  type Case20RpcDiagnosticRejectedEvent,
+  type Case20RpcDiagnosticRejectionReason,
   type Case20RetainedRssCheckpointPlan,
   type Case20RetainedRssSample,
   type Case20ResourceSample,
@@ -198,6 +200,15 @@ export function createCase20ObservationBuffer(input: {
   };
 }
 
+export function recordCase20RpcDiagnosticEvent(
+  buffer: Case20ObservationBuffer,
+  event: Case20RpcDiagnosticEvent | Case20RpcDiagnosticRejectedEvent,
+): void {
+  const recorded =
+    event.type === "rpc_diagnostic_rejected" ? buffer.recordFailure(event) : buffer.record(event);
+  if (!recorded) throw new Error("Case20 RPC diagnostic event buffer is full");
+}
+
 interface Case20ExpectedRpcDiagnostic {
   readonly clientId: string;
   readonly sequence: number;
@@ -233,7 +244,8 @@ function expectedDaemonTypes(name: Case20ObservedRpcName): {
     : { requestType: "fetch_agent_request", responseType: "rpc_error" };
 }
 
-function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
+function validClientRpcTraceShape(trace: unknown): trace is Case20ClientRpcTraceEvent {
+  if (!isRecord(trace)) return false;
   const finiteFields = [
     trace.rpcStartedMonotonicUnixMs,
     trace.messageOutboundBeginMonotonicUnixMs,
@@ -254,14 +266,22 @@ function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
     Reflect.ownKeys(trace).length === 22 &&
     trace.type === "client_rpc_trace" &&
     typeof trace.at === "string" &&
+    typeof trace.clientId === "string" &&
     /^case20-client-[0-9]{2}$/.test(trace.clientId) &&
+    typeof trace.sequence === "number" &&
     Number.isInteger(trace.sequence) &&
     trace.sequence > 0 &&
     typeof trace.baseline === "boolean" &&
     (trace.name === "fetch_agents" || trace.name === "foreign_fetch_agent_denial") &&
     trace.messageType === targetMessageType(trace.name) &&
+    typeof trace.requestId === "string" &&
     CASE20_RPC_REQUEST_ID_PATTERN.test(trace.requestId) &&
-    finiteFields.every(isFiniteNonNegative) &&
+    finiteFields.every(isFiniteNonNegative)
+  );
+}
+
+function validClientRpcTraceOrder(trace: Case20ClientRpcTraceEvent): boolean {
+  return (
     trace.rpcStartedMonotonicUnixMs <= trace.messageOutboundBeginMonotonicUnixMs &&
     trace.messageOutboundBeginMonotonicUnixMs <= trace.messageOutboundEndMonotonicUnixMs &&
     trace.messageOutboundEndMonotonicUnixMs <= trace.frameOutboundBeginMonotonicUnixMs &&
@@ -272,26 +292,62 @@ function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
   );
 }
 
-function validDaemonRpcDiagnostic(diagnostic: Case20DaemonRpcDiagnostic): boolean {
-  let previous = -1;
+function isDaemonRequestType(value: unknown): value is Case20DaemonRpcDiagnostic["requestType"] {
+  return value === "fetch_agents_request" || value === "fetch_agent_request";
+}
+
+function isDaemonResponseType(value: unknown): value is Case20DaemonRpcDiagnostic["responseType"] {
   return (
-    Reflect.ownKeys(diagnostic).length === 4 &&
-    CASE20_RPC_REQUEST_ID_PATTERN.test(diagnostic.requestId) &&
-    diagnostic.phases.length === CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES.length &&
-    diagnostic.phases.every((sample, index) => {
-      const valid =
-        Reflect.ownKeys(sample).length === 2 &&
-        sample.phase === CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES[index] &&
-        isFiniteNonNegative(sample.monotonicUnixMs) &&
-        sample.monotonicUnixMs >= previous;
-      previous = sample.monotonicUnixMs;
-      return valid;
-    })
+    value === "fetch_agents_response" || value === "fetch_agent_response" || value === "rpc_error"
   );
 }
 
+function validDaemonRpcDiagnosticShape(
+  diagnostic: unknown,
+): diagnostic is Case20DaemonRpcDiagnostic {
+  if (
+    !isRecord(diagnostic) ||
+    Reflect.ownKeys(diagnostic).length !== 4 ||
+    typeof diagnostic.requestId !== "string" ||
+    !CASE20_RPC_REQUEST_ID_PATTERN.test(diagnostic.requestId) ||
+    !isDaemonRequestType(diagnostic.requestType) ||
+    !isDaemonResponseType(diagnostic.responseType) ||
+    !Array.isArray(diagnostic.phases) ||
+    diagnostic.phases.length !== CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES.length
+  )
+    return false;
+  return diagnostic.phases.every(
+    (sample, index) =>
+      isRecord(sample) &&
+      Reflect.ownKeys(sample).length === 2 &&
+      sample.phase === CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES[index] &&
+      isFiniteNonNegative(sample.monotonicUnixMs),
+  );
+}
+
+function validDaemonRpcDiagnosticOrder(diagnostic: Case20DaemonRpcDiagnostic): boolean {
+  let previous = -1;
+  return diagnostic.phases.every((sample) => {
+    const valid = sample.monotonicUnixMs >= previous;
+    previous = sample.monotonicUnixMs;
+    return valid;
+  });
+}
+
+function nullableTimestamp(value: unknown): number | null {
+  return isFiniteNonNegative(value) ? value : null;
+}
+
+function diagnosticBoundary(
+  diagnostic: Case20DaemonRpcDiagnostic | null,
+  index: number,
+): number | null {
+  if (!diagnostic || !Array.isArray(diagnostic.phases)) return null;
+  return nullableTimestamp(diagnostic.phases[index]?.monotonicUnixMs);
+}
+
 export function createCase20RpcDiagnosticJoiner(input: {
-  readonly record: (event: Case20RpcDiagnosticEvent) => void;
+  readonly record: (event: Case20RpcDiagnosticEvent | Case20RpcDiagnosticRejectedEvent) => void;
   readonly onFailure: (code: Case20ObservationFailureCode, clientId?: string) => void;
   readonly capacity?: number;
   readonly nowIso?: () => string;
@@ -304,6 +360,7 @@ export function createCase20RpcDiagnosticJoiner(input: {
   const nextClientSequence = new Map<string, number>();
   const nextDaemonSequence = new Map<string, number>();
   let finished = false;
+  let firstRejectionRecorded = false;
   const fail = (code: Case20ObservationFailureCode, clientId?: string) => {
     try {
       input.onFailure(code, clientId);
@@ -314,23 +371,88 @@ export function createCase20RpcDiagnosticJoiner(input: {
   const discard = (requestId: string) => {
     expected.delete(requestId);
   };
+  const recordFirstRejection = (
+    entry: Case20ExpectedRpcDiagnostic,
+    expectedSequence: number,
+    reason: Case20RpcDiagnosticRejectionReason,
+  ) => {
+    if (firstRejectionRecorded) return;
+    firstRejectionRecorded = true;
+    const daemonTypes = expectedDaemonTypes(entry.name);
+    const client = entry.clientTrace;
+    const daemon = entry.daemonDiagnostic;
+    try {
+      input.record({
+        type: "rpc_diagnostic_rejected",
+        at: input.nowIso?.() ?? new Date().toISOString(),
+        clientId: entry.clientId,
+        sequence: entry.sequence,
+        expectedSequence,
+        name: entry.name,
+        requestType:
+          daemon && isDaemonRequestType(daemon.requestType)
+            ? daemon.requestType
+            : daemonTypes.requestType,
+        responseType:
+          daemon && isDaemonResponseType(daemon.responseType)
+            ? daemon.responseType
+            : daemonTypes.responseType,
+        reason,
+        boundaries: {
+          clientRpcStartedMonotonicUnixMs: nullableTimestamp(
+            client?.rpcStartedMonotonicUnixMs ?? entry.rpcStartedMonotonicUnixMs,
+          ),
+          clientMessageOutboundBeginMonotonicUnixMs: nullableTimestamp(
+            client?.messageOutboundBeginMonotonicUnixMs,
+          ),
+          clientMessageOutboundEndMonotonicUnixMs: nullableTimestamp(
+            client?.messageOutboundEndMonotonicUnixMs,
+          ),
+          clientFrameOutboundBeginMonotonicUnixMs: nullableTimestamp(
+            client?.frameOutboundBeginMonotonicUnixMs,
+          ),
+          clientFrameOutboundEndMonotonicUnixMs: nullableTimestamp(
+            client?.frameOutboundEndMonotonicUnixMs,
+          ),
+          clientFrameBeginMonotonicUnixMs: nullableTimestamp(client?.frameBeginMonotonicUnixMs),
+          clientFrameEndMonotonicUnixMs: nullableTimestamp(client?.frameEndMonotonicUnixMs),
+          clientPromiseResumedMonotonicUnixMs: nullableTimestamp(
+            client?.promiseResumedMonotonicUnixMs,
+          ),
+          daemonFrameReceivedMonotonicUnixMs: diagnosticBoundary(daemon, 0),
+          daemonResponseDeliverReturnMonotonicUnixMs: diagnosticBoundary(
+            daemon,
+            CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES.length - 1,
+          ),
+        },
+      });
+    } catch {
+      fail("rpc_diagnostic_join_invalid", entry.clientId);
+    }
+  };
+  const rejectOutOfOrder = (
+    entry: Case20ExpectedRpcDiagnostic,
+    expectedSequence: number,
+    reason: Case20RpcDiagnosticRejectionReason,
+  ) => {
+    recordFirstRejection(entry, expectedSequence, reason);
+    fail("rpc_diagnostic_join_out_of_order", entry.clientId);
+    discard(entry.requestId);
+  };
   const tryJoin = (entry: Case20ExpectedRpcDiagnostic) => {
     const client = entry.clientTrace;
     const daemon = entry.daemonDiagnostic;
     if (!client || !daemon) return;
     const daemonTypes = expectedDaemonTypes(entry.name);
     const daemonSequence = nextDaemonSequence.get(entry.clientId) ?? 1;
-    if (
-      daemon.requestType !== daemonTypes.requestType ||
-      daemon.responseType !== daemonTypes.responseType ||
-      daemon.phases[0]!.monotonicUnixMs < client.frameOutboundEndMonotonicUnixMs ||
-      daemon.phases.at(-1)!.monotonicUnixMs > client.frameBeginMonotonicUnixMs ||
-      entry.sequence !== daemonSequence
-    ) {
-      fail("rpc_diagnostic_join_out_of_order", entry.clientId);
-      discard(entry.requestId);
-      return;
-    }
+    // The runner and daemon child establish independent performance.timeOrigin values without
+    // offset calibration. Their timestamps remain diagnostic; only each process's order is strict.
+    if (daemon.requestType !== daemonTypes.requestType)
+      return rejectOutOfOrder(entry, daemonSequence, "request_type_mismatch");
+    if (daemon.responseType !== daemonTypes.responseType)
+      return rejectOutOfOrder(entry, daemonSequence, "response_type_mismatch");
+    if (entry.sequence !== daemonSequence)
+      return rejectOutOfOrder(entry, daemonSequence, "joined_sequence_mismatch");
     nextDaemonSequence.set(entry.clientId, daemonSequence + 1);
     try {
       input.record({
@@ -360,6 +482,13 @@ export function createCase20RpcDiagnosticJoiner(input: {
           frameEndToPromiseResumeMs: client.frameEndToPromiseResumeMs,
         },
         daemon: { phases: daemon.phases },
+        crossProcessClock: {
+          calibrated: false,
+          frameOutboundEndToDaemonFrameReceivedMs:
+            daemon.phases[0]!.monotonicUnixMs - client.frameOutboundEndMonotonicUnixMs,
+          daemonResponseDeliverReturnToClientFrameBeginMs:
+            client.frameBeginMonotonicUnixMs - daemon.phases.at(-1)!.monotonicUnixMs,
+        },
       });
     } catch {
       fail("rpc_diagnostic_join_invalid", entry.clientId);
@@ -391,6 +520,15 @@ export function createCase20RpcDiagnosticJoiner(input: {
       }
       const expectedSequence = nextClientSequence.get(value.clientId) ?? 1;
       if (value.sequence !== expectedSequence) {
+        recordFirstRejection(
+          {
+            ...value,
+            clientTrace: null,
+            daemonDiagnostic: null,
+          },
+          expectedSequence,
+          "expected_sequence_mismatch",
+        );
         fail("rpc_diagnostic_join_out_of_order", value.clientId);
         return;
       }
@@ -418,19 +556,38 @@ export function createCase20RpcDiagnosticJoiner(input: {
         discard(entry.requestId);
         return;
       }
+      entry.clientTrace = trace;
+      const clientShapeValid = validClientRpcTraceShape(trace);
+      if (!clientShapeValid) {
+        rejectOutOfOrder(
+          entry,
+          nextDaemonSequence.get(entry.clientId) ?? 1,
+          "client_trace_invalid",
+        );
+        return;
+      }
+      if (!validClientRpcTraceOrder(trace)) {
+        rejectOutOfOrder(
+          entry,
+          nextDaemonSequence.get(entry.clientId) ?? 1,
+          "client_trace_out_of_order",
+        );
+        return;
+      }
       if (
-        !validClientRpcTrace(trace) ||
         trace.clientId !== entry.clientId ||
         trace.sequence !== entry.sequence ||
         trace.baseline !== entry.baseline ||
         trace.name !== entry.name ||
         trace.rpcStartedMonotonicUnixMs !== entry.rpcStartedMonotonicUnixMs
       ) {
-        fail("rpc_diagnostic_join_out_of_order", entry.clientId);
-        discard(entry.requestId);
+        rejectOutOfOrder(
+          entry,
+          nextDaemonSequence.get(entry.clientId) ?? 1,
+          "client_expectation_mismatch",
+        );
         return;
       }
-      entry.clientTrace = trace;
       tryJoin(entry);
     },
     recordDaemon(diagnostic) {
@@ -444,12 +601,24 @@ export function createCase20RpcDiagnosticJoiner(input: {
         discard(entry.requestId);
         return;
       }
-      if (!validDaemonRpcDiagnostic(diagnostic)) {
-        fail("rpc_diagnostic_join_out_of_order", entry.clientId);
-        discard(entry.requestId);
+      entry.daemonDiagnostic = diagnostic;
+      const daemonShapeValid = validDaemonRpcDiagnosticShape(diagnostic);
+      if (!daemonShapeValid) {
+        rejectOutOfOrder(
+          entry,
+          nextDaemonSequence.get(entry.clientId) ?? 1,
+          "daemon_trace_invalid",
+        );
         return;
       }
-      entry.daemonDiagnostic = diagnostic;
+      if (!validDaemonRpcDiagnosticOrder(diagnostic)) {
+        rejectOutOfOrder(
+          entry,
+          nextDaemonSequence.get(entry.clientId) ?? 1,
+          "daemon_trace_out_of_order",
+        );
+        return;
+      }
       tryJoin(entry);
     },
     recordDaemonFailure(failure) {
@@ -2139,9 +2308,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
     onOverflow: () => bufferCase20ObservationFailure(state, "observation_buffer_limit_exceeded"),
   });
   const rpcDiagnosticJoiner = createCase20RpcDiagnosticJoiner({
-    record: (event) => {
-      state.observationBuffer.record(event);
-    },
+    record: (event) => recordCase20RpcDiagnosticEvent(state.observationBuffer, event),
     onFailure: (code, clientId) => bufferCase20ObservationFailure(state, code, clientId),
   });
   state = {
