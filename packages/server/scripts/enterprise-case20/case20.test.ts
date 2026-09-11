@@ -352,21 +352,29 @@ function parseCase20ObservationRequest(frame: string | Uint8Array | ArrayBuffer)
   return envelope.message;
 }
 
-function emitCase20TraceFrame(trace: DaemonClientTrace, messageType: string): void {
+function emitCase20TraceFrame(
+  trace: DaemonClientTrace,
+  messageType: string,
+  envelopeType = "session",
+): void {
   trace.beginSection("paseo.ws.frame.inbound", { kind: "text", size: "100" });
   trace.beginSection("paseo.ws.json.parse", { size: "100" });
   trace.endSection();
   trace.beginSection("paseo.ws.message.inbound", {
-    envelopeType: "session",
+    envelopeType,
     messageType,
   });
   trace.endSection();
   trace.endSection();
 }
 
-function emitCase20TraceOutboundMessage(trace: DaemonClientTrace, messageType: string): void {
+function emitCase20TraceOutboundMessage(
+  trace: DaemonClientTrace,
+  messageType: string,
+  envelopeType = "session",
+): void {
   trace.beginSection("paseo.ws.message.outbound", {
-    envelopeType: "session",
+    envelopeType,
     messageType,
   });
   trace.endSection();
@@ -379,6 +387,11 @@ function emitCase20TraceOutboundFrame(trace: DaemonClientTrace): void {
 
 function emitCase20TraceOutbound(trace: DaemonClientTrace, messageType: string): void {
   emitCase20TraceOutboundMessage(trace, messageType);
+  emitCase20TraceOutboundFrame(trace);
+}
+
+function emitCase20LivenessPing(trace: DaemonClientTrace): void {
+  emitCase20TraceOutboundMessage(trace, "ping", "ping");
   emitCase20TraceOutboundFrame(trace);
 }
 
@@ -1191,6 +1204,141 @@ describe("Case20 evidence helpers", () => {
         emitCase20TraceOutboundMessage(trace, "fetch_agents_request");
       }),
     ).toEqual(["client_rpc_trace_invalid"]);
+  });
+
+  test("ignores one complete liveness ping pair between the target send and response", () => {
+    const events: Case20ClientObservationTestEvent[] = [];
+    const failures: string[] = [];
+    let now = 1;
+    const controller = createCase20ClientObservationController({
+      clientId: "case20-client-04",
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      nowMonotonicUnixMs: () => now++,
+      delegateLogger: noopLogger(),
+    });
+    controller.armRpc({
+      name: "fetch_agents",
+      baseline: false,
+      requestId: "case20-rpc-00000000000000000000000000000017",
+      rpcStartedMonotonicUnixMs: 0,
+    });
+    emitCase20TraceOutbound(controller.trace, "fetch_agents_request");
+    emitCase20LivenessPing(controller.trace);
+    emitCase20TraceFrame(controller.trace, "pong", "pong");
+    emitCase20TraceFrame(controller.trace, "fetch_agents_response");
+    controller.finishRpc(now + 1);
+
+    expect(failures).toEqual([]);
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "client_rpc_trace",
+        clientId: "case20-client-04",
+        requestId: "case20-rpc-00000000000000000000000000000017",
+        messageOutboundBeginMonotonicUnixMs: 1,
+        messageOutboundEndMonotonicUnixMs: 2,
+        frameOutboundBeginMonotonicUnixMs: 3,
+        frameOutboundEndMonotonicUnixMs: 4,
+        frameBeginMonotonicUnixMs: 15,
+        frameEndMonotonicUnixMs: 20,
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain('"ping"');
+    expect(JSON.stringify(events)).not.toContain('"pong"');
+  });
+
+  test("fails closed on incomplete, duplicate, nested, misplaced, and non-ping concurrent outbound", () => {
+    const run = (
+      exercise: (trace: DaemonClientTrace) => void,
+      options: { targetFrameComplete?: boolean } = {},
+    ): string[] => {
+      const events: Case20ClientObservationTestEvent[] = [];
+      const failures: string[] = [];
+      let now = 1;
+      const controller = createCase20ClientObservationController({
+        clientId: "case20-client-04",
+        record: (event) => events.push(event),
+        onFailure: (code) => failures.push(code),
+        nowMonotonicUnixMs: () => now++,
+        delegateLogger: noopLogger(),
+      });
+      controller.armRpc({
+        name: "fetch_agents",
+        baseline: false,
+        requestId: "case20-rpc-00000000000000000000000000000018",
+        rpcStartedMonotonicUnixMs: 0,
+      });
+      if (options.targetFrameComplete === false) {
+        emitCase20TraceOutboundMessage(controller.trace, "fetch_agents_request");
+      } else {
+        emitCase20TraceOutbound(controller.trace, "fetch_agents_request");
+      }
+      exercise(controller.trace);
+      if (options.targetFrameComplete === false) emitCase20TraceOutboundFrame(controller.trace);
+      emitCase20TraceFrame(controller.trace, "fetch_agents_response");
+      controller.finishRpc(now + 1);
+      expect(events).toEqual([]);
+      return failures;
+    };
+
+    expect(run((trace) => emitCase20TraceOutboundMessage(trace, "ping", "ping"))).toEqual([
+      "client_rpc_trace_invalid",
+    ]);
+    expect(
+      run((trace) => {
+        emitCase20TraceOutboundMessage(trace, "ping", "ping");
+        emitCase20TraceOutboundMessage(trace, "ping", "ping");
+        emitCase20TraceOutboundFrame(trace);
+      }),
+    ).toEqual(["client_rpc_trace_invalid"]);
+    expect(
+      run((trace) => {
+        trace.beginSection("paseo.ws.frame.inbound", { kind: "text", size: "100" });
+        emitCase20LivenessPing(trace);
+        trace.endSection();
+      }),
+    ).toEqual(["client_rpc_trace_invalid"]);
+    expect(run((trace) => emitCase20LivenessPing(trace), { targetFrameComplete: false })).toEqual([
+      "client_rpc_trace_invalid",
+    ]);
+    expect(
+      run((trace) => {
+        emitCase20LivenessPing(trace);
+        emitCase20TraceOutboundFrame(trace);
+      }),
+    ).toEqual(["client_rpc_trace_invalid"]);
+    expect(run((trace) => emitCase20TraceOutbound(trace, "client_heartbeat"))).toEqual([
+      "client_rpc_trace_invalid",
+    ]);
+    expect(
+      run((trace) => {
+        emitCase20LivenessPing(trace);
+        emitCase20LivenessPing(trace);
+      }),
+    ).toEqual(["client_rpc_trace_invalid"]);
+
+    const events: Case20ClientObservationTestEvent[] = [];
+    const failures: string[] = [];
+    let now = 1;
+    const controller = createCase20ClientObservationController({
+      clientId: "case20-client-04",
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      nowMonotonicUnixMs: () => now++,
+      delegateLogger: noopLogger(),
+    });
+    controller.armRpc({
+      name: "fetch_agents",
+      baseline: false,
+      requestId: "case20-rpc-00000000000000000000000000000019",
+      rpcStartedMonotonicUnixMs: 0,
+    });
+    emitCase20TraceOutbound(controller.trace, "fetch_agents_request");
+    emitCase20TraceFrame(controller.trace, "fetch_agents_response");
+    emitCase20LivenessPing(controller.trace);
+    controller.finishRpc(now + 1);
+    expect(events).toEqual([]);
+    expect(failures).toEqual(["client_rpc_trace_invalid"]);
   });
 
   test("keeps observation work outside the existing RPC latency duration", async () => {

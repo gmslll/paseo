@@ -738,6 +738,8 @@ export function createCase20ClientObservationController(input: {
   let suppressedTraceDepth = 0;
   let targetOutboundMessage: Case20CompletedTraceSection | null = null;
   let targetOutboundFrame: Case20CompletedTraceSection | null = null;
+  let pendingLivenessPingMessage: Case20CompletedTraceSection | null = null;
+  let livenessPingPairSeen = false;
   let traceInvalid = false;
   const reportFailure = (code: Case20ObservationFailureCode) => {
     if (reportedFailures.has(code)) return;
@@ -791,6 +793,21 @@ export function createCase20ClientObservationController(input: {
   ): boolean => {
     if (completed.name !== "paseo.ws.message.outbound") return false;
     const args = completed.args;
+    if (args?.envelopeType === "ping" && args.messageType === "ping") {
+      if (
+        parent ||
+        Reflect.ownKeys(args).length !== 2 ||
+        !targetOutboundFrame ||
+        targetFrames.length !== 0 ||
+        pendingLivenessPingMessage ||
+        livenessPingPairSeen
+      ) {
+        invalidateTrace();
+      } else {
+        pendingLivenessPingMessage = completed;
+      }
+      return true;
+    }
     if (
       parent ||
       !args ||
@@ -806,11 +823,36 @@ export function createCase20ClientObservationController(input: {
     }
     return true;
   };
+  const capturePendingLivenessPingFrame = (
+    completed: Case20CompletedTraceSection,
+    parent: Case20OpenTraceSection | undefined,
+  ): boolean => {
+    if (!pendingLivenessPingMessage) return false;
+    const args = completed.args;
+    if (
+      parent ||
+      !args ||
+      Reflect.ownKeys(args).length !== 2 ||
+      args.kind !== "text" ||
+      !/^\d+$/.test(args.size ?? "") ||
+      !targetOutboundFrame ||
+      targetFrames.length !== 0 ||
+      livenessPingPairSeen ||
+      completed.startedAtMs < pendingLivenessPingMessage.endedAtMs
+    ) {
+      invalidateTrace();
+    } else {
+      pendingLivenessPingMessage = null;
+      livenessPingPairSeen = true;
+    }
+    return true;
+  };
   const captureOutboundFrame = (
     completed: Case20CompletedTraceSection,
     parent: Case20OpenTraceSection | undefined,
   ): boolean => {
     if (completed.name !== "paseo.ws.frame.outbound") return false;
+    if (capturePendingLivenessPingFrame(completed, parent)) return true;
     const args = completed.args;
     if (
       parent ||
@@ -877,6 +919,10 @@ export function createCase20ClientObservationController(input: {
             parent.children.push(completed);
           }
         }
+        if (pendingLivenessPingMessage && completed.name !== "paseo.ws.frame.outbound") {
+          invalidateTrace();
+          return;
+        }
         if (captureOutboundMessage(completed, parent, armed)) return;
         if (captureOutboundFrame(completed, parent)) return;
         captureInboundTarget(completed, armed);
@@ -902,6 +948,8 @@ export function createCase20ClientObservationController(input: {
       }
       targetOutboundMessage = null;
       targetOutboundFrame = null;
+      pendingLivenessPingMessage = null;
+      livenessPingPairSeen = false;
       if (sealed || invalidIdentity) return sequence;
       armed = {
         sequence,
@@ -925,6 +973,7 @@ export function createCase20ClientObservationController(input: {
           suppressedTraceDepth !== 0 ||
           !targetOutboundMessage ||
           !targetOutboundFrame ||
+          pendingLivenessPingMessage ||
           targetFrames.length !== 1
         )
           throw new Error("Case20 client target trace is incomplete");
@@ -976,13 +1025,15 @@ export function createCase20ClientObservationController(input: {
         suppressedTraceDepth = 0;
         targetOutboundMessage = null;
         targetOutboundFrame = null;
+        pendingLivenessPingMessage = null;
+        livenessPingPairSeen = false;
         traceInvalid = false;
       }
     },
     seal() {
       if (sealed) return;
       sealed = true;
-      if (armed || traceStack.length > 0 || suppressedTraceDepth > 0)
+      if (armed || traceStack.length > 0 || suppressedTraceDepth > 0 || pendingLivenessPingMessage)
         reportFailure("client_rpc_trace_invalid");
       if (finalRuntimeMetrics !== 1) reportFailure("client_runtime_metrics_invalid");
       armed = null;
@@ -991,6 +1042,8 @@ export function createCase20ClientObservationController(input: {
       suppressedTraceDepth = 0;
       targetOutboundMessage = null;
       targetOutboundFrame = null;
+      pendingLivenessPingMessage = null;
+      livenessPingPairSeen = false;
       traceInvalid = false;
     },
   };
