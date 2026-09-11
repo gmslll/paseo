@@ -159,6 +159,22 @@ export class ResourceAuthorizationService implements ResourceAuthorizationContra
     return agent;
   }
 
+  preauthorizeAgentEvent(ctx: PrincipalContext, agentId: string): boolean {
+    try {
+      if (!this.isCurrent(ctx)) return false;
+      const agent = this.owners.getAgent(agentId);
+      if (
+        !agent ||
+        agent.nodeId !== this.nodeId ||
+        !grantAllows(ctx, "workspace.content.read", agent, agent.workspaceId)
+      )
+        return false;
+      return this.isCurrent(ctx);
+    } catch {
+      return false;
+    }
+  }
+
   async assertBrowserProfile(
     ctx: PrincipalContext,
     action: EnterpriseAction,

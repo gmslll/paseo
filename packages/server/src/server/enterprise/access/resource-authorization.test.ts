@@ -85,6 +85,107 @@ function revocableGuard() {
 }
 
 describe("ResourceAuthorizationService", () => {
+  test("preauthorizes only current owned agents with content grant", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace({ id: "wks_a", ...owner });
+    owners.registerAgent({ id: "agent_a", workspaceId: "wks_a", ...owner });
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    expect(authorization.preauthorizeAgentEvent(ctx, "agent_a")).toBe(true);
+    expect(authorization.preauthorizeAgentEvent(ctx, "missing")).toBe(false);
+    expect(authorization.preauthorizeAgentEvent(ctx, "")).toBe(false);
+  });
+
+  test("preauthorization fails closed on revoked guard and foreign owner", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace({ id: "wks_a", ...owner });
+    owners.registerAgent({ id: "agent_a", workspaceId: "wks_a", ...owner });
+    const revocable = revocableGuard();
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: revocable.guard,
+    });
+    revocable.revoke();
+    expect(
+      authorization.preauthorizeAgentEvent(
+        { ...ctx, grants: [{ action: "workspace.content.read", selector: { kind: "self" } }] },
+        "agent_a",
+      ),
+    ).toBe(false);
+    const currentAuthorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: "nod_ffffffffffffffff",
+      grantVersionGuard: guard,
+    });
+    expect(currentAuthorization.preauthorizeAgentEvent(ctx, "agent_a")).toBe(false);
+  });
+  test("preauthorization rejects foreign organization and owner rebind", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace({ id: "wks_a", ...owner });
+    owners.registerAgent({ id: "agent_a", workspaceId: "wks_a", ...owner });
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    expect(
+      authorization.preauthorizeAgentEvent(
+        { ...ctx, organizationId: "org_ffffffffffffffff" },
+        "agent_a",
+      ),
+    ).toBe(false);
+    owners.registerWorkspace({ id: "wks_a", ...owner, ownerPrincipalId: "usr_ffffffffffffffff" });
+    owners.registerAgent({
+      id: "agent_a",
+      workspaceId: "wks_a",
+      ...owner,
+      ownerPrincipalId: "usr_ffffffffffffffff",
+    });
+    expect(
+      authorization.preauthorizeAgentEvent(
+        { ...ctx, grants: [{ action: "workspace.content.read", selector: { kind: "self" } }] },
+        "agent_a",
+      ),
+    ).toBe(false);
+  });
+  test("rejects no grant, owner lookup errors, and a post-check guard flip", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace({ id: "wks_a", ...owner });
+    owners.registerAgent({ id: "agent_a", workspaceId: "wks_a", ...owner });
+    const noGrantAuthorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    expect(noGrantAuthorization.preauthorizeAgentEvent({ ...ctx, grants: [] }, "agent_a")).toBe(
+      false,
+    );
+
+    const throwingOwners = new OwnerRegistry();
+    throwingOwners.registerWorkspace({ id: "wks_a", ...owner });
+    throwingOwners.registerAgent({ id: "agent_a", workspaceId: "wks_a", ...owner });
+    throwingOwners.getAgent = () => {
+      throw new Error("owners unavailable");
+    };
+    const throwingAuthorization = new ResourceAuthorizationService({
+      owners: throwingOwners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    expect(throwingAuthorization.preauthorizeAgentEvent(ctx, "agent_a")).toBe(false);
+
+    let checks = 0;
+    const flippingAuthorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: { isCurrent: () => ++checks === 1 },
+    });
+    expect(flippingAuthorization.preauthorizeAgentEvent(ctx, "agent_a")).toBe(false);
+  });
   test("permits only an exact empty organization projection with empty resource context", async () => {
     const authorization = new ResourceAuthorizationService({
       owners: new OwnerRegistry(),
