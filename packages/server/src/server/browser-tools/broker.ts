@@ -29,7 +29,6 @@ import { browserToolsFailure, type BrowserToolsResponsePayload } from "./errors.
 import {
   isAuthenticatedBrowserHostSession,
   isBrowserPageIdentityRegistry,
-  isBrowserPageIdentityVerification,
   type AuthenticatedBrowserHostSession,
   type BrowserPageIdentityRegistry,
   type BrowserPageIdentityVerification,
@@ -60,8 +59,6 @@ export interface BrowserToolsExecuteInput {
 export interface EnterpriseBrowserToolsExecuteInput {
   handle: EnterpriseAgentContextHandle;
   command: BrowserAutomationCommand;
-  /** W2 preauthorization proof. Agents and browser hosts cannot construct this value. */
-  pageIdentityVerification?: BrowserPageIdentityVerification;
 }
 
 export interface EnterpriseBrowserProfileHostBindingInput {
@@ -451,7 +448,7 @@ export class BrowserToolsBroker {
         });
       }
       const handleAuthority = this.snapshotCurrentHandle(runtime, snapshot.handle);
-      const pageIdentity = await this.preparePageIdentityExecution(snapshot);
+      const pageIdentity = await this.preparePageIdentityExecution(runtime, snapshot);
       const authorization = await this.resolveCurrentAuthorization(
         runtime,
         snapshot.handle,
@@ -670,6 +667,7 @@ export class BrowserToolsBroker {
   }
 
   private async preparePageIdentityExecution(
+    runtime: EnterpriseRuntimeSnapshot,
     input: ReturnType<typeof snapshotEnterpriseExecuteInput>,
   ): Promise<EnterprisePageIdentityExecution | null> {
     if (!this.pageIdentity) {
@@ -681,14 +679,17 @@ export class BrowserToolsBroker {
     if (input.command.command === "list_tabs" || input.command.command === "new_tab") {
       return null;
     }
-    const verification = input.pageIdentityVerification;
-    if (!verification) {
-      throw new Error("Current Browser page identity proof is required.");
-    }
-    await this.pageIdentity.recheck(verification);
+    const browserId = getBrowserIdForCommand(input.command);
+    if (!browserId) throw new Error("Enterprise browser command has no canonical Browser ID.");
+    // The command ID is only a selector; Profile, binding, host, and observation authority all
+    // come from the unique server-owned Browser registration resolved by the registry.
+    const verification = await this.pageIdentity.verify({ browserId });
+    this.assertCurrentHandle(runtime, input.handle);
+    await this.pageIdentity.recheck(verification, { browserId });
+    this.assertCurrentHandle(runtime, input.handle);
     return Object.freeze({
       verification,
-      browserId: getBrowserIdForCommand(input.command) ?? verification.browserId,
+      browserId,
     });
   }
 
@@ -705,17 +706,22 @@ export class BrowserToolsBroker {
     ) {
       throw new Error("Authenticated Browser host Session is unavailable.");
     }
-    await this.pageIdentity.recheck(input.verification, {
-      browserId: input.browserId,
-      browserProfileId: authorization.profile.browserProfileId,
-      bindingRevision: authorization.bindingRevision,
-      ...(authenticatedSession
+    await this.pageIdentity.recheck(
+      input.verification,
+      authenticatedSession
         ? {
+            browserId: input.browserId,
+            browserProfileId: authorization.profile.browserProfileId,
+            bindingRevision: authorization.bindingRevision,
             hostClientId: authenticatedSession.clientId,
             hostSessionBindingGeneration: authenticatedSession.sessionBindingGeneration,
           }
-        : {}),
-    });
+        : {
+            browserId: input.browserId,
+            browserProfileId: authorization.profile.browserProfileId,
+            bindingRevision: authorization.bindingRevision,
+          },
+    );
   }
 
   private assertCurrentHandle(
@@ -1506,34 +1512,19 @@ function snapshotBrowserToolsExecuteInput(input: BrowserToolsExecuteInput): {
 function snapshotEnterpriseExecuteInput(input: EnterpriseBrowserToolsExecuteInput): {
   handle: EnterpriseAgentContextHandle;
   command: BrowserAutomationCommand;
-  pageIdentityVerification?: BrowserPageIdentityVerification;
 } {
   const values = readSelectedOwnDataProperties(
     input,
-    ["command", "handle", "pageIdentityVerification"],
+    ["command", "handle"],
     ["command", "handle"],
     "Enterprise Browser execution input",
   );
-  if (
-    Reflect.ownKeys(input).some(
-      (key) => key !== "command" && key !== "handle" && key !== "pageIdentityVerification",
-    )
-  ) {
+  if (Reflect.ownKeys(input).some((key) => key !== "command" && key !== "handle")) {
     throw new Error("Enterprise Browser execution input has invalid fields.");
   }
-  if (
-    values.pageIdentityVerification !== undefined &&
-    !isBrowserPageIdentityVerification(values.pageIdentityVerification)
-  ) {
-    throw new Error("Enterprise Browser page identity proof is invalid.");
-  }
-  const pageIdentityVerification = values.pageIdentityVerification;
   return {
     handle: values.handle as EnterpriseAgentContextHandle,
     command: snapshotBrowserAutomationCommand(values.command),
-    ...(isBrowserPageIdentityVerification(pageIdentityVerification)
-      ? { pageIdentityVerification }
-      : {}),
   };
 }
 

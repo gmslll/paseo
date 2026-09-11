@@ -1,9 +1,32 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { z } from "zod";
-import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "./broker.js";
+import type {
+  BrowserAutomationExecuteRequest,
+  BrowserAutomationExecuteResponse,
+} from "@getpaseo/protocol/browser-automation/rpc-schemas";
+import type {
+  AuthorizedAgent,
+  AuthorizedBrowserProfile,
+  AuthorizedWorkspace,
+  FencedLease,
+} from "@getpaseo/protocol/messages";
+import {
+  BrowserToolsBroker,
+  type BrowserHostClient,
+  type BrowserToolsExecuteInput,
+  type EnterpriseBrowserToolsRuntime,
+} from "./broker.js";
 import type { BrowserToolsResponsePayload } from "./errors.js";
 import { registerBrowserTools, type RegisterBrowserToolsOptions } from "./tools.js";
-import type { EnterpriseAgentContextHandle } from "../session/enterprise-agent-session-context-registry.js";
+import {
+  createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseAgentContextHandle,
+} from "../session/enterprise-agent-session-context-registry.js";
+import type { BrowserProfileLeaseAuthorization } from "../enterprise/browser/lease-manager.js";
+import {
+  BrowserPageIdentityRegistry,
+  createAuthenticatedBrowserHostSession,
+} from "./page-identity-registry.js";
 import type {
   PaseoToolConfig,
   PaseoToolExecutionContext,
@@ -11,6 +34,11 @@ import type {
 } from "../agent/tools/types.js";
 
 const BROWSER_ID = "11111111-1111-4111-8111-111111111111";
+const ORGANIZATION_ID = "org_1111111111111111";
+const NODE_ID = "nod_1111111111111111";
+const PRINCIPAL_ID = "usr_1111111111111111";
+const PROFILE_ID = "brp_1111111111111111";
+const BINDING_REVISION = "binding-workspace-a";
 const BROWSER_ID_MESSAGE =
   "browserId must be a real id returned by browser_new_tab or browser_list_tabs";
 const WAIT_CONDITION_MESSAGE = "browser_wait requires exactly one of text or url";
@@ -80,6 +108,210 @@ class BrowserToolHarness {
     }
     return tool;
   }
+}
+
+class ProductionEnterpriseBrowserHost implements BrowserHostClient {
+  public readonly id = "browser-route-production";
+  public readonly hostKind = "desktop app";
+  public readonly supportedCommands = ["list_tabs", "click"] as const;
+  public readonly enterpriseProfiles = { version: 1 as const };
+  public readonly homeNodeId = NODE_ID;
+  public readonly authenticatedSession = createAuthenticatedBrowserHostSession({
+    clientId: "desktop-client-production",
+    homeNodeId: NODE_ID,
+    sessionBindingGeneration: "session-production",
+  });
+  public readonly receivedRequests: BrowserAutomationExecuteRequest[] = [];
+
+  public readonly sendBrowserAutomationRequest = (
+    request: BrowserAutomationExecuteRequest,
+  ): void => {
+    this.receivedRequests.push(request);
+  };
+
+  public respond(
+    broker: BrowserToolsBroker,
+    request: BrowserAutomationExecuteRequest,
+    payload: Omit<BrowserAutomationExecuteResponse["payload"], "requestId">,
+  ): boolean {
+    return broker.receiveResponse(this.id, {
+      type: "browser.automation.execute.response",
+      payload: {
+        ...payload,
+        requestId: request.requestId,
+      } as BrowserAutomationExecuteResponse["payload"],
+    });
+  }
+}
+
+async function createProductionEnterpriseBrowserToolFixture() {
+  const sessionRegistry = createEnterpriseAgentSessionContextRegistry();
+  const handle = sessionRegistry.bind({
+    agentId: "agent-1",
+    context: {
+      principal: {
+        organizationId: ORGANIZATION_ID,
+        principalType: "human",
+        principalId: PRINCIPAL_ID,
+        credentialId: "credential-production",
+        grantVersion: "grant-production",
+        grants: [{ action: "browser.use", selector: { kind: "self" } }],
+      },
+      node: { nodeId: NODE_ID, paseoServerId: "server-production", mode: "managed" },
+      sessionBindingGeneration: "session-production",
+    },
+  });
+  const workspace: AuthorizedWorkspace = {
+    organizationId: ORGANIZATION_ID,
+    nodeId: NODE_ID,
+    workspaceId: "wks_workspace_a",
+    ownerPrincipalId: PRINCIPAL_ID,
+    createdByPrincipalId: PRINCIPAL_ID,
+  };
+  const agent: AuthorizedAgent = { ...workspace, agentId: handle.agentId };
+  const profile: AuthorizedBrowserProfile = {
+    browserProfileId: PROFILE_ID,
+    organizationId: ORGANIZATION_ID,
+    homeNodeId: NODE_ID,
+    businessIdentityId: "bid_1111111111111111",
+    ownerPrincipalId: PRINCIPAL_ID,
+    platform: "generic",
+    businessAccountKey: "account-production",
+    label: "Production Account",
+    partitionKey: `persist:paseo-enterprise-${PROFILE_ID}`,
+    downloadRoot: `/profiles/${PROFILE_ID}/downloads`,
+    expectedIdentity: {
+      hostnames: ["shop.example"],
+      accountLabelHash: "sha256:account-production",
+    },
+    status: "ready",
+    createdAt: "2026-09-11T00:00:00.000Z",
+    updatedAt: "2026-09-11T00:00:00.000Z",
+  };
+  const authorization: BrowserProfileLeaseAuthorization = {
+    workspace,
+    agent,
+    profile,
+    bindingRevision: BINDING_REVISION,
+  };
+  let authorizationCalls = 0;
+  let auditCalls = 0;
+  let leaseAcquireCalls = 0;
+  let leaseSequence = 0;
+  const createLease = (mode: "read" | "write"): FencedLease => ({
+    organizationId: ORGANIZATION_ID,
+    nodeId: NODE_ID,
+    businessIdentityId: profile.businessIdentityId,
+    resourceKind: "browser_profile",
+    resourceId: PROFILE_ID,
+    leaseId: `lea_11111111-1111-4111-8111-${String(++leaseSequence).padStart(12, "0")}`,
+    holderPrincipalId: PRINCIPAL_ID,
+    holderAgentId: handle.agentId,
+    fencingToken: leaseSequence,
+    mode,
+    acquiredAt: "2026-09-11T00:00:00.000Z",
+    heartbeatAt: "2026-09-11T00:00:00.000Z",
+    expiresAt: "2026-09-11T00:01:00.000Z",
+    leaseRevision: `lease-revision-${leaseSequence}`,
+  });
+  const enterprise: EnterpriseBrowserToolsRuntime = {
+    isCurrentHandle: (candidate) => sessionRegistry.isCurrentHandle(candidate),
+    resolveAuthorization: async () => {
+      authorizationCalls += 1;
+      auditCalls += 1;
+      return authorization;
+    },
+    leases: {
+      acquire: async (input) => {
+        leaseAcquireCalls += 1;
+        return createLease(input.mode);
+      },
+      attachHost: async () => {},
+      validateLease: async (input) => input.lease,
+      releaseLease: async () => {},
+      invalidateHost: async () => {},
+    },
+    leaseTtlMs: 30_000,
+  };
+  const pageIdentity = new BrowserPageIdentityRegistry({
+    profiles: { get: async (profileId) => (profileId === PROFILE_ID ? profile : null) },
+  });
+  const broker = new BrowserToolsBroker({
+    enterprise,
+    pageIdentity,
+    defaultTimeoutMs: 1_000,
+    createRequestId: (() => {
+      let sequence = 0;
+      return () => `production-browser-tool-${++sequence}`;
+    })(),
+  });
+  const host = new ProductionEnterpriseBrowserHost();
+  broker.registerClient(host);
+  const tools = new Map<string, RegisteredTool>();
+  registerBrowserTools({
+    registerTool: (name, config, handler) => tools.set(name, { config, handler }),
+    broker,
+    callerAgentId: handle.agentId,
+    resolveCallerAgent: () => ({
+      id: handle.agentId,
+      cwd: "/repo",
+      workspaceId: workspace.workspaceId,
+    }),
+    resolveEnterpriseBrowserContext: () => ({ handle }),
+  });
+  const executeTool = async (name: string, input: unknown): Promise<PaseoToolResult> => {
+    const tool = tools.get(name);
+    if (!tool) throw new Error(`Missing production Browser tool ${name}.`);
+    const parsed = schemaFor(tool.config.inputSchema).parse(input);
+    return tool.handler(parsed, {});
+  };
+  await pageIdentity.observe(host.authenticatedSession, {
+    type: "enterprise.browser.page_identity.observe.request",
+    requestId: "production-observe-bootstrap",
+    browser: { browserId: BROWSER_ID, browserProfileId: PROFILE_ID },
+    hostname: "shop.example",
+    accountLabelHash: "sha256:account-production",
+    observationRevision: "production-observation-bootstrap",
+    bindingRevision: BINDING_REVISION,
+    lifecycleGeneration: "session-production",
+  });
+  const bootstrap = executeTool("browser_list_tabs", {});
+  await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(1));
+  const bootstrapRequest = host.receivedRequests[0];
+  if (!bootstrapRequest.enterpriseContext || !bootstrapRequest.workspaceId) {
+    throw new Error("Expected production enterprise Browser bootstrap request.");
+  }
+  host.respond(broker, bootstrapRequest, {
+    ok: true,
+    enterpriseContext: bootstrapRequest.enterpriseContext,
+    result: {
+      command: "list_tabs",
+      tabs: [
+        {
+          browserId: BROWSER_ID,
+          workspaceId: bootstrapRequest.workspaceId,
+          enterpriseContext: bootstrapRequest.enterpriseContext,
+          url: "https://shop.example",
+          title: "Shop",
+        },
+      ],
+    },
+  });
+  await bootstrap;
+  host.receivedRequests.length = 0;
+  authorizationCalls = 0;
+  auditCalls = 0;
+  leaseAcquireCalls = 0;
+  return {
+    broker,
+    executeTool,
+    handle,
+    host,
+    pageIdentity,
+    getAuthorizationCalls: () => authorizationCalls,
+    getAuditCalls: () => auditCalls,
+    getLeaseAcquireCalls: () => leaseAcquireCalls,
+  };
 }
 
 function schemaFor(inputSchema: PaseoToolConfig["inputSchema"]): z.ZodType {
@@ -567,6 +799,93 @@ describe("registerBrowserTools", () => {
 
     expect(enterpriseCalls).toEqual([{ handle, command: { command: "list_tabs", args: {} } }]);
   });
+
+  test("derives current page identity inside the production Broker before executing click", async () => {
+    const fixture = await createProductionEnterpriseBrowserToolFixture();
+
+    const click = fixture.executeTool("browser_click", {
+      browserId: BROWSER_ID,
+      ref: "@e1",
+      pageIdentityVerification: { caller: "must be ignored" },
+    });
+    await vi.waitFor(() => expect(fixture.host.receivedRequests).toHaveLength(1));
+    const request = fixture.host.receivedRequests[0];
+    expect(request.command).toEqual({
+      command: "click",
+      args: {
+        browserId: BROWSER_ID,
+        ref: "@e1",
+        button: "left",
+        doubleClick: false,
+        modifiers: [],
+      },
+    });
+    expect(
+      fixture.host.respond(fixture.broker, request, {
+        ok: true,
+        enterpriseContext: request.enterpriseContext,
+        result: { command: "click", browserId: BROWSER_ID, ref: "@e1" },
+      }),
+    ).toBe(true);
+    await expect(click).resolves.toMatchObject({
+      structuredContent: { ok: true, result: { command: "click", browserId: BROWSER_ID } },
+    });
+    expect(fixture.getAuthorizationCalls()).toBeGreaterThan(0);
+    expect(fixture.getLeaseAcquireCalls()).toBe(1);
+  });
+
+  test("denies production click identity mismatch before authorization, audit, lease, send, or pending state", async () => {
+    const fixture = await createProductionEnterpriseBrowserToolFixture();
+    await fixture.pageIdentity.observe(fixture.host.authenticatedSession, {
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "production-observe-mismatch",
+      browser: { browserId: BROWSER_ID, browserProfileId: PROFILE_ID },
+      hostname: "wrong.example",
+      accountLabelHash: "sha256:account-production",
+      observationRevision: "production-observation-mismatch",
+      bindingRevision: BINDING_REVISION,
+      lifecycleGeneration: "session-production",
+    });
+
+    await expect(
+      fixture.executeTool("browser_click", { browserId: BROWSER_ID, ref: "@e1" }),
+    ).resolves.toMatchObject({
+      structuredContent: { ok: false, error: { code: "browser_denied" } },
+    });
+    expect(fixture.getAuthorizationCalls()).toBe(0);
+    expect(fixture.getAuditCalls()).toBe(0);
+    expect(fixture.getLeaseAcquireCalls()).toBe(0);
+    expect(fixture.host.receivedRequests).toEqual([]);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
+  });
+
+  test.each(["stale", "rebound"] as const)(
+    "denies production click when page identity is %s before authorization or browser side effects",
+    async (state) => {
+      const fixture = await createProductionEnterpriseBrowserToolFixture();
+      if (state === "stale") {
+        fixture.pageIdentity.invalidateBrowser(fixture.host.authenticatedSession, BROWSER_ID);
+      } else {
+        fixture.pageIdentity.registerBrowser({
+          host: fixture.host.authenticatedSession,
+          browserId: BROWSER_ID,
+          browserProfileId: PROFILE_ID,
+          bindingRevision: "binding-rebound",
+        });
+      }
+
+      await expect(
+        fixture.executeTool("browser_click", { browserId: BROWSER_ID, ref: "@e1" }),
+      ).resolves.toMatchObject({
+        structuredContent: { ok: false, error: { code: "browser_denied" } },
+      });
+      expect(fixture.getAuthorizationCalls()).toBe(0);
+      expect(fixture.getAuditCalls()).toBe(0);
+      expect(fixture.getLeaseAcquireCalls()).toBe(0);
+      expect(fixture.host.receivedRequests).toEqual([]);
+      expect(fixture.broker.getPendingRequestCount()).toBe(0);
+    },
+  );
 
   test("registers the kept browser automation tools only", () => {
     const harness = new BrowserToolHarness();

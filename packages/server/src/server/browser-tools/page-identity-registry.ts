@@ -37,7 +37,7 @@ const BrowserRegistrationInputSchema = z
   })
   .strict();
 
-const VerificationTargetSchema = BrowserRegistrationInputSchema.extend({
+const ScopedVerificationTargetSchema = BrowserRegistrationInputSchema.extend({
   hostClientId: z.string().min(1).optional(),
   hostSessionBindingGeneration: z.string().min(1).optional(),
 })
@@ -47,6 +47,10 @@ const VerificationTargetSchema = BrowserRegistrationInputSchema.extend({
       (target.hostClientId === undefined) === (target.hostSessionBindingGeneration === undefined),
     { message: "Browser host identity requires both client ID and Session generation." },
   );
+const VerificationTargetSchema = z.union([
+  ScopedVerificationTargetSchema,
+  z.object({ browserId: BrowserAutomationBrowserIdSchema }).strict(),
+]);
 
 export type BrowserPageIdentityFailureReason =
   | "account_label_mismatch"
@@ -95,13 +99,29 @@ export interface BrowserPageIdentityVerifiedProfile {
   readonly verification: BrowserPageIdentityVerification;
 }
 
-export interface BrowserPageIdentityVerificationTarget {
-  readonly browserId: string;
-  readonly browserProfileId: string;
-  readonly bindingRevision: string;
-  readonly hostClientId?: string;
-  readonly hostSessionBindingGeneration?: string;
-}
+export type BrowserPageIdentityVerificationTarget =
+  | Readonly<{
+      browserId: string;
+      browserProfileId?: never;
+      bindingRevision?: never;
+      hostClientId?: never;
+      hostSessionBindingGeneration?: never;
+    }>
+  | (Readonly<{
+      browserId: string;
+      browserProfileId: string;
+      bindingRevision: string;
+    }> &
+      (
+        | Readonly<{
+            hostClientId?: never;
+            hostSessionBindingGeneration?: never;
+          }>
+        | Readonly<{
+            hostClientId: string;
+            hostSessionBindingGeneration: string;
+          }>
+      ));
 
 export interface BrowserPageIdentityProfileSource {
   get(browserProfileId: string): Promise<BrowserProfileRecord | null>;
@@ -396,13 +416,17 @@ export class BrowserPageIdentityRegistry {
       .filter(
         (record) =>
           record.browserId === target.browserId &&
-          record.browserProfileId === target.browserProfileId &&
-          record.bindingRevision === target.bindingRevision &&
+          (target.browserProfileId === undefined ||
+            (record.browserProfileId === target.browserProfileId &&
+              record.bindingRevision === target.bindingRevision)) &&
           (target.hostClientId === undefined ||
             (record.host.clientId === target.hostClientId &&
               record.host.sessionBindingGeneration === target.hostSessionBindingGeneration)),
       )
       .sort((left, right) => right.sequence - left.sequence);
+    if (target.browserProfileId === undefined && candidates.length !== 1) {
+      throw new BrowserPageIdentityVerificationError("observation_unavailable");
+    }
     const registration = candidates[0];
     if (!registration) {
       throw new BrowserPageIdentityVerificationError("observation_unavailable");
@@ -470,8 +494,9 @@ export class BrowserPageIdentityRegistry {
       const target = snapshotVerificationTarget(input);
       if (
         proof.registration.browserId !== target.browserId ||
-        proof.registration.browserProfileId !== target.browserProfileId ||
-        proof.registration.bindingRevision !== target.bindingRevision ||
+        (target.browserProfileId !== undefined &&
+          (proof.registration.browserProfileId !== target.browserProfileId ||
+            proof.registration.bindingRevision !== target.bindingRevision)) ||
         (target.hostClientId !== undefined &&
           (proof.registration.host.clientId !== target.hostClientId ||
             proof.registration.host.sessionBindingGeneration !==
@@ -987,11 +1012,30 @@ function snapshotVerificationTarget(
   input: BrowserPageIdentityVerificationTarget,
 ): BrowserPageIdentityVerificationTarget {
   try {
-    return Object.freeze(
-      VerificationTargetSchema.parse(
-        cloneStableData(input, "Browser page identity verification target"),
-      ),
+    const parsed = VerificationTargetSchema.parse(
+      cloneStableData(input, "Browser page identity verification target"),
     );
+    if (!("browserProfileId" in parsed)) {
+      return Object.freeze({ browserId: parsed.browserId });
+    }
+    if (parsed.hostClientId !== undefined) {
+      const hostSessionBindingGeneration = parsed.hostSessionBindingGeneration;
+      if (hostSessionBindingGeneration === undefined) {
+        throw new Error("Browser host identity requires a Session generation.");
+      }
+      return Object.freeze({
+        browserId: parsed.browserId,
+        browserProfileId: parsed.browserProfileId,
+        bindingRevision: parsed.bindingRevision,
+        hostClientId: parsed.hostClientId,
+        hostSessionBindingGeneration,
+      });
+    }
+    return Object.freeze({
+      browserId: parsed.browserId,
+      browserProfileId: parsed.browserProfileId,
+      bindingRevision: parsed.bindingRevision,
+    });
   } catch (error) {
     throw new BrowserPageIdentityVerificationError("observation_unavailable", { cause: error });
   }

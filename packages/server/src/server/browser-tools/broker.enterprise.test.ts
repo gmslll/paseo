@@ -410,7 +410,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     },
   );
 
-  test("rejects structural handles and caller-owned Profile, partition, lease, or process authority before resolution", async () => {
+  test("rejects structural handles and caller-owned proof, Profile, partition, lease, or process authority before resolution", async () => {
     const fixture = await createEnterpriseFixture();
     const fakeHandle = { ...fixture.handles.a } as EnterpriseAgentContextHandle;
 
@@ -429,6 +429,13 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
         partition: "persist:caller",
         leaseId: "lea_11111111-1111-4111-8111-111111111111",
         processId: 123,
+      } as never),
+    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
+    await expect(
+      fixture.broker.executeEnterprise({
+        handle: fixture.handles.a,
+        command: { command: "snapshot", args: { browserId: BROWSER_A } },
+        pageIdentityVerification: Object.freeze({ browserId: BROWSER_A }),
       } as never),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
     expect(fixture.getResolverCalls()).toBe(0);
@@ -1305,16 +1312,9 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       bindingRevision: "binding-workspace-a",
       lifecycleGeneration: "session-reconnected",
     });
-    const pageIdentityVerification = await fixture.pageIdentity!.verify({
-      browserId: BROWSER_A,
-      browserProfileId: PROFILE_A,
-      bindingRevision: "binding-workspace-a",
-    });
-
     const snapshot = fixture.broker.executeEnterprise({
       handle: fixture.handles.a,
       command: { command: "snapshot", args: { browserId: BROWSER_A } },
-      pageIdentityVerification,
     });
     await vi.waitFor(() => expect(reconnectedHost.receivedRequests).toHaveLength(2));
     const snapshotRequest = reconnectedHost.receivedRequests[1];
@@ -1361,7 +1361,7 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     expect(replacement.respond(fixture.broker, oldRequest, newTabSuccess(oldRequest))).toBe(false);
   });
 
-  test("keeps transport routes separate from same-client authenticated Session generations", async () => {
+  test("fails closed before authorization when one Browser ID has current registrations in two Session generations", async () => {
     const fixture = await createEnterpriseFixture();
     const pageIdentity = fixture.pageIdentity;
     if (!pageIdentity) throw new Error("Expected Browser page identity registry.");
@@ -1462,16 +1462,23 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     expect(fixture.broker.receiveResponse(newHost.id, response)).toBe(true);
     await expect(execution).resolves.toMatchObject({ ok: true });
 
-    const beforeWrongGenerationAcquireCount = fixture.acquired.length;
+    const beforeAmbiguousResolverCalls = fixture.getResolverCalls();
+    const beforeAmbiguousAuditCalls = fixture.getAuditCallCount();
+    const beforeAmbiguousAcquireCount = fixture.acquired.length;
+    const beforeAmbiguousOldHostRequests = oldHost.receivedRequests.length;
+    const beforeAmbiguousNewHostRequests = newHost.receivedRequests.length;
     await expect(
       fixture.broker.executeEnterprise({
         handle: fixture.handles.a,
         command: { command: "snapshot", args: { browserId: BROWSER_A } },
-        pageIdentityVerification: oldProof,
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
-    expect(fixture.acquired).toHaveLength(beforeWrongGenerationAcquireCount);
-    expect(newHost.receivedRequests).toHaveLength(1);
+    expect(fixture.getResolverCalls()).toBe(beforeAmbiguousResolverCalls);
+    expect(fixture.getAuditCallCount()).toBe(beforeAmbiguousAuditCalls);
+    expect(fixture.acquired).toHaveLength(beforeAmbiguousAcquireCount);
+    expect(oldHost.receivedRequests).toHaveLength(beforeAmbiguousOldHostRequests);
+    expect(newHost.receivedRequests).toHaveLength(beforeAmbiguousNewHostRequests);
+    expect(fixture.broker.getPendingRequestCount()).toBe(0);
 
     unregisterOld();
     await fixture.manager.waitForIdle();
@@ -1484,7 +1491,6 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     const snapshot = fixture.broker.executeEnterprise({
       handle: fixture.handles.a,
       command: { command: "snapshot", args: { browserId: BROWSER_A } },
-      pageIdentityVerification: newProof,
     });
     await vi.waitFor(() => expect(newHost.receivedRequests).toHaveLength(2));
     const snapshotRequest = newHost.receivedRequests[1];
@@ -1644,11 +1650,6 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       },
     });
     await expect(listTabs).resolves.toMatchObject({ ok: true });
-    const proof = await pageIdentity.verify({
-      browserId: BROWSER_A,
-      browserProfileId: PROFILE_A,
-      bindingRevision: "binding-workspace-a",
-    });
     const resolverCalls = fixture.getResolverCalls();
     const acquiredCount = fixture.acquired.length;
     const sentCount = host.receivedRequests.length;
@@ -1663,13 +1664,6 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       bindingRevision: "binding-workspace-a",
       lifecycleGeneration: "session-a",
     });
-    await expect(
-      fixture.broker.executeEnterprise({
-        handle: fixture.handles.a,
-        command: { command: "snapshot", args: { browserId: BROWSER_A } },
-        pageIdentityVerification: proof,
-      }),
-    ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
     await expect(
       fixture.broker.executeEnterprise({
         handle: fixture.handles.a,
@@ -1698,7 +1692,6 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
     const snapshot = fixture.broker.executeEnterprise({
       handle: fixture.handles.a,
       command: { command: "snapshot", args: { browserId: BROWSER_A } },
-      pageIdentityVerification: currentProof,
     });
     await vi.waitFor(() => expect(host.receivedRequests).toHaveLength(sentCount + 1));
     const snapshotRequest = host.receivedRequests.at(-1)!;
@@ -1740,22 +1733,17 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       bindingRevision: "binding-workspace-a",
       lifecycleGeneration: "session-b",
     });
-    const foreignProof = await pageIdentity.verify({
-      browserId: BROWSER_A,
-      browserProfileId: PROFILE_A,
-      bindingRevision: "binding-workspace-a",
-    });
     const preForeignAcquiredCount = fixture.acquired.length;
     const preForeignSentCount = host.receivedRequests.length;
     await expect(
       fixture.broker.executeEnterprise({
         handle: fixture.handles.a,
         command: { command: "snapshot", args: { browserId: BROWSER_A } },
-        pageIdentityVerification: foreignProof,
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
     expect(fixture.acquired).toHaveLength(preForeignAcquiredCount);
     expect(host.receivedRequests).toHaveLength(preForeignSentCount);
+    pageIdentity.invalidateHostSession(foreignSession);
 
     const postSuccessResolverCalls = fixture.getResolverCalls();
     const postSuccessAcquiredCount = fixture.acquired.length;
@@ -1765,7 +1753,6 @@ describe("BrowserToolsBroker enterprise Profile execution", () => {
       fixture.broker.executeEnterprise({
         handle: fixture.handles.a,
         command: { command: "snapshot", args: { browserId: BROWSER_A } },
-        pageIdentityVerification: currentProof,
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "browser_denied" } });
     expect(fixture.getResolverCalls()).toBe(postSuccessResolverCalls);
