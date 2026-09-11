@@ -1,7 +1,12 @@
-import { performance } from "node:perf_hooks";
+import { monitorEventLoopDelay, performance, type IntervalHistogram } from "node:perf_hooks";
 
 import { createPaseoApi, type PaseoApi } from "@getpaseo/client";
-import { DaemonClient, type ConnectionState } from "@getpaseo/client/internal/daemon-client";
+import {
+  DaemonClient,
+  type ConnectionState,
+  type DaemonClientTrace,
+  type Logger,
+} from "@getpaseo/client/internal/daemon-client";
 
 import { createCase20ArtifactWriter, type Case20ArtifactWriter } from "./artifact.js";
 import { parseCase20CliArguments, readPrivateManifest } from "./manifest.js";
@@ -12,13 +17,20 @@ import {
 } from "./metrics.js";
 import {
   CASE20_PART_A_CLIENT_COUNT,
+  type Case20ClientRpcTraceEvent,
+  type Case20ClientRuntimeMetricsEvent,
   type Case20ClientRecord,
   type Case20Counts,
   type Case20Failure,
   type Case20FinalActiveSample,
+  type Case20ObservedInboundMessageType,
+  type Case20ObservedRpcName,
+  type Case20ObservedRpcResponseType,
+  type Case20RawEvent,
   type Case20RetainedRssCheckpointPlan,
   type Case20RetainedRssSample,
   type Case20ResourceSample,
+  type Case20RunnerEventLoopDelayEvent,
   PartAManifestSchema,
   type PartAManifest,
 } from "./model.js";
@@ -49,6 +61,7 @@ interface ConnectedClient {
   readonly releaseTimeline: () => void;
   readonly releaseConnection: () => void;
   readonly lifecycle: ConnectionLifecycle;
+  readonly observation: Case20ClientObservationController;
   readonly connectedAt: string;
 }
 
@@ -97,7 +110,588 @@ interface PartAMeasurementState {
   readonly finalCanaries: Map<string, string>;
   readonly finalAgentCanaries: Set<string>;
   readonly finalTimelineCanaries: Set<string>;
+  readonly observationBuffer: Case20ObservationBuffer;
+  readonly observationFailureKeys: Set<string>;
   canarySequence: number;
+}
+
+type Case20ObservationEvent =
+  | Case20ClientRuntimeMetricsEvent
+  | Case20ClientRpcTraceEvent
+  | Case20RunnerEventLoopDelayEvent;
+
+type Case20ObservationFailureCode =
+  | "client_runtime_metrics_invalid"
+  | "client_rpc_trace_invalid"
+  | "observation_buffer_limit_exceeded"
+  | "runner_event_loop_delay_invalid";
+
+const CASE20_OBSERVATION_EVENT_CAPACITY = 100_000;
+const CASE20_OBSERVATION_FAILURE_RESERVE = 64;
+const CASE20_TRACE_DEPTH_LIMIT = 16;
+const CASE20_TRACE_CHILD_LIMIT = 16;
+const CASE20_TRACE_TARGET_FRAME_LIMIT = 2;
+
+export interface Case20ObservationBuffer {
+  readonly size: number;
+  record(event: Case20RawEvent): boolean;
+  recordFailure(event: Case20RawEvent): boolean;
+  drain(): Case20RawEvent[];
+}
+
+export function createCase20ObservationBuffer(input: {
+  readonly onOverflow: () => void;
+  readonly capacity?: number;
+  readonly reservedFailureEvents?: number;
+}): Case20ObservationBuffer {
+  const capacity = input.capacity ?? CASE20_OBSERVATION_EVENT_CAPACITY;
+  const reservedFailureEvents = input.reservedFailureEvents ?? CASE20_OBSERVATION_FAILURE_RESERVE;
+  if (
+    !Number.isInteger(capacity) ||
+    !Number.isInteger(reservedFailureEvents) ||
+    capacity <= 1 ||
+    reservedFailureEvents <= 0 ||
+    reservedFailureEvents >= capacity
+  )
+    throw new Error("Case20 observation buffer limits are invalid");
+  const events: Case20RawEvent[] = [];
+  const dataCapacity = capacity - reservedFailureEvents;
+  let overflowReported = false;
+  return {
+    get size() {
+      return events.length;
+    },
+    record(event) {
+      if (events.length >= dataCapacity) {
+        if (!overflowReported) {
+          overflowReported = true;
+          try {
+            input.onOverflow();
+          } catch {
+            // Observation limits must not change the business Promise path.
+          }
+        }
+        return false;
+      }
+      events.push(event);
+      return true;
+    },
+    recordFailure(event) {
+      if (events.length >= capacity) return false;
+      events.push(event);
+      return true;
+    },
+    drain() {
+      return events.splice(0, events.length);
+    },
+  };
+}
+
+interface Case20CompletedTraceSection {
+  readonly name: string;
+  readonly args?: Record<string, string>;
+  readonly startedAtMs: number;
+  readonly endedAtMs: number;
+  readonly children: readonly Case20CompletedTraceSection[];
+}
+
+interface Case20OpenTraceSection {
+  readonly name: string;
+  readonly args?: Record<string, string>;
+  readonly startedAtMs: number;
+  readonly children: Case20CompletedTraceSection[];
+}
+
+interface Case20ArmedRpcTrace {
+  readonly sequence: number;
+  readonly baseline: boolean;
+  readonly name: Case20ObservedRpcName;
+  readonly messageType: Case20ObservedRpcResponseType;
+}
+
+export interface Case20ClientObservationController {
+  readonly logger: Logger;
+  readonly trace: DaemonClientTrace;
+  armRpc(input: { readonly name: Case20ObservedRpcName; readonly baseline: boolean }): number;
+  finishRpc(promiseResumedAtMs: number): void;
+  seal(): void;
+}
+
+export function createCase20ObservedRpcTiming(input: {
+  readonly startedAtMs: number;
+  readonly nowMs: () => number;
+  readonly finishRpc: (promiseResumedAtMs: number) => void;
+}): {
+  markPromiseResumed(): void;
+  finish(recordDuration: (durationMs: number) => Promise<void>): Promise<void>;
+} {
+  let promiseResumedAtMs: number | null = null;
+  return {
+    markPromiseResumed() {
+      promiseResumedAtMs ??= input.nowMs();
+    },
+    async finish(recordDuration) {
+      const durationMs = input.nowMs() - input.startedAtMs;
+      try {
+        await recordDuration(durationMs);
+      } finally {
+        input.finishRpc(promiseResumedAtMs ?? Number.NaN);
+      }
+    },
+  };
+}
+
+const CASE20_OBSERVED_MESSAGE_TYPES = [
+  "fetch_agents_response",
+  "rpc_error",
+  "agent_stream",
+] as const;
+const CASE20_CONNECTION_STATUSES = [
+  "idle",
+  "connecting",
+  "connected",
+  "disconnected",
+  "disposed",
+] as const;
+
+const case20ConsoleLogger: Logger = {
+  debug() {},
+  info: (object, message) => console.log(message, object),
+  warn: (object, message) => console.warn(message, object),
+  error: (object, message) => console.error(message, object),
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return isFiniteNonNegative(value) && Number.isInteger(value);
+}
+
+function isObservedMessageType(value: unknown): value is Case20ObservedInboundMessageType {
+  return CASE20_OBSERVED_MESSAGE_TYPES.some((candidate) => candidate === value);
+}
+
+function parseObservedCountRows(value: unknown): Map<Case20ObservedInboundMessageType, number> {
+  if (!Array.isArray(value)) throw new Error("Case20 client metric counts are not an array");
+  const result = new Map<Case20ObservedInboundMessageType, number>();
+  for (const row of value) {
+    if (!Array.isArray(row) || row.length !== 2 || !isObservedMessageType(row[0])) continue;
+    if (!isNonNegativeInteger(row[1]) || result.has(row[0]))
+      throw new Error("Case20 client metric count row is invalid");
+    result.set(row[0], row[1]);
+  }
+  return result;
+}
+
+interface Case20ObservedHandlerTiming {
+  readonly count: number;
+  readonly totalMs: number;
+  readonly avgMs: number;
+  readonly maxMs: number;
+}
+
+function parseObservedHandlerRows(
+  value: unknown,
+): Map<Case20ObservedInboundMessageType, Case20ObservedHandlerTiming> {
+  if (!Array.isArray(value)) throw new Error("Case20 client handler metrics are not an array");
+  const result = new Map<Case20ObservedInboundMessageType, Case20ObservedHandlerTiming>();
+  for (const row of value) {
+    if (!isRecord(row) || !isObservedMessageType(row.type)) continue;
+    if (
+      !isNonNegativeInteger(row.count) ||
+      !isFiniteNonNegative(row.totalMs) ||
+      !isFiniteNonNegative(row.avgMs) ||
+      !isFiniteNonNegative(row.maxMs) ||
+      result.has(row.type)
+    )
+      throw new Error("Case20 client handler metric row is invalid");
+    result.set(row.type, {
+      count: row.count,
+      totalMs: row.totalMs,
+      avgMs: row.avgMs,
+      maxMs: row.maxMs,
+    });
+  }
+  return result;
+}
+
+function parseCase20ClientRuntimeMetrics(
+  clientId: string,
+  at: string,
+  value: unknown,
+): Case20ClientRuntimeMetricsEvent {
+  if (!isRecord(value)) throw new Error("Case20 client runtime metric is not an object");
+  if (
+    !isFiniteNonNegative(value.windowMs) ||
+    !isFiniteNonNegative(value.rollingWindowMs) ||
+    value.rollingWindowMs <= 0 ||
+    !isNonNegativeInteger(value.bucketCount) ||
+    typeof value.final !== "boolean" ||
+    (value.connectionPath !== "direct" && value.connectionPath !== "relay") ||
+    !CASE20_CONNECTION_STATUSES.some((status) => status === value.connectionStatus)
+  )
+    throw new Error("Case20 client runtime metric envelope is invalid");
+  const counts = parseObservedCountRows(value.inboundMessageTypesTop);
+  const bytes = parseObservedCountRows(value.inboundMessageBytesTop);
+  const handlers = parseObservedHandlerRows(value.handlerTimingTop);
+  const messages = CASE20_OBSERVED_MESSAGE_TYPES.flatMap((messageType) => {
+    const count = counts.get(messageType);
+    const byteCount = bytes.get(messageType);
+    const handler = handlers.get(messageType);
+    if (count === undefined && byteCount === undefined && handler === undefined) return [];
+    if (count === undefined || byteCount === undefined || !handler || handler.count !== count)
+      throw new Error("Case20 client runtime metric target rows are incomplete");
+    return [
+      {
+        messageType,
+        count,
+        bytes: byteCount,
+        handlerCount: handler.count,
+        handlerTotalMs: handler.totalMs,
+        handlerAvgMs: handler.avgMs,
+        handlerMaxMs: handler.maxMs,
+      },
+    ];
+  });
+  return {
+    type: "client_runtime_metrics",
+    at,
+    clientId,
+    windowMs: value.windowMs,
+    rollingWindowMs: value.rollingWindowMs,
+    bucketCount: value.bucketCount,
+    final: value.final,
+    connectionPath: value.connectionPath,
+    connectionStatus: value.connectionStatus,
+    messages,
+  };
+}
+
+function findCompletedTraceSections(
+  section: Case20CompletedTraceSection,
+  name: string,
+): Case20CompletedTraceSection[] {
+  const matches = section.name === name ? [section] : [];
+  for (const child of section.children) matches.push(...findCompletedTraceSections(child, name));
+  return matches;
+}
+
+function targetMessageType(name: Case20ObservedRpcName): Case20ObservedRpcResponseType {
+  return name === "fetch_agents" ? "fetch_agents_response" : "rpc_error";
+}
+
+function finiteDuration(endedAtMs: number, startedAtMs: number): number {
+  const duration = endedAtMs - startedAtMs;
+  if (!isFiniteNonNegative(duration)) throw new Error("Case20 client trace duration is invalid");
+  return duration;
+}
+
+export function createCase20ClientObservationController(input: {
+  readonly clientId: string;
+  readonly record: (event: Case20ObservationEvent) => void;
+  readonly onFailure: (code: Case20ObservationFailureCode) => void;
+  readonly nowMs?: () => number;
+  readonly nowIso?: () => string;
+  readonly delegateLogger?: Logger;
+}): Case20ClientObservationController {
+  const nowMs = input.nowMs ?? performance.now.bind(performance);
+  const nowIso = input.nowIso ?? (() => new Date().toISOString());
+  const delegate = input.delegateLogger ?? case20ConsoleLogger;
+  const traceStack: Case20OpenTraceSection[] = [];
+  const targetFrames: Case20CompletedTraceSection[] = [];
+  const reportedFailures = new Set<Case20ObservationFailureCode>();
+  let armed: Case20ArmedRpcTrace | null = null;
+  let sequence = 0;
+  let finalRuntimeMetrics = 0;
+  let sealed = false;
+  let suppressedTraceDepth = 0;
+  const reportFailure = (code: Case20ObservationFailureCode) => {
+    if (reportedFailures.has(code)) return;
+    reportedFailures.add(code);
+    try {
+      input.onFailure(code);
+    } catch {
+      // Observation failures must not change the business Promise path.
+    }
+  };
+  const safeRecord = (event: Case20ObservationEvent) => {
+    try {
+      input.record(event);
+    } catch {
+      reportFailure(
+        event.type === "client_rpc_trace"
+          ? "client_rpc_trace_invalid"
+          : "client_runtime_metrics_invalid",
+      );
+    }
+  };
+  const logger: Logger = {
+    debug: (object, message) => delegate.debug(object, message),
+    info: (object, message) => {
+      if (message !== "ws_runtime_metrics_client") {
+        delegate.info(object, message);
+        return;
+      }
+      try {
+        const event = parseCase20ClientRuntimeMetrics(input.clientId, nowIso(), object);
+        if (event.final) {
+          finalRuntimeMetrics += 1;
+          if (finalRuntimeMetrics !== 1) throw new Error("Duplicate final client metrics");
+        }
+        safeRecord(event);
+      } catch {
+        reportFailure("client_runtime_metrics_invalid");
+      }
+    },
+    warn: (object, message) => delegate.warn(object, message),
+    error: (object, message) => delegate.error(object, message),
+  };
+  const trace: DaemonClientTrace = {
+    isEnabled: () => armed !== null,
+    beginSection(name, args) {
+      if (!armed) return;
+      try {
+        if (suppressedTraceDepth > 0 || traceStack.length >= CASE20_TRACE_DEPTH_LIMIT) {
+          suppressedTraceDepth += 1;
+          reportFailure("client_rpc_trace_invalid");
+          return;
+        }
+        traceStack.push({ name, args, startedAtMs: nowMs(), children: [] });
+      } catch {
+        reportFailure("client_rpc_trace_invalid");
+      }
+    },
+    endSection() {
+      if (!armed) return;
+      try {
+        if (suppressedTraceDepth > 0) {
+          suppressedTraceDepth -= 1;
+          return;
+        }
+        const open = traceStack.pop();
+        if (!open) throw new Error("Case20 client trace stack underflow");
+        const completed: Case20CompletedTraceSection = {
+          ...open,
+          endedAtMs: nowMs(),
+        };
+        const parent = traceStack.at(-1);
+        if (parent) {
+          if (parent.children.length >= CASE20_TRACE_CHILD_LIMIT) {
+            reportFailure("client_rpc_trace_invalid");
+          } else {
+            parent.children.push(completed);
+          }
+        }
+        if (completed.name !== "paseo.ws.frame.inbound") return;
+        const messages = findCompletedTraceSections(completed, "paseo.ws.message.inbound");
+        if (messages.length === 1 && messages[0]?.args?.messageType === armed.messageType) {
+          if (targetFrames.length >= CASE20_TRACE_TARGET_FRAME_LIMIT) {
+            reportFailure("client_rpc_trace_invalid");
+          } else {
+            targetFrames.push(completed);
+          }
+        }
+      } catch {
+        reportFailure("client_rpc_trace_invalid");
+      }
+    },
+  };
+  return {
+    logger,
+    trace,
+    armRpc(rpc) {
+      sequence += 1;
+      if (sealed || armed || traceStack.length > 0) {
+        reportFailure("client_rpc_trace_invalid");
+        traceStack.length = 0;
+        targetFrames.length = 0;
+        suppressedTraceDepth = 0;
+      }
+      armed = {
+        sequence,
+        name: rpc.name,
+        baseline: rpc.baseline,
+        messageType: targetMessageType(rpc.name),
+      };
+      return sequence;
+    },
+    finishRpc(promiseResumedAtMs) {
+      const target = armed;
+      armed = null;
+      try {
+        if (
+          !target ||
+          traceStack.length !== 0 ||
+          suppressedTraceDepth !== 0 ||
+          targetFrames.length !== 1
+        )
+          throw new Error("Case20 client target trace is incomplete");
+        const frame = targetFrames[0]!;
+        const parses = findCompletedTraceSections(frame, "paseo.ws.json.parse");
+        const messages = findCompletedTraceSections(frame, "paseo.ws.message.inbound");
+        if (parses.length !== 1 || messages.length !== 1)
+          throw new Error("Case20 client target trace phases are incomplete");
+        const parse = parses[0]!;
+        const message = messages[0]!;
+        safeRecord({
+          type: "client_rpc_trace",
+          at: nowIso(),
+          clientId: input.clientId,
+          sequence: target.sequence,
+          baseline: target.baseline,
+          name: target.name,
+          messageType: target.messageType,
+          callbackTotalMs: finiteDuration(frame.endedAtMs, frame.startedAtMs),
+          decodeBeforeParseMs: finiteDuration(parse.startedAtMs, frame.startedAtMs),
+          jsonParseMs: finiteDuration(parse.endedAtMs, parse.startedAtMs),
+          aotValidateMs: finiteDuration(message.startedAtMs, parse.endedAtMs),
+          dispatchAndWaiterMs: finiteDuration(frame.endedAtMs, message.endedAtMs),
+          frameEndToPromiseResumeMs: finiteDuration(promiseResumedAtMs, frame.endedAtMs),
+        });
+      } catch {
+        reportFailure("client_rpc_trace_invalid");
+      } finally {
+        traceStack.length = 0;
+        targetFrames.length = 0;
+        suppressedTraceDepth = 0;
+      }
+    },
+    seal() {
+      if (sealed) return;
+      sealed = true;
+      if (armed || traceStack.length > 0 || suppressedTraceDepth > 0)
+        reportFailure("client_rpc_trace_invalid");
+      if (finalRuntimeMetrics !== 1) reportFailure("client_runtime_metrics_invalid");
+      armed = null;
+      traceStack.length = 0;
+      targetFrames.length = 0;
+      suppressedTraceDepth = 0;
+    },
+  };
+}
+
+interface Case20EventLoopDelayHistogram {
+  readonly count: number;
+  readonly max: number;
+  enable(): void;
+  disable(): void;
+  reset(): void;
+  percentile(percentile: number): number;
+}
+
+interface Case20ScheduledInterval {
+  unref?(): unknown;
+}
+
+export function createCase20RunnerEventLoopDelayObserver(input: {
+  readonly intervalMs: number;
+  readonly record: (event: Case20RunnerEventLoopDelayEvent) => void;
+  readonly onFailure: (code: Case20ObservationFailureCode) => void;
+  readonly histogram?: Case20EventLoopDelayHistogram;
+  readonly nowUnixMs?: () => number;
+  readonly schedule?: (handler: () => void, intervalMs: number) => Case20ScheduledInterval;
+  readonly cancel?: (interval: Case20ScheduledInterval) => void;
+}): { finish(): void } {
+  const histogram =
+    input.histogram ?? (monitorEventLoopDelay({ resolution: 10 }) as IntervalHistogram);
+  const nowUnixMs = input.nowUnixMs ?? Date.now;
+  const schedule = input.schedule ?? ((handler, intervalMs) => setInterval(handler, intervalMs));
+  const cancel =
+    input.cancel ?? ((interval) => clearInterval(interval as ReturnType<typeof setInterval>));
+  let windowStartedAtMs = nowUnixMs();
+  let finished = false;
+  let failureReported = false;
+  const reportFailure = () => {
+    if (failureReported) return;
+    failureReported = true;
+    try {
+      input.onFailure("runner_event_loop_delay_invalid");
+    } catch {
+      // Observation failures must not change the workload timer path.
+    }
+  };
+  const capture = (final: boolean) => {
+    if (finished && !final) return;
+    const windowEndedAtMs = nowUnixMs();
+    try {
+      const sampleCount = histogram.count;
+      const values =
+        sampleCount === 0
+          ? { p50Ms: 0, p95Ms: 0, p99Ms: 0, maxMs: 0 }
+          : {
+              p50Ms: histogram.percentile(50) / 1_000_000,
+              p95Ms: histogram.percentile(95) / 1_000_000,
+              p99Ms: histogram.percentile(99) / 1_000_000,
+              maxMs: histogram.max / 1_000_000,
+            };
+      if (
+        !isNonNegativeInteger(sampleCount) ||
+        !isFiniteNonNegative(windowStartedAtMs) ||
+        !isFiniteNonNegative(windowEndedAtMs) ||
+        windowEndedAtMs < windowStartedAtMs ||
+        !Object.values(values).every(isFiniteNonNegative)
+      )
+        throw new Error("Case20 runner event-loop metric is invalid");
+      input.record({
+        type: "runner_event_loop_delay",
+        at: new Date(windowEndedAtMs).toISOString(),
+        windowStartedAtMs,
+        windowEndedAtMs,
+        intervalMs: input.intervalMs,
+        sampleCount,
+        ...values,
+        final,
+      });
+    } catch {
+      reportFailure();
+    } finally {
+      windowStartedAtMs = windowEndedAtMs;
+      try {
+        histogram.reset();
+      } catch {
+        reportFailure();
+      }
+    }
+  };
+  let interval: Case20ScheduledInterval;
+  try {
+    if (!isFiniteNonNegative(input.intervalMs) || input.intervalMs <= 0)
+      throw new Error("Case20 runner event-loop interval is invalid");
+    histogram.enable();
+    interval = schedule(() => capture(false), input.intervalMs);
+    interval.unref?.();
+  } catch {
+    reportFailure();
+    try {
+      histogram.disable();
+    } catch {
+      reportFailure();
+    }
+    return { finish() {} };
+  }
+  return {
+    finish() {
+      if (finished) return;
+      finished = true;
+      try {
+        cancel(interval);
+      } catch {
+        reportFailure();
+      }
+      capture(true);
+      try {
+        histogram.disable();
+      } catch {
+        reportFailure();
+      }
+    },
+  };
 }
 
 function createCounts(): Case20Counts {
@@ -261,6 +855,40 @@ function recordDurableFailure(state: PartAMeasurementState, failure: Case20Failu
     });
 }
 
+function case20ObservationFailureMetric(code: Case20ObservationFailureCode): string {
+  if (code === "observation_buffer_limit_exceeded") return "runner.observation_buffer";
+  if (code.startsWith("runner_")) return "runner.event_loop_delay";
+  return "client.observation";
+}
+
+function bufferCase20ObservationFailure(
+  state: PartAMeasurementState,
+  code: Case20ObservationFailureCode,
+  clientId?: string,
+): void {
+  const key = `${clientId ?? "runner"}:${code}`;
+  if (state.observationFailureKeys.has(key)) return;
+  state.observationFailureKeys.add(key);
+  state.counts.auditErrors += 1;
+  const failure: Case20Failure = {
+    code,
+    metric: case20ObservationFailureMetric(code),
+    observed: clientId ?? "runner",
+    threshold: "complete valid observation",
+    evidenceRef: "raw.jsonl",
+  };
+  state.evidenceFailures.push(failure);
+  state.observationBuffer.recordFailure({
+    type: "failure",
+    at: new Date().toISOString(),
+    failure,
+  });
+}
+
+async function flushCase20ObservationEvents(state: PartAMeasurementState): Promise<void> {
+  for (const event of state.observationBuffer.drain()) await state.artifact.append(event);
+}
+
 function streamCounter(state: PartAMeasurementState, clientId: string): StreamCounter {
   let counter = state.streamCounters.get(clientId);
   if (!counter) {
@@ -378,7 +1006,15 @@ async function connectClient(
   fixture: Case20PartAFixture,
   config: Case20PartAClientFixture,
   state: PartAMeasurementState,
+  runtimeMetricsIntervalMs: number,
 ): Promise<ConnectedClient> {
+  const observation = createCase20ClientObservationController({
+    clientId: config.clientId,
+    record: (event) => {
+      state.observationBuffer.record(event);
+    },
+    onFailure: (code) => bufferCase20ObservationFailure(state, code, config.clientId),
+  });
   const daemonClient = new DaemonClient({
     url: fixture.daemonUrl,
     clientId: config.clientId,
@@ -386,6 +1022,10 @@ async function connectClient(
     password: config.personalAccessToken,
     connectTimeoutMs: 10_000,
     reconnect: { enabled: false },
+    logger: observation.logger,
+    trace: observation.trace,
+    runtimeMetricsIntervalMs,
+    runtimeMetricsWindowMs: runtimeMetricsIntervalMs,
   });
   const lifecycle: ConnectionLifecycle = {
     intentionalClose: false,
@@ -451,6 +1091,7 @@ async function connectClient(
       releaseTimeline,
       releaseConnection,
       lifecycle,
+      observation,
       connectedAt: new Date().toISOString(),
     };
   } catch (error) {
@@ -465,6 +1106,7 @@ async function connectClient(
       () => null,
       (failure: unknown) => failure,
     );
+    observation.seal();
     const cleanupFailures = [releaseFailure, closeError].filter(
       (failure): failure is NonNullable<typeof failure> =>
         failure !== undefined && failure !== null,
@@ -540,20 +1182,32 @@ async function measureAgentList(
   baseline: boolean,
 ): Promise<readonly string[]> {
   const started = performance.now();
+  connected.observation.armRpc({ name: "fetch_agents", baseline });
+  const timing = createCase20ObservedRpcTiming({
+    startedAtMs: started,
+    nowMs: () => performance.now(),
+    finishRpc: (promiseResumedAtMs) => connected.observation.finishRpc(promiseResumedAtMs),
+  });
   let ok = false;
   try {
     const response = await connected.client.agents.list({ page: { limit: 200 } });
+    timing.markPromiseResumed();
     ok = true;
     return response.entries.map((entry) => entry.agent.id);
+  } catch (error) {
+    timing.markPromiseResumed();
+    throw error;
   } finally {
-    await recordRpc({
-      state,
-      clientId: connected.config.clientId,
-      name: "fetch_agents",
-      durationMs: performance.now() - started,
-      ok,
-      baseline,
-    });
+    await timing.finish((durationMs) =>
+      recordRpc({
+        state,
+        clientId: connected.config.clientId,
+        name: "fetch_agents",
+        durationMs,
+        ok,
+        baseline,
+      }),
+    );
   }
 }
 
@@ -564,20 +1218,31 @@ async function measureWrongRoute(
   baseline: boolean,
 ): Promise<boolean> {
   const started = performance.now();
+  connected.observation.armRpc({ name: "foreign_fetch_agent_denial", baseline });
+  const timing = createCase20ObservedRpcTiming({
+    startedAtMs: started,
+    nowMs: () => performance.now(),
+    finishRpc: (promiseResumedAtMs) => connected.observation.finishRpc(promiseResumedAtMs),
+  });
   let denied = false;
   try {
-    denied = (await connected.client.agents.ref(foreignAgentId).refresh()) === null;
+    const agent = await connected.client.agents.ref(foreignAgentId).refresh();
+    timing.markPromiseResumed();
+    denied = agent === null;
   } catch (error) {
+    timing.markPromiseResumed();
     denied = isCase20AccessDenial(error);
   } finally {
-    await recordRpc({
-      state,
-      clientId: connected.config.clientId,
-      name: "foreign_fetch_agent_denial",
-      durationMs: performance.now() - started,
-      ok: denied,
-      baseline,
-    });
+    await timing.finish((durationMs) =>
+      recordRpc({
+        state,
+        clientId: connected.config.clientId,
+        name: "foreign_fetch_agent_denial",
+        durationMs,
+        ok: denied,
+        baseline,
+      }),
+    );
   }
   return denied;
 }
@@ -967,7 +1632,11 @@ export async function runCase20PartA(manifest: PartAManifest) {
     artifactRoot: manifest.artifactRoot,
     runId: manifest.runId,
   });
-  const state: PartAMeasurementState = {
+  let state: PartAMeasurementState;
+  const observationBuffer = createCase20ObservationBuffer({
+    onOverflow: () => bufferCase20ObservationFailure(state, "observation_buffer_limit_exceeded"),
+  });
+  state = {
     artifact,
     counts: createCounts(),
     feedbackLatencyMs: [],
@@ -983,6 +1652,8 @@ export async function runCase20PartA(manifest: PartAManifest) {
     finalCanaries: new Map(),
     finalAgentCanaries: new Set(),
     finalTimelineCanaries: new Set(),
+    observationBuffer,
+    observationFailureKeys: new Set(),
     canarySequence: 0,
   };
   const runStartedAt = new Date();
@@ -995,6 +1666,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
   let streamCoverageStartedAt: Date | null = null;
   let finalActiveSample: Case20FinalActiveSample | undefined;
   let postCloseResourceSample: Case20ResourceSample | undefined;
+  let runnerEventLoopObserver: { finish(): void } | null = null;
   let primaryError: unknown;
   let runFailure: unknown;
   let artifactCloseFailure: unknown;
@@ -1026,7 +1698,14 @@ export async function runCase20PartA(manifest: PartAManifest) {
       await waitForInitialMetrics(fixture);
       if (fixture.clients.length < 2) throw new Error("Case20 Part A fixture is incomplete");
       for (const config of fixture.clients)
-        clients.push(await connectClient(fixture, config, state));
+        clients.push(await connectClient(fixture, config, state, manifest.sampleIntervalMs));
+      runnerEventLoopObserver = createCase20RunnerEventLoopDelayObserver({
+        intervalMs: manifest.sampleIntervalMs,
+        record: (event) => {
+          state.observationBuffer.record(event);
+        },
+        onFailure: (code) => bufferCase20ObservationFailure(state, code),
+      });
       await runBaseline(clients, state);
       for (const client of clients) {
         await artifact.append({
@@ -1099,6 +1778,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
       });
     } finally {
       measurementEndedAt ??= new Date();
+      runnerEventLoopObserver?.finish();
       for (const waiter of state.canaryWaiters.values()) waiter.cancel();
       for (const client of clients) {
         client.lifecycle.intentionalClose = true;
@@ -1128,6 +1808,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
           releaseTimeline: client.releaseTimeline,
         })),
       );
+      for (const client of clients) client.observation.seal();
       for (const result of clientCleanupResults) {
         if (result.timelineError) {
           primaryError ??= result.timelineError;
@@ -1152,6 +1833,17 @@ export async function runCase20PartA(manifest: PartAManifest) {
         }
       }
       for (const client of clients) client.releaseConnection();
+      await flushCase20ObservationEvents(state).catch((error) => {
+        primaryError ??= error;
+        state.counts.auditErrors += 1;
+        state.evidenceFailures.push({
+          code: "client_observation_flush_failed",
+          metric: "client.observation",
+          observed: "failed",
+          threshold: "all buffered observations persisted",
+          evidenceRef: "raw.jsonl",
+        });
+      });
       await flushStreamAggregates(state).catch((error) => {
         primaryError ??= error;
         state.counts.auditErrors += 1;

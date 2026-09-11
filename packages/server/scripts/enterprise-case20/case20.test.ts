@@ -8,6 +8,12 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, test } from "vitest";
+import {
+  DaemonClient,
+  type DaemonClientTrace,
+  type Logger,
+} from "@getpaseo/client/internal/daemon-client";
+import type { DaemonTransport } from "@getpaseo/client/internal/daemon-client-transport-types";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 
 import {
@@ -22,6 +28,7 @@ import {
   PartAManifestSchema,
   PartBManifestSchema,
   type Case20Counts,
+  type Case20RawEvent,
   type Case20RetainedRssCheckpointPlan,
   type Case20RetainedRssSample,
   type Case20ResourceSample,
@@ -33,6 +40,10 @@ import {
   case20MeasuredWorkloadDeadlineMs,
   classifyCase20AgentList,
   cleanupCase20TimelineClients,
+  createCase20ClientObservationController,
+  createCase20ObservationBuffer,
+  createCase20ObservedRpcTiming,
+  createCase20RunnerEventLoopDelayObserver,
   establishCase20PartAMeasurementBoundary,
   isCase20AccessDenial,
   isUnexpectedCase20ConnectionTerminal,
@@ -264,7 +275,577 @@ function retainedMemorySample(
   };
 }
 
+function noopLogger(): Logger {
+  return {
+    debug() {},
+    info() {},
+    warn() {},
+    error() {},
+  };
+}
+
+function createCase20ObservationTransport() {
+  const sent: Array<string | Uint8Array | ArrayBuffer> = [];
+  let onMessage: (data: unknown, isBinary: boolean) => void = () => {};
+  let onOpen: () => void = () => {};
+  const transport: DaemonTransport = {
+    send(data) {
+      sent.push(data);
+    },
+    close() {},
+    onMessage(handler) {
+      onMessage = handler;
+      return () => {};
+    },
+    onOpen(handler) {
+      onOpen = handler;
+      return () => {};
+    },
+    onClose() {
+      return () => {};
+    },
+    onError() {
+      return () => {};
+    },
+  };
+  const triggerSessionMessage = (message: SessionOutboundMessage) => {
+    onMessage(JSON.stringify({ type: "session", message }), false);
+  };
+  return {
+    transport,
+    sent,
+    triggerOpen() {
+      onOpen();
+      triggerSessionMessage({
+        type: "status",
+        payload: {
+          status: "server_info",
+          serverId: "srv_case20_observation",
+          hostname: null,
+          version: null,
+        },
+      });
+      sent.length = 0;
+    },
+    triggerSessionMessage,
+  };
+}
+
+function parseCase20ObservationRequest(frame: string | Uint8Array | ArrayBuffer): {
+  readonly type: string;
+  readonly requestId: string;
+} {
+  if (typeof frame !== "string") throw new Error("Expected text request frame");
+  const envelope = JSON.parse(frame) as {
+    readonly type: string;
+    readonly message: { readonly type: string; readonly requestId: string };
+  };
+  return envelope.message;
+}
+
+function emitCase20TraceFrame(trace: DaemonClientTrace, messageType: string): void {
+  trace.beginSection("paseo.ws.frame.inbound", { kind: "text", size: "100" });
+  trace.beginSection("paseo.ws.json.parse", { size: "100" });
+  trace.endSection();
+  trace.beginSection("paseo.ws.message.inbound", {
+    envelopeType: "session",
+    messageType,
+  });
+  trace.endSection();
+  trace.endSection();
+}
+
 describe("Case20 evidence helpers", () => {
+  test("caps buffered observations and reserves a durable fail-closed marker", () => {
+    const overflowSignals: string[] = [];
+    const failure: Case20RawEvent = {
+      type: "failure",
+      at: "2026-09-11T00:00:00.000Z",
+      failure: {
+        code: "observation_buffer_limit_exceeded",
+        metric: "runner.observation_buffer",
+        observed: "runner",
+        threshold: "complete valid observation",
+        evidenceRef: "raw.jsonl",
+      },
+    };
+    let buffer: ReturnType<typeof createCase20ObservationBuffer>;
+    buffer = createCase20ObservationBuffer({
+      capacity: 4,
+      reservedFailureEvents: 1,
+      onOverflow: () => {
+        overflowSignals.push("limit");
+        expect(buffer.recordFailure(failure)).toBe(true);
+      },
+    });
+    const observation: Case20RawEvent = {
+      type: "runner_event_loop_delay",
+      at: "2026-09-11T00:00:01.000Z",
+      windowStartedAtMs: 0,
+      windowEndedAtMs: 1_000,
+      intervalMs: 1_000,
+      sampleCount: 1,
+      p50Ms: 1,
+      p95Ms: 2,
+      p99Ms: 3,
+      maxMs: 4,
+      final: false,
+    };
+
+    expect(buffer.record(observation)).toBe(true);
+    expect(buffer.record(observation)).toBe(true);
+    expect(buffer.record(observation)).toBe(true);
+    expect(buffer.record(observation)).toBe(false);
+    expect(buffer.record(observation)).toBe(false);
+    expect(buffer.size).toBe(4);
+    expect(overflowSignals).toEqual(["limit"]);
+    expect(buffer.drain()).toEqual([observation, observation, observation, failure]);
+    expect(buffer.size).toBe(0);
+  });
+
+  test("strictly allowlists client runtime metric windows in memory", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const controller = createCase20ClientObservationController({
+      clientId: "case20-client-01",
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      nowIso: () => "2026-09-11T00:00:01.000Z",
+      delegateLogger: noopLogger(),
+    });
+    controller.logger.info(
+      {
+        windowMs: 1_000,
+        rollingWindowMs: 1_000,
+        bucketCount: 1,
+        final: false,
+        connectionPath: "direct",
+        serverId: "private-hostname.invalid",
+        connectionStatus: "connected",
+        inboundMessageTypesTop: [
+          ["agent_stream", 99],
+          ["fetch_agents_response", 3],
+          ["rpc_error", 2],
+        ],
+        inboundMessageBytesTop: [
+          ["agent_stream", 9_999],
+          ["fetch_agents_response", 300],
+          ["rpc_error", 120],
+        ],
+        inboundAgentStreamAgentsTop: [["agt_private", 99]],
+        handlerTimingTop: [
+          { type: "agent_stream", count: 99, totalMs: 90, avgMs: 0.91, maxMs: 2 },
+          { type: "fetch_agents_response", count: 3, totalMs: 12, avgMs: 4, maxMs: 6 },
+          { type: "rpc_error", count: 2, totalMs: 8, avgMs: 4, maxMs: 5 },
+        ],
+        privatePath: "/private/runner/home",
+        personalAccessToken: "pso_u_private.secret-material-that-must-never-persist",
+      },
+      "ws_runtime_metrics_client",
+    );
+    for (let index = 0; index < 2; index += 1) {
+      controller.logger.info(
+        {
+          windowMs: -1,
+          rollingWindowMs: 1_000,
+          bucketCount: 1,
+          final: false,
+          connectionPath: "direct",
+          connectionStatus: "connected",
+          inboundMessageTypesTop: [],
+          inboundMessageBytesTop: [],
+          handlerTimingTop: [],
+        },
+        "ws_runtime_metrics_client",
+      );
+    }
+    controller.logger.info(
+      {
+        windowMs: 1_000,
+        rollingWindowMs: 1_000,
+        bucketCount: 0,
+        final: true,
+        connectionPath: "direct",
+        connectionStatus: "connected",
+        inboundMessageTypesTop: [],
+        inboundMessageBytesTop: [],
+        handlerTimingTop: [],
+      },
+      "ws_runtime_metrics_client",
+    );
+    controller.seal();
+
+    expect(events).toEqual([
+      {
+        type: "client_runtime_metrics",
+        at: "2026-09-11T00:00:01.000Z",
+        clientId: "case20-client-01",
+        windowMs: 1_000,
+        rollingWindowMs: 1_000,
+        bucketCount: 1,
+        final: false,
+        connectionPath: "direct",
+        connectionStatus: "connected",
+        messages: [
+          {
+            messageType: "fetch_agents_response",
+            count: 3,
+            bytes: 300,
+            handlerCount: 3,
+            handlerTotalMs: 12,
+            handlerAvgMs: 4,
+            handlerMaxMs: 6,
+          },
+          {
+            messageType: "rpc_error",
+            count: 2,
+            bytes: 120,
+            handlerCount: 2,
+            handlerTotalMs: 8,
+            handlerAvgMs: 4,
+            handlerMaxMs: 5,
+          },
+          {
+            messageType: "agent_stream",
+            count: 99,
+            bytes: 9_999,
+            handlerCount: 99,
+            handlerTotalMs: 90,
+            handlerAvgMs: 0.91,
+            handlerMaxMs: 2,
+          },
+        ],
+      },
+      {
+        type: "client_runtime_metrics",
+        at: "2026-09-11T00:00:01.000Z",
+        clientId: "case20-client-01",
+        windowMs: 1_000,
+        rollingWindowMs: 1_000,
+        bucketCount: 0,
+        final: true,
+        connectionPath: "direct",
+        connectionStatus: "connected",
+        messages: [],
+      },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("private-hostname");
+    expect(JSON.stringify(events)).not.toContain("agt_private");
+    expect(JSON.stringify(events)).not.toContain("/private/runner/home");
+    expect(JSON.stringify(events)).not.toContain("secret-material");
+    expect(failures).toEqual(["client_runtime_metrics_invalid"]);
+  });
+
+  test("records only the armed target frame with nested LIFO trace timings", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const times = [0, 1, 3, 5, 6, 10, 20, 21, 23, 25, 26, 30];
+    const controller = createCase20ClientObservationController({
+      clientId: "case20-client-02",
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      nowMs: () => times.shift()!,
+      nowIso: () => "2026-09-11T00:00:02.000Z",
+      delegateLogger: noopLogger(),
+    });
+
+    expect(controller.armRpc({ name: "fetch_agents", baseline: true })).toBe(1);
+    expect(controller.trace.isEnabled()).toBe(true);
+    emitCase20TraceFrame(controller.trace, "agent_stream");
+    emitCase20TraceFrame(controller.trace, "fetch_agents_response");
+    controller.finishRpc(32);
+
+    expect(controller.trace.isEnabled()).toBe(false);
+    expect(events).toEqual([
+      {
+        type: "client_rpc_trace",
+        at: "2026-09-11T00:00:02.000Z",
+        clientId: "case20-client-02",
+        sequence: 1,
+        baseline: true,
+        name: "fetch_agents",
+        messageType: "fetch_agents_response",
+        callbackTotalMs: 10,
+        decodeBeforeParseMs: 1,
+        jsonParseMs: 2,
+        aotValidateMs: 2,
+        dispatchAndWaiterMs: 4,
+        frameEndToPromiseResumeMs: 2,
+      },
+    ]);
+    expect(failures).toEqual([]);
+  });
+
+  test("keeps observation work outside the existing RPC latency duration", async () => {
+    let clock = 10;
+    let clockReads = 0;
+    let recordedDuration = -1;
+    let tracedPromiseResume = -1;
+    const timing = createCase20ObservedRpcTiming({
+      startedAtMs: clock,
+      nowMs: () => {
+        clockReads += 1;
+        return clock;
+      },
+      finishRpc: (promiseResumedAtMs) => {
+        tracedPromiseResume = promiseResumedAtMs;
+        clock = 200;
+      },
+    });
+
+    clock = 20;
+    timing.markPromiseResumed();
+    clock = 30;
+    await timing.finish(async (durationMs) => {
+      recordedDuration = durationMs;
+      clock = 100;
+    });
+
+    expect(recordedDuration).toBe(20);
+    expect(tracedPromiseResume).toBe(20);
+    expect(clockReads).toBe(2);
+    expect(clock).toBe(200);
+  });
+
+  test("fails closed when an armed trace receives no target response frame", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const controller = createCase20ClientObservationController({
+      clientId: "case20-client-02",
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      delegateLogger: noopLogger(),
+    });
+
+    controller.armRpc({ name: "foreign_fetch_agent_denial", baseline: false });
+    emitCase20TraceFrame(controller.trace, "agent_stream");
+    controller.finishRpc(performance.now());
+    controller.finishRpc(performance.now());
+
+    expect(events).toEqual([]);
+    expect(failures).toEqual(["client_rpc_trace_invalid"]);
+  });
+
+  test("observes real DaemonClient fetch and denial responses through a fake transport", async () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const observation = createCase20ClientObservationController({
+      clientId: "case20-client-03",
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      delegateLogger: noopLogger(),
+    });
+    const fake = createCase20ObservationTransport();
+    const client = new DaemonClient({
+      url: "ws://case20-observation.invalid",
+      clientId: "case20-client-03",
+      transportFactory: () => fake.transport,
+      reconnect: { enabled: false },
+      logger: observation.logger,
+      trace: observation.trace,
+      runtimeMetricsIntervalMs: 60_000,
+      runtimeMetricsWindowMs: 60_000,
+    });
+    try {
+      const connectPromise = client.connect();
+      fake.triggerOpen();
+      await connectPromise;
+
+      expect(observation.armRpc({ name: "fetch_agents", baseline: true })).toBe(1);
+      const listPromise = client.fetchAgents({ page: { limit: 1 } });
+      const listRequest = parseCase20ObservationRequest(fake.sent.at(-1)!);
+      queueMicrotask(() =>
+        fake.triggerSessionMessage({
+          type: "fetch_agents_response",
+          payload: {
+            requestId: listRequest.requestId,
+            entries: [],
+            pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+          },
+        }),
+      );
+      await listPromise;
+      observation.finishRpc(performance.now());
+
+      expect(observation.armRpc({ name: "foreign_fetch_agent_denial", baseline: false })).toBe(2);
+      const denialPromise = client.fetchAgent("agt_foreign");
+      const denialRequest = parseCase20ObservationRequest(fake.sent.at(-1)!);
+      queueMicrotask(() =>
+        fake.triggerSessionMessage({
+          type: "rpc_error",
+          payload: {
+            requestId: denialRequest.requestId,
+            requestType: "fetch_agent_request",
+            error: "Resource unavailable",
+            code: "access_denied",
+          },
+        }),
+      );
+      let denial: unknown;
+      try {
+        await denialPromise;
+      } catch (error) {
+        denial = error;
+      }
+      observation.finishRpc(performance.now());
+      expect(isCase20AccessDenial(denial)).toBe(true);
+    } finally {
+      await client.close();
+    }
+    observation.seal();
+
+    expect(failures).toEqual([]);
+    expect(
+      events
+        .filter((event) => event.type === "client_rpc_trace")
+        .map((event) => ({
+          sequence: event.sequence,
+          name: event.name,
+          baseline: event.baseline,
+          messageType: event.messageType,
+        })),
+    ).toEqual([
+      {
+        sequence: 1,
+        name: "fetch_agents",
+        baseline: true,
+        messageType: "fetch_agents_response",
+      },
+      {
+        sequence: 2,
+        name: "foreign_fetch_agent_denial",
+        baseline: false,
+        messageType: "rpc_error",
+      },
+    ]);
+    const runtime = events.filter((event) => event.type === "client_runtime_metrics");
+    expect(runtime).toHaveLength(1);
+    expect(runtime[0]).toMatchObject({
+      clientId: "case20-client-03",
+      rollingWindowMs: 60_000,
+      final: true,
+      messages: [
+        { messageType: "fetch_agents_response", count: 1, handlerCount: 1 },
+        { messageType: "rpc_error", count: 1, handlerCount: 1 },
+      ],
+    });
+  });
+
+  test("buffers runner event-loop windows and stops without a live timer", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const times = [1_000, 2_000, 2_500];
+    let tick: (() => void) | null = null;
+    let unrefs = 0;
+    let cancels = 0;
+    let enables = 0;
+    let disables = 0;
+    let resets = 0;
+    const histogram = {
+      count: 4,
+      max: 4_000_000,
+      enable() {
+        enables += 1;
+      },
+      disable() {
+        disables += 1;
+      },
+      reset() {
+        resets += 1;
+      },
+      percentile(percentile: number) {
+        return new Map([
+          [50, 1_000_000],
+          [95, 2_000_000],
+          [99, 3_000_000],
+        ]).get(percentile)!;
+      },
+    };
+    const observer = createCase20RunnerEventLoopDelayObserver({
+      intervalMs: 1_000,
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      histogram,
+      nowUnixMs: () => times.shift()!,
+      schedule(handler) {
+        tick = handler;
+        return { unref: () => (unrefs += 1) };
+      },
+      cancel() {
+        cancels += 1;
+      },
+    });
+    const runTick = tick as (() => void) | null;
+    if (!runTick) throw new Error("Case20 event-loop timer was not scheduled");
+    runTick();
+    observer.finish();
+    observer.finish();
+    runTick();
+
+    expect(events).toEqual([
+      {
+        type: "runner_event_loop_delay",
+        at: "1970-01-01T00:00:02.000Z",
+        windowStartedAtMs: 1_000,
+        windowEndedAtMs: 2_000,
+        intervalMs: 1_000,
+        sampleCount: 4,
+        p50Ms: 1,
+        p95Ms: 2,
+        p99Ms: 3,
+        maxMs: 4,
+        final: false,
+      },
+      {
+        type: "runner_event_loop_delay",
+        at: "1970-01-01T00:00:02.500Z",
+        windowStartedAtMs: 2_000,
+        windowEndedAtMs: 2_500,
+        intervalMs: 1_000,
+        sampleCount: 4,
+        p50Ms: 1,
+        p95Ms: 2,
+        p99Ms: 3,
+        maxMs: 4,
+        final: true,
+      },
+    ]);
+    expect({ enables, disables, resets, unrefs, cancels }).toEqual({
+      enables: 1,
+      disables: 1,
+      resets: 2,
+      unrefs: 1,
+      cancels: 1,
+    });
+    expect(failures).toEqual([]);
+  });
+
+  test("fails closed on an invalid runner event-loop window", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const observer = createCase20RunnerEventLoopDelayObserver({
+      intervalMs: 1_000,
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      histogram: {
+        count: 1,
+        max: Number.NaN,
+        enable() {},
+        disable() {},
+        reset() {},
+        percentile: () => 1_000_000,
+      },
+      nowUnixMs: () => 1_000,
+      schedule: () => ({ unref() {} }),
+      cancel() {},
+    });
+
+    observer.finish();
+    observer.finish();
+    expect(events).toEqual([]);
+    expect(failures).toEqual(["runner_event_loop_delay_invalid"]);
+  });
+
   test("fixes retained RSS checkpoints before a run and always includes the end", () => {
     let sequence = 0;
     const schedule = createCase20RetainedRssSchedule(1_901, () => `gc-${sequence++}`);
@@ -1116,6 +1697,56 @@ describe("Case20 evidence helpers", () => {
       },
       { durable: true },
     );
+    await writer.append({
+      type: "client_runtime_metrics",
+      at: "2026-09-11T00:00:01.000Z",
+      clientId: "case20-client-01",
+      windowMs: 1_000,
+      rollingWindowMs: 1_000,
+      bucketCount: 1,
+      final: false,
+      connectionPath: "direct",
+      connectionStatus: "connected",
+      messages: [
+        {
+          messageType: "rpc_error",
+          count: 1,
+          bytes: 120,
+          handlerCount: 1,
+          handlerTotalMs: 2,
+          handlerAvgMs: 2,
+          handlerMaxMs: 2,
+        },
+      ],
+    });
+    await writer.append({
+      type: "client_rpc_trace",
+      at: "2026-09-11T00:00:01.500Z",
+      clientId: "case20-client-01",
+      sequence: 1,
+      baseline: false,
+      name: "foreign_fetch_agent_denial",
+      messageType: "rpc_error",
+      callbackTotalMs: 4,
+      decodeBeforeParseMs: 0.1,
+      jsonParseMs: 0.2,
+      aotValidateMs: 0.3,
+      dispatchAndWaiterMs: 0.4,
+      frameEndToPromiseResumeMs: 0.1,
+    });
+    await writer.append({
+      type: "runner_event_loop_delay",
+      at: "2026-09-11T00:00:02.000Z",
+      windowStartedAtMs: 1_000,
+      windowEndedAtMs: 2_000,
+      intervalMs: 1_000,
+      sampleCount: 10,
+      p50Ms: 1,
+      p95Ms: 2,
+      p99Ms: 3,
+      maxMs: 4,
+      final: false,
+    });
     expect(() =>
       writer.append({
         type: "client_connected",
@@ -1130,6 +1761,9 @@ describe("Case20 evidence helpers", () => {
     expect(raw).toContain('"type":"run_started"');
     expect(raw).toContain('"type":"retained_rss_schedule"');
     expect(raw).toContain('"type":"retained_resource"');
+    expect(raw).toContain('"type":"client_runtime_metrics"');
+    expect(raw).toContain('"type":"client_rpc_trace"');
+    expect(raw).toContain('"type":"runner_event_loop_delay"');
     const inventory = JSON.parse(await readFile(writer.inventoryPath, "utf8")) as {
       readonly entries: readonly {
         readonly name: string;

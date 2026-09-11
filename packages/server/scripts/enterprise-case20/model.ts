@@ -290,6 +290,69 @@ export interface Case20Provenance {
   readonly binaries: Readonly<Record<string, string>>;
 }
 
+export type Case20ObservedRpcName = "fetch_agents" | "foreign_fetch_agent_denial";
+export type Case20ObservedInboundMessageType =
+  | "fetch_agents_response"
+  | "rpc_error"
+  | "agent_stream";
+export type Case20ObservedRpcResponseType = Exclude<
+  Case20ObservedInboundMessageType,
+  "agent_stream"
+>;
+
+export interface Case20ClientRuntimeMessageMetric {
+  readonly messageType: Case20ObservedInboundMessageType;
+  readonly count: number;
+  readonly bytes: number;
+  readonly handlerCount: number;
+  readonly handlerTotalMs: number;
+  readonly handlerAvgMs: number;
+  readonly handlerMaxMs: number;
+}
+
+export interface Case20ClientRuntimeMetricsEvent {
+  readonly type: "client_runtime_metrics";
+  readonly at: string;
+  readonly clientId: string;
+  readonly windowMs: number;
+  readonly rollingWindowMs: number;
+  readonly bucketCount: number;
+  readonly final: boolean;
+  readonly connectionPath: "direct" | "relay";
+  readonly connectionStatus: "idle" | "connecting" | "connected" | "disconnected" | "disposed";
+  readonly messages: readonly Case20ClientRuntimeMessageMetric[];
+}
+
+export interface Case20ClientRpcTraceEvent {
+  readonly type: "client_rpc_trace";
+  readonly at: string;
+  readonly clientId: string;
+  readonly sequence: number;
+  readonly baseline: boolean;
+  readonly name: Case20ObservedRpcName;
+  readonly messageType: Case20ObservedRpcResponseType;
+  readonly callbackTotalMs: number;
+  readonly decodeBeforeParseMs: number;
+  readonly jsonParseMs: number;
+  readonly aotValidateMs: number;
+  readonly dispatchAndWaiterMs: number;
+  readonly frameEndToPromiseResumeMs: number;
+}
+
+export interface Case20RunnerEventLoopDelayEvent {
+  readonly type: "runner_event_loop_delay";
+  readonly at: string;
+  readonly windowStartedAtMs: number;
+  readonly windowEndedAtMs: number;
+  readonly intervalMs: number;
+  readonly sampleCount: number;
+  readonly p50Ms: number;
+  readonly p95Ms: number;
+  readonly p99Ms: number;
+  readonly maxMs: number;
+  readonly final: boolean;
+}
+
 export type Case20RawEvent =
   | {
       readonly type: "run_started";
@@ -326,6 +389,9 @@ export type Case20RawEvent =
       readonly ok: boolean;
       readonly baseline: boolean;
     }
+  | Case20ClientRuntimeMetricsEvent
+  | Case20ClientRpcTraceEvent
+  | Case20RunnerEventLoopDelayEvent
   | {
       readonly type: "feedback";
       readonly at: string;
