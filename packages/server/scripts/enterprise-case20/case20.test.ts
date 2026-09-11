@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -35,6 +35,7 @@ import {
 } from "./part-b.js";
 import { createCase20Provenance } from "./provenance.js";
 import {
+  assertCase20GeneratedProviderHomeSecretFree,
   captureCase20ImmutableProviderFiles,
   createCase20AllowlistedBaseEnvironment,
   getCase20RealProviderConfig,
@@ -662,6 +663,47 @@ describe("Case20 evidence helpers", () => {
     await expect(verify()).resolves.toBeUndefined();
     await writeFile(configPath, "changed", { mode: 0o600 });
     await expect(verify()).rejects.toThrow("original source file");
+  });
+
+  test("allows only Codex executable shims in generated provider state", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "case20-provider-symlink-"));
+    temporaryRoots.push(root);
+    const generatedRoot = path.join(root, "generated");
+    const toolDirectory = path.join(generatedRoot, "codex-home", "tmp", "arg0", "codex-arg0ABC123");
+    const codexBinary = path.join(root, "codex");
+    await mkdir(toolDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(codexBinary, "binary", { mode: 0o700 });
+    await Promise.all(
+      ["applypatch", "apply_patch", "codex-execve-wrapper"].map(async (name) =>
+        symlink(codexBinary, path.join(toolDirectory, name)),
+      ),
+    );
+
+    await expect(
+      assertCase20GeneratedProviderHomeSecretFree({
+        root: generatedRoot,
+        knownSecrets: [],
+        provider: "codex",
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      assertCase20GeneratedProviderHomeSecretFree({
+        root: generatedRoot,
+        knownSecrets: [],
+        provider: "claude",
+      }),
+    ).rejects.toThrow("symbolic link");
+
+    const unexpectedRoot = path.join(root, "unexpected");
+    await mkdir(unexpectedRoot, { mode: 0o700 });
+    await symlink(codexBinary, path.join(unexpectedRoot, "apply_patch"));
+    await expect(
+      assertCase20GeneratedProviderHomeSecretFree({
+        root: unexpectedRoot,
+        knownSecrets: [],
+        provider: "codex",
+      }),
+    ).rejects.toThrow("symbolic link");
   });
 
   test("binds provider process identity to PID, start time, and command", () => {

@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
   rm,
   stat,
@@ -29,6 +30,7 @@ import { CodexAppServerAgentClient } from "../../src/server/agent/providers/code
 import type { Case20Provider } from "./provider-preflight.js";
 import {
   assertFileContainsNoSecrets,
+  assertTextContainsNoSecrets,
   readKnownSecretsFromJson,
   readKnownSecretsFromJsonContents,
 } from "./secret-scan.js";
@@ -177,12 +179,49 @@ export async function captureCase20ImmutableProviderFiles(
   return async () => await assertSnapshotsUnchanged(snapshots);
 }
 
-async function regularFiles(root: string): Promise<readonly string[]> {
+async function isAllowedCodexArg0Symlink(input: {
+  readonly root: string;
+  readonly filePath: string;
+  readonly knownSecrets: readonly string[];
+}): Promise<boolean> {
+  const relativePath = path.relative(input.root, input.filePath);
+  if (
+    !/^codex-home\/tmp\/arg0\/codex-arg0[A-Za-z0-9]+\/(?:applypatch|apply_patch|codex-execve-wrapper)$/.test(
+      relativePath,
+    )
+  )
+    return false;
+  const target = await readlink(input.filePath);
+  assertTextContainsNoSecrets({
+    text: target,
+    label: `${input.filePath} symlink target`,
+    knownSecrets: input.knownSecrets,
+  });
+  if (!path.isAbsolute(target) || path.basename(target) !== "codex") return false;
+  const targetInfo = await stat(input.filePath);
+  return targetInfo.isFile() && (targetInfo.mode & 0o111) !== 0;
+}
+
+async function regularFiles(input: {
+  readonly root: string;
+  readonly knownSecrets: readonly string[];
+  readonly provider: Case20Provider;
+}): Promise<readonly string[]> {
   const output: string[] = [];
   async function visit(current: string): Promise<void> {
     const info = await lstat(current);
-    if (info.isSymbolicLink())
+    if (info.isSymbolicLink()) {
+      if (
+        input.provider === "codex" &&
+        (await isAllowedCodexArg0Symlink({
+          root: input.root,
+          filePath: current,
+          knownSecrets: input.knownSecrets,
+        }))
+      )
+        return;
       throw new Error(`Case20 generated provider home contains a symbolic link: ${current}`);
+    }
     if (info.isFile()) {
       output.push(current);
       return;
@@ -190,16 +229,17 @@ async function regularFiles(root: string): Promise<readonly string[]> {
     if (!info.isDirectory()) return;
     for (const entry of await readdir(current)) await visit(path.join(current, entry));
   }
-  await visit(root);
+  await visit(input.root);
   return output.sort();
 }
 
-async function scanGeneratedProviderHome(
-  root: string,
-  knownSecrets: readonly string[],
-): Promise<void> {
-  for (const filePath of await regularFiles(root))
-    await assertFileContainsNoSecrets({ filePath, knownSecrets });
+export async function assertCase20GeneratedProviderHomeSecretFree(input: {
+  readonly root: string;
+  readonly knownSecrets: readonly string[];
+  readonly provider: Case20Provider;
+}): Promise<void> {
+  for (const filePath of await regularFiles(input))
+    await assertFileContainsNoSecrets({ filePath, knownSecrets: input.knownSecrets });
 }
 
 function sanitizedProcessEnvironment(): NodeJS.ProcessEnv {
@@ -240,6 +280,7 @@ async function cleanupFailedProviderHome(input: {
   readonly root: string;
   readonly authPath: string;
   readonly knownSecrets: readonly string[];
+  readonly provider: Case20Provider;
   readonly verifyOriginals: () => Promise<void>;
 }): Promise<readonly unknown[]> {
   const failures: unknown[] = [];
@@ -251,9 +292,11 @@ async function cleanupFailedProviderHome(input: {
     }
     await rm(input.authPath, { force: true }).catch((error) => failures.push(error));
   }
-  await scanGeneratedProviderHome(input.root, input.knownSecrets).catch((error) =>
-    failures.push(error),
-  );
+  await assertCase20GeneratedProviderHomeSecretFree({
+    root: input.root,
+    knownSecrets: input.knownSecrets,
+    provider: input.provider,
+  }).catch((error) => failures.push(error));
   await input.verifyOriginals().catch((error) => failures.push(error));
   await rm(input.root, { recursive: true, force: true }).catch((error) => failures.push(error));
   return failures;
@@ -302,6 +345,7 @@ async function prepareCodexHome(
       root,
       authPath,
       knownSecrets,
+      provider: "codex",
       verifyOriginals,
     });
     if (cleanupFailures.length > 0)
@@ -332,7 +376,11 @@ async function prepareCodexHome(
       try {
         await assertPrivateRegularFile(authPath);
         await rm(authPath, { force: true });
-        await scanGeneratedProviderHome(root, knownSecrets);
+        await assertCase20GeneratedProviderHomeSecretFree({
+          root,
+          knownSecrets,
+          provider: "codex",
+        });
       } catch (error) {
         failures.push(error);
       }
@@ -440,6 +488,7 @@ async function prepareClaudeHome(
       root,
       authPath,
       knownSecrets,
+      provider: "claude",
       verifyOriginals: async () =>
         await Promise.all([verifyOriginals(), credentialSource.verify()]).then(() => undefined),
     });
@@ -471,7 +520,11 @@ async function prepareClaudeHome(
       try {
         await assertPrivateRegularFile(authPath);
         await rm(authPath, { force: true });
-        await scanGeneratedProviderHome(root, knownSecrets);
+        await assertCase20GeneratedProviderHomeSecretFree({
+          root,
+          knownSecrets,
+          provider: "claude",
+        });
       } catch (error) {
         failures.push(error);
       }
