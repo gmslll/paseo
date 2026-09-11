@@ -30,8 +30,10 @@ import {
 import { assertCase20PartBProviderPreflight } from "./provider-preflight.js";
 import {
   case20ConcurrentBaselineForeignAgentIds,
+  case20MeasuredWorkloadDeadlineMs,
   classifyCase20AgentList,
   cleanupCase20TimelineClients,
+  establishCase20PartAMeasurementBoundary,
   isCase20AccessDenial,
   isUnexpectedCase20ConnectionTerminal,
 } from "./part-a.js";
@@ -279,6 +281,110 @@ describe("Case20 evidence helpers", () => {
     ]);
     expect(case20RetainedRssCheckpointDelayMs(1_000, 300, 1_100)).toBe(299_900);
     expect(case20RetainedRssCheckpointDelayMs(1_000, 300, 400_000)).toBe(0);
+  });
+
+  test("starts measurement only after active metrics reach exact 10/10", async () => {
+    let clock = 0;
+    let streamStartedAt = -1;
+    const events: string[] = [];
+    const observations = [
+      { sessions: 0, sockets: 0 },
+      { sessions: 10, sockets: 9 },
+      { sessions: 10, sockets: 10 },
+    ];
+    const boundary = await establishCase20PartAMeasurementBoundary({
+      sample: async () => {
+        const observation = observations.shift()!;
+        events.push(`sample:${observation.sessions}/${observation.sockets}`);
+        return observation;
+      },
+      markStreamCoverageStarted: async (startedAtMs) => {
+        events.push(`coverage:${startedAtMs}`);
+      },
+      startStreams: async () => {
+        streamStartedAt = clock;
+        events.push("streams-started");
+        clock += 50;
+      },
+      now: () => clock,
+      pause: async (milliseconds) => {
+        events.push("pause");
+        clock += milliseconds;
+      },
+      timeoutMs: 5_000,
+      pollIntervalMs: 1_000,
+    });
+
+    expect(events).toEqual([
+      "sample:0/0",
+      "pause",
+      "sample:10/9",
+      "pause",
+      "sample:10/10",
+      "coverage:2000",
+      "streams-started",
+    ]);
+    expect(boundary).toEqual({
+      streamCoverageStartedAtMs: 2_000,
+      measurementStartedAtMs: 2_050,
+      sessions: 10,
+      sockets: 10,
+    });
+    const deadline = case20MeasuredWorkloadDeadlineMs(boundary.measurementStartedAtMs, 1_800);
+    expect(deadline - boundary.measurementStartedAtMs).toBe(1_800_000);
+    expect(boundary.measurementStartedAtMs - streamStartedAt).toBe(50);
+    expect(deadline - streamStartedAt).toBe(1_800_050);
+  });
+
+  test("fails closed when active metrics never reach exact 10/10", async () => {
+    let clock = 0;
+    let samples = 0;
+    let coverageStarted = false;
+    let streamsStarted = false;
+    await expect(
+      establishCase20PartAMeasurementBoundary({
+        sample: async () => {
+          samples += 1;
+          return { sessions: 10, sockets: 9 };
+        },
+        markStreamCoverageStarted: async () => {
+          coverageStarted = true;
+        },
+        startStreams: async () => {
+          streamsStarted = true;
+        },
+        now: () => clock,
+        pause: async (milliseconds) => {
+          clock += milliseconds;
+        },
+        timeoutMs: 2_000,
+        pollIntervalMs: 1_000,
+      }),
+    ).rejects.toThrow("exactly 10 sessions and 10 sockets");
+    expect(samples).toBe(2);
+    expect(coverageStarted).toBe(false);
+    expect(streamsStarted).toBe(false);
+  });
+
+  test("propagates a stream start failure without retrying after exact 10/10 readiness", async () => {
+    const failure = new Error("first canary failed");
+    let samples = 0;
+    let streamStarts = 0;
+    await expect(
+      establishCase20PartAMeasurementBoundary({
+        sample: async () => {
+          samples += 1;
+          return { sessions: 10, sockets: 10 };
+        },
+        markStreamCoverageStarted: async () => undefined,
+        startStreams: async () => {
+          streamStarts += 1;
+          throw failure;
+        },
+      }),
+    ).rejects.toBe(failure);
+    expect(samples).toBe(1);
+    expect(streamStarts).toBe(1);
   });
 
   test("collects each planned GC checkpoint exactly once before sampling OS RSS", async () => {

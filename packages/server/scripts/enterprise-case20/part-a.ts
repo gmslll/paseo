@@ -11,6 +11,7 @@ import {
   sampleDaemonResources,
 } from "./metrics.js";
 import {
+  CASE20_PART_A_CLIENT_COUNT,
   type Case20ClientRecord,
   type Case20Counts,
   type Case20Failure,
@@ -116,6 +117,70 @@ function createCounts(): Case20Counts {
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export interface Case20PartAMeasurementBoundary {
+  readonly streamCoverageStartedAtMs: number;
+  readonly measurementStartedAtMs: number;
+  readonly sessions: number;
+  readonly sockets: number;
+}
+
+export function case20MeasuredWorkloadDeadlineMs(
+  measurementStartedAtMs: number,
+  durationSec: number,
+): number {
+  return measurementStartedAtMs + durationSec * 1_000;
+}
+
+export async function establishCase20PartAMeasurementBoundary(input: {
+  readonly sample: () => Promise<Pick<Case20ResourceSample, "sessions" | "sockets">>;
+  readonly markStreamCoverageStarted: (startedAtMs: number) => Promise<void>;
+  readonly startStreams: () => Promise<void>;
+  readonly timeoutMs?: number;
+  readonly pollIntervalMs?: number;
+  readonly now?: () => number;
+  readonly pause?: (milliseconds: number) => Promise<void>;
+}): Promise<Case20PartAMeasurementBoundary> {
+  const now = input.now ?? Date.now;
+  const pause = input.pause ?? sleep;
+  const timeoutMs = input.timeoutMs ?? 40_000;
+  const pollIntervalMs = input.pollIntervalMs ?? 1_000;
+  const deadline = now() + timeoutMs;
+  let lastObserved = "unavailable";
+  let lastError: unknown;
+  while (now() < deadline) {
+    let sample: Pick<Case20ResourceSample, "sessions" | "sockets">;
+    try {
+      sample = await input.sample();
+    } catch (error) {
+      lastError = error;
+      await pause(pollIntervalMs);
+      continue;
+    }
+    const observedAt = now();
+    lastObserved = `${String(sample.sessions)}/${String(sample.sockets)}`;
+    if (
+      observedAt <= deadline &&
+      sample.sessions === CASE20_PART_A_CLIENT_COUNT &&
+      sample.sockets === CASE20_PART_A_CLIENT_COUNT
+    ) {
+      const streamCoverageStartedAtMs = now();
+      await input.markStreamCoverageStarted(streamCoverageStartedAtMs);
+      await input.startStreams();
+      return {
+        streamCoverageStartedAtMs,
+        measurementStartedAtMs: now(),
+        sessions: sample.sessions,
+        sockets: sample.sockets,
+      };
+    }
+    await pause(pollIntervalMs);
+  }
+  throw new Error(
+    `Case20 did not observe exactly ${CASE20_PART_A_CLIENT_COUNT} sessions and ${CASE20_PART_A_CLIENT_COUNT} sockets before measurement (last ${lastObserved})`,
+    { cause: lastError },
+  );
 }
 
 function case20Error(error: unknown): Error {
@@ -879,7 +944,7 @@ async function runMeasuredWorkload(input: {
         case20RetainedRssCheckpointDelayMs(input.startedAtMs, checkpoint.scheduledTSec),
       ),
     );
-  const deadline = input.startedAtMs + input.manifest.durationSec * 1_000;
+  const deadline = case20MeasuredWorkloadDeadlineMs(input.startedAtMs, input.manifest.durationSec);
   try {
     while (Date.now() < deadline) {
       await runWorkloadCycle(input.clients, input.state);
@@ -971,17 +1036,27 @@ export async function runCase20PartA(manifest: PartAManifest) {
           principalId: client.config.principalId,
         });
       }
-      streamCoverageStartedAt = new Date();
-      await artifact.append(
-        {
-          type: "stream_coverage_started",
-          at: streamCoverageStartedAt.toISOString(),
-          clients: clients.length,
+      const measurementBoundary = await establishCase20PartAMeasurementBoundary({
+        sample: () =>
+          sampleDaemonResources({
+            daemonPid: fixture!.daemonPid,
+            daemonLogPath: fixture!.daemonLogPath,
+            tSec: 0,
+          }),
+        markStreamCoverageStarted: async (startedAtMs) => {
+          streamCoverageStartedAt = new Date(startedAtMs);
+          await artifact.append(
+            {
+              type: "stream_coverage_started",
+              at: streamCoverageStartedAt.toISOString(),
+              clients: clients.length,
+            },
+            { durable: true },
+          );
         },
-        { durable: true },
-      );
-      await startConversations(clients, state);
-      measurementStartedAt = new Date();
+        startStreams: () => startConversations(clients, state),
+      });
+      measurementStartedAt = new Date(measurementBoundary.measurementStartedAtMs);
       await captureRetainedRss(
         retainedRssSchedule[0]!,
         fixture,
