@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,8 +18,6 @@ import { EnterpriseManagementPlane } from "./management-plane.js";
 
 const ORGANIZATION_ID = "org_abcdef0123456789";
 const BOOTSTRAP_SECRET = "managed-node-integration-bootstrap-secret";
-const CERTIFICATE_PATH = new URL("./test-fixtures/localhost-cert.pem", import.meta.url).pathname;
-const PRIVATE_KEY_PATH = new URL("./test-fixtures/localhost-key.pem", import.meta.url).pathname;
 
 describe("managed node production channel", () => {
   const cleanup: Array<() => Promise<void> | void> = [];
@@ -29,18 +28,19 @@ describe("managed node production channel", () => {
   test("enrolls a node, authenticates a node-bound ticket, and applies revocation", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "paseo-managed-node-"));
     cleanup.push(() => rmSync(directory, { recursive: true, force: true }));
+    const { certificatePath, privateKeyPath } = createLocalhostCertificate(directory);
     const port = await reservePort();
     const managementBaseUrl = `https://localhost:${port}`;
     const plane = createPlane(managementBaseUrl);
     cleanup.push(() => plane.close());
     const server = createManagementHttpsServer({
       plane,
-      certificatePath: CERTIFICATE_PATH,
-      privateKeyPath: PRIVATE_KEY_PATH,
+      certificatePath,
+      privateKeyPath,
     });
     await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
     cleanup.push(() => closeServer(server));
-    const caCertificate = readFileSync(CERTIFICATE_PATH);
+    const caCertificate = readFileSync(certificatePath);
 
     const bootstrap = await plane.bootstrapAdministrator({
       bootstrapSecret: BOOTSTRAP_SECRET,
@@ -169,6 +169,37 @@ describe("managed node production channel", () => {
     expect(await authenticator.authenticateBearer(issued.ticket, connection)).toBeNull();
   });
 });
+
+function createLocalhostCertificate(directory: string): {
+  readonly certificatePath: string;
+  readonly privateKeyPath: string;
+} {
+  const certificatePath = path.join(directory, "localhost-cert.pem");
+  const privateKeyPath = path.join(directory, "localhost-key.pem");
+  execFileSync(
+    "openssl",
+    [
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-sha256",
+      "-keyout",
+      privateKeyPath,
+      "-out",
+      certificatePath,
+      "-subj",
+      "/CN=localhost",
+      "-days",
+      "1",
+      "-addext",
+      "subjectAltName=DNS:localhost",
+    ],
+    { stdio: "ignore" },
+  );
+  return { certificatePath, privateKeyPath };
+}
 
 function createPlane(issuer: string): EnterpriseManagementPlane {
   const ticketKeys = generateKeyPairSync("ed25519");
