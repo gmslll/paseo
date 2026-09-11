@@ -41,7 +41,11 @@ describe("management HTTP API", () => {
     expect(await health.json()).toEqual({ status: "ok" });
     const managementUi = await fetch(`${base}/`);
     expect(managementUi.headers.get("content-security-policy")).toContain("frame-ancestors");
-    expect(await managementUi.text()).toContain("保存 Grant");
+    const managementUiHtml = await managementUi.text();
+    expect(managementUiHtml).toContain("保存 Grant");
+    expect(managementUiHtml).toContain("生成 5 分钟连接票据");
+    expect(managementUiHtml).toContain("tcp://");
+    expect(managementUiHtml).toContain("/v1/tickets/session");
 
     const bootstrap = await jsonRequest(base, "/v1/bootstrap", {
       method: "POST",
