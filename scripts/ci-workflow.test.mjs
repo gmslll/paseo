@@ -7,6 +7,7 @@ const repoRoot = new URL("../", import.meta.url);
 const ciWorkflowPath = new URL(".github/workflows/ci.yml", repoRoot);
 const dockerWorkflowPath = new URL(".github/workflows/docker.yml", repoRoot);
 const nixWorkflowPath = new URL(".github/workflows/nix.yml", repoRoot);
+const desktopReleaseWorkflowPath = new URL(".github/workflows/desktop-release.yml", repoRoot);
 const filtersPath = new URL(".github/ci-paths.yml", repoRoot);
 const serverTsconfigPath = new URL("packages/server/tsconfig.server.json", repoRoot);
 const desktopPackagePath = new URL("packages/desktop/package.json", repoRoot);
@@ -107,6 +108,22 @@ test("change gating allows superseded workflow runs to cancel", () => {
       "always() keeps jobs alive after concurrency cancellation; use !cancelled() for fail-open gating",
     );
   }
+});
+
+test("non-publishing macOS desktop builds do not require release credentials", () => {
+  const workflowSource = readFileSync(desktopReleaseWorkflowPath, "utf8");
+  const jobs = jobBlocks(workflowSource);
+  const publishMacos = jobs.get("publish-macos")?.join("\n") ?? "";
+
+  assert.match(publishMacos, /if \[\[ "\$SHOULD_PUBLISH" != "true" \]\]; then/);
+  assert.match(
+    publishMacos,
+    /unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID/,
+  );
+  assert.match(publishMacos, /export CSC_IDENTITY_AUTO_DISCOVERY=false/);
+  assert.match(publishMacos, /build_args\+=\("-c\.mac\.notarize=false"\)/);
+  assert.match(publishMacos, /if: env\.SHOULD_PUBLISH != 'true'/);
+  assert.match(publishMacos, /name: desktop-macos-\$\{\{ matrix\.electron_arch \}\}/);
 });
 
 test("focused contracts stay inside existing required checks", () => {
