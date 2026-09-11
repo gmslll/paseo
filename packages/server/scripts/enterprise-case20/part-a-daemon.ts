@@ -330,7 +330,7 @@ async function startDaemon(
       mcpEnabled: false,
       staticDir,
       mcpDebug: false,
-      agentClients: { mock: new MockLoadTestAgentClient(logger) },
+      agentClients: { mock: new MockLoadTestAgentClient(logger, { retainHistory: false }) },
       agentStoragePath: path.join(paseoHome, "agents"),
       relayEnabled: false,
       appBaseUrl: "https://app.paseo.sh",

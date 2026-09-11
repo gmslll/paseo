@@ -23,6 +23,7 @@ import {
 } from "./model.js";
 import { assertCase20PartBProviderPreflight } from "./provider-preflight.js";
 import {
+  case20ConcurrentBaselineForeignAgentIds,
   classifyCase20AgentList,
   isCase20AccessDenial,
   isUnexpectedCase20ConnectionTerminal,
@@ -525,6 +526,25 @@ describe("Case20 evidence helpers", () => {
     expect(isCase20AccessDenial({ code: "not_found" })).toBe(true);
     expect(isCase20AccessDenial({ code: "internal_error" })).toBe(false);
     expect(isCase20AccessDenial(new Error("socket disconnected"))).toBe(false);
+  });
+
+  test("builds a same-shape concurrent baseline across all ten clients", () => {
+    const clients = Array.from({ length: CASE20_PART_A_CLIENT_COUNT }, (_, index) => ({
+      agentId: `agent-${index + 1}`,
+    }));
+
+    expect(case20ConcurrentBaselineForeignAgentIds(clients)).toEqual([
+      "agent-2",
+      "agent-3",
+      "agent-4",
+      "agent-5",
+      "agent-6",
+      "agent-7",
+      "agent-8",
+      "agent-9",
+      "agent-10",
+      "agent-1",
+    ]);
   });
 
   test("classifies a missing owned agent as a single failed isolation outcome", () => {

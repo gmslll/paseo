@@ -427,6 +427,17 @@ async function measureWrongRoute(
   return denied;
 }
 
+export function case20ConcurrentBaselineForeignAgentIds(
+  clients: readonly { readonly agentId: string }[],
+): readonly string[] {
+  if (clients.length < 2) throw new Error("Case20 concurrent baseline requires two clients");
+  return clients.map((_, index) => {
+    const neighbour = clients[(index + 1) % clients.length];
+    if (!neighbour) throw new Error("Case20 concurrent baseline neighbour missing");
+    return neighbour.agentId;
+  });
+}
+
 export function isCase20AccessDenial(error: unknown): boolean {
   if (!error || typeof error !== "object" || !("code" in error)) return false;
   const code = String((error as { readonly code?: unknown }).code);
@@ -472,17 +483,25 @@ function recordIsolation(
 }
 
 async function runBaseline(
-  client: ConnectedClient,
-  foreignAgentId: string,
+  clients: readonly ConnectedClient[],
   state: PartAMeasurementState,
 ): Promise<void> {
-  for (let iteration = 0; iteration < 5; iteration += 1) {
-    const ids = await measureAgentList(client, state, true);
-    if (!recordIsolation(client, ids, state))
-      throw new Error(`Case20 baseline isolation failed for ${client.config.clientId}`);
-    if (!(await measureWrongRoute(client, foreignAgentId, state, true)))
-      throw new Error(`Case20 baseline did not deny a foreign agent for ${client.config.clientId}`);
-  }
+  const foreignAgentIds = case20ConcurrentBaselineForeignAgentIds(
+    clients.map((client) => client.config),
+  );
+  await Promise.all(
+    clients.map(async (client, index) => {
+      const foreignAgentId = foreignAgentIds[index];
+      if (!foreignAgentId) throw new Error("Case20 concurrent baseline target missing");
+      const ids = await measureAgentList(client, state, true);
+      if (!recordIsolation(client, ids, state))
+        throw new Error(`Case20 baseline isolation failed for ${client.config.clientId}`);
+      if (!(await measureWrongRoute(client, foreignAgentId, state, true)))
+        throw new Error(
+          `Case20 baseline did not deny a foreign agent for ${client.config.clientId}`,
+        );
+    }),
+  );
 }
 
 function nextCanary(connected: ConnectedClient, state: PartAMeasurementState): string {
@@ -782,14 +801,10 @@ export async function runCase20PartA(manifest: PartAManifest) {
         mode: manifest.mode,
       });
       await waitForInitialMetrics(fixture);
-      const firstConfig = fixture.clients[0];
-      const foreignConfig = fixture.clients[1];
-      if (!firstConfig || !foreignConfig) throw new Error("Case20 Part A fixture is incomplete");
-      const firstClient = await connectClient(fixture, firstConfig, state);
-      clients = [firstClient];
-      await runBaseline(firstClient, foreignConfig.agentId, state);
-      for (const config of fixture.clients.slice(1))
+      if (fixture.clients.length < 2) throw new Error("Case20 Part A fixture is incomplete");
+      for (const config of fixture.clients)
         clients.push(await connectClient(fixture, config, state));
+      await runBaseline(clients, state);
       for (const client of clients) {
         await artifact.append({
           type: "client_connected",
