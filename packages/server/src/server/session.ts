@@ -575,6 +575,38 @@ export interface SessionFileSystem {
   isDirectory(path: string): Promise<boolean>;
 }
 
+/** Scheduling-only hook supplied by the daemon runtime; it carries no authority or request data. */
+const enterpriseFetchAgentsStartSchedulerBrand: unique symbol = Symbol(
+  "EnterpriseFetchAgentsStartScheduler",
+);
+const issuedEnterpriseFetchAgentsStartSchedulers = new WeakSet<object>();
+
+export type EnterpriseFetchAgentsStartScheduler = Readonly<{
+  readonly [enterpriseFetchAgentsStartSchedulerBrand]: true;
+  waitForStart(): Promise<void>;
+}>;
+
+export function createEnterpriseFetchAgentsStartScheduler(
+  waitForStart: () => Promise<void>,
+): EnterpriseFetchAgentsStartScheduler {
+  const scheduler = Object.freeze({
+    [enterpriseFetchAgentsStartSchedulerBrand]: true as const,
+    waitForStart: () => waitForStart(),
+  });
+  issuedEnterpriseFetchAgentsStartSchedulers.add(scheduler);
+  return scheduler;
+}
+
+function isEnterpriseFetchAgentsStartScheduler(
+  scheduler: unknown,
+): scheduler is EnterpriseFetchAgentsStartScheduler {
+  return (
+    typeof scheduler === "object" &&
+    scheduler !== null &&
+    issuedEnterpriseFetchAgentsStartSchedulers.has(scheduler)
+  );
+}
+
 const nodeSessionFileSystem: SessionFileSystem = {
   async isDirectory(path) {
     const stats = await stat(path).catch(() => null);
@@ -607,6 +639,8 @@ export interface SessionOptions {
   enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   /** Integration/W1 supplies the current-session decision for identity-self requests. */
   enterpriseIdentitySelfAuthorization?: SessionAuthorization["authorizeInbound"];
+  /** Optional enterprise-only start ticket. The scheduler receives no request or authority data. */
+  enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler;
   /** Trusted server clock used to timestamp Browser Profile waiting status. */
   now?: () => number;
   /** Optional local-only RPC timing sink. It never participates in authorization or wire output. */
@@ -1059,6 +1093,7 @@ export class Session {
   private readonly enterpriseIdentitySelfAuthorization:
     | SessionAuthorization["authorizeInbound"]
     | null;
+  private readonly enterpriseFetchAgentsStartScheduler: EnterpriseFetchAgentsStartScheduler | null;
   private readonly now: () => number;
 
   // oxlint-disable-next-line complexity -- Session constructor wires existing ports.
@@ -1081,6 +1116,7 @@ export class Session {
       enterpriseDispatcherFactory,
       enterpriseDispatcherRegistration,
       enterpriseIdentitySelfAuthorization,
+      enterpriseFetchAgentsStartScheduler,
       now,
       rpcDiagnosticObserver,
       permissions,
@@ -1141,6 +1177,13 @@ export class Session {
     this.enterpriseDispatcherFactory = enterpriseDispatcherFactory ?? null;
     this.enterpriseDispatcherLease = null;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization ?? null;
+    if (
+      enterpriseFetchAgentsStartScheduler !== undefined &&
+      !isEnterpriseFetchAgentsStartScheduler(enterpriseFetchAgentsStartScheduler)
+    ) {
+      throw new Error("Enterprise fetch-agents start scheduler must be created by its factory");
+    }
+    this.enterpriseFetchAgentsStartScheduler = enterpriseFetchAgentsStartScheduler ?? null;
     this.now = now ?? Date.now;
     const enterpriseConfigured = Boolean(
       enterpriseContext ||
@@ -7537,6 +7580,27 @@ export class Session {
     await this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options);
   }
 
+  private requestEnterpriseFetchAgentsStartTicket(
+    request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
+  ): Promise<boolean> | null {
+    const scheduler = this.enterpriseFetchAgentsStartScheduler;
+    if (
+      !this.enterpriseContext ||
+      !scheduler ||
+      request.subscribe !== undefined ||
+      request.sync !== undefined
+    ) {
+      return null;
+    }
+    return scheduler
+      .waitForStart()
+      .then(() => !this.isCleanedUp && this.isEnterpriseLegacyResourceCurrent());
+  }
+
+  private clearFetchAgentsSubscription(subscriptionId: string | null): void {
+    if (subscriptionId) this.agentUpdates.clearSubscription(subscriptionId);
+  }
+
   private async handleFetchAgents(
     request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
   ): Promise<void> {
@@ -7544,10 +7608,14 @@ export class Session {
       this.emitLegacyResourceDenied(request.requestId, request.type);
       return;
     }
-    const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
-    const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
+    let subscriptionId: string | null = null;
 
     try {
+      const startTicket = this.requestEnterpriseFetchAgentsStartTicket(request);
+      if (startTicket && !(await startTicket)) return;
+
+      const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
+      subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
       if (subscriptionId) {
         this.agentUpdates.beginSubscription({
           subscriptionId,
@@ -7581,7 +7649,7 @@ export class Session {
       if (this.enterpriseContext) {
         const delivered = await this.enqueueAuthorizedEmit(response, responseContext);
         if (!delivered) {
-          if (subscriptionId) this.agentUpdates.clearSubscription(subscriptionId);
+          this.clearFetchAgentsSubscription(subscriptionId);
           return;
         }
       } else {
@@ -7595,9 +7663,7 @@ export class Session {
         }
       }
     } catch (error) {
-      if (subscriptionId) {
-        this.agentUpdates.clearSubscription(subscriptionId);
-      }
+      this.clearFetchAgentsSubscription(subscriptionId);
       const code = error instanceof SessionRequestError ? error.code : "fetch_agents_failed";
       const message = error instanceof Error ? error.message : "Failed to fetch agents";
       this.sessionLogger.error({ err: error }, "Failed to handle fetch_agents_request");

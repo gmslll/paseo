@@ -42,7 +42,9 @@ import {
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
 import {
+  createEnterpriseFetchAgentsStartScheduler,
   Session,
+  type EnterpriseFetchAgentsStartScheduler,
   type SessionRpcDiagnosticObservation,
   type SessionRpcDiagnosticObserver,
 } from "./session.js";
@@ -148,7 +150,9 @@ import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 
 interface SessionHandlerInternals {
   authorization: SessionAuthorization;
+  sessionLogger: pino.Logger;
   agentUpdates: {
+    beginSubscription(...args: unknown[]): void;
     flushBootstrapped(subscriptionId: string): Promise<void>;
     hasSubscription(): boolean;
     invalidateWorkspace(workspaceId: string): void;
@@ -482,6 +486,7 @@ interface SessionForTestOptions {
   enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
   enterpriseDispatcherRegistration?: SessionOptions["enterpriseDispatcherRegistration"];
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
+  enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler;
   rpcDiagnosticObserver?: SessionOptions["rpcDiagnosticObserver"];
   now?: SessionOptions["now"];
 }
@@ -623,6 +628,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     enterpriseDispatcher: options.enterpriseDispatcher,
     enterpriseDispatcherRegistration: options.enterpriseDispatcherRegistration,
     enterpriseIdentitySelfAuthorization: options.enterpriseIdentitySelfAuthorization,
+    enterpriseFetchAgentsStartScheduler: options.enterpriseFetchAgentsStartScheduler,
     rpcDiagnosticObserver: options.rpcDiagnosticObserver,
     now: options.now,
   };
@@ -2388,6 +2394,367 @@ async function createBinaryAuthorizationFixture(
     owners,
   };
 }
+
+function createBinaryAuthorizedSession(
+  fixture: Awaited<ReturnType<typeof createBinaryAuthorizationFixture>>,
+  options: SessionForTestOptions = {},
+): Session {
+  return createSessionForTest({
+    ...options,
+    clientId: "client-test",
+    enterpriseContext: fixture.enterpriseSessionContext,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: fixture.authorityState,
+    principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+    resourceAuthorization: fixture.runtime.resourceAuthorization,
+    sessionId: fixture.sessionId,
+    sessionAuthorization: fixture.sessionAuthorization,
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    enterpriseAuthorizationRuntime: fixture.runtime,
+  });
+}
+
+describe("enterprise fetch-agents start scheduling", () => {
+  test("only the frozen nominal factory result can be injected", async () => {
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const scheduler = createEnterpriseFetchAgentsStartScheduler(waitForStart);
+    expect(Object.isFrozen(scheduler)).toBe(true);
+    await scheduler.waitForStart();
+    expect(waitForStart.mock.calls).toEqual([[]]);
+
+    const structuralScheduler = { waitForStart };
+    // @ts-expect-error The unexported unique-symbol brand rejects structural construction.
+    const nominalScheduler: EnterpriseFetchAgentsStartScheduler = structuralScheduler;
+    expect(() =>
+      createSessionForTest({ enterpriseFetchAgentsStartScheduler: nominalScheduler }),
+    ).toThrow("Enterprise fetch-agents start scheduler must be created by its factory");
+
+    const clonedScheduler = { ...scheduler };
+    expect(() =>
+      createSessionForTest({ enterpriseFetchAgentsStartScheduler: clonedScheduler }),
+    ).toThrow("Enterprise fetch-agents start scheduler must be created by its factory");
+  });
+
+  test("two Sessions reach a shared scheduling ticket before either starts directory work", async () => {
+    if (process.platform !== "darwin") return;
+    const [fixtureA, fixtureB] = await Promise.all([
+      createBinaryAuthorizationFixture("fetch-agents-start-a"),
+      createBinaryAuthorizationFixture("fetch-agents-start-b"),
+    ]);
+    const release = deferred<void>();
+    const waitForStart = vi.fn(() => release.promise);
+    const scheduler = createEnterpriseFetchAgentsStartScheduler(waitForStart);
+    const messagesA: SessionOutboundMessage[] = [];
+    const messagesB: SessionOutboundMessage[] = [];
+    const listAgentsA = vi.fn(() => []);
+    const listAgentsB = vi.fn(() => []);
+    const listStorageA = vi.fn().mockResolvedValue([]);
+    const listStorageB = vi.fn().mockResolvedValue([]);
+    const sessionA = createBinaryAuthorizedSession(fixtureA, {
+      messages: messagesA,
+      enterpriseFetchAgentsStartScheduler: scheduler,
+      agentManager: { listAgents: listAgentsA },
+      agentStorage: { list: listStorageA },
+    });
+    const sessionB = createBinaryAuthorizedSession(fixtureB, {
+      messages: messagesB,
+      enterpriseFetchAgentsStartScheduler: scheduler,
+      agentManager: { listAgents: listAgentsB },
+      agentStorage: { list: listStorageB },
+    });
+
+    const handlingA = sessionA.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-a",
+    });
+    const handlingB = sessionB.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-b",
+    });
+
+    await vi.waitFor(() => expect(waitForStart).toHaveBeenCalledTimes(2));
+    expect(waitForStart.mock.calls).toEqual([[], []]);
+    expect(listAgentsA).not.toHaveBeenCalled();
+    expect(listAgentsB).not.toHaveBeenCalled();
+    expect(listStorageA).not.toHaveBeenCalled();
+    expect(listStorageB).not.toHaveBeenCalled();
+    expect(messagesA).toEqual([]);
+    expect(messagesB).toEqual([]);
+
+    release.resolve();
+    await Promise.all([handlingA, handlingB]);
+
+    expect(listAgentsA).toHaveBeenCalledTimes(1);
+    expect(listAgentsB).toHaveBeenCalledTimes(1);
+    expect(listStorageA).toHaveBeenCalledTimes(1);
+    expect(listStorageB).toHaveBeenCalledTimes(1);
+    expect(messagesA).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-a" }),
+      }),
+    );
+    expect(messagesB).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-b" }),
+      }),
+    );
+    await Promise.all([sessionA.cleanup(), sessionB.cleanup()]);
+  });
+
+  test("subscription and explicit sync modes keep their original synchronous start", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-start-stateful");
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const messages: SessionOutboundMessage[] = [];
+    const session = createBinaryAuthorizedSession(fixture, {
+      messages,
+      enterpriseFetchAgentsStartScheduler: createEnterpriseFetchAgentsStartScheduler(waitForStart),
+    });
+    const internals = asSessionInternals(session);
+    const beginSubscription = vi.spyOn(internals.agentUpdates, "beginSubscription");
+    const listFetchAgentsEntries = vi.spyOn(internals, "listFetchAgentsEntries").mockResolvedValue({
+      entries: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+    const readAgentDirectorySync = vi.spyOn(internals, "readAgentDirectorySync").mockResolvedValue({
+      entries: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+
+    const subscribed = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-subscribe",
+      subscribe: { subscriptionId: "sub-start-stateful" },
+    });
+    expect(beginSubscription).toHaveBeenCalledTimes(1);
+    expect(listFetchAgentsEntries).toHaveBeenCalledTimes(1);
+    expect(waitForStart).not.toHaveBeenCalled();
+    await subscribed;
+
+    const explicitAsync = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-explicit-async",
+      sync: false,
+    });
+    expect(listFetchAgentsEntries).toHaveBeenCalledTimes(2);
+    expect(waitForStart).not.toHaveBeenCalled();
+    await explicitAsync;
+
+    const explicitSync = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-explicit-sync",
+      sync: true,
+    });
+    expect(readAgentDirectorySync).toHaveBeenCalledTimes(1);
+    expect(waitForStart).not.toHaveBeenCalled();
+    await explicitSync;
+
+    expect(messages.filter((message) => message.type === "fetch_agents_response")).toHaveLength(3);
+    await session.cleanup();
+  });
+
+  test.each(["cleanup", "revoke"] as const)(
+    "%s while waiting prevents every directory, authorization, and delivery side effect",
+    async (terminal) => {
+      if (process.platform !== "darwin") return;
+      const fixture = await createBinaryAuthorizationFixture(`fetch-agents-start-${terminal}`);
+      const release = deferred<void>();
+      const waitForStart = vi.fn(() => release.promise);
+      const listAgents = vi.fn(() => []);
+      const listStorage = vi.fn().mockResolvedValue([]);
+      const prefilterAgentContentRows = vi.spyOn(
+        fixture.runtime.resourceAuthorization,
+        "prefilterAgentContentRows",
+      );
+      const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+      const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+      const messages: SessionOutboundMessage[] = [];
+      const session = createBinaryAuthorizedSession(fixture, {
+        messages,
+        enterpriseFetchAgentsStartScheduler:
+          createEnterpriseFetchAgentsStartScheduler(waitForStart),
+        agentManager: { listAgents },
+        agentStorage: { list: listStorage },
+      });
+      const beginSubscription = vi.spyOn(
+        asSessionInternals(session).agentUpdates,
+        "beginSubscription",
+      );
+
+      const handling = session.handleMessage({
+        type: "fetch_agents_request",
+        requestId: `fetch-agents-start-${terminal}`,
+      });
+      await vi.waitFor(() => expect(waitForStart).toHaveBeenCalledTimes(1));
+      if (terminal === "cleanup") {
+        await session.cleanup();
+      } else {
+        await fixture.grantStore.update({
+          organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+          principalId: fixture.enterpriseSessionContext.principal.principalId,
+          expectedVersion: fixture.runtime.principal.grantVersion,
+          grants: [],
+          actor: fixture.runtime.principal,
+        });
+      }
+      release.resolve();
+      await handling;
+
+      expect(beginSubscription).not.toHaveBeenCalled();
+      expect(listAgents).not.toHaveBeenCalled();
+      expect(listStorage).not.toHaveBeenCalled();
+      expect(prefilterAgentContentRows).not.toHaveBeenCalled();
+      expect(assertAgent).not.toHaveBeenCalled();
+      expect(canEmit).not.toHaveBeenCalled();
+      expect(messages).toEqual([]);
+      if (terminal === "revoke") await session.cleanup();
+    },
+  );
+
+  test.each([
+    ["reject", () => Promise.reject(new Error("scheduler rejected"))],
+    [
+      "throw",
+      () => {
+        throw new Error("scheduler threw");
+      },
+    ],
+  ] as const)(
+    "%s is contained by the correlated request error path",
+    async (name, waitForStart) => {
+      if (process.platform !== "darwin") return;
+      const fixture = await createBinaryAuthorizationFixture(`fetch-agents-start-${name}`);
+      const listAgents = vi.fn(() => []);
+      const listStorage = vi.fn().mockResolvedValue([]);
+      const prefilterAgentContentRows = vi.spyOn(
+        fixture.runtime.resourceAuthorization,
+        "prefilterAgentContentRows",
+      );
+      const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+      const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+      const messages: SessionOutboundMessage[] = [];
+      const session = createBinaryAuthorizedSession(fixture, {
+        messages,
+        enterpriseFetchAgentsStartScheduler:
+          createEnterpriseFetchAgentsStartScheduler(waitForStart),
+        agentManager: { listAgents },
+        agentStorage: { list: listStorage },
+      });
+      const requestError = vi.spyOn(asSessionInternals(session).sessionLogger, "error");
+
+      await expect(
+        session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: `fetch-agents-start-${name}`,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(listAgents).not.toHaveBeenCalled();
+      expect(listStorage).not.toHaveBeenCalled();
+      expect(prefilterAgentContentRows).not.toHaveBeenCalled();
+      expect(assertAgent).not.toHaveBeenCalled();
+      expect(canEmit).not.toHaveBeenCalled();
+      expect(requestError).toHaveBeenCalledWith(
+        {
+          err: expect.objectContaining({
+            message: `scheduler ${name === "reject" ? "rejected" : "threw"}`,
+          }),
+        },
+        "Failed to handle fetch_agents_request",
+      );
+      expect(messages).toEqual([]);
+      await session.cleanup();
+    },
+  );
+
+  test("no-port enterprise and configured-port legacy fetches keep synchronous starts and results", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-start-no-port");
+    const enterpriseMessages: SessionOutboundMessage[] = [];
+    const enterpriseList = vi.fn().mockResolvedValue([]);
+    const enterprise = createBinaryAuthorizedSession(fixture, {
+      messages: enterpriseMessages,
+      agentStorage: { list: enterpriseList },
+    });
+    const enterpriseHandling = enterprise.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-no-port",
+    });
+    expect(enterpriseList).toHaveBeenCalledTimes(1);
+    await enterpriseHandling;
+    expect(enterpriseMessages).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-no-port" }),
+      }),
+    );
+
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const legacyMessages: SessionOutboundMessage[] = [];
+    const legacyLiveList = vi.fn(() => []);
+    const legacyList = vi.fn().mockResolvedValue([]);
+    const legacy = createSessionForTest({
+      messages: legacyMessages,
+      enterpriseFetchAgentsStartScheduler: createEnterpriseFetchAgentsStartScheduler(waitForStart),
+      agentManager: { listAgents: legacyLiveList },
+      agentStorage: { list: legacyList },
+    });
+    const legacyHandling = legacy.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-legacy",
+    });
+    expect(legacyLiveList).toHaveBeenCalledTimes(1);
+    await legacyHandling;
+    expect(legacyList).toHaveBeenCalledTimes(1);
+    expect(waitForStart).not.toHaveBeenCalled();
+    expect(legacyMessages).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-legacy" }),
+      }),
+    );
+    await Promise.all([enterprise.cleanup(), legacy.cleanup()]);
+  });
+
+  test("enterprise history and other RPCs do not request a fetch-agents start ticket", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-start-other");
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const messages: SessionOutboundMessage[] = [];
+    const session = createBinaryAuthorizedSession(fixture, {
+      messages,
+      enterpriseFetchAgentsStartScheduler: createEnterpriseFetchAgentsStartScheduler(waitForStart),
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-agents-start-history",
+    });
+    await session.handleMessage({
+      type: "fetch_agent_request",
+      requestId: "fetch-agents-start-single",
+      agentId: "agt_unknown_exact_id",
+    });
+
+    expect(waitForStart).not.toHaveBeenCalled();
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agent_history_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-history" }),
+      }),
+    );
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "rpc_error",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-single" }),
+      }),
+    );
+    await session.cleanup();
+  });
+});
 
 const enterpriseSendAgentId = "agt_aaaaaaaaaaaaaaaa";
 const enterpriseSendWorkspaceId = "workspace-1";
