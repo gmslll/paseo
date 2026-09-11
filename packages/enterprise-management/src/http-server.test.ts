@@ -1,5 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 import { createServer } from "node:http";
+import { Script } from "node:vm";
 
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -47,6 +48,9 @@ describe("management HTTP API", () => {
     expect(managementUiHtml).toContain("生成 5 分钟连接票据");
     expect(managementUiHtml).toContain("tcp://");
     expect(managementUiHtml).toContain("/v1/tickets/session");
+    const managementScript = managementUiHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    expect(managementScript).toBeDefined();
+    expect(() => new Script(managementScript!, { filename: "management-ui.js" })).not.toThrow();
 
     const bootstrap = await jsonRequest(base, "/v1/bootstrap", {
       method: "POST",
