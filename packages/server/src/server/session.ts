@@ -4462,34 +4462,46 @@ export class Session {
     else this.onMessage(message);
   }
 
-  private async filterLegacyAgentSnapshots(
-    agents: readonly AgentSnapshotPayload[],
-  ): Promise<AgentSnapshotPayload[]> {
-    if (!this.enterpriseContext) return [...agents];
+  private async filterEnterpriseAgentProjectionSources(
+    liveAgents: readonly ManagedAgent[],
+    persistedRecords: readonly StoredAgentRecord[],
+  ): Promise<{ liveAgents: ManagedAgent[]; persistedRecords: StoredAgentRecord[] }> {
     const authorization = this.enterpriseLegacyResourceAuthorization;
     if (!authorization || !authorization.isCurrent()) {
       throw new SessionRequestError("access_denied", "Resource unavailable");
     }
-    const originals = new Map(agents.map((agent) => [agent.id, agent] as const));
-    const rows = agents.flatMap((agent) => {
-      if (!agent.workspaceId) return [];
+    const liveRows = liveAgents.flatMap((agent) => {
+      const ownership = agent.enterpriseOwnership;
+      if (!agent.workspaceId || !ownership || ownership.workspaceId !== agent.workspaceId)
+        return [];
       try {
-        const owner = normalizeEnterpriseResourceOwner(agent);
-        return owner ? [{ ...agent, ...owner, id: agent.id, workspaceId: agent.workspaceId }] : [];
+        const owner = normalizeEnterpriseResourceOwner(ownership);
+        return owner ? [{ ...owner, id: agent.id, workspaceId: agent.workspaceId }] : [];
       } catch {
-        // A malformed persisted row is quarantined without making the whole
-        // directory distinguishable from an empty, authorized result.
         return [];
       }
     });
-    const authorized = await authorization.filterAgents("workspace.content.read", rows);
+    const persistedRows = persistedRecords.flatMap((record) => {
+      if (!record.workspaceId) return [];
+      try {
+        const owner = normalizeEnterpriseResourceOwner(record);
+        return owner ? [{ ...owner, id: record.id, workspaceId: record.workspaceId }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const authorized = await authorization.filterAgents("workspace.content.read", [
+      ...liveRows,
+      ...persistedRows,
+    ]);
     if (!authorization.isCurrent()) {
       throw new SessionRequestError("access_denied", "Resource unavailable");
     }
-    return authorized.flatMap((row) => {
-      const original = originals.get(row.id);
-      return original ? [original] : [];
-    });
+    const authorizedIds = new Set(authorized.map((row) => row.id));
+    return {
+      liveAgents: liveAgents.filter((agent) => authorizedIds.has(agent.id)),
+      persistedRecords: persistedRecords.filter((record) => authorizedIds.has(record.id)),
+    };
   }
 
   private async allowedEnterpriseWorkspaceIds(): Promise<ReadonlySet<string>> {
@@ -6374,6 +6386,58 @@ export class Session {
     return agents;
   }
 
+  private async listEnterpriseContentAuthorizedAgentPayloads(filter: {
+    labels?: Record<string, string>;
+    includeArchived?: boolean;
+    includeUnavailablePersisted?: boolean;
+  }): Promise<AgentSnapshotPayload[]> {
+    const includeArchived = filter.includeArchived === true;
+    const labelEntries = filter.labels ? Object.entries(filter.labels) : [];
+    const agentSnapshots = this.agentManager.listAgents();
+    const registryRecords = await this.agentStorage.list();
+    const liveIds = new Set(agentSnapshots.map((agent) => agent.id));
+    const registeredProviderIds = new Set(this.providerSnapshotManager.listRegisteredProviderIds());
+    const persistedRecords = registryRecords
+      .filter((record) => !liveIds.has(record.id) && !record.internal)
+      .filter((record) => includeArchived || !record.archivedAt)
+      .filter((record) => labelEntries.every(([key, value]) => record.labels?.[key] === value))
+      .filter(
+        (record) =>
+          filter.includeUnavailablePersisted === true ||
+          isStoredAgentProviderAvailable(record, registeredProviderIds),
+      );
+    const authorizedSources = await this.filterEnterpriseAgentProjectionSources(
+      agentSnapshots,
+      persistedRecords,
+    );
+    this.assertEnterpriseLegacyResourceCurrent();
+
+    const liveAgents = await Promise.all(
+      authorizedSources.liveAgents.map((agent) => this.buildAgentPayload(agent)),
+    );
+    this.assertEnterpriseLegacyResourceCurrent();
+    const persistedAgents = authorizedSources.persistedRecords.flatMap((record) => {
+      try {
+        return [this.buildStoredAgentPayload(record, registeredProviderIds)];
+      } catch {
+        return [];
+      }
+    });
+    this.assertEnterpriseLegacyResourceCurrent();
+
+    let agents = [...liveAgents, ...persistedAgents];
+    agents = agents.filter((agent) => this.isProviderVisibleToClient(agent.provider));
+    if (!includeArchived) {
+      agents = agents.filter((agent) => !agent.archivedAt);
+    }
+    if (labelEntries.length > 0) {
+      agents = agents.filter((agent) =>
+        labelEntries.every(([key, value]) => agent.labels[key] === value),
+      );
+    }
+    return agents;
+  }
+
   private async resolveAgentIdentifier(
     identifier: string,
   ): Promise<{ ok: true; agentId: string } | { ok: false; error: string }> {
@@ -6557,13 +6621,17 @@ export class Session {
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
-    let agents = await this.listAgentPayloads({
+    const listOptions = {
       labels: filter?.labels,
       includeArchived: filter?.includeArchived,
       includeUnavailablePersisted: request.type === "fetch_agent_history_request",
-    });
+    };
+    let agents = this.enterpriseContext
+      ? await this.listEnterpriseContentAuthorizedAgentPayloads(listOptions)
+      : await this.listAgentPayloads(listOptions);
     const activePlacementsByWorkspaceId =
       scope === "active" ? await this.buildActiveProjectPlacementsByWorkspaceId() : null;
+    this.assertEnterpriseLegacyResourceCurrent();
     if (activePlacementsByWorkspaceId) {
       agents = agents.filter(
         (agent) =>
@@ -6572,8 +6640,6 @@ export class Session {
           activePlacementsByWorkspaceId.has(agent.workspaceId),
       );
     }
-    agents = await this.filterLegacyAgentSnapshots(agents);
-
     const placementByWorkspaceId = new Map<string, Promise<ProjectPlacementPayload | null>>();
     const getPlacement = (
       workspaceId: string | undefined,
@@ -6623,6 +6689,7 @@ export class Session {
       getPlacement,
       filter,
     });
+    this.assertEnterpriseLegacyResourceCurrent();
 
     const pagedEntries = matchedEntries.slice(0, limit);
     const hasMore = matchedEntries.length > limit;
@@ -9743,6 +9810,12 @@ export class Session {
     );
   }
 
+  private assertEnterpriseLegacyResourceCurrent(): void {
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+  }
+
   /**
    * Emit a message to the client
    */
@@ -10440,8 +10513,8 @@ export class Session {
   }
 
   private deliverForSource(msg: SessionOutboundMessage, source?: object): boolean {
-    if (!this.authorization.allowsOutbound(msg)) return false;
     if (source && this.onMessageToSource) {
+      if (!this.authorization.allowsOutbound(msg)) return false;
       this.onMessageToSource(source, msg);
       return true;
     }

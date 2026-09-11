@@ -1140,6 +1140,7 @@ test.each(browserPageIdentityRequests())(
     expect(handle).toHaveBeenCalledTimes(1);
     expect(consumeResponse).not.toHaveBeenCalled();
     expect(canEmit).not.toHaveBeenCalled();
+    expect(allowsOutbound).toHaveBeenCalledTimes(1);
     expect(allowsOutbound).toHaveBeenCalledWith(response);
     expect(messages).toEqual([response]);
     await session.cleanup();
@@ -10359,6 +10360,364 @@ describe("enterprise dispatcher integration seam", () => {
     await session.cleanup();
   });
 
+  test("enterprise agent lists authorize mixed raw rows before live-agent enrichment", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-raw-prefilter");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const currentPrincipalId = fixture.enterpriseSessionContext.principal.principalId;
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    const workspaceA = "wks_aaaaaaaaaaaaaaaa";
+    const workspaceB = "wks_bbbbbbbbbbbbbbbb";
+    const ownedLiveId = "agt_owned_live_aaaa";
+    const foreignLiveId = "agt_foreign_live_b";
+    const malformedLiveId = "agt_malformed_live";
+    const ownedPersistedId = "agt_owned_stored_a";
+    const foreignPersistedId = "agt_foreign_store";
+    const malformedPersistedId = "agt_malformed_store";
+    fixture.owners.registerWorkspace({
+      id: workspaceA,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: currentPrincipalId,
+      createdByPrincipalId: currentPrincipalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: workspaceB,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    for (const id of [ownedLiveId, malformedLiveId, ownedPersistedId, malformedPersistedId]) {
+      fixture.owners.registerAgent({
+        id,
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      });
+    }
+    for (const id of [foreignLiveId, foreignPersistedId]) {
+      fixture.owners.registerAgent({
+        id,
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      });
+    }
+
+    const ownedLive = makeEnterpriseDirectoryManagedAgent({
+      id: ownedLiveId,
+      workspaceId: workspaceA,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: currentPrincipalId,
+    });
+    const foreignLive = makeEnterpriseDirectoryManagedAgent({
+      id: foreignLiveId,
+      workspaceId: workspaceB,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+    });
+    const malformedLive = {
+      ...makeEnterpriseDirectoryManagedAgent({
+        id: malformedLiveId,
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+      }),
+      enterpriseOwnership: {
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      },
+    } satisfies ManagedAgent;
+    const records = [
+      createStoredAgentRecord({
+        id: ownedLiveId,
+        cwd: ownedLive.cwd,
+        title: "a-owned-live",
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: foreignLiveId,
+        cwd: foreignLive.cwd,
+        title: "foreign-live",
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: malformedLiveId,
+        cwd: malformedLive.cwd,
+        title: "malformed-live",
+        workspaceId: workspaceA,
+      }),
+      createStoredAgentRecord({
+        id: ownedPersistedId,
+        cwd: "/repo/a/persisted",
+        title: "b-owned-persisted",
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: foreignPersistedId,
+        cwd: "/repo/b/persisted",
+        title: "foreign-persisted",
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: malformedPersistedId,
+        cwd: "/repo/a/malformed",
+        title: "malformed-persisted",
+        workspaceId: workspaceA,
+      }),
+    ];
+    const recordById = new Map(records.map((record) => [record.id, record] as const));
+    const getStorage = vi.fn(async (id: string) => recordById.get(id));
+    const messages: SessionOutboundMessage[] = [];
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { listAgents: vi.fn(() => [ownedLive, foreignLive, malformedLive]) },
+      agentStorage: { get: getStorage, list: vi.fn(async () => records) },
+      workspaceRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === workspaceA
+            ? {
+                workspaceId: workspaceA,
+                projectId: "project-a",
+                cwd: "/repo/a",
+                kind: "checkout" as const,
+                displayName: "A",
+                archivedAt: null,
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      projectRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === "project-a"
+            ? {
+                projectId: "project-a",
+                rootPath: "/repo/a",
+                kind: "git" as const,
+                displayName: "A",
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-raw-prefilter",
+      sort: [{ key: "title", direction: "asc" }],
+      page: { limit: 200 },
+    });
+
+    expect(getStorage.mock.calls).toEqual([[ownedLiveId]]);
+    expect(assertAgent.mock.calls.map(([, , agentId]) => agentId)).toEqual([
+      ownedLiveId,
+      foreignLiveId,
+      ownedPersistedId,
+      foreignPersistedId,
+    ]);
+    expect(messages).toContainEqual({
+      type: "fetch_agents_response",
+      payload: {
+        requestId: "fetch-agents-raw-prefilter",
+        entries: [
+          expect.objectContaining({ agent: expect.objectContaining({ id: ownedLiveId }) }),
+          expect.objectContaining({ agent: expect.objectContaining({ id: ownedPersistedId }) }),
+        ],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      },
+    });
+    expect(canEmit).toHaveBeenCalledWith(
+      fixture.enterpriseSessionContext.principal,
+      expect.objectContaining({ type: "fetch_agents_response" }),
+      expect.objectContaining({ kind: "resources" }),
+    );
+    await session.cleanup();
+  });
+
+  test("enterprise agent lists fail closed when authorization changes during live projection", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-projection-current");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const workspaceId = "wks_aaaaaaaaaaaaaaaa";
+    const agentId = "agt_projection_current";
+    fixture.owners.registerWorkspace({
+      id: workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerAgent({
+      id: agentId,
+      workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const liveAgent = makeEnterpriseDirectoryManagedAgent({
+      id: agentId,
+      workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+    });
+    const record = createStoredAgentRecord({
+      id: agentId,
+      cwd: liveAgent.cwd,
+      workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const projectionStarted = deferred<void>();
+    const releaseProjection = deferred<void>();
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { listAgents: vi.fn(() => [liveAgent]) },
+      agentStorage: {
+        list: vi.fn(async () => [record]),
+        get: vi.fn(async () => {
+          projectionStarted.resolve();
+          await releaseProjection.promise;
+          return record;
+        }),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const listing = asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-projection-current",
+      page: { limit: 200 },
+    });
+    await projectionStarted.promise;
+    await fixture.runtime.release();
+    releaseProjection.resolve();
+
+    await expect(listing).rejects.toMatchObject({ code: "access_denied" });
+    await session.cleanup();
+  });
+
+  test("legacy agent lists retain live and persisted projection behavior", async () => {
+    const workspaceId = "workspace-legacy-list";
+    const liveAgentIds = ["agent-legacy-live-a", "agent-legacy-live-b"];
+    const liveAgents = liveAgentIds.map((id) => makeEnterpriseEventManagedAgent(id, workspaceId));
+    const records = [
+      ...liveAgentIds.map((id) =>
+        createStoredAgentRecord({ id, cwd: "/repo/legacy", workspaceId, title: id }),
+      ),
+      createStoredAgentRecord({
+        id: "agent-legacy-persisted",
+        cwd: "/repo/legacy",
+        workspaceId,
+        title: "agent-legacy-persisted",
+      }),
+    ];
+    const recordById = new Map(records.map((record) => [record.id, record] as const));
+    const getStorage = vi.fn(async (id: string) => recordById.get(id));
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      agentManager: { listAgents: vi.fn(() => liveAgents) },
+      agentStorage: { get: getStorage, list: vi.fn(async () => records) },
+      workspaceRegistry: {
+        get: vi.fn(async () => ({
+          workspaceId,
+          projectId: "project-legacy",
+          cwd: "/repo/legacy",
+          kind: "checkout" as const,
+          displayName: "legacy",
+          archivedAt: null,
+        })),
+        list: vi.fn(async () => []),
+      },
+      projectRegistry: {
+        get: vi.fn(async () => ({
+          projectId: "project-legacy",
+          rootPath: "/repo/legacy",
+          kind: "git" as const,
+          displayName: "legacy",
+        })),
+        list: vi.fn(async () => []),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const response = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-legacy-projection",
+      page: { limit: 200 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+
+    expect(response.entries.map((entry) => entry.agent.id).sort()).toEqual(
+      [...liveAgentIds, "agent-legacy-persisted"].sort(),
+    );
+    expect(getStorage.mock.calls).toEqual(liveAgentIds.map((id) => [id]));
+    await session.cleanup();
+  });
+
   test("metadata-only enterprise grants produce no agent content", async () => {
     if (process.platform !== "darwin") return;
     const fixture = await createBinaryAuthorizationFixture("fetch-agents-metadata", [
@@ -10673,6 +11032,25 @@ function makeEnterpriseEventManagedAgent(
     lifecycle: "running",
     activeForegroundTurnId: null,
   } as unknown as ManagedAgent;
+}
+
+function makeEnterpriseDirectoryManagedAgent(input: {
+  id: string;
+  workspaceId: string;
+  organizationId: string;
+  nodeId: string;
+  ownerPrincipalId: string;
+}): ManagedAgent {
+  return {
+    ...makeEnterpriseEventManagedAgent(input.id, input.workspaceId),
+    enterpriseOwnership: {
+      workspaceId: input.workspaceId,
+      organizationId: input.organizationId,
+      nodeId: input.nodeId,
+      ownerPrincipalId: input.ownerPrincipalId,
+      createdByPrincipalId: input.ownerPrincipalId,
+    },
+  };
 }
 
 function enterpriseTimelineEvent(
