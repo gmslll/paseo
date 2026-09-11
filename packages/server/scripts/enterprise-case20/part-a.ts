@@ -236,6 +236,10 @@ function expectedDaemonTypes(name: Case20ObservedRpcName): {
 function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
   const finiteFields = [
     trace.rpcStartedMonotonicUnixMs,
+    trace.messageOutboundBeginMonotonicUnixMs,
+    trace.messageOutboundEndMonotonicUnixMs,
+    trace.frameOutboundBeginMonotonicUnixMs,
+    trace.frameOutboundEndMonotonicUnixMs,
     trace.frameBeginMonotonicUnixMs,
     trace.frameEndMonotonicUnixMs,
     trace.promiseResumedMonotonicUnixMs,
@@ -247,7 +251,7 @@ function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
     trace.frameEndToPromiseResumeMs,
   ];
   return (
-    Reflect.ownKeys(trace).length === 18 &&
+    Reflect.ownKeys(trace).length === 22 &&
     trace.type === "client_rpc_trace" &&
     typeof trace.at === "string" &&
     /^case20-client-[0-9]{2}$/.test(trace.clientId) &&
@@ -258,7 +262,11 @@ function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
     trace.messageType === targetMessageType(trace.name) &&
     CASE20_RPC_REQUEST_ID_PATTERN.test(trace.requestId) &&
     finiteFields.every(isFiniteNonNegative) &&
-    trace.rpcStartedMonotonicUnixMs <= trace.frameBeginMonotonicUnixMs &&
+    trace.rpcStartedMonotonicUnixMs <= trace.messageOutboundBeginMonotonicUnixMs &&
+    trace.messageOutboundBeginMonotonicUnixMs <= trace.messageOutboundEndMonotonicUnixMs &&
+    trace.messageOutboundEndMonotonicUnixMs <= trace.frameOutboundBeginMonotonicUnixMs &&
+    trace.frameOutboundBeginMonotonicUnixMs <= trace.frameOutboundEndMonotonicUnixMs &&
+    trace.frameOutboundEndMonotonicUnixMs <= trace.frameBeginMonotonicUnixMs &&
     trace.frameBeginMonotonicUnixMs <= trace.frameEndMonotonicUnixMs &&
     trace.frameEndMonotonicUnixMs <= trace.promiseResumedMonotonicUnixMs
   );
@@ -315,7 +323,7 @@ export function createCase20RpcDiagnosticJoiner(input: {
     if (
       daemon.requestType !== daemonTypes.requestType ||
       daemon.responseType !== daemonTypes.responseType ||
-      daemon.phases[0]!.monotonicUnixMs < entry.rpcStartedMonotonicUnixMs ||
+      daemon.phases[0]!.monotonicUnixMs < client.frameOutboundEndMonotonicUnixMs ||
       daemon.phases.at(-1)!.monotonicUnixMs > client.frameBeginMonotonicUnixMs ||
       entry.sequence !== daemonSequence
     ) {
@@ -337,6 +345,10 @@ export function createCase20RpcDiagnosticJoiner(input: {
         responseType: daemon.responseType,
         client: {
           rpcStartedMonotonicUnixMs: client.rpcStartedMonotonicUnixMs,
+          messageOutboundBeginMonotonicUnixMs: client.messageOutboundBeginMonotonicUnixMs,
+          messageOutboundEndMonotonicUnixMs: client.messageOutboundEndMonotonicUnixMs,
+          frameOutboundBeginMonotonicUnixMs: client.frameOutboundBeginMonotonicUnixMs,
+          frameOutboundEndMonotonicUnixMs: client.frameOutboundEndMonotonicUnixMs,
           frameBeginMonotonicUnixMs: client.frameBeginMonotonicUnixMs,
           frameEndMonotonicUnixMs: client.frameEndMonotonicUnixMs,
           promiseResumedMonotonicUnixMs: client.promiseResumedMonotonicUnixMs,
@@ -471,6 +483,7 @@ interface Case20ArmedRpcTrace {
   readonly sequence: number;
   readonly baseline: boolean;
   readonly name: Case20ObservedRpcName;
+  readonly requestType: Case20DaemonRpcDiagnostic["requestType"];
   readonly messageType: Case20ObservedRpcResponseType;
   readonly requestId: string;
   readonly rpcStartedMonotonicUnixMs: number;
@@ -693,6 +706,10 @@ function targetMessageType(name: Case20ObservedRpcName): Case20ObservedRpcRespon
   return name === "fetch_agents" ? "fetch_agents_response" : "rpc_error";
 }
 
+function targetRequestType(name: Case20ObservedRpcName): Case20DaemonRpcDiagnostic["requestType"] {
+  return name === "fetch_agents" ? "fetch_agents_request" : "fetch_agent_request";
+}
+
 function finiteDuration(endedAtMs: number, startedAtMs: number): number {
   const duration = endedAtMs - startedAtMs;
   if (!isFiniteNonNegative(duration)) throw new Error("Case20 client trace duration is invalid");
@@ -719,6 +736,9 @@ export function createCase20ClientObservationController(input: {
   let finalRuntimeMetrics = 0;
   let sealed = false;
   let suppressedTraceDepth = 0;
+  let targetOutboundMessage: Case20CompletedTraceSection | null = null;
+  let targetOutboundFrame: Case20CompletedTraceSection | null = null;
+  let traceInvalid = false;
   const reportFailure = (code: Case20ObservationFailureCode) => {
     if (reportedFailures.has(code)) return;
     reportedFailures.add(code);
@@ -727,6 +747,10 @@ export function createCase20ClientObservationController(input: {
     } catch {
       // Observation failures must not change the business Promise path.
     }
+  };
+  const invalidateTrace = () => {
+    traceInvalid = true;
+    reportFailure("client_rpc_trace_invalid");
   };
   const safeRecord = (event: Case20ObservationEvent) => {
     try {
@@ -760,6 +784,63 @@ export function createCase20ClientObservationController(input: {
     warn: (object, message) => delegate.warn(object, message),
     error: (object, message) => delegate.error(object, message),
   };
+  const captureOutboundMessage = (
+    completed: Case20CompletedTraceSection,
+    parent: Case20OpenTraceSection | undefined,
+    target: Case20ArmedRpcTrace,
+  ): boolean => {
+    if (completed.name !== "paseo.ws.message.outbound") return false;
+    const args = completed.args;
+    if (
+      parent ||
+      !args ||
+      Reflect.ownKeys(args).length !== 2 ||
+      args.envelopeType !== "session" ||
+      args.messageType !== target.requestType ||
+      targetOutboundMessage ||
+      targetOutboundFrame
+    ) {
+      invalidateTrace();
+    } else {
+      targetOutboundMessage = completed;
+    }
+    return true;
+  };
+  const captureOutboundFrame = (
+    completed: Case20CompletedTraceSection,
+    parent: Case20OpenTraceSection | undefined,
+  ): boolean => {
+    if (completed.name !== "paseo.ws.frame.outbound") return false;
+    const args = completed.args;
+    if (
+      parent ||
+      !args ||
+      Reflect.ownKeys(args).length !== 2 ||
+      args.kind !== "text" ||
+      !/^\d+$/.test(args.size ?? "") ||
+      !targetOutboundMessage ||
+      targetOutboundFrame ||
+      completed.startedAtMs < targetOutboundMessage.endedAtMs
+    ) {
+      invalidateTrace();
+    } else {
+      targetOutboundFrame = completed;
+    }
+    return true;
+  };
+  const captureInboundTarget = (
+    completed: Case20CompletedTraceSection,
+    target: Case20ArmedRpcTrace,
+  ) => {
+    if (completed.name !== "paseo.ws.frame.inbound") return;
+    const messages = findCompletedTraceSections(completed, "paseo.ws.message.inbound");
+    if (messages.length !== 1 || messages[0]?.args?.messageType !== target.messageType) return;
+    if (targetFrames.length >= CASE20_TRACE_TARGET_FRAME_LIMIT) {
+      invalidateTrace();
+    } else {
+      targetFrames.push(completed);
+    }
+  };
   const trace: DaemonClientTrace = {
     isEnabled: () => armed !== null,
     beginSection(name, args) {
@@ -767,12 +848,12 @@ export function createCase20ClientObservationController(input: {
       try {
         if (suppressedTraceDepth > 0 || traceStack.length >= CASE20_TRACE_DEPTH_LIMIT) {
           suppressedTraceDepth += 1;
-          reportFailure("client_rpc_trace_invalid");
+          invalidateTrace();
           return;
         }
         traceStack.push({ name, args, startedAtMs: nowMonotonicUnixMs(), children: [] });
       } catch {
-        reportFailure("client_rpc_trace_invalid");
+        invalidateTrace();
       }
     },
     endSection() {
@@ -791,22 +872,16 @@ export function createCase20ClientObservationController(input: {
         const parent = traceStack.at(-1);
         if (parent) {
           if (parent.children.length >= CASE20_TRACE_CHILD_LIMIT) {
-            reportFailure("client_rpc_trace_invalid");
+            invalidateTrace();
           } else {
             parent.children.push(completed);
           }
         }
-        if (completed.name !== "paseo.ws.frame.inbound") return;
-        const messages = findCompletedTraceSections(completed, "paseo.ws.message.inbound");
-        if (messages.length === 1 && messages[0]?.args?.messageType === armed.messageType) {
-          if (targetFrames.length >= CASE20_TRACE_TARGET_FRAME_LIMIT) {
-            reportFailure("client_rpc_trace_invalid");
-          } else {
-            targetFrames.push(completed);
-          }
-        }
+        if (captureOutboundMessage(completed, parent, armed)) return;
+        if (captureOutboundFrame(completed, parent)) return;
+        captureInboundTarget(completed, armed);
       } catch {
-        reportFailure("client_rpc_trace_invalid");
+        invalidateTrace();
       }
     },
   };
@@ -818,17 +893,21 @@ export function createCase20ClientObservationController(input: {
       const invalidIdentity =
         !CASE20_RPC_REQUEST_ID_PATTERN.test(rpc.requestId) ||
         !isFiniteNonNegative(rpc.rpcStartedMonotonicUnixMs);
-      if (sealed || armed || traceStack.length > 0 || invalidIdentity) {
-        reportFailure("client_rpc_trace_invalid");
+      traceInvalid = sealed || armed !== null || traceStack.length > 0 || invalidIdentity;
+      if (traceInvalid) {
+        invalidateTrace();
         traceStack.length = 0;
         targetFrames.length = 0;
         suppressedTraceDepth = 0;
       }
-      if (invalidIdentity) return sequence;
+      targetOutboundMessage = null;
+      targetOutboundFrame = null;
+      if (sealed || invalidIdentity) return sequence;
       armed = {
         sequence,
         name: rpc.name,
         baseline: rpc.baseline,
+        requestType: targetRequestType(rpc.name),
         messageType: targetMessageType(rpc.name),
         requestId: rpc.requestId,
         rpcStartedMonotonicUnixMs: rpc.rpcStartedMonotonicUnixMs,
@@ -841,8 +920,11 @@ export function createCase20ClientObservationController(input: {
       try {
         if (
           !target ||
+          traceInvalid ||
           traceStack.length !== 0 ||
           suppressedTraceDepth !== 0 ||
+          !targetOutboundMessage ||
+          !targetOutboundFrame ||
           targetFrames.length !== 1
         )
           throw new Error("Case20 client target trace is incomplete");
@@ -853,6 +935,15 @@ export function createCase20ClientObservationController(input: {
           throw new Error("Case20 client target trace phases are incomplete");
         const parse = parses[0]!;
         const message = messages[0]!;
+        if (
+          target.rpcStartedMonotonicUnixMs > targetOutboundMessage.startedAtMs ||
+          targetOutboundMessage.startedAtMs > targetOutboundMessage.endedAtMs ||
+          targetOutboundMessage.endedAtMs > targetOutboundFrame.startedAtMs ||
+          targetOutboundFrame.startedAtMs > targetOutboundFrame.endedAtMs ||
+          targetOutboundFrame.endedAtMs > frame.startedAtMs ||
+          frame.endedAtMs > promiseResumedMonotonicUnixMs
+        )
+          throw new Error("Case20 client target trace order is invalid");
         safeRecord({
           type: "client_rpc_trace",
           at: nowIso(),
@@ -863,6 +954,10 @@ export function createCase20ClientObservationController(input: {
           messageType: target.messageType,
           requestId: target.requestId,
           rpcStartedMonotonicUnixMs: target.rpcStartedMonotonicUnixMs,
+          messageOutboundBeginMonotonicUnixMs: targetOutboundMessage.startedAtMs,
+          messageOutboundEndMonotonicUnixMs: targetOutboundMessage.endedAtMs,
+          frameOutboundBeginMonotonicUnixMs: targetOutboundFrame.startedAtMs,
+          frameOutboundEndMonotonicUnixMs: targetOutboundFrame.endedAtMs,
           frameBeginMonotonicUnixMs: frame.startedAtMs,
           frameEndMonotonicUnixMs: frame.endedAtMs,
           promiseResumedMonotonicUnixMs,
@@ -879,6 +974,9 @@ export function createCase20ClientObservationController(input: {
         traceStack.length = 0;
         targetFrames.length = 0;
         suppressedTraceDepth = 0;
+        targetOutboundMessage = null;
+        targetOutboundFrame = null;
+        traceInvalid = false;
       }
     },
     seal() {
@@ -891,6 +989,9 @@ export function createCase20ClientObservationController(input: {
       traceStack.length = 0;
       targetFrames.length = 0;
       suppressedTraceDepth = 0;
+      targetOutboundMessage = null;
+      targetOutboundFrame = null;
+      traceInvalid = false;
     },
   };
 }

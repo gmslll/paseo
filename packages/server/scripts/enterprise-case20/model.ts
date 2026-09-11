@@ -385,6 +385,10 @@ export interface Case20ClientRpcTraceEvent {
   readonly messageType: Case20ObservedRpcResponseType;
   readonly requestId: string;
   readonly rpcStartedMonotonicUnixMs: number;
+  readonly messageOutboundBeginMonotonicUnixMs: number;
+  readonly messageOutboundEndMonotonicUnixMs: number;
+  readonly frameOutboundBeginMonotonicUnixMs: number;
+  readonly frameOutboundEndMonotonicUnixMs: number;
   readonly frameBeginMonotonicUnixMs: number;
   readonly frameEndMonotonicUnixMs: number;
   readonly promiseResumedMonotonicUnixMs: number;
@@ -408,6 +412,10 @@ export interface Case20RpcDiagnosticEvent {
   readonly responseType: Case20DaemonRpcDiagnosticResponseType;
   readonly client: {
     readonly rpcStartedMonotonicUnixMs: number;
+    readonly messageOutboundBeginMonotonicUnixMs: number;
+    readonly messageOutboundEndMonotonicUnixMs: number;
+    readonly frameOutboundBeginMonotonicUnixMs: number;
+    readonly frameOutboundEndMonotonicUnixMs: number;
     readonly frameBeginMonotonicUnixMs: number;
     readonly frameEndMonotonicUnixMs: number;
     readonly promiseResumedMonotonicUnixMs: number;
