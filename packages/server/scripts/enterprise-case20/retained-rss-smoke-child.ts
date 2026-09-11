@@ -16,7 +16,7 @@ const garbageCollection = createCase20GarbageCollectionController({
   schedule,
   collectGarbage,
 });
-let releaseMessageHandler = () => undefined;
+let releaseMessageHandler: () => void = () => undefined;
 releaseMessageHandler = installCase20ChildMessageHandler({
   source: {
     on: (_event, listener) => process.on("message", listener),

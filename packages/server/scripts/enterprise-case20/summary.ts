@@ -171,7 +171,7 @@ function isValidRetainedRssScheduleCheckpoint(
   index: number,
   expectedScheduledTSec: number,
   requestIds: ReadonlySet<string>,
-): checkpoint is Case20RetainedRssCheckpointPlan {
+): boolean {
   return Boolean(
     checkpoint &&
     checkpoint.index === index &&
