@@ -111,7 +111,8 @@ vi.mock("ws", () => ({
   WebSocketServer: wsModuleMock.MockWebSocketServer,
 }));
 
-vi.mock("./session.js", () => ({
+vi.mock("./session.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./session.js")>()),
   Session: sessionMock.MockSession,
 }));
 
@@ -663,6 +664,65 @@ describe("relay external socket reconnect behavior", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  test("isolates fetch start schedulers per server and wires each Session", async () => {
+    const serverA = createServer();
+    const serverB = createServer();
+    try {
+      await attachDirectAndHello({
+        server: serverA,
+        socket: new MockSocket(),
+        clientId: "batch-a",
+      });
+      const sessionA = sessionMock.instances.at(-1)!;
+      await attachDirectAndHello({
+        server: serverB,
+        socket: new MockSocket(),
+        clientId: "batch-b",
+      });
+      const sessionB = sessionMock.instances.at(-1)!;
+      const schedulerA = sessionA.args.enterpriseFetchAgentsStartScheduler;
+      const schedulerB = sessionB.args.enterpriseFetchAgentsStartScheduler;
+      expect(schedulerA).toBeTypeOf("object");
+      expect(schedulerB).toBeTypeOf("object");
+      expect(schedulerA).not.toBe(schedulerB);
+    } finally {
+      await serverA.close();
+      await serverB.close();
+    }
+  });
+
+  test("server close settles fetch ticket after connection cleanup", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const order: string[] = [];
+    h.releaseSession.mockImplementation((handle) => {
+      const released = releaseEnterpriseAdmissionSession(h.authorizationIssuer, handle);
+      expect(released).toBe(true);
+      order.push("release-authority");
+      return released;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    await attachEnterpriseAuthenticated(server, socket);
+    const internals = asInternals<{
+      handleRawMessage: (socket: MockSocket, data: string, capturedAtUnixMs?: number) => void;
+    }>(server);
+    internals.handleRawMessage(socket, JSON.stringify(createHelloMessage("batch-close")), 1);
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+    const session = sessionMock.instances.at(-1)!;
+    const ticket = (
+      session.args.enterpriseFetchAgentsStartScheduler as {
+        waitForStart(): Promise<void>;
+      }
+    )
+      .waitForStart()
+      .then(() => order.push("ticket-resume"));
+    await server.close();
+    await expect(ticket).resolves.toBe(2);
+    expect(session.cleanup).toHaveBeenCalledOnce();
+    expect(order).toEqual(["release-authority", "ticket-resume"]);
   });
 
   test("keeps the same session when relay reconnects within grace window", async () => {

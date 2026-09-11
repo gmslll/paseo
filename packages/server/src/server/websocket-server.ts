@@ -794,7 +794,6 @@ interface SocketSessionOptions {
   admissionInvalidationSink?: SessionOptions["admissionInvalidationSink"];
   admissionAuthorizationIssuer?: EnterpriseAdmissionRuntime["admission"]["authorizationIssuer"];
   admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
-  enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler;
 }
 
 interface ClosePhysicalSocketParams {
@@ -940,7 +939,10 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
   private readonly rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
   private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
-  private readonly enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler;
+  private readonly enterpriseFetchAgentsStartScheduler: EnterpriseFetchAgentsStartScheduler;
+  private readonly enterpriseFetchAgentsStartBatcher: ReturnType<
+    typeof createFetchAgentsStartBatcher
+  >;
 
   constructor(
     server: HTTPServer,
@@ -996,15 +998,13 @@ export class VoiceAssistantWebSocketServer {
     enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory,
     enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration,
     rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver,
-    enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.enterpriseRuntime = enterpriseRuntime;
     this.rpcDiagnosticObserver = rpcDiagnosticObserver;
-    this.enterpriseFetchAgentsStartScheduler = enterpriseFetchAgentsStartScheduler
-      ? createFetchAgentsStartBatcher(enterpriseFetchAgentsStartScheduler)
-      : undefined;
+    this.enterpriseFetchAgentsStartBatcher = createFetchAgentsStartBatcher();
+    this.enterpriseFetchAgentsStartScheduler = this.enterpriseFetchAgentsStartBatcher.scheduler;
     this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
     this.enterpriseDispatcher = enterpriseDispatcher;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
@@ -1632,6 +1632,7 @@ export class VoiceAssistantWebSocketServer {
       );
     }
 
+    this.enterpriseFetchAgentsStartBatcher.close();
     await Promise.all(cleanupPromises);
     await Promise.all(this.authenticationTasks.values());
     await Promise.all(this.pendingMessageTasks.values());
@@ -2111,9 +2112,7 @@ export class VoiceAssistantWebSocketServer {
       ...(options.sessionAuthorization
         ? { sessionAuthorization: options.sessionAuthorization }
         : {}),
-      ...(this.enterpriseFetchAgentsStartScheduler
-        ? { enterpriseFetchAgentsStartScheduler: this.enterpriseFetchAgentsStartScheduler }
-        : {}),
+      enterpriseFetchAgentsStartScheduler: this.enterpriseFetchAgentsStartScheduler,
       ...(this.rpcDiagnosticObserver
         ? {
             rpcDiagnosticObserver: (observation: SessionRpcDiagnosticObservation) =>
