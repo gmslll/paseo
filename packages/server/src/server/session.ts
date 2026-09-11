@@ -64,6 +64,10 @@ import {
 } from "@getpaseo/protocol/binary-frames/index";
 import type { ActiveFileDownloadStreamHandle } from "./enterprise/access/file-binary-outbound-authorizer.js";
 import {
+  createEnterpriseAgentEventPreauthorization,
+  type EnterpriseAgentEventPreauthorization,
+} from "./enterprise/access/agent-event-preauthorization.js";
+import {
   isCurrentProductionAuthorizationRuntimeForSession,
   type ProductionAuthorizationRuntime,
   type ProductionAuthorizationRuntimeSessionInput,
@@ -846,6 +850,7 @@ export class Session {
   private readonly resourceAuthorization?: ResourceAuthorization;
   private readonly outboundAuthorityEmissionAuthorizer?: OutboundAuthorityEmissionAuthorizer;
   private readonly enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  private readonly enterpriseAgentEventPreauthorization?: EnterpriseAgentEventPreauthorization;
   private readonly productionAuthorizationSession?: ProductionAuthorizationRuntimeSessionInput;
   private readonly enterpriseLegacyResourceAuthorization?: EnterpriseLegacyResourceAuthorization;
   private readonly activeFileBinaryStreams = new Map<
@@ -1154,6 +1159,11 @@ export class Session {
     this.authorityReceiptState = authorityReceiptState;
     this.resourceAuthorization = resourceAuthorization;
     this.enterpriseAuthorizationRuntime = enterpriseAuthorizationRuntime;
+    this.enterpriseAgentEventPreauthorization = enterpriseAuthorizationRuntime
+      ? (createEnterpriseAgentEventPreauthorization({
+          authorizationRuntime: enterpriseAuthorizationRuntime,
+        }) ?? undefined)
+      : undefined;
     this.productionAuthorizationSession = productionAuthorizationSession;
     this.enterpriseLegacyResourceAuthorization = enterpriseAuthorizationRuntime
       ? (createEnterpriseLegacyResourceAuthorization({
@@ -2451,6 +2461,18 @@ export class Session {
     return update.type === "upsert" ? update.subagent.parentAgentId : update.parentAgentId;
   }
 
+  private canonicalAgentIdForEvent(event: AgentManagerEvent): string {
+    switch (event.type) {
+      case "agent_state":
+        return event.agent.id;
+      case "provider_subagent":
+        return this.providerSubagentParentAgentId(event.event);
+      case "timeline_replacement":
+      case "agent_stream":
+        return event.agentId;
+    }
+  }
+
   private async forwardEnterpriseProviderSubagentUpdate(
     update: ProviderSubagentManagerEvent,
   ): Promise<void> {
@@ -2496,7 +2518,11 @@ export class Session {
 
     this.unsubscribeAgentEvents = this.agentManager.subscribe(
       (event) => {
-        if (this.enterpriseContext) return this.enqueueEnterpriseAgentEvent(event);
+        if (this.enterpriseContext) {
+          const agentId = this.canonicalAgentIdForEvent(event);
+          if (this.enterpriseAgentEventPreauthorization?.allowsAgentEvent(agentId) !== true) return;
+          return this.enqueueEnterpriseAgentEvent(event);
+        }
         this.forwardLegacyAgentEvent(event);
       },
       { replayState: false },

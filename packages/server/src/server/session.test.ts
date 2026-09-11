@@ -10699,11 +10699,12 @@ async function createEnterpriseAgentEventHarness(
     agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
     workspaceRegistry?: Partial<SessionOptions["workspaceRegistry"]>;
     projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
+    grants?: Parameters<typeof createBinaryAuthorizationFixture>[1];
   } = {},
 ) {
   const fixture = await createBinaryAuthorizationFixture(
     name,
-    [
+    options.grants ?? [
       {
         action: "workspace.content.read",
         selector: { kind: "workspace", workspaceIds: [enterpriseEventWorkspaceId] },
@@ -11108,6 +11109,190 @@ async function createEnterpriseOwnershipTransferHarness(
 }
 
 describe("enterprise agent event publication", () => {
+  test("preauthorizes every global Agent event with its canonical Agent before tail admission", async () => {
+    if (process.platform !== "darwin") return;
+    const respondToPermission = vi.fn(async () => true);
+    const activeVoice = vi.spyOn(VoiceSession.prototype, "isActiveForAgent").mockReturnValue(true);
+    const h = await createEnterpriseAgentEventHarness("agent-event-preauth-targets", {
+      agentManager: { respondToPermission },
+    });
+    const preauthorize = vi
+      .spyOn(h.fixture.runtime.resourceAuthorization, "preauthorizeAgentEvent")
+      .mockReturnValue(false);
+    const assertAgent = vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent");
+    const providerSubagent = {
+      id: "provider-child-preauth",
+      parentAgentId: "agt_provider_upsert_parent",
+      parentSubagentId: null,
+      provider: "codex" as const,
+      title: "child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-09-10T12:00:00.000Z",
+      updatedAt: "2026-09-10T12:00:01.000Z",
+      toolCallId: null,
+      cwd: null,
+      subtitle: null,
+    };
+    const events: AgentManagerEvent[] = [
+      {
+        type: "agent_state",
+        agent: makeEnterpriseEventManagedAgent("agt_state_preapproval"),
+      },
+      { type: "provider_subagent", event: { type: "upsert", subagent: providerSubagent } },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "timeline",
+          parentAgentId: "agt_provider_timeline_parent",
+          subagentId: providerSubagent.id,
+          provider: "codex",
+          row: {
+            item: { type: "assistant_message", messageId: "provider-preauth", text: "child" },
+            timestamp: "2026-09-10T12:00:02.000Z",
+            seq: 1,
+          },
+          epoch: "provider-preauth-epoch",
+        },
+      },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "remove",
+          parentAgentId: "agt_provider_remove_parent",
+          subagentId: providerSubagent.id,
+        },
+      },
+      {
+        type: "timeline_replacement",
+        agentId: "agt_timeline_replacement_preapproval",
+        epoch: "replacement-preauth-epoch",
+      },
+      enterpriseTimelineEvent("preauth-stream", "agt_stream_preapproval"),
+      {
+        type: "agent_stream",
+        agentId: "agt_voice_preapproval",
+        event: {
+          type: "permission_requested",
+          provider: "codex",
+          request: {
+            id: "voice-preauth-request",
+            provider: "codex",
+            name: "paseo_voice.speak",
+            kind: "tool",
+          },
+        },
+      },
+    ];
+
+    try {
+      expect(events.map((event) => h.listener(event))).toEqual(events.map(() => undefined));
+      expect(preauthorize.mock.calls.map(([, agentId]) => agentId)).toEqual([
+        "agt_state_preapproval",
+        "agt_provider_upsert_parent",
+        "agt_provider_timeline_parent",
+        "agt_provider_remove_parent",
+        "agt_timeline_replacement_preapproval",
+        "agt_stream_preapproval",
+        "agt_voice_preapproval",
+      ]);
+      expect(assertAgent).not.toHaveBeenCalled();
+      expect(respondToPermission).not.toHaveBeenCalled();
+      expect(h.messages).toEqual([]);
+    } finally {
+      activeVoice.mockRestore();
+      await h.session.cleanup();
+    }
+  });
+
+  test("keeps denied Session events out of a blocked authorized Session tail", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-event-preauth-before-tail");
+    const authorizeDelivery = deferred<void>();
+    const deliveryStarted = deferred<void>();
+    const preauthorize = vi.spyOn(
+      h.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const assertAgent = vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent");
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        deliveryStarted.resolve();
+        await authorizeDelivery.promise;
+        return originalCanEmit(principal, event, context);
+      },
+    );
+
+    const authorized = h.listener(enterpriseTimelineEvent("authorized-before-tail"));
+    await deliveryStarted.promise;
+    const denied = h.listener(
+      enterpriseTimelineEvent("foreign-before-tail", enterpriseEventForeignAgentId),
+    );
+
+    expect(denied).toBeUndefined();
+    expect(preauthorize.mock.calls.map(([, agentId]) => agentId)).toEqual([
+      enterpriseEventAgentId,
+      enterpriseEventForeignAgentId,
+    ]);
+    expect(assertAgent).toHaveBeenCalledTimes(1);
+    authorizeDelivery.resolve();
+    await authorized;
+
+    expect(h.messages).toHaveLength(1);
+    expect(h.messages[0]).toMatchObject({
+      type: "agent_stream",
+      payload: { agentId: enterpriseEventAgentId },
+    });
+    await h.session.cleanup();
+  });
+
+  test("admits a shared global event only to production Sessions passing nominal preauthorization", async () => {
+    if (process.platform !== "darwin") return;
+    const allowed = await createEnterpriseAgentEventHarness("agent-event-preauth-multisession");
+    const denied = await createEnterpriseAgentEventHarness("agent-event-preauth-no-grant", {
+      grants: [],
+    });
+    const allowedPreauthorize = vi.spyOn(
+      allowed.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const deniedPreauthorize = vi.spyOn(
+      denied.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const allowedAssertAgent = vi.spyOn(
+      allowed.fixture.runtime.resourceAuthorization,
+      "assertAgent",
+    );
+    const deniedAssertAgent = vi.spyOn(denied.fixture.runtime.resourceAuthorization, "assertAgent");
+    const event = enterpriseTimelineEvent("shared-global-event");
+
+    try {
+      const allowedPublication = allowed.listener(event);
+      const deniedPublication = denied.listener(event);
+      expect(deniedPublication).toBeUndefined();
+      await allowedPublication;
+
+      expect(allowedPreauthorize).toHaveBeenCalledExactlyOnceWith(
+        allowed.fixture.runtime.principal,
+        enterpriseEventAgentId,
+      );
+      expect(deniedPreauthorize).toHaveBeenCalledExactlyOnceWith(
+        denied.fixture.runtime.principal,
+        enterpriseEventAgentId,
+      );
+      expect(allowedAssertAgent).toHaveBeenCalledTimes(1);
+      expect(deniedAssertAgent).not.toHaveBeenCalled();
+      expect(allowed.messages).toHaveLength(1);
+      expect(denied.messages).toEqual([]);
+    } finally {
+      await Promise.all([allowed.session.cleanup(), denied.session.cleanup()]);
+    }
+  });
+
   test("serializes authorized stream delivery and uses the exact canonical workspace context", async () => {
     if (process.platform !== "darwin") return;
     const h = await createEnterpriseAgentEventHarness("agent-event-order");
@@ -11222,6 +11407,49 @@ describe("enterprise agent event publication", () => {
     storageRead.resolve(undefined);
     await publishing;
 
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("keeps the async current fence after nominally admitting a timeline replacement", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("timeline-replacement-current-fence");
+    const authorizationStarted = deferred<void>();
+    const releaseAuthorization = deferred<void>();
+    const preauthorize = vi.spyOn(
+      h.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const originalAssertAgent = h.fixture.runtime.resourceAuthorization.assertAgent.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    const assertAgent = vi
+      .spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent")
+      .mockImplementation(async (...args) => {
+        authorizationStarted.resolve();
+        await releaseAuthorization.promise;
+        return originalAssertAgent(...args);
+      });
+
+    const publishing = h.listener({
+      type: "timeline_replacement",
+      agentId: enterpriseEventAgentId,
+      epoch: "replacement-current-fence",
+    });
+    await authorizationStarted.promise;
+    expect(preauthorize).toHaveBeenCalledExactlyOnceWith(
+      h.fixture.runtime.principal,
+      enterpriseEventAgentId,
+    );
+    await h.fixture.runtime.release();
+    releaseAuthorization.resolve();
+    await publishing;
+
+    expect(assertAgent).toHaveBeenCalledExactlyOnceWith(
+      h.fixture.runtime.principal,
+      "workspace.content.read",
+      enterpriseEventAgentId,
+    );
     expect(h.messages).toEqual([]);
     await h.session.cleanup();
   });
@@ -11457,14 +11685,29 @@ describe("enterprise agent event publication", () => {
       "agent_permission_request",
     ]);
 
-    await h.fixture.runtime.release();
-    await h.listener({
+    const authorizationStarted = deferred<void>();
+    const releaseAuthorization = deferred<void>();
+    const originalAssertAgent = h.fixture.runtime.resourceAuthorization.assertAgent.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent").mockImplementation(
+      async (...args) => {
+        authorizationStarted.resolve();
+        await releaseAuthorization.promise;
+        return originalAssertAgent(...args);
+      },
+    );
+    const revoked = h.listener({
       ...permissionEvent,
       event: {
         ...permissionEvent.event,
         request: { ...permissionEvent.event.request, id: "speak-revoked" },
       },
     });
+    await authorizationStarted.promise;
+    await h.fixture.runtime.release();
+    releaseAuthorization.resolve();
+    await revoked;
     expect(respondToPermission).toHaveBeenCalledTimes(1);
     expect(h.messages).toHaveLength(2);
     activeVoice.mockRestore();
@@ -11579,6 +11822,21 @@ describe("enterprise agent event publication", () => {
       },
     });
     expect(providerResult).toBeUndefined();
+    expect(messages.map((message) => message.type)).toEqual([
+      "agent_stream",
+      "agent.provider_subagents.update",
+    ]);
+    const stateResult = listener({
+      type: "agent_state",
+      agent: makeEnterpriseEventManagedAgent("agt_legacy_state"),
+    });
+    const replacementResult = listener({
+      type: "timeline_replacement",
+      agentId: "agt_legacy_replacement",
+      epoch: "legacy-replacement",
+    });
+    expect(stateResult).toBeUndefined();
+    expect(replacementResult).toBeUndefined();
     expect(messages.map((message) => message.type)).toEqual([
       "agent_stream",
       "agent.provider_subagents.update",
