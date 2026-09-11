@@ -12,6 +12,7 @@ import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
+import { performance } from "node:perf_hooks";
 import { basename, resolve, sep } from "path";
 import { homedir } from "node:os";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
@@ -608,6 +609,8 @@ export interface SessionOptions {
   enterpriseIdentitySelfAuthorization?: SessionAuthorization["authorizeInbound"];
   /** Trusted server clock used to timestamp Browser Profile waiting status. */
   now?: () => number;
+  /** Optional local-only RPC timing sink. It never participates in authorization or wire output. */
+  rpcDiagnosticObserver?: SessionRpcDiagnosticObserver;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -761,6 +764,65 @@ function sessionRequestId(message: SessionInboundMessage): string | null {
   return null;
 }
 
+type SessionRpcDiagnosticRequestType = "fetch_agents_request" | "fetch_agent_request";
+type SessionRpcDiagnosticResponseType =
+  | "fetch_agents_response"
+  | "fetch_agent_response"
+  | "rpc_error";
+
+export type SessionRpcDiagnosticObservation =
+  | Readonly<{
+      phase: "session.enter";
+      requestId: string;
+      requestType: SessionRpcDiagnosticRequestType;
+      atUnixMs: number;
+    }>
+  | Readonly<{
+      phase: "response.deliver.begin" | "response.deliver.return";
+      requestId: string;
+      responseType: SessionRpcDiagnosticResponseType;
+      atUnixMs: number;
+    }>;
+
+export type SessionRpcDiagnosticObserver = (observation: SessionRpcDiagnosticObservation) => void;
+
+interface SessionRpcResponseIdentity {
+  readonly requestId: string;
+  readonly responseType: SessionRpcDiagnosticResponseType;
+}
+
+function sessionRpcDiagnosticUnixMs(): number {
+  return performance.timeOrigin + performance.now();
+}
+
+function sessionRpcResponseIdentity(
+  message: SessionOutboundMessage,
+): SessionRpcResponseIdentity | null {
+  if (message.type === "rpc_error") {
+    if (
+      message.payload.requestType !== "fetch_agents_request" &&
+      message.payload.requestType !== "fetch_agent_request"
+    ) {
+      return null;
+    }
+  } else if (message.type !== "fetch_agents_response" && message.type !== "fetch_agent_response") {
+    return null;
+  }
+  const requestId = message.payload.requestId;
+  if (typeof requestId !== "string" || requestId.length === 0) return null;
+  return Object.freeze({ requestId, responseType: message.type });
+}
+
+function sessionRpcRequestIdentity(
+  message: SessionInboundMessage,
+): Readonly<{ requestId: string; requestType: SessionRpcDiagnosticRequestType }> | null {
+  if (message.type !== "fetch_agents_request" && message.type !== "fetch_agent_request") {
+    return null;
+  }
+  const requestId = sessionRequestId(message);
+  return requestId ? Object.freeze({ requestId, requestType: message.type }) : null;
+}
+
 interface EnterpriseTransportRequestContext {
   readonly sessionId: string;
   readonly clientId: string;
@@ -899,6 +961,7 @@ export class Session {
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
     | null;
   private readonly sessionLogger: pino.Logger;
+  private readonly rpcDiagnosticObserver: SessionRpcDiagnosticObserver | null;
   private readonly paseoHome: string;
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
@@ -1019,6 +1082,7 @@ export class Session {
       enterpriseDispatcherRegistration,
       enterpriseIdentitySelfAuthorization,
       now,
+      rpcDiagnosticObserver,
       permissions,
       appVersion,
       clientCapabilities,
@@ -1191,8 +1255,18 @@ export class Session {
       });
     }
     this.enterpriseWorkspaceOwnershipTransferDispatcher = this.enterpriseDispatcher;
-    this.onMessage = onMessage;
-    this.onMessageToSource = onMessageToSource ?? null;
+    this.rpcDiagnosticObserver = rpcDiagnosticObserver ?? null;
+    if (this.rpcDiagnosticObserver) {
+      this.onMessage = (message) =>
+        this.deliverWithRpcDiagnostics(message, () => onMessage(message));
+      this.onMessageToSource = onMessageToSource
+        ? (source, message) =>
+            this.deliverWithRpcDiagnostics(message, () => onMessageToSource(source, message))
+        : null;
+    } else {
+      this.onMessage = onMessage;
+      this.onMessageToSource = onMessageToSource ?? null;
+    }
     this.onBinaryMessage = onBinaryMessage ?? null;
     this.onBinaryMessageToSource = onBinaryMessageToSource ?? null;
     this.getTransportBufferedAmount = getTransportBufferedAmount ?? (() => 0);
@@ -2805,6 +2879,19 @@ export class Session {
    */
   // oxlint-disable-next-line complexity -- inbound authorization and receipt lifecycle are one transaction.
   public async handleMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
+    if (this.rpcDiagnosticObserver) {
+      const request = sessionRpcRequestIdentity(msg);
+      if (request) {
+        this.observeRpcDiagnostic(
+          Object.freeze({
+            phase: "session.enter",
+            requestId: request.requestId,
+            requestType: request.requestType,
+            atUnixMs: sessionRpcDiagnosticUnixMs(),
+          }),
+        );
+      }
+    }
     this.inflightRequests++;
     if (this.inflightRequests > this.peakInflightRequests) {
       this.peakInflightRequests = this.inflightRequests;
@@ -10245,6 +10332,42 @@ export class Session {
     if (!("payload" in msg) || !msg.payload || typeof msg.payload !== "object") return null;
     const requestId = (msg.payload as { requestId?: unknown }).requestId;
     return typeof requestId === "string" && requestId.length > 0 ? requestId : null;
+  }
+
+  private observeRpcDiagnostic(observation: SessionRpcDiagnosticObservation): void {
+    try {
+      this.rpcDiagnosticObserver?.(observation);
+    } catch {
+      // Diagnostics cannot affect Session authorization, delivery, or caller-visible errors.
+    }
+  }
+
+  private deliverWithRpcDiagnostics(message: SessionOutboundMessage, deliver: () => void): void {
+    const identity = sessionRpcResponseIdentity(message);
+    if (!identity) {
+      deliver();
+      return;
+    }
+    this.observeRpcDiagnostic(
+      Object.freeze({
+        phase: "response.deliver.begin",
+        requestId: identity.requestId,
+        responseType: identity.responseType,
+        atUnixMs: sessionRpcDiagnosticUnixMs(),
+      }),
+    );
+    try {
+      deliver();
+    } finally {
+      this.observeRpcDiagnostic(
+        Object.freeze({
+          phase: "response.deliver.return",
+          requestId: identity.requestId,
+          responseType: identity.responseType,
+          atUnixMs: sessionRpcDiagnosticUnixMs(),
+        }),
+      );
+    }
   }
 
   private deliver(msg: SessionOutboundMessage): boolean {

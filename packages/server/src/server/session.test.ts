@@ -41,7 +41,11 @@ import {
   FileTransferOpcode,
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
-import { Session } from "./session.js";
+import {
+  Session,
+  type SessionRpcDiagnosticObservation,
+  type SessionRpcDiagnosticObserver,
+} from "./session.js";
 import { VoiceSession } from "./session/voice/voice-session.js";
 import {
   createEnterpriseAgentSessionContextRegistry,
@@ -478,6 +482,7 @@ interface SessionForTestOptions {
   enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
   enterpriseDispatcherRegistration?: SessionOptions["enterpriseDispatcherRegistration"];
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
+  rpcDiagnosticObserver?: SessionOptions["rpcDiagnosticObserver"];
   now?: SessionOptions["now"];
 }
 
@@ -618,10 +623,211 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     enterpriseDispatcher: options.enterpriseDispatcher,
     enterpriseDispatcherRegistration: options.enterpriseDispatcherRegistration,
     enterpriseIdentitySelfAuthorization: options.enterpriseIdentitySelfAuthorization,
+    rpcDiagnosticObserver: options.rpcDiagnosticObserver,
     now: options.now,
   };
   return new Session(sessionOptions);
 }
+
+describe("Session RPC diagnostic observer", () => {
+  test("observes a correlated response around its synchronous delivery", async () => {
+    const observations: SessionRpcDiagnosticObservation[] = [];
+    const order: string[] = [];
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      onMessage: (message) => {
+        order.push(`sink:${message.type}`);
+        messages.push(message);
+      },
+      rpcDiagnosticObserver: (observation) => {
+        observations.push(observation);
+        order.push(observation.phase);
+      },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "rpc-diagnostic-normal",
+    });
+    order.push("handled");
+
+    expect(order).toEqual([
+      "session.enter",
+      "response.deliver.begin",
+      "sink:fetch_agents_response",
+      "response.deliver.return",
+      "handled",
+    ]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: "fetch_agents_response",
+      payload: { requestId: "rpc-diagnostic-normal" },
+    });
+    expect(observations.map(({ atUnixMs: _atUnixMs, ...observation }) => observation)).toEqual([
+      {
+        phase: "session.enter",
+        requestId: "rpc-diagnostic-normal",
+        requestType: "fetch_agents_request",
+      },
+      {
+        phase: "response.deliver.begin",
+        requestId: "rpc-diagnostic-normal",
+        responseType: "fetch_agents_response",
+      },
+      {
+        phase: "response.deliver.return",
+        requestId: "rpc-diagnostic-normal",
+        responseType: "fetch_agents_response",
+      },
+    ]);
+    expect(observations.every((observation) => Object.isFrozen(observation))).toBe(true);
+    for (const [index, observation] of observations.entries()) {
+      expect(Number.isFinite(observation.atUnixMs)).toBe(true);
+      expect(observation.atUnixMs).toBeGreaterThan(1_000_000_000_000);
+      if (index > 0)
+        expect(observation.atUnixMs).toBeGreaterThanOrEqual(observations[index - 1]!.atUnixMs);
+    }
+
+    await session.cleanup();
+  });
+
+  test("observes a correlated denial only when its rpc_error reaches the sink", async () => {
+    const observations: SessionRpcDiagnosticObservation[] = [];
+    const order: string[] = [];
+    const session = createSessionForTest({
+      permissions: [],
+      onMessage: (message) => order.push(`sink:${message.type}`),
+      rpcDiagnosticObserver: (observation) => {
+        observations.push(observation);
+        order.push(observation.phase);
+      },
+    });
+
+    const handling = session.handleMessage({
+      type: "fetch_agent_request",
+      agentId: "11111111-1111-4111-8111-111111111111",
+      requestId: "rpc-diagnostic-denied",
+    });
+    order.push("handle-returned");
+
+    expect(order).toEqual([
+      "session.enter",
+      "response.deliver.begin",
+      "sink:rpc_error",
+      "response.deliver.return",
+      "handle-returned",
+    ]);
+    expect(observations.map(({ atUnixMs: _atUnixMs, ...observation }) => observation)).toEqual([
+      {
+        phase: "session.enter",
+        requestId: "rpc-diagnostic-denied",
+        requestType: "fetch_agent_request",
+      },
+      {
+        phase: "response.deliver.begin",
+        requestId: "rpc-diagnostic-denied",
+        responseType: "rpc_error",
+      },
+      {
+        phase: "response.deliver.return",
+        requestId: "rpc-diagnostic-denied",
+        responseType: "rpc_error",
+      },
+    ]);
+
+    await handling;
+    await session.cleanup();
+  });
+
+  test("does not report delivery phases when outbound authorization rejects the response", async () => {
+    const observations: SessionRpcDiagnosticObservation[] = [];
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    vi.spyOn(asSessionInternals(session).authorization, "allowsOutbound").mockReturnValue(false);
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "rpc-diagnostic-outbound-denied",
+    });
+
+    expect(messages).toEqual([]);
+    expect(observations.map(({ atUnixMs: _atUnixMs, ...observation }) => observation)).toEqual([
+      {
+        phase: "session.enter",
+        requestId: "rpc-diagnostic-outbound-denied",
+        requestType: "fetch_agents_request",
+      },
+    ]);
+    await session.cleanup();
+  });
+
+  test("does not observe non-target requests, responses, or rpc errors", async () => {
+    const observer = vi.fn<SessionRpcDiagnosticObserver>();
+    const allowed = createSessionForTest({ rpcDiagnosticObserver: observer });
+    const denied = createSessionForTest({
+      permissions: [],
+      rpcDiagnosticObserver: observer,
+    });
+
+    await allowed.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "rpc-diagnostic-non-target-response",
+    });
+    await denied.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "rpc-diagnostic-non-target-error",
+    });
+
+    expect(observer).not.toHaveBeenCalled();
+    await Promise.all([allowed.cleanup(), denied.cleanup()]);
+  });
+
+  test("isolates observer failures from response delivery", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const observer = vi.fn<SessionRpcDiagnosticObserver>(() => {
+      throw new Error("diagnostic observer failed");
+    });
+    const session = createSessionForTest({ messages, rpcDiagnosticObserver: observer });
+
+    await expect(
+      session.handleMessage({
+        type: "fetch_agents_request",
+        requestId: "rpc-diagnostic-observer-throws",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(observer).toHaveBeenCalledTimes(3);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: "fetch_agents_response",
+      payload: { requestId: "rpc-diagnostic-observer-throws" },
+    });
+    await session.cleanup();
+  });
+
+  test("keeps synchronous rejection delivery unchanged when no observer is configured", async () => {
+    const order: string[] = [];
+    const session = createSessionForTest({
+      permissions: [],
+      onMessage: (message) => order.push(`sink:${message.type}`),
+    });
+
+    const handling = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "rpc-diagnostic-disabled",
+    });
+    order.push("handle-returned");
+
+    expect(order).toEqual(["sink:rpc_error", "handle-returned"]);
+    await handling;
+    order.push("handled");
+    expect(order).toEqual(["sink:rpc_error", "handle-returned", "handled"]);
+    await session.cleanup();
+  });
+});
 
 function enterpriseContext(
   generation = "generation-a",
