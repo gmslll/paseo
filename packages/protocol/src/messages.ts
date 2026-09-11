@@ -906,6 +906,7 @@ export interface LeaseCoordinator {
   acquire(input: LeaseAcquireInput): Promise<FencedLease>;
   renew(input: LeaseRenewInput): Promise<FencedLease>;
   release(input: LeaseReleaseInput): Promise<void>;
+  validate?(input: LeaseReleaseInput): Promise<FencedLease>;
 }
 
 export type AuditHashInput = Omit<AuditEvent, "eventHash">;

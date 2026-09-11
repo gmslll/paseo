@@ -6,7 +6,7 @@ import { open, rm } from "fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
 import path from "node:path";
-import { NodeContextSchema } from "@getpaseo/protocol/messages";
+import { NodeContextSchema, type NodeContext } from "@getpaseo/protocol/messages";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Logger } from "pino";
 import { z } from "zod";
@@ -247,6 +247,7 @@ import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
 } from "./enterprise/audit/production-audit-runtime.js";
+import { createManagedPlacementSnapshotSource } from "./enterprise/managed-node/placement-source.js";
 import { createServiceProxySubsystem, type ServiceProxySubsystem } from "./service-proxy.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { ScriptHealthMonitor } from "./script-health-monitor.js";
@@ -599,6 +600,9 @@ async function resolveEnterpriseRuntime(
     const capturedGrantGuard = runtime.grantVersionGuard;
     const capturedResourceAuthorization = runtime.resourceAuthorization;
     const capturedPrincipalSource = runtime.principalSource;
+    const capturedBrowserProfiles = runtime.browserProfiles;
+    const capturedIdentityDispatcherRegistration = runtime.identityDispatcherRegistration;
+    const capturedLeaseCoordinator = runtime.leaseCoordinator;
     const capturedClose = runtime.close?.bind(runtime);
     const authorizationRuntimeProvider = resolveAuthorizationRuntimeProvider(
       runtime,
@@ -608,15 +612,16 @@ async function resolveEnterpriseRuntime(
     const capturedGenerationSource = runtime.nextSessionBindingGeneration.bind(runtime);
     if (
       !capturedResourceAuthorization ||
-      capturedNode.nodeId !== enterpriseConfig.nodeId ||
-      capturedNode.paseoServerId !== serverId ||
-      capturedNode.mode !== "standalone" ||
-      authenticatorNode.nodeId !== capturedNode.nodeId ||
-      authenticatorNode.paseoServerId !== capturedNode.paseoServerId ||
-      authenticatorNode.mode !== capturedNode.mode ||
-      capturedAuthenticator.configuredOrganizationId !== enterpriseConfig.organizationId ||
-      capturedAudit !== audit ||
-      capturedAudit !== capturedAdmission.audit
+      !enterpriseRuntimeIdentityMatches({
+        configuredOrganizationId: enterpriseConfig.organizationId,
+        configuredNodeId: enterpriseConfig.nodeId,
+        configuredMode: enterpriseConfig.managementMode,
+        serverId,
+        capturedNode,
+        authenticatorNode,
+        authenticatorOrganizationId: capturedAuthenticator.configuredOrganizationId,
+        auditMatches: capturedAudit === audit && capturedAudit === capturedAdmission.audit,
+      })
     )
       throw new Error("enterprise runtime does not match configured organization or node");
     productionAuditCapabilityIssuer.requireCurrent(capturedAudit);
@@ -635,6 +640,11 @@ async function resolveEnterpriseRuntime(
       resourceAuthorization: capturedResourceAuthorization,
       authorizationRuntimeProvider,
       ...(capturedPrincipalSource ? { principalSource: capturedPrincipalSource } : {}),
+      ...(capturedBrowserProfiles ? { browserProfiles: capturedBrowserProfiles } : {}),
+      ...(capturedIdentityDispatcherRegistration
+        ? { identityDispatcherRegistration: capturedIdentityDispatcherRegistration }
+        : {}),
+      ...(capturedLeaseCoordinator ? { leaseCoordinator: capturedLeaseCoordinator } : {}),
       ...(runtime.admissionInvalidationSink
         ? { admissionInvalidationSink: runtime.admissionInvalidationSink }
         : {}),
@@ -643,6 +653,28 @@ async function resolveEnterpriseRuntime(
   } catch (primary) {
     return closeFailedEnterpriseRuntime(runtime, closeAudit, primary);
   }
+}
+
+function enterpriseRuntimeIdentityMatches(input: {
+  readonly configuredOrganizationId: string;
+  readonly configuredNodeId: string;
+  readonly configuredMode: "standalone" | "managed";
+  readonly serverId: string;
+  readonly capturedNode: Readonly<NodeContext>;
+  readonly authenticatorNode: Readonly<NodeContext>;
+  readonly authenticatorOrganizationId: string;
+  readonly auditMatches: boolean;
+}): boolean {
+  return (
+    input.capturedNode.nodeId === input.configuredNodeId &&
+    input.capturedNode.paseoServerId === input.serverId &&
+    input.capturedNode.mode === input.configuredMode &&
+    input.authenticatorNode.nodeId === input.capturedNode.nodeId &&
+    input.authenticatorNode.paseoServerId === input.capturedNode.paseoServerId &&
+    input.authenticatorNode.mode === input.capturedNode.mode &&
+    input.authenticatorOrganizationId === input.configuredOrganizationId &&
+    input.auditMatches
+  );
 }
 
 async function closeFailedEnterpriseRuntime(
@@ -1356,6 +1388,9 @@ export async function createPaseoDaemon(
     requireConstructionAudit();
     logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
     if (enterpriseRuntime) {
+      if (capturedEnterpriseMultiUser?.enabled !== true) {
+        throw new Error("enterprise runtime configuration unavailable");
+      }
       const authorizationRuntimeProvider = enterpriseRuntime.authorizationRuntimeProvider;
       if (!authorizationRuntimeProvider) {
         throw new Error("enterprise authorization provider unavailable");
@@ -1383,16 +1418,20 @@ export async function createPaseoDaemon(
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
       });
-      const identityRegistration = createProductionIdentityDispatcherRegistration({
-        admission: enterpriseRuntime.admission,
-        audit: enterpriseRuntime.audit,
-        provider: authorizationRuntimeProvider,
-      });
-      const browserProfiles = resolveProductionBrowserProfileRegistry({
-        admission: enterpriseRuntime.admission,
-        audit: enterpriseRuntime.audit,
-        provider: authorizationRuntimeProvider,
-      });
+      const identityRegistration =
+        enterpriseRuntime.identityDispatcherRegistration ??
+        createProductionIdentityDispatcherRegistration({
+          admission: enterpriseRuntime.admission,
+          audit: enterpriseRuntime.audit,
+          provider: authorizationRuntimeProvider,
+        });
+      const browserProfiles =
+        enterpriseRuntime.browserProfiles ??
+        resolveProductionBrowserProfileRegistry({
+          admission: enterpriseRuntime.admission,
+          audit: enterpriseRuntime.audit,
+          provider: authorizationRuntimeProvider,
+        });
       if (!browserProfiles) {
         throw new Error("enterprise browser profile authority unavailable");
       }
@@ -1410,6 +1449,9 @@ export async function createPaseoDaemon(
         createLeaseId: () => `lea_${randomUUID()}`,
         createRequestId: () => `req_${randomUUID()}`,
         maxLeaseTtlMs: 60_000,
+        ...(enterpriseRuntime.leaseCoordinator
+          ? { leaseCoordinator: enterpriseRuntime.leaseCoordinator }
+          : {}),
         onError: (error) => logger.error({ err: error }, "Enterprise browser lease failure"),
       });
       let browserBundleClosePromise: Promise<void> | null = null;
@@ -1421,6 +1463,19 @@ export async function createPaseoDaemon(
       await browserBundle.profiles.initialize();
       await browserBundle.bindings.initialize();
       await browserBundle.leases.initialize();
+      if (!resourceBundle) {
+        throw new Error("enterprise resource production bundle unavailable");
+      }
+      if (enterpriseRuntime.managedPlacementSource) {
+        await enterpriseRuntime.managedPlacementSource.install(
+          createManagedPlacementSnapshotSource({
+            organizationId: capturedEnterpriseMultiUser.organizationId,
+            nodeId: enterpriseRuntime.node.nodeId,
+            organizationResources: resourceBundle.organizationResources,
+            browserProfiles,
+          }),
+        );
+      }
       const browserProfileContentProbe = capturedBrowserProfileContentReadSourceFactory({
         pageIdentity: browserBundle.pageIdentityVerifier,
       });
@@ -1454,7 +1509,6 @@ export async function createPaseoDaemon(
       });
       if (
         !identityRegistration ||
-        !resourceBundle ||
         !contentRegistration ||
         !auditRegistration ||
         !browserRegistration

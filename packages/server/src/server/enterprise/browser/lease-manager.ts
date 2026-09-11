@@ -10,6 +10,8 @@ import {
   type FencedLease,
   type AuditSink,
   type AuditEventInput,
+  type LeaseCoordinator,
+  type LeaseReleaseInput,
 } from "@getpaseo/protocol/messages";
 import type { EnterpriseAgentContextHandle } from "../../session/enterprise-agent-session-context-registry.js";
 import { z } from "zod";
@@ -122,6 +124,7 @@ export interface BrowserProfileLeaseManagerOptions {
   createRequestId: () => string;
   auditSink: AuditSink;
   maxLeaseTtlMs: number;
+  leaseCoordinator?: LeaseCoordinator;
   isCurrentHandle: (handle: EnterpriseAgentContextHandle) => boolean;
   resolveAuthorization: (
     handle: EnterpriseAgentContextHandle,
@@ -302,6 +305,21 @@ export class BrowserProfileLeaseManager {
     const active = this.getActive(parsed.handle, parsed.lease);
     await this.assertCurrentAuthorization(active, parsed.handle, parsed.lease);
     this.assertActiveIdentity(active, parsed.handle, parsed.lease);
+    if (this.options.leaseCoordinator) {
+      const renewed = FencedLeaseSchema.parse(
+        await this.options.leaseCoordinator.renew({
+          ...leaseReleaseInput(active.lease),
+          ttlMs: parsed.ttlMs,
+        }),
+      );
+      this.assertActiveIdentity(active, parsed.handle, parsed.lease);
+      assertCoordinatedLeaseRenewal(renewed, active.lease);
+      active.lease = renewed;
+      active.authorization = { ...active.authorization, ttlMs: parsed.ttlMs };
+      this.arm(active, Math.max(1, Date.parse(renewed.expiresAt) - this.readNow()));
+      this.observeLeaseAudit(active, "allowed", LEASE_AUDIT_REASON.renewed);
+      return cloneLease(renewed);
+    }
     const now = this.readNow(parsed.ttlMs);
     const renewed = FencedLeaseSchema.parse({
       ...active.lease,
@@ -323,8 +341,15 @@ export class BrowserProfileLeaseManager {
     this.assertCurrentHandle(parsed.handle);
     const active = this.getActive(parsed.handle, parsed.lease);
     this.deactivate(active);
+    let releaseFailure: unknown = null;
+    try {
+      await this.releaseCoordinatedLease(active);
+    } catch (error) {
+      releaseFailure = error;
+    }
     await this.track(this.appendLeaseAudit(active, "allowed", LEASE_AUDIT_REASON.released));
     await this.track(this.drain(leaseKey(parsed.lease)));
+    if (releaseFailure) throw releaseFailure;
   }
 
   public async validateLease(input: BrowserProfileLeaseAccessInput): Promise<FencedLease> {
@@ -335,6 +360,20 @@ export class BrowserProfileLeaseManager {
     const active = this.getActive(parsed.handle, parsed.lease);
     await this.assertCurrentAuthorization(active, parsed.handle, parsed.lease);
     this.assertActiveIdentity(active, parsed.handle, parsed.lease);
+    if (this.options.leaseCoordinator) {
+      const validateCoordinatedLease = this.options.leaseCoordinator.validate;
+      if (!validateCoordinatedLease) {
+        throw new Error("Managed lease coordinator validation is unavailable.");
+      }
+      const validated = FencedLeaseSchema.parse(
+        await validateCoordinatedLease.call(
+          this.options.leaseCoordinator,
+          leaseReleaseInput(active.lease),
+        ),
+      );
+      this.assertActiveIdentity(active, parsed.handle, parsed.lease);
+      assertLeaseMatch(validated, active.lease);
+    }
     const now = this.readNow();
     if (Date.parse(active.lease.expiresAt) <= now) {
       await this.expireActive(active);
@@ -402,7 +441,8 @@ export class BrowserProfileLeaseManager {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.closePromise = (async () => {
-      for (const active of this.active.values()) this.deactivate(active);
+      const coordinated = Array.from(this.active.values());
+      for (const active of coordinated) this.deactivate(active);
       this.active.clear();
       for (const queue of this.queues.values()) {
         for (const request of queue) {
@@ -411,6 +451,13 @@ export class BrowserProfileLeaseManager {
         }
       }
       this.queues.clear();
+      for (const active of coordinated) {
+        try {
+          await this.releaseCoordinatedLease(active);
+        } catch (error) {
+          this.recordError(error);
+        }
+      }
       await this.waitForIdle();
       if (
         this.active.size > 0 ||
@@ -558,51 +605,114 @@ export class BrowserProfileLeaseManager {
 
   private async grant(input: ResolvedAcquireInput): Promise<FencedLease> {
     const grantGeneration = this.generation;
-    const leaseId = this.allocateLeaseId();
+    const leaseId = this.options.leaseCoordinator ? null : this.allocateLeaseId();
     try {
       return await this.grantReserved(input, grantGeneration, leaseId);
     } finally {
-      this.reservedLeaseIds.delete(leaseId);
+      if (leaseId) this.reservedLeaseIds.delete(leaseId);
     }
   }
 
   private async grantReserved(
     input: ResolvedAcquireInput,
     grantGeneration: number,
-    leaseId: string,
+    leaseId: string | null,
   ): Promise<FencedLease> {
+    const reservation = await this.reserveLeaseIdentity(input);
+    this.assertGrantState(input, grantGeneration);
+    const currentAuthorization = await this.refreshGrantAuthorization(input, grantGeneration);
+    this.assertSharedReadReservation(reservation);
+    this.assertGrantState(currentAuthorization, grantGeneration);
+    const now = this.readNow(input.ttlMs);
+    const lease = await this.createReservedLease(
+      currentAuthorization,
+      input,
+      leaseId,
+      reservation.fencingToken,
+      now,
+    );
+    await this.assertAcquiredLeaseOrRelease(lease, currentAuthorization, input, now);
+    const active: ActiveLease = { lease, authorization: currentAuthorization };
+    this.assertGrantState(currentAuthorization, grantGeneration);
+    assertLeaseAuthorization(lease, currentAuthorization);
+    await this.requireAcquisitionAudit(active);
+    return this.publishReservedLease(active, input, grantGeneration, reservation);
+  }
+
+  private async reserveLeaseIdentity(input: ResolvedAcquireInput): Promise<{
+    readonly sharedRead?: ActiveLease;
+    readonly sharedReadLeaseId?: string;
+    readonly fencingToken: number;
+  }> {
     const sharedRead =
-      input.mode === "read"
+      !this.options.leaseCoordinator && input.mode === "read"
         ? Array.from(this.active.values()).find(
             (item) => item.lease.mode === "read" && leaseKey(item.lease) === resourceKey(input),
           )
         : undefined;
     const sharedReadLeaseId = sharedRead?.lease.leaseId;
-    const fencingToken = sharedRead?.lease.fencingToken ?? this.nextFencingToken++;
-    if (!sharedRead && this.nextFencingToken > Number.MAX_SAFE_INTEGER)
+    const fencingToken = this.options.leaseCoordinator
+      ? 0
+      : (sharedRead?.lease.fencingToken ?? this.nextFencingToken++);
+    if (
+      !this.options.leaseCoordinator &&
+      !sharedRead &&
+      this.nextFencingToken > Number.MAX_SAFE_INTEGER
+    )
       throw new Error("Lease fencing token exhausted.");
-    if (!sharedRead) {
+    if (!this.options.leaseCoordinator && !sharedRead) {
       await this.options.generationStorage.write({
         version: 1,
         generation: this.generation,
         nextFencingToken: this.nextFencingToken,
       });
     }
-    this.assertGrantState(input, grantGeneration);
-    const currentAuthorization = await this.refreshGrantAuthorization(input, grantGeneration);
-    if (sharedReadLeaseId && this.active.get(sharedReadLeaseId) !== sharedRead)
+    return { sharedRead, sharedReadLeaseId, fencingToken };
+  }
+
+  private assertSharedReadReservation(reservation: {
+    readonly sharedRead?: ActiveLease;
+    readonly sharedReadLeaseId?: string;
+  }): void {
+    if (
+      reservation.sharedReadLeaseId &&
+      this.active.get(reservation.sharedReadLeaseId) !== reservation.sharedRead
+    ) {
       throw new Error("Shared read lease became inactive during grant.");
-    this.assertGrantState(currentAuthorization, grantGeneration);
-    const now = this.readNow(input.ttlMs);
-    const lease = FencedLeaseSchema.parse({
-      organizationId: currentAuthorization.handle.context.principal.organizationId,
-      nodeId: currentAuthorization.handle.context.node.nodeId,
-      businessIdentityId: currentAuthorization.profile.businessIdentityId,
+    }
+  }
+
+  private async createReservedLease(
+    authorization: ResolvedAcquireInput,
+    input: ResolvedAcquireInput,
+    leaseId: string | null,
+    fencingToken: number,
+    now: number,
+  ): Promise<FencedLease> {
+    if (this.options.leaseCoordinator) {
+      return FencedLeaseSchema.parse(
+        await this.options.leaseCoordinator.acquire({
+          organizationId: authorization.handle.context.principal.organizationId,
+          nodeId: authorization.handle.context.node.nodeId,
+          businessIdentityId: authorization.profile.businessIdentityId,
+          resourceKind: "browser_profile",
+          resourceId: authorization.profile.browserProfileId,
+          holderPrincipalId: authorization.handle.context.principal.principalId,
+          holderAgentId: authorization.agent.agentId,
+          mode: input.mode,
+          ttlMs: input.ttlMs,
+        }),
+      );
+    }
+    return FencedLeaseSchema.parse({
+      organizationId: authorization.handle.context.principal.organizationId,
+      nodeId: authorization.handle.context.node.nodeId,
+      businessIdentityId: authorization.profile.businessIdentityId,
       resourceKind: "browser_profile",
-      resourceId: currentAuthorization.profile.browserProfileId,
+      resourceId: authorization.profile.browserProfileId,
       leaseId,
-      holderPrincipalId: currentAuthorization.handle.context.principal.principalId,
-      holderAgentId: currentAuthorization.agent.agentId,
+      holderPrincipalId: authorization.handle.context.principal.principalId,
+      holderAgentId: authorization.agent.agentId,
       fencingToken,
       mode: input.mode,
       acquiredAt: isoTimestamp(now),
@@ -610,15 +720,32 @@ export class BrowserProfileLeaseManager {
       expiresAt: isoTimestamp(now + input.ttlMs),
       leaseRevision: this.nextRevision(),
     });
-    const active: ActiveLease = {
-      lease,
-      authorization: currentAuthorization,
-    };
-    this.assertGrantState(currentAuthorization, grantGeneration);
-    assertLeaseAuthorization(lease, currentAuthorization);
+  }
+
+  private async assertAcquiredLeaseOrRelease(
+    lease: FencedLease,
+    authorization: ResolvedAcquireInput,
+    input: ResolvedAcquireInput,
+    now: number,
+  ): Promise<void> {
+    try {
+      assertCoordinatedLeaseAcquisition(lease, authorization, input.mode, now, input.ttlMs);
+    } catch (error) {
+      if (this.options.leaseCoordinator) {
+        try {
+          await this.options.leaseCoordinator.release(leaseReleaseInput(lease));
+        } catch (releaseError) {
+          this.recordError(releaseError);
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async requireAcquisitionAudit(active: ActiveLease): Promise<void> {
     try {
       await this.appendAudit(
-        currentAuthorization,
+        active.authorization,
         "allowed",
         LEASE_AUDIT_REASON.acquired,
         "required",
@@ -626,8 +753,13 @@ export class BrowserProfileLeaseManager {
     } catch (error) {
       this.recordError(error);
       try {
+        await this.releaseCoordinatedLease(active);
+      } catch (releaseError) {
+        this.recordError(releaseError);
+      }
+      try {
         await this.appendAudit(
-          currentAuthorization,
+          active.authorization,
           "failed",
           LEASE_AUDIT_REASON.auditUnavailable,
           "buffered",
@@ -637,6 +769,16 @@ export class BrowserProfileLeaseManager {
       }
       throw new Error("Lease audit unavailable.", { cause: error });
     }
+  }
+
+  private async publishReservedLease(
+    active: ActiveLease,
+    input: ResolvedAcquireInput,
+    grantGeneration: number,
+    reservation: { readonly sharedRead?: ActiveLease; readonly sharedReadLeaseId?: string },
+  ): Promise<FencedLease> {
+    const { lease } = active;
+    const currentAuthorization = active.authorization;
     try {
       this.assertGrantState(currentAuthorization, grantGeneration);
       assertLeaseAuthorization(lease, currentAuthorization);
@@ -646,15 +788,25 @@ export class BrowserProfileLeaseManager {
       );
       this.assertGrantState(publishAuthorization, grantGeneration);
       assertLeaseAuthorization(lease, publishAuthorization);
-      if (sharedReadLeaseId && this.active.get(sharedReadLeaseId) !== sharedRead)
-        throw new Error("Shared read lease became inactive during grant.");
-      if (this.active.has(leaseId)) throw new Error("Lease ID became unavailable during grant.");
+      this.assertSharedReadReservation(reservation);
+      if (this.active.has(lease.leaseId))
+        throw new Error("Lease ID became unavailable during grant.");
       active.authorization = publishAuthorization;
-      this.active.set(leaseId, active);
-      this.arm(active, input.ttlMs);
+      this.active.set(lease.leaseId, active);
+      this.arm(
+        active,
+        this.options.leaseCoordinator
+          ? Math.max(1, Date.parse(lease.expiresAt) - this.readNow())
+          : input.ttlMs,
+      );
       return cloneLease(lease);
     } catch (error) {
-      if (this.active.get(leaseId) === active) this.deactivate(active);
+      if (this.active.get(lease.leaseId) === active) this.deactivate(active);
+      try {
+        await this.releaseCoordinatedLease(active);
+      } catch (releaseError) {
+        this.recordError(releaseError);
+      }
       try {
         await this.appendAudit(
           currentAuthorization,
@@ -712,6 +864,11 @@ export class BrowserProfileLeaseManager {
   private async expireActive(active: ActiveLease): Promise<void> {
     if (this.active.get(active.lease.leaseId) !== active) return;
     this.deactivate(active);
+    try {
+      await this.releaseCoordinatedLease(active);
+    } catch (error) {
+      this.recordError(error);
+    }
     await this.track(this.appendLeaseAudit(active, "allowed", LEASE_AUDIT_REASON.expired));
     await this.track(this.drain(leaseKey(active.lease)));
   }
@@ -894,6 +1051,11 @@ export class BrowserProfileLeaseManager {
       if (activePredicate(active)) {
         keys.add(leaseKey(active.lease));
         this.deactivate(active);
+        try {
+          await this.releaseCoordinatedLease(active);
+        } catch (error) {
+          this.recordError(error);
+        }
         await this.track(this.appendLeaseAudit(active, "allowed", reasonCode));
       }
     for (const [key, queue] of this.queues) {
@@ -913,6 +1075,10 @@ export class BrowserProfileLeaseManager {
   private assertTtl(ttlMs: number): void {
     if (!Number.isSafeInteger(ttlMs) || ttlMs > this.options.maxLeaseTtlMs)
       throw new Error("Lease TTL exceeds the configured safe maximum.");
+  }
+
+  private async releaseCoordinatedLease(active: ActiveLease): Promise<void> {
+    await this.options.leaseCoordinator?.release(leaseReleaseInput(active.lease));
   }
 
   private allocateLeaseId(): string {
@@ -1106,6 +1272,56 @@ function assertLeaseAuthorization(
     lease.holderAgentId !== authorization.agent.agentId
   )
     throw new Error("Resolved Browser Profile authorization does not match the lease.");
+}
+
+function assertCoordinatedLeaseAcquisition(
+  lease: FencedLease,
+  authorization: ResolvedAcquireInput,
+  mode: "read" | "write",
+  now: number,
+  ttlMs: number,
+): void {
+  assertLeaseAuthorization(lease, authorization);
+  if (
+    lease.mode !== mode ||
+    lease.fencingToken < 1 ||
+    !Number.isFinite(Date.parse(lease.acquiredAt)) ||
+    !Number.isFinite(Date.parse(lease.heartbeatAt)) ||
+    Date.parse(lease.expiresAt) <= now ||
+    Date.parse(lease.expiresAt) > now + ttlMs
+  ) {
+    throw new Error("Managed lease acquisition returned an invalid lease.");
+  }
+}
+
+function assertCoordinatedLeaseRenewal(renewed: FencedLease, previous: FencedLease): void {
+  if (
+    renewed.leaseId !== previous.leaseId ||
+    renewed.organizationId !== previous.organizationId ||
+    renewed.nodeId !== previous.nodeId ||
+    renewed.businessIdentityId !== previous.businessIdentityId ||
+    renewed.resourceKind !== previous.resourceKind ||
+    renewed.resourceId !== previous.resourceId ||
+    renewed.holderPrincipalId !== previous.holderPrincipalId ||
+    renewed.holderAgentId !== previous.holderAgentId ||
+    renewed.fencingToken !== previous.fencingToken ||
+    renewed.mode !== previous.mode ||
+    renewed.acquiredAt !== previous.acquiredAt ||
+    renewed.leaseRevision === previous.leaseRevision ||
+    Date.parse(renewed.heartbeatAt) < Date.parse(previous.heartbeatAt) ||
+    Date.parse(renewed.expiresAt) <= Date.parse(renewed.heartbeatAt)
+  ) {
+    throw new Error("Managed lease renewal returned a different lease identity.");
+  }
+}
+
+function leaseReleaseInput(lease: FencedLease): LeaseReleaseInput {
+  return {
+    leaseId: lease.leaseId,
+    nodeId: lease.nodeId,
+    holderPrincipalId: lease.holderPrincipalId,
+    fencingToken: lease.fencingToken,
+  };
 }
 
 function cloneLease(lease: FencedLease): FencedLease {

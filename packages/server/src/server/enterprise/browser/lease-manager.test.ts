@@ -15,6 +15,7 @@ import type {
   AuditEventInput,
   AuditSink,
   FencedLease,
+  LeaseCoordinator,
 } from "@getpaseo/protocol/messages";
 import {
   createEnterpriseAgentSessionContextRegistry,
@@ -262,6 +263,7 @@ function createManager(
     onError?: (error: Error) => void;
     registry?: EnterpriseAgentSessionContextRegistry;
     auditSink?: AuditSink;
+    leaseCoordinator?: LeaseCoordinator;
   } = {},
 ): BrowserProfileLeaseManager {
   sessionCache.clear();
@@ -288,6 +290,7 @@ function createManager(
     waitingErrorLimit: options.waitingErrorLimit,
     initialLeaseRevision: options.initialLeaseRevision,
     onError: options.onError,
+    leaseCoordinator: options.leaseCoordinator,
   });
 }
 
@@ -446,6 +449,95 @@ describe("BrowserProfileLeaseManager", () => {
       resource: { kind: "browser_profile_lease" },
     });
     expect(audit.attempts[0]?.options).toEqual({ durability: "required" });
+  });
+
+  test("uses a global coordinator for acquire, validate, renew, release, and close", async () => {
+    const clock = new FakeClockScheduler();
+    let current: FencedLease | null = null;
+    let fencingToken = 40;
+    const acquire = vi.fn(async (input) => {
+      const at = new Date(clock.nowMs).toISOString();
+      current = {
+        ...input,
+        businessIdentityId: input.businessIdentityId!,
+        leaseId: "lea_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        fencingToken: ++fencingToken,
+        leaseRevision: "remote-1",
+        acquiredAt: at,
+        heartbeatAt: at,
+        expiresAt: new Date(clock.nowMs + input.ttlMs).toISOString(),
+      } as FencedLease;
+      return current;
+    });
+    const validate = vi.fn(async () => current!);
+    const renew = vi.fn(async (input) => {
+      current = {
+        ...current!,
+        leaseRevision: "remote-2",
+        heartbeatAt: new Date(clock.nowMs).toISOString(),
+        expiresAt: new Date(clock.nowMs + input.ttlMs).toISOString(),
+      };
+      return current;
+    });
+    const release = vi.fn(async () => {
+      current = null;
+    });
+    const manager = createManager({
+      clock,
+      leaseCoordinator: { acquire, validate, renew, release },
+    });
+
+    const lease = await manager.acquire(acquireInput({ mode: "write", ttlMs: 2_000 }));
+    expect(lease).toMatchObject({ fencingToken: 41, leaseRevision: "remote-1" });
+    expect(acquire).toHaveBeenCalledOnce();
+    await expect(manager.validateLease(access(lease))).resolves.toEqual(lease);
+    expect(validate).toHaveBeenCalledOnce();
+    const renewed = await manager.renew({ ...access(lease), ttlMs: 3_000 });
+    expect(renewed.leaseRevision).toBe("remote-2");
+    expect(renew).toHaveBeenCalledOnce();
+    await manager.releaseLease(access(renewed));
+    expect(release).toHaveBeenCalledOnce();
+
+    const closingLease = await manager.acquire(
+      acquireInput({ mode: "write", holderAgentId: "agent-close-global" }),
+    );
+    expect(closingLease.fencingToken).toBe(42);
+    await manager.close();
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
+  test("releases a globally acquired lease when the coordinator returns mismatched authority", async () => {
+    const clock = new FakeClockScheduler();
+    const release = vi.fn(async () => undefined);
+    const manager = createManager({
+      clock,
+      leaseCoordinator: {
+        acquire: async (input) => ({
+          ...input,
+          businessIdentityId: input.businessIdentityId!,
+          leaseId: "lea_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          fencingToken: 1,
+          leaseRevision: "remote-invalid",
+          acquiredAt: new Date(clock.nowMs).toISOString(),
+          heartbeatAt: new Date(clock.nowMs).toISOString(),
+          expiresAt: new Date(clock.nowMs + input.ttlMs).toISOString(),
+          resourceId: "brp_2222222222222222",
+        }),
+        validate: async () => {
+          throw new Error("unexpected validation");
+        },
+        renew: async () => {
+          throw new Error("unexpected renewal");
+        },
+        release,
+      },
+    });
+
+    await expect(manager.acquire(acquireInput({ mode: "write" }))).rejects.toThrow(
+      "does not match the lease",
+    );
+    expect(release).toHaveBeenCalledOnce();
+    await manager.close();
   });
 
   test("release audit failure does not block FIFO drain", async () => {

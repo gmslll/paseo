@@ -352,6 +352,10 @@ interface AuthoritativeGrantStoreRecord {
 }
 
 const authoritativeGrantStores = new WeakMap<object, AuthoritativeGrantStoreRecord>();
+const authoritativeGrantStoreSynchronizers = new WeakMap<
+  object,
+  (records: readonly GrantRecord[]) => Promise<void>
+>();
 
 export class GrantStore {
   private mutationQueue: Promise<void> = Promise.resolve();
@@ -364,6 +368,9 @@ export class GrantStore {
     audit: AuditSink,
   ) {
     authoritativeGrantStores.set(this, Object.freeze({ audit }));
+    authoritativeGrantStoreSynchronizers.set(this, (records) =>
+      this.synchronizeAuthoritativeRecords(records),
+    );
   }
 
   async get(principalId: string): Promise<GrantRecord | null> {
@@ -406,6 +413,53 @@ export class GrantStore {
       () => undefined,
     );
     return operation;
+  }
+
+  private synchronizeAuthoritativeRecords(records: readonly GrantRecord[]): Promise<void> {
+    const captured = records.map((record) => {
+      const parsed = GrantRecordSchema.parse(structuredClone(record));
+      validateOrganizationSelectors(parsed);
+      return cloneRecord(parsed);
+    });
+    const principalIds = new Set(captured.map((record) => record.principalId));
+    if (principalIds.size !== captured.length) {
+      return Promise.reject(new Error("duplicate authoritative grant record"));
+    }
+    const operation = this.mutationQueue.then(() =>
+      this.synchronizeAuthoritativeRecordsSerial(captured),
+    );
+    this.mutationQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  private async synchronizeAuthoritativeRecordsSerial(
+    records: readonly GrantRecord[],
+  ): Promise<void> {
+    const listenerFailures: unknown[] = [];
+    for (const record of records) {
+      const previous =
+        this.authoritative.get(record.principalId) ?? (await this.readRecord(record.principalId));
+      if (previous && JSON.stringify(previous) === JSON.stringify(record)) {
+        this.authoritative.set(record.principalId, cloneRecord(record));
+        continue;
+      }
+      await this.storage.put(record);
+      this.authoritative.set(record.principalId, cloneRecord(record));
+      const invalidation = frozenInvalidation(record);
+      for (const listener of this.listeners) {
+        try {
+          await listener(invalidation);
+        } catch (error) {
+          listenerFailures.push(error);
+        }
+      }
+    }
+    if (listenerFailures.length > 0) {
+      throw new AggregateError(listenerFailures, "Authoritative grant synchronization failed");
+    }
   }
 
   // oxlint-disable-next-line complexity
@@ -562,6 +616,20 @@ export function subscribeAuthoritativeGrantInvalidation(
 ): () => void {
   if (!isAuthoritativeGrantStore(store)) throw new Error("invalid GrantStore");
   return GrantStore.prototype.subscribe.call(store, listener);
+}
+
+/** Applies grant records received from the central management authority without minting versions locally. */
+export function synchronizeAuthoritativeGrantRecords(
+  store: GrantStore,
+  audit: AuditSink,
+  records: readonly GrantRecord[],
+): Promise<void> {
+  if (!isAuthoritativeGrantStoreForAudit(store, audit)) {
+    return Promise.reject(new Error("invalid GrantStore authority"));
+  }
+  const synchronize = authoritativeGrantStoreSynchronizers.get(store);
+  if (!synchronize) return Promise.reject(new Error("invalid GrantStore"));
+  return synchronize(records);
 }
 
 function authoritativeGrantStoreAudit(store: GrantStore): AuditSink {

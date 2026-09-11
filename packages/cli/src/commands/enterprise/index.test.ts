@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { loadPersistedConfig } from "@getpaseo/server";
 import { resolveLocalDaemonState } from "../daemon/local-daemon.js";
 import { createProductionEnterpriseInitDependencies } from "./index.js";
+import { createProductionEnterpriseEnrollDependencies } from "./index.js";
 
 const organizationId = "org_aaaaaaaaaaaaaaaa" as const;
 const nodeId = "nod_aaaaaaaaaaaaaaaa" as const;
@@ -65,6 +67,99 @@ describe("production enterprise init CLI adapter", () => {
       bootstrapPassword: "password",
       principalId,
       displayName: "Initial administrator",
+    });
+  });
+});
+
+describe("production enterprise enroll CLI adapter", () => {
+  test("rejects enrollment while the daemon is running", async () => {
+    const home = await createHome();
+    const state = resolveLocalDaemonState({ home });
+    const enrollNode = vi.fn();
+    const dependencies = createProductionEnterpriseEnrollDependencies({
+      resolveState: () => ({ ...state, running: true }),
+      enrollNode,
+    });
+
+    await expect(
+      dependencies.enroll({
+        home,
+        managementBaseUrl: "https://management.example:17443",
+        caCertificatePath: "/private/ca.pem",
+        endpoint: "wss://node.example:6767",
+        enrollmentToken: "one-time-token",
+      }),
+    ).rejects.toMatchObject({ code: "ENTERPRISE_ENROLL_DAEMON_RUNNING" });
+    expect(enrollNode).not.toHaveBeenCalled();
+  });
+
+  test("enrolls the local identity and atomically selects managed mode", async () => {
+    const home = await createHome();
+    const caCertificatePath = path.join(home, "management-ca.pem");
+    await writeFile(caCertificatePath, "test-ca", { mode: 0o600 });
+    const relationshipPath = path.join(home, "managed-relationship.json");
+    const enrollNode = vi.fn(async (input) => ({
+      version: 1 as const,
+      managementBaseUrl: "https://management.example:17443",
+      node: {
+        nodeId,
+        organizationId,
+        bootId: input.heartbeat.bootId,
+        paseoServerId: input.heartbeat.paseoServerId,
+        endpoint: input.heartbeat.endpoint,
+        version: input.heartbeat.version,
+        capabilities: input.heartbeat.capabilities,
+        capacity: input.heartbeat.capacity,
+        publicKeyPem: "public-key",
+        status: "registered" as const,
+        lastSeenAt: null,
+        createdAt: "2026-09-11T00:00:00.000Z",
+        updatedAt: "2026-09-11T00:00:00.000Z",
+      },
+      nodePrivateKeyPem: "private-key",
+      ticketPublicKeyPem: "ticket-public-key",
+    }));
+    const dependencies = createProductionEnterpriseEnrollDependencies({
+      enrollNode,
+      resolveVersion: () => "8.1.0-enterprise",
+    });
+
+    await expect(
+      dependencies.enroll({
+        home,
+        managementBaseUrl: "https://management.example:17443",
+        caCertificatePath,
+        endpoint: "wss://node.example:6767",
+        relationshipPath,
+        enrollmentToken: "one-time-token",
+      }),
+    ).resolves.toMatchObject({ nodeId, organizationId, relationshipPath });
+    expect(enrollNode).toHaveBeenCalledWith(
+      expect.objectContaining({
+        managementBaseUrl: "https://management.example:17443",
+        enrollmentToken: "one-time-token",
+        relationshipPath,
+        caCertificate: Buffer.from("test-ca"),
+        heartbeat: expect.objectContaining({
+          bootId: expect.stringMatching(/^boot_[0-9a-f]{32}$/),
+          paseoServerId: expect.stringMatching(/^srv_/),
+          endpoint: "wss://node.example:6767",
+          version: "8.1.0-enterprise",
+          capabilities: expect.objectContaining({ enterpriseManagedV1: true }),
+        }),
+      }),
+    );
+    expect(loadPersistedConfig(home).features?.enterpriseMultiUser).toEqual({
+      enabled: true,
+      organizationId,
+      nodeId,
+      managementMode: "managed",
+      legacyRecords: "owner_only",
+      management: {
+        baseUrl: "https://management.example:17443",
+        caCertificatePath,
+        relationshipPath,
+      },
     });
   });
 });

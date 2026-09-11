@@ -31,3 +31,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0026: Provider history and search resource contract](decisions/0026-provider-history-and-search-resource-contract.md)
 - [ADR 0027: Single-resource ownership transfer contract](decisions/0027-single-resource-ownership-transfer.md)
 - [ADR 0028: Browser page identity observation ownership](decisions/0028-browser-page-identity-observation.md)
+- [ADR 0029: Distributed management plane v1](decisions/0029-distributed-management-plane-v1.md)

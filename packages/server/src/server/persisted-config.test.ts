@@ -49,10 +49,51 @@ describe("PersistedConfigSchema daemon auth config", () => {
   test.each([
     ["organizationId", { ...enabledConfig, organizationId: "bad" }],
     ["nodeId", { ...enabledConfig, nodeId: "bad" }],
-    ["managementMode", { ...enabledConfig, managementMode: "managed" }],
+    ["managementMode", { ...enabledConfig, managementMode: "federated" }],
     ["legacyRecords", { ...enabledConfig, legacyRecords: "all" }],
   ])("rejects invalid enabled field %s", (_field, value) => {
     expect(EnterpriseMultiUserSchema.safeParse(value).success).toBe(false);
+  });
+
+  test("accepts strict managed enterprise configuration", () => {
+    const managed = {
+      ...enabledConfig,
+      managementMode: "managed" as const,
+      management: {
+        baseUrl: "https://management.example.test:17443",
+        caCertificatePath: "/etc/paseo/management-ca.pem",
+        relationshipPath: "/var/lib/paseo/managed-node.json",
+        heartbeatIntervalMs: 15_000,
+      },
+    };
+    expect(EnterpriseMultiUserSchema.parse(managed)).toEqual(managed);
+    const normalized = normalizeEnterpriseMultiUser(managed);
+    expect(Object.isFrozen(normalized)).toBe(true);
+    expect(
+      normalized?.enabled && normalized.managementMode === "managed"
+        ? Object.isFrozen(normalized.management)
+        : false,
+    ).toBe(true);
+    managed.management.heartbeatIntervalMs = 30_000;
+    expect(
+      normalized?.enabled && normalized.managementMode === "managed"
+        ? normalized.management.heartbeatIntervalMs
+        : undefined,
+    ).toBe(15_000);
+  });
+
+  test("rejects managed control-plane URLs without TLS", () => {
+    expect(
+      EnterpriseMultiUserSchema.safeParse({
+        ...enabledConfig,
+        managementMode: "managed",
+        management: {
+          baseUrl: "http://management.example.test:17443",
+          caCertificatePath: "/etc/paseo/management-ca.pem",
+          relationshipPath: "/var/lib/paseo/managed-node.json",
+        },
+      }).success,
+    ).toBe(false);
   });
 
   test("enterprise config is under features and rejects daemon path", () => {

@@ -241,7 +241,7 @@ export function createProductionOrganizationResourceSource(
         const last = page.at(-1);
         return Object.freeze({
           principals: Object.freeze([]),
-          resources: Object.freeze(resources),
+          resources: Object.freeze(page),
           nextCursor: hasMore && last ? resourceId(last) : null,
         });
       },

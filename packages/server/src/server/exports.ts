@@ -3,6 +3,7 @@ export { createPaseoDaemon, type PaseoDaemon, type PaseoDaemonConfig } from "./b
 export { loadConfig, type CliConfigOverrides } from "./config.js";
 export { resolvePaseoHome } from "./paseo-home.js";
 export { getOrCreateServerId } from "./server-id.js";
+export { resolveDaemonVersion } from "./daemon-version.js";
 export { createRootLogger, type LogLevel, type LogFormat } from "./logger.js";
 export {
   loadPersistedConfig,
@@ -21,6 +22,11 @@ export {
   type ProductionEnterpriseInitialAdminInput,
   type ProductionEnterpriseInitialAdminDependencies,
 } from "./enterprise/production-runtime-factory.js";
+export {
+  enrollManagedNode,
+  type ManagedNodeRelationship,
+} from "./enterprise/managed-node/index.js";
+export { defaultManagedNodeCapacity } from "./enterprise/managed-node/lifecycle.js";
 export { generateLocalPairingOffer, type LocalPairingOffer } from "./pairing-offer.js";
 export {
   ConnectionOfferSchema,

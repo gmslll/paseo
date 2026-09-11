@@ -31,7 +31,8 @@
     "packages/relay",
     "packages/website",
     "packages/desktop",
-    "packages/cli"
+    "packages/cli",
+    "packages/enterprise-management"
   ],
   "scripts": {
     "dev": "npm run dev:server",

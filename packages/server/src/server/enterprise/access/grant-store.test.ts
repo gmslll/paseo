@@ -7,6 +7,7 @@ import {
   GrantRevisionConflictError,
   GrantStore,
   GrantVersionSourceError,
+  synchronizeAuthoritativeGrantRecords,
 } from "./grant-store.js";
 import type { GrantRecord, GrantStorage, GrantVersionSource } from "./grant-store.js";
 
@@ -64,6 +65,35 @@ function deferred<T>() {
 }
 
 describe("GrantStore", () => {
+  test("installs centrally issued grant versions and invalidates only changed records", async () => {
+    const storage = new MemoryGrantStorage();
+    const store = new GrantStore(storage, new TestGrantVersionSource(), audit);
+    const invalidations: string[] = [];
+    store.subscribe((change) => invalidations.push(change.grantVersion));
+    const remote = {
+      principalId: actor.principalId,
+      organizationId: actor.organizationId,
+      grants: [workspaceWrite],
+      grantVersion: "grv_remote_1",
+    };
+
+    await synchronizeAuthoritativeGrantRecords(store, audit, [remote]);
+    expect(await store.get(actor.principalId)).toEqual(remote);
+    expect(store.currentVersion(actor.organizationId, actor.principalId)).toBe("grv_remote_1");
+    expect(invalidations).toEqual(["grv_remote_1"]);
+
+    await synchronizeAuthoritativeGrantRecords(store, audit, [structuredClone(remote)]);
+    expect(invalidations).toEqual(["grv_remote_1"]);
+
+    const revoked = { ...remote, grants: [], grantVersion: "grv_remote_2" };
+    await synchronizeAuthoritativeGrantRecords(store, audit, [revoked]);
+    expect(await storage.get(actor.principalId)).toEqual(revoked);
+    expect(invalidations).toEqual(["grv_remote_1", "grv_remote_2"]);
+    await expect(
+      synchronizeAuthoritativeGrantRecords(store, { append: audit.append }, [remote]),
+    ).rejects.toThrow("invalid GrantStore authority");
+  });
+
   test("normalizes grants and advances version only for semantic changes", async () => {
     const store = new GrantStore(new MemoryGrantStorage(), new TestGrantVersionSource(), audit);
 

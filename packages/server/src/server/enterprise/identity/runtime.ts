@@ -2,6 +2,7 @@ import type {
   ConnectionContext,
   NodeContext,
   ResourceAuthorization,
+  LeaseCoordinator,
 } from "@getpaseo/protocol/messages";
 import type { EnterpriseAgentSessionContextRegistry } from "../../session/enterprise-agent-session-context-registry.js";
 import type { AuthoritySessionBindingLifecycle } from "../../session/enterprise-authority-receipt-state.js";
@@ -18,6 +19,9 @@ import type {
   EnterpriseAdmissionAuthorizationHandle,
   EnterpriseAdmissionAuthorizationIssuer,
 } from "./admission-authorization.js";
+import type { BrowserProfileRegistry } from "../browser/profile-registry.js";
+import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
+import type { ManagedPlacementSnapshotSource } from "../managed-node/lifecycle.js";
 
 export interface EnterpriseAdmissionPort {
   readonly audit: ProductionAuditCapability;
@@ -59,6 +63,12 @@ export interface EnterpriseAdmissionRuntime {
   readonly authorizationRuntimeProvider?: ProductionAuthorizationRuntimeProvider;
   readonly admissionInvalidationSink?: AdmissionInvalidationSink;
   readonly principalSource?: ProductionPrincipalGrantSource;
+  readonly browserProfiles?: BrowserProfileRegistry;
+  readonly identityDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
+  readonly leaseCoordinator?: LeaseCoordinator;
+  readonly managedPlacementSource?: Readonly<{
+    install(source: ManagedPlacementSnapshotSource): Promise<void>;
+  }>;
   nextSessionBindingGeneration(): string;
   close?(): Promise<void>;
 }

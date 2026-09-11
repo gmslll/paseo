@@ -53,6 +53,7 @@ import type {
   EnterpriseSessionDispatcher,
   EnterpriseSessionDispatcherFactoryRegistration,
 } from "../session/enterprise-dispatcher.js";
+import { createManagedEnterpriseRuntime } from "./managed-node/runtime-factory.js";
 import {
   createProductionEnterpriseProvisioningPorts,
   provisionProductionEnterpriseInitialAdmin,
@@ -108,6 +109,9 @@ export function createProductionEnterpriseRuntimeFactory(
   const daemonPassword = options.daemonPassword;
   return async ({ config, audit }) => {
     if (config.enabled !== true) throw new Error("enterprise runtime requires enabled config");
+    if (config.managementMode === "managed") {
+      return createManagedEnterpriseRuntime({ paseoHome, config, audit });
+    }
     const currentAudit = productionAuditCapabilityIssuer.requireCurrent(audit);
     const node = Object.freeze(
       NodeContextSchema.parse({

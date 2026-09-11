@@ -251,7 +251,6 @@ function captureOptions(value: unknown): CapturedOptions | null {
   const paseoHome = canonicalAbsolutePath(record.paseoHome);
   const organizationId = OrganizationIdSchema.parse(record.organizationId);
   const node = deepFreeze(NodeContextSchema.strict().parse(snapshotPlainData(record.node)));
-  if (node.mode !== "standalone") return null;
   return Object.freeze({
     filePath: path.join(paseoHome, "enterprise", "app-slots.json"),
     organizationId,

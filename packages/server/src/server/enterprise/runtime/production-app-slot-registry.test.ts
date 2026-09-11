@@ -136,18 +136,25 @@ describe("production App Slot registry", () => {
       );
       expect(createProductionAppSlotRegistry(hostile)).toBeNull();
       expect(createProductionAppSlotRegistry({ paseoHome: "/", organizationId, node })).toBeNull();
-      expect(
-        createProductionAppSlotRegistry({
-          paseoHome,
-          organizationId,
-          node: { ...node, mode: "managed" },
-        }),
-      ).toBeNull();
       expect(getterCalls).toBe(0);
       await expect(stat(path.join(paseoHome, "enterprise"))).rejects.toMatchObject({
         code: "ENOENT",
       });
       expect(isCurrentProductionAppSlotRegistry({ current: () => true })).toBe(false);
+    });
+  });
+
+  test("accepts a managed node without weakening node ownership", async () => {
+    await withTemporaryHome("managed", async (paseoHome) => {
+      const registry = createProductionAppSlotRegistry({
+        paseoHome,
+        organizationId,
+        node: { ...node, mode: "managed" },
+      });
+      expect(registry).not.toBeNull();
+      await registry!.initialize();
+      expect(registry!.current()).toBe(true);
+      await registry!.close();
     });
   });
 });
