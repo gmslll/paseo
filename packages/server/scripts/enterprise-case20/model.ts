@@ -352,6 +352,50 @@ export interface Case20DaemonRpcDiagnosticBatch {
   readonly done: boolean;
 }
 
+export type Case20DaemonRuntimeObservationFailureCode =
+  | "daemon_runtime_observation_invalid"
+  | "daemon_runtime_observation_missing"
+  | "daemon_runtime_observation_duplicate"
+  | "daemon_runtime_observation_out_of_order"
+  | "daemon_runtime_observation_overflow";
+
+export interface Case20DaemonGarbageCollectionSample {
+  readonly startMonotonicUnixMs: number;
+  readonly durationMs: number;
+  readonly kind: number;
+  readonly flags: number;
+}
+
+export type Case20DaemonRuntimeResourceSampleKind =
+  | "resource"
+  | "retained_resource"
+  | "final_active_sample"
+  | "final_drain";
+
+export interface Case20DaemonRuntimeObservationEvent {
+  readonly type: "daemon_runtime_observation";
+  readonly at: string;
+  readonly sequence: number;
+  readonly final: boolean;
+  readonly resourceSampleKind: Case20DaemonRuntimeResourceSampleKind;
+  readonly resourceTSec: number;
+  readonly windowStartedMonotonicUnixMs: number;
+  readonly windowEndedMonotonicUnixMs: number;
+  readonly windowMs: number;
+  readonly cpuUserMicros: number;
+  readonly cpuSystemMicros: number;
+  readonly eventLoopIdleMs: number;
+  readonly eventLoopActiveMs: number;
+  readonly eventLoopUtilization: number;
+  readonly garbageCollections: readonly Case20DaemonGarbageCollectionSample[];
+}
+
+export interface Case20DaemonRuntimeObservationBatch {
+  readonly observation: Case20DaemonRuntimeObservationEvent | null;
+  readonly failures: readonly Case20DaemonRuntimeObservationFailureCode[];
+  readonly done: boolean;
+}
+
 export interface Case20ClientRuntimeMessageMetric {
   readonly messageType: Case20ObservedInboundMessageType;
   readonly count: number;
@@ -524,6 +568,7 @@ export type Case20RawEvent =
   | Case20ClientRuntimeMetricsEvent
   | Case20RpcDiagnosticEvent
   | Case20RpcDiagnosticRejectedEvent
+  | Case20DaemonRuntimeObservationEvent
   | Case20RunnerEventLoopDelayEvent
   | {
       readonly type: "feedback";

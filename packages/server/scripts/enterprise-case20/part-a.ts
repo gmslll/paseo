@@ -22,6 +22,9 @@ import {
   CASE20_RPC_REQUEST_ID_PATTERN,
   type Case20DaemonRpcDiagnostic,
   type Case20DaemonRpcDiagnosticFailureCode,
+  type Case20DaemonRuntimeObservationEvent,
+  type Case20DaemonRuntimeObservationFailureCode,
+  type Case20DaemonRuntimeResourceSampleKind,
   type Case20ClientRpcTraceEvent,
   type Case20ClientRuntimeMetricsEvent,
   type Case20ClientRecord,
@@ -122,12 +125,14 @@ interface PartAMeasurementState {
   readonly observationBuffer: Case20ObservationBuffer;
   readonly rpcDiagnosticJoiner: Case20RpcDiagnosticJoiner;
   readonly observationFailureKeys: Set<string>;
+  daemonRuntimeObservation: Case20DaemonRuntimeObservationRecorder | null;
   canarySequence: number;
 }
 
 type Case20ObservationEvent =
   | Case20ClientRuntimeMetricsEvent
   | Case20ClientRpcTraceEvent
+  | Case20DaemonRuntimeObservationEvent
   | Case20RunnerEventLoopDelayEvent;
 
 type Case20ObservationFailureCode =
@@ -135,6 +140,7 @@ type Case20ObservationFailureCode =
   | "client_rpc_trace_invalid"
   | "observation_buffer_limit_exceeded"
   | "runner_event_loop_delay_invalid"
+  | Case20DaemonRuntimeObservationFailureCode
   | Case20DaemonRpcDiagnosticFailureCode
   | Case20RpcDiagnosticJoinFailureCode;
 
@@ -207,6 +213,47 @@ export function recordCase20RpcDiagnosticEvent(
   const recorded =
     event.type === "rpc_diagnostic_rejected" ? buffer.recordFailure(event) : buffer.record(event);
   if (!recorded) throw new Error("Case20 RPC diagnostic event buffer is full");
+}
+
+export interface Case20DaemonRuntimeObservationRecorder {
+  recordResource(input: {
+    readonly resourceSampleKind: Exclude<Case20DaemonRuntimeResourceSampleKind, "final_drain">;
+    readonly resourceTSec: number;
+  }): Promise<void>;
+  finish(resourceTSec: number): Promise<void>;
+}
+
+export function createCase20DaemonRuntimeObservationRecorder(input: {
+  readonly collect: Case20PartAFixture["collectDaemonRuntimeObservation"];
+  readonly record: (event: Case20DaemonRuntimeObservationEvent) => void;
+  readonly onFailure: (code: Case20DaemonRuntimeObservationFailureCode) => void;
+}): Case20DaemonRuntimeObservationRecorder {
+  let finalAttempted = false;
+  const collect = async (
+    resourceSampleKind: Case20DaemonRuntimeResourceSampleKind,
+    resourceTSec: number,
+    final: boolean,
+  ) => {
+    if (finalAttempted) {
+      input.onFailure(
+        final ? "daemon_runtime_observation_duplicate" : "daemon_runtime_observation_out_of_order",
+      );
+      return;
+    }
+    if (final) finalAttempted = true;
+    try {
+      const batch = await input.collect({ resourceSampleKind, resourceTSec, final });
+      for (const failure of batch.failures) input.onFailure(failure);
+      if (batch.observation) input.record(batch.observation);
+    } catch {
+      input.onFailure("daemon_runtime_observation_invalid");
+    }
+  };
+  return {
+    recordResource: ({ resourceSampleKind, resourceTSec }) =>
+      collect(resourceSampleKind, resourceTSec, false),
+    finish: (resourceTSec) => collect("final_drain", resourceTSec, true),
+  };
 }
 
 interface Case20ExpectedRpcDiagnostic {
@@ -1500,6 +1547,7 @@ function recordDurableFailure(state: PartAMeasurementState, failure: Case20Failu
 function case20ObservationFailureMetric(code: Case20ObservationFailureCode): string {
   if (code === "observation_buffer_limit_exceeded") return "runner.observation_buffer";
   if (code.startsWith("runner_")) return "runner.event_loop_delay";
+  if (code.startsWith("daemon_runtime_")) return "daemon.runtime_observation";
   if (code.startsWith("daemon_rpc_")) return "daemon.rpc_diagnostic";
   if (code.startsWith("rpc_diagnostic_join_")) return "rpc.diagnostic_join";
   return "client.observation";
@@ -2121,6 +2169,10 @@ async function sampleDuringRun(
     daemonLogPath: fixture.daemonLogPath,
     tSec: (Date.now() - startedAtMs) / 1_000,
   });
+  await state.daemonRuntimeObservation?.recordResource({
+    resourceSampleKind: "resource",
+    resourceTSec: sample.tSec,
+  });
   state.resourceSamples.push(sample);
   await state.artifact.append({ type: "resource", at: new Date().toISOString(), sample });
   await flushStreamAggregates(state);
@@ -2138,12 +2190,18 @@ async function captureRetainedRss(
       daemonPid: fixture.daemonPid,
       measurementStartedAtMs: startedAtMs,
       collectGarbage: (request) => fixture.collectGarbage(request),
-      sample: (tSec) =>
-        sampleDaemonResources({
+      sample: async (tSec) => {
+        const sample = await sampleDaemonResources({
           daemonPid: fixture.daemonPid,
           daemonLogPath: fixture.daemonLogPath,
           tSec,
-        }),
+        });
+        await state.daemonRuntimeObservation?.recordResource({
+          resourceSampleKind: "retained_resource",
+          resourceTSec: sample.tSec,
+        });
+        return sample;
+      },
     });
     state.retainedRssSamples.push(checkpoint);
     await state.artifact.append(
@@ -2227,6 +2285,10 @@ async function captureFinalActiveSample(input: {
       timelineCanaries: input.state.finalTimelineCanaries.has(client.config.clientId) ? 1 : 0,
     })),
   };
+  await input.state.daemonRuntimeObservation?.recordResource({
+    resourceSampleKind: "final_active_sample",
+    resourceTSec: sample.tSec,
+  });
   await input.state.artifact.append({ type: "resource", at: finalActive.at, sample });
   await input.state.artifact.append(
     {
@@ -2330,6 +2392,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
     observationBuffer,
     rpcDiagnosticJoiner,
     observationFailureKeys: new Set(),
+    daemonRuntimeObservation: null,
     canarySequence: 0,
   };
   const runStartedAt = new Date();
@@ -2370,6 +2433,13 @@ export async function runCase20PartA(manifest: PartAManifest) {
         childLogPath,
         mode: manifest.mode,
         retainedRssSchedule,
+      });
+      state.daemonRuntimeObservation = createCase20DaemonRuntimeObservationRecorder({
+        collect: (input) => fixture!.collectDaemonRuntimeObservation(input),
+        record: (event) => {
+          state.observationBuffer.record(event);
+        },
+        onFailure: (code) => bufferCase20ObservationFailure(state, code),
       });
       await waitForInitialMetrics(fixture);
       if (fixture.clients.length < 2) throw new Error("Case20 Part A fixture is incomplete");
@@ -2454,6 +2524,9 @@ export async function runCase20PartA(manifest: PartAManifest) {
       });
     } finally {
       measurementEndedAt ??= new Date();
+      await state.daemonRuntimeObservation?.finish(
+        Math.max(0, (measurementEndedAt.getTime() - measurementStartedAt.getTime()) / 1_000),
+      );
       runnerEventLoopObserver?.finish();
       for (const waiter of state.canaryWaiters.values()) waiter.cancel();
       for (const client of clients) {

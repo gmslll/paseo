@@ -42,6 +42,7 @@ import {
   case20MeasuredWorkloadDeadlineMs,
   classifyCase20AgentList,
   cleanupCase20TimelineClients,
+  createCase20DaemonRuntimeObservationRecorder,
   createCase20ClientObservationController,
   createCase20ObservationBuffer,
   createCase20ObservedRpcTiming,
@@ -56,7 +57,9 @@ import {
 import {
   CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT,
   case20PartAChildExecArgv,
+  createCase20DaemonRuntimeObservationController,
   createCase20DaemonRpcDiagnosticCollector,
+  parseCase20DaemonRuntimeObservationBatchMessage,
 } from "./part-a-fixture.js";
 import {
   case20RetainedRssCheckpointDelayMs,
@@ -489,6 +492,364 @@ function case20TestClientTrace(input: {
 }
 
 describe("Case20 evidence helpers", () => {
+  test("maps daemon GC entries and CPU/ELU deltas before disconnecting on final drain", () => {
+    let emitEntries: (entries: readonly unknown[]) => void = () => undefined;
+    let pendingEntries: readonly unknown[] = [];
+    let disconnects = 0;
+    const cpu = [
+      { user: 100, system: 50 },
+      { user: 160, system: 80 },
+      { user: 205, system: 100 },
+    ];
+    const elu = [
+      { idle: 10, active: 5, utilization: 1 / 3 },
+      { idle: 16, active: 9, utilization: 0.4 },
+      { idle: 20, active: 12, utilization: 3 / 7 },
+    ];
+    const monotonic = [1_000, 1_100, 1_200];
+    const controller = createCase20DaemonRuntimeObservationController({
+      capacity: 4,
+      timeOriginMs: 10_000,
+      monotonicNow: () => monotonic.shift()!,
+      cpuUsage: () => cpu.shift()!,
+      eventLoopUtilization: () => elu.shift()!,
+      nowIso: () => "2026-09-11T00:00:01.000Z",
+      createObserver: (emit) => {
+        emitEntries = emit;
+        return {
+          takeRecords: () => {
+            const records = pendingEntries;
+            pendingEntries = [];
+            return records;
+          },
+          disconnect: () => {
+            disconnects += 1;
+          },
+        };
+      },
+    });
+    emitEntries([
+      {
+        entryType: "gc",
+        startTime: 5,
+        duration: 2,
+        detail: { kind: 4, flags: 1 },
+        personalAccessToken: "pso_u_private.secret-material-that-must-never-persist",
+        privatePath: "/private/runner/home",
+      },
+    ]);
+
+    expect(
+      controller.sample({
+        sequence: 1,
+        final: false,
+        resourceSampleKind: "resource",
+        resourceTSec: 0,
+      }),
+    ).toEqual({
+      observation: {
+        type: "daemon_runtime_observation",
+        at: "2026-09-11T00:00:01.000Z",
+        sequence: 1,
+        final: false,
+        resourceSampleKind: "resource",
+        resourceTSec: 0,
+        windowStartedMonotonicUnixMs: 11_000,
+        windowEndedMonotonicUnixMs: 11_100,
+        windowMs: 100,
+        cpuUserMicros: 60,
+        cpuSystemMicros: 30,
+        eventLoopIdleMs: 6,
+        eventLoopActiveMs: 4,
+        eventLoopUtilization: 0.4,
+        garbageCollections: [{ startMonotonicUnixMs: 10_005, durationMs: 2, kind: 4, flags: 1 }],
+      },
+      failures: [],
+      done: false,
+    });
+    pendingEntries = [
+      { entryType: "gc", startTime: 150, duration: 3, detail: { kind: 1, flags: 0 } },
+    ];
+    expect(
+      controller.sample({
+        sequence: 2,
+        final: true,
+        resourceSampleKind: "final_drain",
+        resourceTSec: 10,
+      }),
+    ).toEqual({
+      observation: expect.objectContaining({
+        type: "daemon_runtime_observation",
+        sequence: 2,
+        final: true,
+        resourceSampleKind: "final_drain",
+        resourceTSec: 10,
+        windowStartedMonotonicUnixMs: 11_100,
+        windowEndedMonotonicUnixMs: 11_200,
+        windowMs: 100,
+        cpuUserMicros: 45,
+        cpuSystemMicros: 20,
+        eventLoopIdleMs: 4,
+        eventLoopActiveMs: 3,
+        eventLoopUtilization: 3 / 7,
+        garbageCollections: [{ startMonotonicUnixMs: 10_150, durationMs: 3, kind: 1, flags: 0 }],
+      }),
+      failures: [],
+      done: true,
+    });
+    expect(disconnects).toBe(1);
+    expect(JSON.stringify(controller.finish())).not.toContain("secret-material");
+    expect(JSON.stringify(controller.finish())).not.toContain("/private/runner/home");
+  });
+
+  test("fails daemon runtime observation closed on missing, duplicate, order, and GC overflow", () => {
+    const createController = (capacity = 4) => {
+      let emitEntries: (entries: readonly unknown[]) => void = () => undefined;
+      let disconnects = 0;
+      let now = 0;
+      let user = 0;
+      let active = 0;
+      const controller = createCase20DaemonRuntimeObservationController({
+        capacity,
+        timeOriginMs: 1_000,
+        monotonicNow: () => (now += 10),
+        cpuUsage: () => ({ user: (user += 5), system: user }),
+        eventLoopUtilization: () => ({ idle: active, active: (active += 2), utilization: 0.5 }),
+        createObserver: (emit) => {
+          emitEntries = emit;
+          return {
+            takeRecords: () => [],
+            disconnect: () => {
+              disconnects += 1;
+            },
+          };
+        },
+      });
+      return {
+        controller,
+        emitEntries,
+        disconnects: () => disconnects,
+        request: (sequence: number, final = false) => ({
+          sequence,
+          final,
+          resourceSampleKind: final ? ("final_drain" as const) : ("resource" as const),
+          resourceTSec: sequence,
+        }),
+      };
+    };
+
+    const missing = createController();
+    expect(missing.controller.finish()).toEqual(["daemon_runtime_observation_missing"]);
+    expect(missing.disconnects()).toBe(1);
+
+    const duplicate = createController();
+    expect(duplicate.controller.sample(duplicate.request(1)).failures).toEqual([]);
+    expect(duplicate.controller.sample(duplicate.request(1))).toEqual({
+      observation: null,
+      failures: ["daemon_runtime_observation_duplicate"],
+      done: false,
+    });
+    expect(duplicate.controller.sample(duplicate.request(2, true)).done).toBe(true);
+    expect(duplicate.disconnects()).toBe(1);
+
+    const outOfOrder = createController();
+    expect(outOfOrder.controller.sample(outOfOrder.request(2))).toEqual({
+      observation: null,
+      failures: ["daemon_runtime_observation_out_of_order"],
+      done: false,
+    });
+    expect(outOfOrder.controller.finish()).toEqual(["daemon_runtime_observation_missing"]);
+
+    const overflow = createController(1);
+    overflow.emitEntries([
+      { entryType: "gc", startTime: 1, duration: 1, detail: { kind: 1, flags: 0 } },
+      { entryType: "gc", startTime: 2, duration: 1, detail: { kind: 4, flags: 2 } },
+    ]);
+    const overflowed = overflow.controller.sample(overflow.request(1, true));
+    expect(overflowed.failures).toEqual(["daemon_runtime_observation_overflow"]);
+    expect(overflowed.observation?.garbageCollections).toEqual([
+      { startMonotonicUnixMs: 1_001, durationMs: 1, kind: 1, flags: 0 },
+    ]);
+    expect(overflowed.done).toBe(true);
+    expect(overflow.disconnects()).toBe(1);
+  });
+
+  test("pairs daemon runtime requests with resource samples and drains final exactly once", async () => {
+    const requests: Array<{
+      readonly resourceSampleKind: string;
+      readonly resourceTSec: number;
+      readonly final: boolean;
+    }> = [];
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    let sequence = 0;
+    const recorder = createCase20DaemonRuntimeObservationRecorder({
+      collect: async (input) => {
+        requests.push(input);
+        sequence += 1;
+        return {
+          observation: {
+            type: "daemon_runtime_observation",
+            at: "2026-09-11T00:00:01.000Z",
+            sequence,
+            ...input,
+            windowStartedMonotonicUnixMs: sequence * 100,
+            windowEndedMonotonicUnixMs: sequence * 100 + 10,
+            windowMs: 10,
+            cpuUserMicros: 5,
+            cpuSystemMicros: 2,
+            eventLoopIdleMs: 8,
+            eventLoopActiveMs: 2,
+            eventLoopUtilization: 0.2,
+            garbageCollections: [],
+          },
+          failures:
+            sequence === 2 ? (["daemon_runtime_observation_overflow"] as const) : ([] as const),
+          done: input.final,
+        };
+      },
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+    });
+
+    await recorder.recordResource({ resourceSampleKind: "resource", resourceTSec: 0 });
+    await recorder.recordResource({ resourceSampleKind: "retained_resource", resourceTSec: 300 });
+    await recorder.recordResource({
+      resourceSampleKind: "final_active_sample",
+      resourceTSec: 300.1,
+    });
+    await recorder.finish(300.2);
+    await recorder.finish(300.3);
+    await recorder.recordResource({ resourceSampleKind: "resource", resourceTSec: 300.4 });
+
+    expect(requests).toEqual([
+      { resourceSampleKind: "resource", resourceTSec: 0, final: false },
+      { resourceSampleKind: "retained_resource", resourceTSec: 300, final: false },
+      { resourceSampleKind: "final_active_sample", resourceTSec: 300.1, final: false },
+      { resourceSampleKind: "final_drain", resourceTSec: 300.2, final: true },
+    ]);
+    expect(events).toEqual([
+      expect.objectContaining({ sequence: 1, resourceSampleKind: "resource", final: false }),
+      expect.objectContaining({
+        sequence: 2,
+        resourceSampleKind: "retained_resource",
+        final: false,
+      }),
+      expect.objectContaining({
+        sequence: 3,
+        resourceSampleKind: "final_active_sample",
+        final: false,
+      }),
+      expect.objectContaining({ sequence: 4, resourceSampleKind: "final_drain", final: true }),
+    ]);
+    expect(failures).toEqual([
+      "daemon_runtime_observation_overflow",
+      "daemon_runtime_observation_duplicate",
+      "daemon_runtime_observation_out_of_order",
+    ]);
+  });
+
+  test("turns daemon runtime collection failures into evidence without rejecting workload flow", async () => {
+    const failures: string[] = [];
+    const recorder = createCase20DaemonRuntimeObservationRecorder({
+      collect: async ({ final }) => {
+        if (final) throw new Error("private /runner/path must not escape");
+        return {
+          observation: null,
+          failures: ["daemon_runtime_observation_missing"],
+          done: false,
+        };
+      },
+      record: () => {
+        throw new Error("unexpected observation");
+      },
+      onFailure: (code) => failures.push(code),
+    });
+
+    await expect(
+      recorder.recordResource({ resourceSampleKind: "resource", resourceTSec: 10 }),
+    ).resolves.toBeUndefined();
+    await expect(recorder.finish(10.1)).resolves.toBeUndefined();
+    expect(failures).toEqual([
+      "daemon_runtime_observation_missing",
+      "daemon_runtime_observation_invalid",
+    ]);
+    expect(JSON.stringify(failures)).not.toContain("/runner/path");
+  });
+
+  test("strictly parses daemon runtime batches without retaining unknown secret or path fields", () => {
+    const expected = {
+      sequence: 1,
+      resourceSampleKind: "resource" as const,
+      resourceTSec: 10,
+      final: false,
+    };
+    const observation = {
+      type: "daemon_runtime_observation",
+      at: "2026-09-11T00:00:01.000Z",
+      ...expected,
+      windowStartedMonotonicUnixMs: 1_000,
+      windowEndedMonotonicUnixMs: 1_010,
+      windowMs: 10,
+      cpuUserMicros: 5,
+      cpuSystemMicros: 2,
+      eventLoopIdleMs: 8,
+      eventLoopActiveMs: 2,
+      eventLoopUtilization: 0.2,
+      garbageCollections: [{ startMonotonicUnixMs: 1_005, durationMs: 1, kind: 4, flags: 0 }],
+    };
+    const batch = {
+      type: "daemon_runtime_observation_batch",
+      sequence: 1,
+      observation,
+      failures: [],
+      done: false,
+    };
+    expect(parseCase20DaemonRuntimeObservationBatchMessage(batch, expected)).toEqual({
+      observation,
+      failures: [],
+      done: false,
+    });
+
+    const invalid = [
+      { ...batch, sequence: 2 },
+      { ...batch, observation: null },
+      {
+        ...batch,
+        failures: ["daemon_runtime_observation_invalid", "daemon_runtime_observation_invalid"],
+      },
+      {
+        ...batch,
+        observation: {
+          ...observation,
+          personalAccessToken: "pso_u_private.secret-material-that-must-never-persist",
+          privatePath: "/private/runner/home",
+        },
+      },
+      {
+        ...batch,
+        observation: {
+          ...observation,
+          garbageCollections: [
+            { startMonotonicUnixMs: 1_006, durationMs: 1, kind: 4, flags: 0 },
+            { startMonotonicUnixMs: 1_005, durationMs: 1, kind: 1, flags: 0 },
+          ],
+        },
+      },
+    ];
+    for (const value of invalid) {
+      let message = "";
+      try {
+        parseCase20DaemonRuntimeObservationBatchMessage(value, expected);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/^Case20 daemon (runtime observation|GC samples)/);
+      expect(message).not.toContain("secret-material");
+      expect(message).not.toContain("/private/runner/home");
+    }
+  });
+
   test("collects complete daemon RPC phases in bounded batches for success and rpc_error", () => {
     const collector = createCase20DaemonRpcDiagnosticCollector({ capacity: 4 });
     observeCompleteCase20DaemonRpc({
@@ -705,6 +1066,56 @@ describe("Case20 evidence helpers", () => {
         failures: [],
         done: true,
       });
+      const runtimeResponse = once(child, "message");
+      await send({
+        type: "daemon_runtime_observation_request",
+        sequence: 1,
+        resourceSampleKind: "final_drain",
+        resourceTSec: 300,
+        final: true,
+      });
+      const runtimeBatch = (await runtimeResponse)[0] as Record<string, unknown>;
+      expect(runtimeBatch).toEqual({
+        type: "daemon_runtime_observation_batch",
+        sequence: 1,
+        observation: {
+          type: "daemon_runtime_observation",
+          at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+          sequence: 1,
+          resourceSampleKind: "final_drain",
+          resourceTSec: 300,
+          final: true,
+          windowStartedMonotonicUnixMs: expect.any(Number),
+          windowEndedMonotonicUnixMs: expect.any(Number),
+          windowMs: expect.any(Number),
+          cpuUserMicros: expect.any(Number),
+          cpuSystemMicros: expect.any(Number),
+          eventLoopIdleMs: expect.any(Number),
+          eventLoopActiveMs: expect.any(Number),
+          eventLoopUtilization: expect.any(Number),
+          garbageCollections: expect.any(Array),
+        },
+        failures: [],
+        done: true,
+      });
+      const runtimeObservation = runtimeBatch.observation as Record<string, unknown>;
+      expect(Reflect.ownKeys(runtimeObservation)).toEqual([
+        "type",
+        "at",
+        "sequence",
+        "final",
+        "resourceSampleKind",
+        "resourceTSec",
+        "windowStartedMonotonicUnixMs",
+        "windowEndedMonotonicUnixMs",
+        "windowMs",
+        "cpuUserMicros",
+        "cpuSystemMicros",
+        "eventLoopIdleMs",
+        "eventLoopActiveMs",
+        "eventLoopUtilization",
+        "garbageCollections",
+      ]);
       const closed = once(child, "message");
       const exited = once(child, "exit");
       await send({ type: "shutdown" });
@@ -2906,6 +3317,28 @@ describe("Case20 evidence helpers", () => {
           monotonicUnixMs: 101 + index,
         })),
       },
+      crossProcessClock: {
+        calibrated: false,
+        frameOutboundEndToDaemonFrameReceivedMs: -3,
+        daemonResponseDeliverReturnToClientFrameBeginMs: 11,
+      },
+    });
+    await writer.append({
+      type: "daemon_runtime_observation",
+      at: "2026-09-11T00:00:01.750Z",
+      sequence: 1,
+      resourceSampleKind: "resource",
+      resourceTSec: 10,
+      final: false,
+      windowStartedMonotonicUnixMs: 1_000,
+      windowEndedMonotonicUnixMs: 1_010,
+      windowMs: 10,
+      cpuUserMicros: 5,
+      cpuSystemMicros: 2,
+      eventLoopIdleMs: 8,
+      eventLoopActiveMs: 2,
+      eventLoopUtilization: 0.2,
+      garbageCollections: [{ startMonotonicUnixMs: 1_005, durationMs: 1, kind: 4, flags: 0 }],
     });
     await writer.append({
       type: "runner_event_loop_delay",
@@ -2936,7 +3369,10 @@ describe("Case20 evidence helpers", () => {
     expect(raw).toContain('"type":"retained_resource"');
     expect(raw).toContain('"type":"client_runtime_metrics"');
     expect(raw).toContain('"type":"rpc_diagnostic"');
+    expect(raw).toContain('"type":"daemon_runtime_observation"');
     expect(raw).toContain('"type":"runner_event_loop_delay"');
+    expect(raw).not.toContain("secret-material-that-must-never-persist");
+    expect(raw).not.toContain("/private/runner/home");
     const inventory = JSON.parse(await readFile(writer.inventoryPath, "utf8")) as {
       readonly entries: readonly {
         readonly name: string;

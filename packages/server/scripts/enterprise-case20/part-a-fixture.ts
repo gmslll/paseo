@@ -1,16 +1,22 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { open } from "node:fs/promises";
+import { performance, PerformanceObserver } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import {
   CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES,
   CASE20_RPC_REQUEST_ID_PATTERN,
+  type Case20DaemonGarbageCollectionSample,
   type Case20DaemonRpcDiagnostic,
   type Case20DaemonRpcDiagnosticBatch,
   type Case20DaemonRpcDiagnosticFailureCode,
   type Case20DaemonRpcDiagnosticPhase,
   type Case20DaemonRpcDiagnosticRequestType,
   type Case20DaemonRpcDiagnosticResponseType,
+  type Case20DaemonRuntimeObservationBatch,
+  type Case20DaemonRuntimeObservationFailureCode,
+  type Case20DaemonRuntimeObservationEvent,
+  type Case20DaemonRuntimeResourceSampleKind,
   type Case20Mode,
   type Case20RetainedRssCheckpointPlan,
 } from "./model.js";
@@ -24,6 +30,7 @@ const CASE20_DAEMON_RPC_DIAGNOSTIC_CAPACITY = 50_000;
 export const CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT = 256;
 const CASE20_DAEMON_RPC_DIAGNOSTIC_MAX_BATCHES =
   Math.ceil(CASE20_DAEMON_RPC_DIAGNOSTIC_CAPACITY / CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT) + 1;
+const CASE20_DAEMON_GC_OBSERVATION_CAPACITY = 50_000;
 
 interface ParsedDaemonRpcDiagnosticObservation {
   readonly phase: Case20DaemonRpcDiagnosticPhase;
@@ -50,6 +57,231 @@ export interface Case20DaemonRpcDiagnosticCollector {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return isFiniteNonNegative(value) && Number.isInteger(value);
+}
+
+interface Case20PerformanceObserverPort {
+  takeRecords(): readonly unknown[];
+  disconnect(): void;
+}
+
+interface Case20CpuUsageSnapshot {
+  readonly user: number;
+  readonly system: number;
+}
+
+interface Case20EventLoopUtilizationSnapshot {
+  readonly idle: number;
+  readonly active: number;
+  readonly utilization: number;
+}
+
+export interface Case20DaemonRuntimeObservationController {
+  sample(input: {
+    readonly sequence: number;
+    readonly final: boolean;
+    readonly resourceSampleKind: Case20DaemonRuntimeResourceSampleKind;
+    readonly resourceTSec: number;
+  }): Case20DaemonRuntimeObservationBatch;
+  finish(): readonly Case20DaemonRuntimeObservationFailureCode[];
+}
+
+function isRuntimeResourceSampleKind(
+  value: unknown,
+): value is Case20DaemonRuntimeResourceSampleKind {
+  return (
+    value === "resource" ||
+    value === "retained_resource" ||
+    value === "final_active_sample" ||
+    value === "final_drain"
+  );
+}
+
+function parseCase20GarbageCollectionEntry(
+  value: unknown,
+  timeOriginMs: number,
+): Case20DaemonGarbageCollectionSample {
+  if (
+    !isRecord(value) ||
+    value.entryType !== "gc" ||
+    !isFiniteNonNegative(value.startTime) ||
+    !isFiniteNonNegative(value.duration) ||
+    !isRecord(value.detail) ||
+    !isNonNegativeInteger(value.detail.kind) ||
+    !isNonNegativeInteger(value.detail.flags)
+  )
+    throw new Error("Case20 daemon GC observation is invalid");
+  return {
+    startMonotonicUnixMs: timeOriginMs + value.startTime,
+    durationMs: value.duration,
+    kind: value.detail.kind,
+    flags: value.detail.flags,
+  };
+}
+
+export function createCase20DaemonRuntimeObservationController(input?: {
+  readonly capacity?: number;
+  readonly timeOriginMs?: number;
+  readonly monotonicNow?: () => number;
+  readonly cpuUsage?: () => Case20CpuUsageSnapshot;
+  readonly eventLoopUtilization?: () => Case20EventLoopUtilizationSnapshot;
+  readonly nowIso?: () => string;
+  readonly createObserver?: (
+    observe: (entries: readonly unknown[]) => void,
+  ) => Case20PerformanceObserverPort;
+}): Case20DaemonRuntimeObservationController {
+  const capacity = input?.capacity ?? CASE20_DAEMON_GC_OBSERVATION_CAPACITY;
+  if (!Number.isInteger(capacity) || capacity <= 0)
+    throw new Error("Case20 daemon runtime observation capacity is invalid");
+  const timeOriginMs = input?.timeOriginMs ?? performance.timeOrigin;
+  const monotonicNow = input?.monotonicNow ?? performance.now.bind(performance);
+  const cpuUsage = input?.cpuUsage ?? process.cpuUsage.bind(process);
+  const eventLoopUtilization =
+    input?.eventLoopUtilization ?? performance.eventLoopUtilization.bind(performance);
+  const nowIso = input?.nowIso ?? (() => new Date().toISOString());
+  const failures = new Set<Case20DaemonRuntimeObservationFailureCode>();
+  const garbageCollections: Case20DaemonGarbageCollectionSample[] = [];
+  let observedGarbageCollections = 0;
+  let previousGarbageCollectionStart = -1;
+  let expectedSequence = 1;
+  let sealed = false;
+  let disconnected = false;
+  const recordEntries = (entries: readonly unknown[]) => {
+    if (sealed && entries.length > 0) {
+      failures.add("daemon_runtime_observation_invalid");
+      return;
+    }
+    for (const entry of entries) {
+      let parsed: Case20DaemonGarbageCollectionSample;
+      try {
+        parsed = parseCase20GarbageCollectionEntry(entry, timeOriginMs);
+      } catch {
+        failures.add("daemon_runtime_observation_invalid");
+        continue;
+      }
+      if (parsed.startMonotonicUnixMs < previousGarbageCollectionStart) {
+        failures.add("daemon_runtime_observation_out_of_order");
+        continue;
+      }
+      previousGarbageCollectionStart = parsed.startMonotonicUnixMs;
+      if (observedGarbageCollections >= capacity) {
+        failures.add("daemon_runtime_observation_overflow");
+        continue;
+      }
+      observedGarbageCollections += 1;
+      garbageCollections.push(parsed);
+    }
+  };
+  const createObserver =
+    input?.createObserver ??
+    ((observe: (entries: readonly unknown[]) => void) => {
+      const observer = new PerformanceObserver((list) => observe(list.getEntries()));
+      observer.observe({ entryTypes: ["gc"] });
+      return observer;
+    });
+  const observer = createObserver(recordEntries);
+  let previousWindowMs = monotonicNow();
+  let previousCpu = cpuUsage();
+  let previousElu = eventLoopUtilization();
+  const disconnect = () => {
+    if (disconnected) return;
+    disconnected = true;
+    observer.disconnect();
+  };
+  const drainFailures = () => {
+    const drained = [...failures];
+    failures.clear();
+    return drained;
+  };
+  return {
+    sample(request) {
+      if (
+        !Number.isInteger(request.sequence) ||
+        request.sequence <= 0 ||
+        !isRuntimeResourceSampleKind(request.resourceSampleKind) ||
+        !isFiniteNonNegative(request.resourceTSec)
+      ) {
+        failures.add("daemon_runtime_observation_invalid");
+        return { observation: null, failures: drainFailures(), done: sealed };
+      }
+      if (sealed || request.sequence < expectedSequence) {
+        failures.add("daemon_runtime_observation_duplicate");
+        return { observation: null, failures: drainFailures(), done: sealed };
+      }
+      if (request.sequence > expectedSequence) {
+        failures.add("daemon_runtime_observation_out_of_order");
+        return { observation: null, failures: drainFailures(), done: false };
+      }
+      recordEntries(observer.takeRecords());
+      const windowEndedMs = monotonicNow();
+      const currentCpu = cpuUsage();
+      const currentElu = eventLoopUtilization();
+      const windowStartedMonotonicUnixMs = timeOriginMs + previousWindowMs;
+      const windowEndedMonotonicUnixMs = timeOriginMs + windowEndedMs;
+      const windowMs = windowEndedMonotonicUnixMs - windowStartedMonotonicUnixMs;
+      const cpuUserMicros = currentCpu.user - previousCpu.user;
+      const cpuSystemMicros = currentCpu.system - previousCpu.system;
+      const eventLoopIdleMs = currentElu.idle - previousElu.idle;
+      const eventLoopActiveMs = currentElu.active - previousElu.active;
+      const eventLoopTotalMs = eventLoopIdleMs + eventLoopActiveMs;
+      const eventLoopWindowUtilization =
+        eventLoopTotalMs === 0 ? 0 : eventLoopActiveMs / eventLoopTotalMs;
+      const validWindow = [
+        timeOriginMs,
+        previousWindowMs,
+        windowEndedMs,
+        windowMs,
+        cpuUserMicros,
+        cpuSystemMicros,
+        eventLoopIdleMs,
+        eventLoopActiveMs,
+        eventLoopWindowUtilization,
+      ].every(isFiniteNonNegative);
+      const collectedGarbage = garbageCollections.splice(0, garbageCollections.length);
+      const observation = validWindow
+        ? {
+            type: "daemon_runtime_observation" as const,
+            at: nowIso(),
+            sequence: request.sequence,
+            final: request.final,
+            resourceSampleKind: request.resourceSampleKind,
+            resourceTSec: request.resourceTSec,
+            windowStartedMonotonicUnixMs,
+            windowEndedMonotonicUnixMs,
+            windowMs,
+            cpuUserMicros,
+            cpuSystemMicros,
+            eventLoopIdleMs,
+            eventLoopActiveMs,
+            eventLoopUtilization: eventLoopWindowUtilization,
+            garbageCollections: collectedGarbage,
+          }
+        : null;
+      if (!validWindow) failures.add("daemon_runtime_observation_invalid");
+      previousWindowMs = windowEndedMs;
+      previousCpu = currentCpu;
+      previousElu = currentElu;
+      expectedSequence += 1;
+      if (request.final) {
+        sealed = true;
+        disconnect();
+      }
+      return { observation, failures: drainFailures(), done: sealed };
+    },
+    finish() {
+      if (!sealed) failures.add("daemon_runtime_observation_missing");
+      sealed = true;
+      disconnect();
+      return drainFailures();
+    },
+  };
 }
 
 function isDiagnosticPhase(value: unknown): value is Case20DaemonRpcDiagnosticPhase {
@@ -258,6 +490,11 @@ export interface Case20PartAFixture {
   collectRpcDiagnostics(
     consume: (batch: Case20DaemonRpcDiagnosticBatch) => void | Promise<void>,
   ): Promise<void>;
+  collectDaemonRuntimeObservation(input: {
+    readonly resourceSampleKind: Case20DaemonRuntimeResourceSampleKind;
+    readonly resourceTSec: number;
+    readonly final: boolean;
+  }): Promise<Case20DaemonRuntimeObservationBatch>;
   close(): Promise<Case20AuditVerification>;
 }
 
@@ -273,6 +510,19 @@ interface Case20DaemonRpcDiagnosticBatchMessage extends Case20DaemonRpcDiagnosti
   readonly type: "rpc_diagnostic_batch";
   readonly batchId: string;
   readonly batchIndex: number;
+}
+
+export interface Case20DaemonRuntimeObservationRequest {
+  readonly type: "daemon_runtime_observation_request";
+  readonly sequence: number;
+  readonly resourceSampleKind: Case20DaemonRuntimeResourceSampleKind;
+  readonly resourceTSec: number;
+  readonly final: boolean;
+}
+
+interface Case20DaemonRuntimeObservationBatchMessage extends Case20DaemonRuntimeObservationBatch {
+  readonly type: "daemon_runtime_observation_batch";
+  readonly sequence: number;
 }
 
 type ChildMessage =
@@ -291,6 +541,7 @@ type ChildMessage =
       readonly message: string;
     }
   | Case20DaemonRpcDiagnosticBatchMessage
+  | Case20DaemonRuntimeObservationBatchMessage
   | { readonly type: "closed"; readonly audit: Case20AuditVerification }
   | { readonly type: "failed"; readonly phase: "start" | "close"; readonly message: string };
 
@@ -302,9 +553,224 @@ function isChildMessage(value: unknown): value is ChildMessage {
     type === "gc_checkpoint_ack" ||
     type === "gc_checkpoint_failed" ||
     type === "rpc_diagnostic_batch" ||
+    type === "daemon_runtime_observation_batch" ||
     type === "closed" ||
     type === "failed"
   );
+}
+
+function parseDaemonRuntimeObservationRequest(
+  value: unknown,
+): Case20DaemonRuntimeObservationRequest {
+  if (
+    !isRecord(value) ||
+    Reflect.ownKeys(value).length !== 5 ||
+    value.type !== "daemon_runtime_observation_request" ||
+    !isNonNegativeInteger(value.sequence) ||
+    value.sequence === 0 ||
+    !isRuntimeResourceSampleKind(value.resourceSampleKind) ||
+    !isFiniteNonNegative(value.resourceTSec) ||
+    typeof value.final !== "boolean"
+  )
+    throw new Error("Case20 daemon runtime observation request is invalid");
+  return {
+    type: "daemon_runtime_observation_request",
+    sequence: value.sequence,
+    resourceSampleKind: value.resourceSampleKind,
+    resourceTSec: value.resourceTSec,
+    final: value.final,
+  };
+}
+
+function parseDaemonGarbageCollectionSample(value: unknown): Case20DaemonGarbageCollectionSample {
+  if (
+    !isRecord(value) ||
+    Reflect.ownKeys(value).length !== 4 ||
+    !isFiniteNonNegative(value.startMonotonicUnixMs) ||
+    !isFiniteNonNegative(value.durationMs) ||
+    !isNonNegativeInteger(value.kind) ||
+    !isNonNegativeInteger(value.flags)
+  )
+    throw new Error("Case20 daemon GC sample is invalid");
+  return {
+    startMonotonicUnixMs: value.startMonotonicUnixMs,
+    durationMs: value.durationMs,
+    kind: value.kind,
+    flags: value.flags,
+  };
+}
+
+interface Case20DaemonRuntimeObservationNumbers {
+  readonly windowStartedMonotonicUnixMs: number;
+  readonly windowEndedMonotonicUnixMs: number;
+  readonly windowMs: number;
+  readonly cpuUserMicros: number;
+  readonly cpuSystemMicros: number;
+  readonly eventLoopIdleMs: number;
+  readonly eventLoopActiveMs: number;
+  readonly eventLoopUtilization: number;
+}
+
+function hasDaemonRuntimeObservationNumbers(
+  value: Record<string, unknown>,
+): value is Record<string, unknown> & Case20DaemonRuntimeObservationNumbers {
+  return [
+    value.windowStartedMonotonicUnixMs,
+    value.windowEndedMonotonicUnixMs,
+    value.windowMs,
+    value.cpuUserMicros,
+    value.cpuSystemMicros,
+    value.eventLoopIdleMs,
+    value.eventLoopActiveMs,
+    value.eventLoopUtilization,
+  ].every(isFiniteNonNegative);
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function hasValidDaemonRuntimeObservationWindow(
+  value: Record<string, unknown> & Case20DaemonRuntimeObservationNumbers,
+): boolean {
+  return (
+    value.windowEndedMonotonicUnixMs >= value.windowStartedMonotonicUnixMs &&
+    value.windowEndedMonotonicUnixMs - value.windowStartedMonotonicUnixMs === value.windowMs &&
+    value.eventLoopUtilization <= 1
+  );
+}
+
+function parseDaemonRuntimeObservation(
+  value: unknown,
+  expected: {
+    readonly sequence: number;
+    readonly resourceSampleKind: Case20DaemonRuntimeResourceSampleKind;
+    readonly resourceTSec: number;
+    readonly final: boolean;
+  },
+): Case20DaemonRuntimeObservationEvent {
+  if (
+    !isRecord(value) ||
+    Reflect.ownKeys(value).length !== 15 ||
+    value.type !== "daemon_runtime_observation" ||
+    !isCanonicalIsoTimestamp(value.at) ||
+    value.sequence !== expected.sequence ||
+    value.resourceSampleKind !== expected.resourceSampleKind ||
+    value.resourceTSec !== expected.resourceTSec ||
+    value.final !== expected.final ||
+    !hasDaemonRuntimeObservationNumbers(value) ||
+    !hasValidDaemonRuntimeObservationWindow(value) ||
+    !Array.isArray(value.garbageCollections) ||
+    value.garbageCollections.length > CASE20_DAEMON_GC_OBSERVATION_CAPACITY
+  )
+    throw new Error("Case20 daemon runtime observation is invalid");
+  let previousStart = -1;
+  const garbageCollections = value.garbageCollections.map((entry) => {
+    const parsed = parseDaemonGarbageCollectionSample(entry);
+    if (parsed.startMonotonicUnixMs < previousStart)
+      throw new Error("Case20 daemon GC samples are out of order");
+    previousStart = parsed.startMonotonicUnixMs;
+    return parsed;
+  });
+  return {
+    type: "daemon_runtime_observation",
+    at: value.at,
+    sequence: expected.sequence,
+    resourceSampleKind: expected.resourceSampleKind,
+    resourceTSec: expected.resourceTSec,
+    final: expected.final,
+    windowStartedMonotonicUnixMs: value.windowStartedMonotonicUnixMs,
+    windowEndedMonotonicUnixMs: value.windowEndedMonotonicUnixMs,
+    windowMs: value.windowMs,
+    cpuUserMicros: value.cpuUserMicros,
+    cpuSystemMicros: value.cpuSystemMicros,
+    eventLoopIdleMs: value.eventLoopIdleMs,
+    eventLoopActiveMs: value.eventLoopActiveMs,
+    eventLoopUtilization: value.eventLoopUtilization,
+    garbageCollections,
+  };
+}
+
+function isDaemonRuntimeObservationFailure(
+  value: unknown,
+): value is Case20DaemonRuntimeObservationFailureCode {
+  return (
+    value === "daemon_runtime_observation_invalid" ||
+    value === "daemon_runtime_observation_missing" ||
+    value === "daemon_runtime_observation_duplicate" ||
+    value === "daemon_runtime_observation_out_of_order" ||
+    value === "daemon_runtime_observation_overflow"
+  );
+}
+
+export function parseCase20DaemonRuntimeObservationBatchMessage(
+  value: unknown,
+  expected: {
+    readonly sequence: number;
+    readonly resourceSampleKind: Case20DaemonRuntimeResourceSampleKind;
+    readonly resourceTSec: number;
+    readonly final: boolean;
+  },
+): Case20DaemonRuntimeObservationBatch {
+  if (
+    !isRecord(value) ||
+    Reflect.ownKeys(value).length !== 5 ||
+    value.type !== "daemon_runtime_observation_batch" ||
+    value.sequence !== expected.sequence ||
+    !Array.isArray(value.failures) ||
+    !value.failures.every(isDaemonRuntimeObservationFailure) ||
+    new Set(value.failures).size !== value.failures.length ||
+    typeof value.done !== "boolean" ||
+    value.done !== expected.final
+  )
+    throw new Error("Case20 daemon runtime observation batch is invalid");
+  const observation =
+    value.observation === null ? null : parseDaemonRuntimeObservation(value.observation, expected);
+  if (observation === null && value.failures.length === 0)
+    throw new Error("Case20 daemon runtime observation batch is empty");
+  return { observation, failures: value.failures, done: value.done };
+}
+
+export function installCase20DaemonRuntimeObservationHandler(input: {
+  readonly source: {
+    on(event: "message", listener: (value: unknown) => void): void;
+    off(event: "message", listener: (value: unknown) => void): void;
+  };
+  readonly controller: Case20DaemonRuntimeObservationController;
+  readonly isClosing: () => boolean;
+  readonly send: (message: Case20DaemonRuntimeObservationBatchMessage) => void;
+}): () => void {
+  const onMessage = (value: unknown) => {
+    if (
+      input.isClosing() ||
+      !isRecord(value) ||
+      value.type !== "daemon_runtime_observation_request"
+    )
+      return;
+    let request: Case20DaemonRuntimeObservationRequest;
+    try {
+      request = parseDaemonRuntimeObservationRequest(value);
+    } catch {
+      if (!isNonNegativeInteger(value.sequence) || value.sequence === 0) return;
+      input.send({
+        type: "daemon_runtime_observation_batch",
+        sequence: value.sequence,
+        observation: null,
+        failures: ["daemon_runtime_observation_invalid"],
+        done: false,
+      });
+      return;
+    }
+    input.send({
+      type: "daemon_runtime_observation_batch",
+      sequence: request.sequence,
+      ...input.controller.sample(request),
+    });
+  };
+  input.source.on("message", onMessage);
+  return () => input.source.off("message", onMessage);
 }
 
 function isSafeDiagnosticBatchId(value: unknown): value is string {
@@ -494,6 +960,18 @@ function sendRpcDiagnosticDrainToChild(
   });
 }
 
+function sendDaemonRuntimeObservationToChild(
+  child: ChildProcess,
+  request: Case20DaemonRuntimeObservationRequest,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    child.send(request, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
 function daemonChildEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(
     Object.entries(process.env).filter(
@@ -547,6 +1025,10 @@ export async function createCase20PartAFixture(input: {
   let closed = false;
   let garbageCollectionInFlight = false;
   let rpcDiagnosticCollectionInFlight = false;
+  let daemonRuntimeObservationInFlight = false;
+  let daemonRuntimeObservationSequence = 1;
+  let daemonRuntimeObservationFinished = false;
+  let daemonRuntimeObservationPoisoned = false;
   try {
     const message = await waitForMessage(
       child,
@@ -650,6 +1132,51 @@ export async function createCase20PartAFixture(input: {
           throw new Error("Case20 daemon RPC diagnostic batches exceeded the collection limit");
         } finally {
           rpcDiagnosticCollectionInFlight = false;
+        }
+      },
+      async collectDaemonRuntimeObservation(runtimeInput) {
+        if (closed) throw new Error("Case20 daemon child is closed");
+        if (daemonRuntimeObservationInFlight)
+          throw new Error("Case20 daemon child already has runtime observation in flight");
+        if (daemonRuntimeObservationFinished)
+          throw new Error("Case20 daemon child runtime observation is already final");
+        if (daemonRuntimeObservationPoisoned)
+          throw new Error("Case20 daemon child runtime observation is poisoned");
+        daemonRuntimeObservationInFlight = true;
+        const sequence = daemonRuntimeObservationSequence;
+        const request: Case20DaemonRuntimeObservationRequest = {
+          type: "daemon_runtime_observation_request",
+          sequence,
+          ...runtimeInput,
+        };
+        const pendingController = new AbortController();
+        const pending = waitForMessage(
+          child,
+          (candidate) =>
+            candidate.type === "daemon_runtime_observation_batch" &&
+            candidate.sequence === sequence,
+          10_000,
+          `Case20 daemon runtime observation ${sequence} timed out`,
+          pendingController.signal,
+        );
+        try {
+          try {
+            await sendDaemonRuntimeObservationToChild(child, request);
+          } catch (error) {
+            pendingController.abort();
+            await pending.catch(() => undefined);
+            throw error;
+          }
+          const runtimeMessage = await pending;
+          const batch = parseCase20DaemonRuntimeObservationBatchMessage(runtimeMessage, request);
+          daemonRuntimeObservationSequence += 1;
+          daemonRuntimeObservationFinished = runtimeInput.final;
+          return batch;
+        } catch (error) {
+          daemonRuntimeObservationPoisoned = true;
+          throw error;
+        } finally {
+          daemonRuntimeObservationInFlight = false;
         }
       },
       async close() {

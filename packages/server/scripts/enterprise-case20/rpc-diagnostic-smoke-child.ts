@@ -1,5 +1,7 @@
 import {
+  createCase20DaemonRuntimeObservationController,
   createCase20DaemonRpcDiagnosticCollector,
+  installCase20DaemonRuntimeObservationHandler,
   installCase20DaemonRpcDiagnosticDrainHandler,
 } from "./part-a-fixture.js";
 
@@ -42,11 +44,25 @@ const release = installCase20DaemonRpcDiagnosticDrainHandler({
     process.send?.(message);
   },
 });
+const runtimeObservation = createCase20DaemonRuntimeObservationController();
+const releaseRuntimeObservation = installCase20DaemonRuntimeObservationHandler({
+  source: {
+    on: (_event, listener) => process.on("message", listener),
+    off: (_event, listener) => process.off("message", listener),
+  },
+  controller: runtimeObservation,
+  isClosing: () => closing,
+  send: (message) => {
+    process.send?.(message);
+  },
+});
 const onShutdown = (value: unknown) => {
   if (!value || typeof value !== "object" || !("type" in value) || value.type !== "shutdown")
     return;
   closing = true;
   release();
+  releaseRuntimeObservation();
+  runtimeObservation.finish();
   process.off("message", onShutdown);
   process.send?.({ type: "smoke_closed" });
   process.disconnect?.();

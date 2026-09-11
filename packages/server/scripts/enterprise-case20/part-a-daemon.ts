@@ -19,7 +19,9 @@ import { createProductionEnterpriseWorkspaceFilesProvider } from "../../src/serv
 
 import { CASE20_PART_A_CLIENT_COUNT, type Case20Mode } from "./model.js";
 import {
+  createCase20DaemonRuntimeObservationController,
   createCase20DaemonRpcDiagnosticCollector,
+  installCase20DaemonRuntimeObservationHandler,
   installCase20DaemonRpcDiagnosticDrainHandler,
   type Case20AuditVerification,
   type Case20DaemonRpcDiagnosticCollector,
@@ -559,6 +561,7 @@ async function main(): Promise<void> {
     monotonicNow: performance.now.bind(performance),
   });
   const rpcDiagnostics = createCase20DaemonRpcDiagnosticCollector();
+  const daemonRuntimeObservation = createCase20DaemonRuntimeObservationController();
   const state: StartState = {
     root: null,
     paseoHome: null,
@@ -571,6 +574,7 @@ async function main(): Promise<void> {
   try {
     started = await startDaemon(daemonLogPath, mode, state, rpcDiagnostics);
   } catch (error) {
+    daemonRuntimeObservation.finish();
     const cleanupError = await cleanupFailedStart(state, daemonLogPath).then(
       () => null,
       (failure: unknown) => failure,
@@ -588,14 +592,25 @@ async function main(): Promise<void> {
   let closing = false;
   let releaseMessageHandler: () => void = () => undefined;
   let releaseRpcDiagnosticHandler: () => void = () => undefined;
+  let releaseDaemonRuntimeObservationHandler: () => void = () => undefined;
   const close = (report: boolean) => {
     if (closing) return;
     closing = true;
     releaseMessageHandler();
     releaseRpcDiagnosticHandler();
+    releaseDaemonRuntimeObservationHandler();
+    const daemonRuntimeObservationFailures = daemonRuntimeObservation.finish();
     void closeDaemon(started, daemonLogPath)
       .then((audit) => {
-        if (report) process.send?.({ type: "closed", audit });
+        if (report) {
+          if (daemonRuntimeObservationFailures.length > 0)
+            process.send?.({
+              type: "failed",
+              phase: "close",
+              message: "Case20 daemon runtime observation final drain is missing",
+            });
+          else process.send?.({ type: "closed", audit });
+        }
         return undefined;
       })
       .catch((error: unknown) => {
@@ -628,6 +643,17 @@ async function main(): Promise<void> {
       off: (_event, listener) => process.off("message", listener),
     },
     collector: rpcDiagnostics,
+    isClosing: () => closing,
+    send: (message) => {
+      process.send?.(message);
+    },
+  });
+  releaseDaemonRuntimeObservationHandler = installCase20DaemonRuntimeObservationHandler({
+    source: {
+      on: (_event, listener) => process.on("message", listener),
+      off: (_event, listener) => process.off("message", listener),
+    },
+    controller: daemonRuntimeObservation,
     isClosing: () => closing,
     send: (message) => {
       process.send?.(message);
