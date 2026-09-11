@@ -124,7 +124,10 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
   );
 }
 
-import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
+import {
+  VoiceAssistantWebSocketServer,
+  type WebSocketRpcDiagnosticObserver,
+} from "./websocket-server.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import { createWorkspaceLabelService } from "./workspace-labels/index.js";
 import { createGitHubService } from "../services/github-service.js";
@@ -545,6 +548,7 @@ export interface PaseoDaemonDependencies {
   enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
   enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
+  rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
   createEnterpriseWorkspaceFilesProvider?: (input: {
     workspaceRoots: FileBackedWorkspaceRegistry;
   }) => EnterpriseWorkspaceFilesProductionProvider | null;
@@ -2362,6 +2366,7 @@ export async function createPaseoDaemon(
                 dependencies.enterpriseDispatcherFactory,
                 dependencies.enterpriseDispatcherRegistration ??
                   productionEnterpriseDispatcherRegistration,
+                dependencies.rpcDiagnosticObserver,
               );
               requireStartAudit();
               pluginRuntime.bindPaseoSessionHost(wsServer);

@@ -17,6 +17,7 @@ import {
   TerminalStreamOpcode,
 } from "@getpaseo/protocol/terminal-stream-protocol";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { wrapSessionMessage } from "@getpaseo/protocol/messages";
 import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
 import type { EnterpriseAdmissionPort } from "./enterprise/identity/runtime.js";
 import {
@@ -124,6 +125,8 @@ vi.mock("./push/index.js", () => ({
 
 import { z } from "zod";
 import { VoiceAssistantWebSocketServer, type SessionAdmission } from "./websocket-server";
+import type { SessionRpcDiagnosticObservation } from "./session.js";
+import type { WebSocketRpcDiagnosticObserver } from "./websocket-server";
 import { DAEMON_PERMISSIONS, parseServerInfoStatusPayload } from "./messages.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
 
@@ -380,6 +383,7 @@ function createServer(options?: {
   logger?: ReturnType<typeof createLogger>;
   startPaused?: boolean;
   enterpriseRuntime?: EnterpriseAdmissionRuntime;
+  rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
 }) {
   const speechReadiness = options?.speechReadiness ?? null;
   const daemonConfigStore = {
@@ -463,6 +467,13 @@ function createServer(options?: {
     undefined,
     undefined,
     options?.enterpriseRuntime,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    options?.rpcDiagnosticObserver,
   );
 }
 
@@ -927,6 +938,17 @@ describe("relay external socket reconnect behavior", () => {
       }),
     );
     await Promise.resolve();
+    (
+      server as unknown as {
+        sendMessageToSockets: (sockets: MockSocket[], message: unknown) => void;
+      }
+    ).sendMessageToSockets(
+      [socket],
+      wrapSessionMessage({
+        type: "fetch_agents_response",
+        payload: { requestId: "obs-1", agents: [] },
+      }),
+    );
 
     expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1368,6 +1390,266 @@ describe("relay external socket reconnect behavior", () => {
     expect(frame.slot).toBe(12);
     expect(new TextDecoder().decode(frame.payload ?? new Uint8Array())).toBe("ok");
 
+    await server.close();
+  });
+});
+
+describe("websocket rpc diagnostic observer", () => {
+  beforeEach(() => {
+    sessionMock.instances.length = 0;
+  });
+  test("records request and response phases through production dispatch", async () => {
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-client" });
+    const session = sessionMock.instances.at(-1)!;
+    expect(session.args.rpcDiagnosticObserver).toBeTypeOf("function");
+    session.handleMessage.mockImplementationOnce(async () => {
+      const observe = session.args.rpcDiagnosticObserver as (
+        event: SessionRpcDiagnosticObservation,
+      ) => void;
+      observe({
+        phase: "session.enter",
+        requestId: "obs-1",
+        requestType: "fetch_agents_request",
+        atUnixMs: 1,
+      });
+      observe({
+        phase: "response.deliver.begin",
+        requestId: "obs-1",
+        responseType: "fetch_agents_response",
+        atUnixMs: 2,
+      });
+      session.publish({
+        type: "fetch_agents_response",
+        payload: { requestId: "obs-1", agents: [] },
+      });
+      observe({
+        phase: "response.deliver.return",
+        requestId: "obs-1",
+        responseType: "fetch_agents_response",
+        atUnixMs: 3,
+      });
+    });
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(
+        wrapSessionMessage({
+          type: "fetch_agents_request",
+          requestId: "obs-1",
+          subscribe: { subscriptionId: "obs-sub" },
+        }),
+      ),
+    );
+    await Promise.resolve();
+    expect(observations.map((item) => (item as { phase: string }).phase)).toEqual([
+      "frame.received",
+      "session.call",
+      "session.enter",
+      "response.deliver.begin",
+      "response.stringify.begin",
+      "response.stringify.return",
+      "response.send.begin",
+      "response.send.return",
+      "response.deliver.return",
+    ]);
+    await server.close();
+  });
+
+  test("default-off and non-target traffic emit no diagnostics", async () => {
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-off" });
+    const session = sessionMock.instances.at(-1)!;
+    expect(session.args.rpcDiagnosticObserver).toBeTypeOf("function");
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(wrapSessionMessage({ type: "fetch_workspaces_request", requestId: "other" })),
+    );
+    expect(observations).toHaveLength(0);
+    await server.close();
+  });
+
+  test("default-off leaves session observer absent", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-default-off" });
+    expect(sessionMock.instances.at(-1)!.args.rpcDiagnosticObserver).toBeUndefined();
+    await server.close();
+  });
+
+  test("rpc_error delivery survives throwing observer", async () => {
+    const server = createServer({
+      rpcDiagnosticObserver: () => {
+        throw new Error("observer");
+      },
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-error" });
+    const session = sessionMock.instances.at(-1)!;
+    session.handleMessage.mockImplementationOnce(async () => {
+      session.publish({
+        type: "rpc_error",
+        payload: { requestId: "err-1", requestType: "fetch_agents_request", error: "x", code: "x" },
+      });
+    });
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(
+        wrapSessionMessage({
+          type: "fetch_agents_request",
+          requestId: "err-1",
+          subscribe: { subscriptionId: "s" },
+        }),
+      ),
+    );
+    await Promise.resolve();
+    const delivered = socket.sent
+      .map((frame) => {
+        try {
+          return JSON.parse(String(frame));
+        } catch {
+          return null;
+        }
+      })
+      .find((frame) => frame?.type === "session" && frame.message?.type === "rpc_error");
+    expect(delivered?.message?.payload).toMatchObject({
+      requestId: "err-1",
+      requestType: "fetch_agents_request",
+    });
+    await server.close();
+  });
+
+  test("rpc_error emits exact response phases", async () => {
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-rpc-error" });
+    const session = sessionMock.instances.at(-1)!;
+    session.handleMessage.mockImplementationOnce(async () => {
+      session.publish({
+        type: "rpc_error",
+        payload: { requestId: "err-2", requestType: "fetch_agent_request", error: "x", code: "x" },
+      });
+    });
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(wrapSessionMessage({ type: "fetch_agent_request", requestId: "err-2" })),
+    );
+    await Promise.resolve();
+    const errObservations = observations.filter(
+      (item) => (item as { requestId?: string }).requestId === "err-2",
+    ) as Array<{ phase: string; requestId: string; responseType?: string; atUnixMs: number }>;
+    expect(errObservations).toHaveLength(4);
+    expect(errObservations.map((item) => item.phase)).toEqual([
+      "response.stringify.begin",
+      "response.stringify.return",
+      "response.send.begin",
+      "response.send.return",
+    ]);
+    for (const item of errObservations) {
+      expect(item.requestId).toBe("err-2");
+      expect(item.responseType).toBe("rpc_error");
+      expect(item.atUnixMs).toEqual(expect.any(Number));
+    }
+    const phases = observations.map((item) => (item as { phase: string }).phase);
+    expect(
+      phases.filter(
+        (phase) =>
+          phase.startsWith("response.") &&
+          phase !== "response.deliver.begin" &&
+          phase !== "response.deliver.return",
+      ),
+    ).toEqual([
+      "response.stringify.begin",
+      "response.stringify.return",
+      "response.send.begin",
+      "response.send.return",
+    ]);
+    await server.close();
+  });
+
+  test("pending replay preserves physical target timestamp exactly once", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+      enterpriseRuntime: h.runtime,
+    });
+    const socket = new MockSocket();
+    await attachEnterpriseAuthenticated(server, socket);
+    const internals = asInternals<{
+      handleRawMessage: (socket: MockSocket, data: string, capturedAtUnixMs?: number) => void;
+    }>(server);
+    const targetAt = 202;
+    internals.handleRawMessage(socket, JSON.stringify(createHelloMessage("pending-observer")), 101);
+    await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+    const session = sessionMock.instances.at(-1)!;
+    session.handleMessage.mockImplementationOnce(async () => {
+      session.publish({
+        type: "fetch_agents_response",
+        payload: { requestId: "pending-1", agents: [] },
+      });
+    });
+    internals.handleRawMessage(
+      socket,
+      JSON.stringify(
+        wrapSessionMessage({
+          type: "fetch_agents_request",
+          requestId: "pending-1",
+          subscribe: { subscriptionId: "pending" },
+        }),
+      ),
+      targetAt,
+    );
+    expect(session.handleMessage).not.toHaveBeenCalled();
+    release();
+    await vi.waitFor(() => expect(session.handleMessage).toHaveBeenCalledOnce());
+    const frames = observations.filter(
+      (item) => (item as { phase: string }).phase === "frame.received",
+    ) as Array<{ requestId: string; requestType: string; atUnixMs: number }>;
+    expect(frames).toEqual([
+      {
+        phase: "frame.received",
+        requestId: "pending-1",
+        requestType: "fetch_agents_request",
+        atUnixMs: targetAt,
+      },
+    ]);
+    const response = socket.sent
+      .map((frame) => {
+        try {
+          return JSON.parse(String(frame));
+        } catch {
+          return null;
+        }
+      })
+      .find((frame) => frame?.message?.type === "fetch_agents_response");
+    expect(response?.message?.payload?.requestId).toBe("pending-1");
     await server.close();
   });
 });

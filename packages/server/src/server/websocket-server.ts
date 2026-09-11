@@ -36,8 +36,36 @@ import {
   Session,
   type SessionLifecycleIntent,
   type SessionOptions,
+  type SessionRpcDiagnosticObservation,
   type SessionRuntimeMetrics,
 } from "./session.js";
+
+type WebSocketDiagnosticRequestType = "fetch_agents_request" | "fetch_agent_request";
+type WebSocketDiagnosticResponseType =
+  | "fetch_agents_response"
+  | "fetch_agent_response"
+  | "rpc_error";
+export type WebSocketRpcDiagnosticObservation =
+  | Readonly<{
+      phase: "frame.received" | "session.call";
+      requestId: string;
+      requestType: WebSocketDiagnosticRequestType;
+      atUnixMs: number;
+    }>
+  | Readonly<{
+      phase:
+        | "response.stringify.begin"
+        | "response.stringify.return"
+        | "response.send.begin"
+        | "response.send.return";
+      requestId: string;
+      responseType: WebSocketDiagnosticResponseType;
+      atUnixMs: number;
+    }>
+  | SessionRpcDiagnosticObservation;
+export type WebSocketRpcDiagnosticObserver = (
+  observation: WebSocketRpcDiagnosticObservation,
+) => void;
 import type {
   EnterpriseSessionDispatcher,
   EnterpriseSessionDispatcherFactory,
@@ -381,6 +409,7 @@ interface PendingConnection {
 interface PendingMessageItem {
   readonly message: WSInboundMessage;
   readonly pendingConnection: PendingConnection;
+  readonly capturedAtUnixMs?: number;
 }
 
 interface WebSocketConnectionIdentity {
@@ -397,6 +426,24 @@ interface WebSocketConnectionIdentity {
   clientId?: string;
   sessionId?: string;
   appVersion?: string;
+}
+
+export function getWebSocketRpcDiagnosticResponseIdentity(
+  message: WSOutboundMessage,
+): { requestId: string; responseType: WebSocketDiagnosticResponseType } | null {
+  if (message.type !== "session") return null;
+  const nested = message.message;
+  if (nested.type === "fetch_agents_response" || nested.type === "fetch_agent_response") {
+    return { requestId: nested.payload.requestId, responseType: nested.type };
+  }
+  if (
+    nested.type === "rpc_error" &&
+    (nested.payload.requestType === "fetch_agents_request" ||
+      nested.payload.requestType === "fetch_agent_request")
+  ) {
+    return { requestId: nested.payload.requestId, responseType: "rpc_error" };
+  }
+  return null;
 }
 
 interface WebSocketServerConfig {
@@ -741,6 +788,7 @@ interface SocketSessionOptions {
   enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
   enterpriseSessionBindingGeneration?: string;
   enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
+  rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
   admissionInvalidationSink?: SessionOptions["admissionInvalidationSink"];
   admissionAuthorizationIssuer?: EnterpriseAdmissionRuntime["admission"]["authorizationIssuer"];
   admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
@@ -887,6 +935,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
   private readonly enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
   private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
+  private readonly rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
   private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 
   constructor(
@@ -942,10 +991,12 @@ export class VoiceAssistantWebSocketServer {
     enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement,
     enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory,
     enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration,
+    rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.enterpriseRuntime = enterpriseRuntime;
+    this.rpcDiagnosticObserver = rpcDiagnosticObserver;
     this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
     this.enterpriseDispatcher = enterpriseDispatcher;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
@@ -1622,6 +1673,13 @@ export class VoiceAssistantWebSocketServer {
       return;
     }
 
+    const response = getWebSocketRpcDiagnosticResponseIdentity(message);
+    if (response)
+      this.emitRpcDiagnostic({
+        phase: "response.stringify.begin",
+        ...response,
+        atUnixMs: performance.timeOrigin + performance.now(),
+      });
     let payload: string;
     try {
       payload = JSON.stringify(message);
@@ -1629,12 +1687,30 @@ export class VoiceAssistantWebSocketServer {
       this.logger.warn({ err }, "ws_serialize_failed");
       return;
     }
+    if (response)
+      this.emitRpcDiagnostic({
+        phase: "response.stringify.return",
+        ...response,
+        atUnixMs: performance.timeOrigin + performance.now(),
+      });
 
     const payloadBytes = outboundFrameByteLength(payload);
     for (const ws of writableSockets) {
+      if (response)
+        this.emitRpcDiagnostic({
+          phase: "response.send.begin",
+          ...response,
+          atUnixMs: performance.timeOrigin + performance.now(),
+        });
       this.sendFrameToClient(ws, payload, payloadBytes, () => {
         this.runtimeMetrics.recordOutboundMessage(message, ws.bufferedAmount);
       });
+      if (response)
+        this.emitRpcDiagnostic({
+          phase: "response.send.return",
+          ...response,
+          atUnixMs: performance.timeOrigin + performance.now(),
+        });
     }
   }
 
@@ -2026,6 +2102,12 @@ export class VoiceAssistantWebSocketServer {
       ...(options.sessionId ? { sessionId: options.sessionId } : {}),
       ...(options.sessionAuthorization
         ? { sessionAuthorization: options.sessionAuthorization }
+        : {}),
+      ...(this.rpcDiagnosticObserver
+        ? {
+            rpcDiagnosticObserver: (observation: SessionRpcDiagnosticObservation) =>
+              this.rpcDiagnosticObserver?.(observation),
+          }
         : {}),
       ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
       ...(this.enterpriseIdentitySelfAuthorization
@@ -3231,12 +3313,13 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike;
     message: WSInboundMessage;
     pendingConnection: PendingConnection;
+    capturedAtUnixMs?: number;
   }): void {
-    const { ws, message, pendingConnection } = params;
+    const { ws, message, pendingConnection, capturedAtUnixMs } = params;
     if (message.type === "hello") this.handshakeInFlight.add(ws);
     const queue = this.pendingMessageQueues.get(ws) ?? [];
     this.pendingMessageOwners.set(ws, pendingConnection);
-    queue.push({ message, pendingConnection });
+    queue.push({ message, pendingConnection, capturedAtUnixMs });
     this.pendingMessageQueues.set(ws, queue);
     if (this.pendingMessageDraining.has(ws)) return;
     this.pendingMessageDraining.add(ws);
@@ -3280,9 +3363,13 @@ export class VoiceAssistantWebSocketServer {
           try {
             const active = this.sessions.get(ws);
             if (active && item.message.type === "session") {
-              await this.dispatchSessionMessage(ws, active, item.message);
+              await this.dispatchSessionMessage(ws, active, item.message, item.capturedAtUnixMs);
             } else {
-              this.handleRawMessage(ws, Buffer.from(JSON.stringify(item.message)));
+              this.handleRawMessage(
+                ws,
+                Buffer.from(JSON.stringify(item.message)),
+                item.capturedAtUnixMs,
+              );
             }
           } finally {
             this.pendingMessageReplaying.delete(ws);
@@ -3298,10 +3385,19 @@ export class VoiceAssistantWebSocketServer {
   }
   // oxlint-enable max-depth
 
+  private emitRpcDiagnostic(observation: WebSocketRpcDiagnosticObservation): void {
+    try {
+      this.rpcDiagnosticObserver?.(observation);
+    } catch {
+      // Diagnostics must never affect protocol handling.
+    }
+  }
+
   // oxlint-disable-next-line complexity -- pending queue gate plus protocol dispatch.
   private handleRawMessage(
     ws: WebSocketLike,
     data: Buffer | ArrayBuffer | Buffer[] | string,
+    capturedAtUnixMs = performance.timeOrigin + performance.now(),
   ): void {
     if (
       this.connectionLifecycle === "stopping" ||
@@ -3352,7 +3448,11 @@ export class VoiceAssistantWebSocketServer {
         const owner = this.pendingMessageOwners.get(ws);
         if (owner) {
           const queue = this.pendingMessageQueues.get(ws) ?? [];
-          queue.push({ message, pendingConnection: owner });
+          queue.push({
+            message,
+            pendingConnection: owner,
+            capturedAtUnixMs,
+          });
           this.pendingMessageQueues.set(ws, queue);
           return;
         }
@@ -3374,6 +3474,7 @@ export class VoiceAssistantWebSocketServer {
           ws,
           message,
           pendingConnection,
+          capturedAtUnixMs,
         });
         return;
       }
@@ -3396,9 +3497,11 @@ export class VoiceAssistantWebSocketServer {
       }
 
       if (message.type === "session") {
-        void this.dispatchSessionMessage(ws, activeConnection, message).catch((error: unknown) => {
-          this.handleRawMessageError({ ws, data, error, log: activeConnection.connectionLogger });
-        });
+        void this.dispatchSessionMessage(ws, activeConnection, message, capturedAtUnixMs).catch(
+          (error: unknown) => {
+            this.handleRawMessageError({ ws, data, error, log: activeConnection.connectionLogger });
+          },
+        );
       }
     } catch (error) {
       this.handleRawMessageError({ ws, data, error, log });
@@ -3409,6 +3512,7 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike,
     activeConnection: SessionConnection,
     message: Extract<WSInboundMessage, { type: "session" }>,
+    capturedAtUnixMs = performance.timeOrigin + performance.now(),
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
     const controlRpc = getControlRpcLogInfo(message.message);
@@ -3444,6 +3548,28 @@ export class VoiceAssistantWebSocketServer {
       return;
     }
 
+    if (
+      message.message.type === "fetch_agents_request" ||
+      message.message.type === "fetch_agent_request"
+    ) {
+      this.emitRpcDiagnostic({
+        phase: "frame.received",
+        requestId: message.message.requestId,
+        requestType: message.message.type,
+        atUnixMs: capturedAtUnixMs,
+      });
+    }
+    if (
+      message.message.type === "fetch_agents_request" ||
+      message.message.type === "fetch_agent_request"
+    ) {
+      this.emitRpcDiagnostic({
+        phase: "session.call",
+        requestId: message.message.requestId,
+        requestType: message.message.type,
+        atUnixMs: performance.timeOrigin + performance.now(),
+      });
+    }
     const startMs = performance.now();
     await activeConnection.session.handleMessage(message.message, ws);
     const durationMs = performance.now() - startMs;
