@@ -7,7 +7,10 @@ import {
   type ConnectionState,
   type DaemonClientTrace,
   type Logger,
+  type WebSocketFactory,
+  type WebSocketLike,
 } from "@getpaseo/client/internal/daemon-client";
+import { WebSocket } from "ws";
 
 import { createCase20ArtifactWriter, type Case20ArtifactWriter } from "./artifact.js";
 import { parseCase20CliArguments, readPrivateManifest } from "./manifest.js";
@@ -64,6 +67,13 @@ interface ConnectionLifecycle {
   intentionalClose: boolean;
   connected: boolean;
   lastStatus: ConnectionState["status"];
+}
+
+export function createCase20CliWebSocketFactory(): WebSocketFactory {
+  return (url, options) =>
+    new WebSocket(url, options?.protocols, {
+      headers: options?.headers,
+    }) as unknown as WebSocketLike;
 }
 
 interface ConnectedClient {
@@ -1713,6 +1723,7 @@ async function connectClient(
     clientId: config.clientId,
     clientType: "cli",
     password: config.personalAccessToken,
+    webSocketFactory: createCase20CliWebSocketFactory(),
     connectTimeoutMs: 10_000,
     reconnect: { enabled: false },
     logger: observation.logger,

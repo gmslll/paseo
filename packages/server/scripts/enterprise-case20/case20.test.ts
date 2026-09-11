@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, test } from "vitest";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   DaemonClient,
   type DaemonClientTrace,
@@ -43,6 +44,7 @@ import {
   classifyCase20AgentList,
   cleanupCase20TimelineClients,
   createCase20DaemonRuntimeObservationRecorder,
+  createCase20CliWebSocketFactory,
   createCase20ClientObservationController,
   createCase20ObservationBuffer,
   createCase20ObservedRpcTiming,
@@ -492,6 +494,73 @@ function case20TestClientTrace(input: {
 }
 
 describe("Case20 evidence helpers", () => {
+  test("uses the production CLI WebSocket transport with headers and protocols", async () => {
+    const server = new WebSocketServer({
+      host: "127.0.0.1",
+      port: 0,
+      handleProtocols: (protocols) =>
+        protocols.has("case20.runner.cli") ? "case20.runner.cli" : false,
+    });
+    let client: WebSocket | undefined;
+    try {
+      await once(server, "listening");
+      const address = server.address();
+      expect(address).not.toBeNull();
+      expect(typeof address).toBe("object");
+      if (address === null || typeof address !== "object") {
+        throw new Error("Case20 loopback WebSocket server did not bind a TCP address");
+      }
+      expect(address.address).toBe("127.0.0.1");
+      expect(address.family).toBe("IPv4");
+      expect(address.port).toBeGreaterThan(0);
+
+      const accepted = new Promise<{ authorization: string | undefined; protocol: string }>(
+        (resolve) => {
+          server.once("connection", (socket, request) => {
+            resolve({
+              authorization: request.headers.authorization,
+              protocol: socket.protocol,
+            });
+            socket.send("case20-cli-transport-ready");
+          });
+        },
+      );
+      client = createCase20CliWebSocketFactory()(`ws://127.0.0.1:${address.port}`, {
+        headers: { authorization: "case20-fixture-auth" },
+        protocols: ["case20.runner.cli"],
+      }) as WebSocket;
+      expect(client).toBeInstanceOf(WebSocket);
+      const opened = once(client, "open");
+      const received = once(client, "message");
+      await opened;
+
+      await expect(accepted).resolves.toEqual({
+        authorization: "case20-fixture-auth",
+        protocol: "case20.runner.cli",
+      });
+      const [payload, isBinary] = await received;
+      expect(payload.toString()).toBe("case20-cli-transport-ready");
+      expect(isBinary).toBe(false);
+
+      const closed = once(client, "close");
+      client.close(1000, "case20-cli-transport-complete");
+      const [code, reason] = await closed;
+      expect(code).toBe(1000);
+      expect(reason.toString()).toBe("case20-cli-transport-complete");
+    } finally {
+      if (client?.readyState !== WebSocket.CLOSED) client?.terminate();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    }
+  });
+
   test("maps daemon GC entries and CPU/ELU deltas before disconnecting on final drain", () => {
     let emitEntries: (entries: readonly unknown[]) => void = () => undefined;
     let pendingEntries: readonly unknown[] = [];
