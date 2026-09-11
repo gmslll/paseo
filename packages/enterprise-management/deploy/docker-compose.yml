@@ -25,7 +25,7 @@ services:
           "CMD",
           "node",
           "-e",
-          "fetch(process.env.PASEO_MANAGEMENT_ISSUER+'/v1/health').then(r=>{if(!r.ok)process.exit(1)})",
+          "const fs=require('node:fs'),https=require('node:https'),net=require('node:net'),tls=require('node:tls');const url=new URL(process.env.PASEO_MANAGEMENT_ISSUER),host=url.hostname;const request=https.get({hostname:'127.0.0.1',port:url.port||443,path:'/v1/health',ca:fs.readFileSync(process.env.PASEO_MANAGEMENT_TLS_CERT),servername:net.isIP(host)?undefined:host,checkServerIdentity:(_hostname,certificate)=>tls.checkServerIdentity(host,certificate)},response=>{response.resume();response.on('end',()=>process.exit(response.statusCode===200?0:1))});request.on('error',()=>process.exit(1));request.setTimeout(4000,()=>{request.destroy();process.exit(1)})",
         ]
       interval: 30s
       timeout: 5s
