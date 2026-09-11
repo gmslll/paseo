@@ -4,6 +4,7 @@ import type {
   AppSlotRecord,
   BrowserProfileRecord,
   PrincipalContext,
+  ResourceGrant,
   SessionOutboundMessage,
 } from "@getpaseo/protocol/messages";
 import { OwnerRegistry } from "./owner-registry.js";
@@ -12,6 +13,7 @@ import {
   ResourceAuthorizationService,
   type AppSlotRegistry,
   type BrowserProfileRegistry,
+  type EnterpriseAgentContentAuthorizationRow,
   type WorkspacePathRegistry,
 } from "./resource-authorization.js";
 
@@ -36,7 +38,15 @@ const ctx: PrincipalContext = {
 };
 
 const workspaceRecord = { id: "wks_a", ...owner } as const;
+const agentContentRow = { id: "agent_a", workspaceId: "wks_a", ...owner } as const;
 const guard = { isCurrent: () => true };
+
+function contentContext(selector: ResourceGrant["selector"]): PrincipalContext {
+  return {
+    ...ctx,
+    grants: [{ action: "workspace.content.read", selector }],
+  };
+}
 
 class MemoryBrowserProfiles implements BrowserProfileRegistry {
   constructor(private readonly profiles: readonly BrowserProfileRecord[]) {}
@@ -186,6 +196,167 @@ describe("ResourceAuthorizationService", () => {
     });
     expect(flippingAuthorization.preauthorizeAgentEvent(ctx, "agent_a")).toBe(false);
   });
+
+  test.each([
+    ["workspace", { kind: "workspace", workspaceIds: ["wks_a"] }],
+    ["organization", { kind: "organization", organizationId: owner.organizationId }],
+    ["self", { kind: "self" }],
+  ] as const)("prefilters Agent content rows with an explicit %s grant", (_kind, selector) => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace(workspaceRecord);
+    owners.registerAgent(agentContentRow);
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+
+    const row = { ...agentContentRow };
+    const rows = [row];
+    const before = { ...row };
+    const result = authorization.prefilterAgentContentRows(contentContext(selector), rows);
+
+    expect(result).toEqual([row]);
+    expect(result[0]).toBe(row);
+    expect(rows).toEqual([row]);
+    expect(row).toEqual(before);
+  });
+
+  test("prefilter is fixed to content grants and has no implicit self access", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace(workspaceRecord);
+    owners.registerAgent(agentContentRow);
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+
+    expect(
+      authorization.prefilterAgentContentRows({ ...ctx, grants: [] }, [agentContentRow]),
+    ).toEqual([]);
+    expect(
+      authorization.prefilterAgentContentRows(
+        {
+          ...ctx,
+          grants: [{ action: "workspace.metadata.read", selector: { kind: "self" } }],
+        },
+        [agentContentRow],
+      ),
+    ).toEqual([]);
+  });
+
+  test.each([
+    ["agent id", { id: "agent_b" }],
+    ["workspace id", { workspaceId: "wks_b" }],
+    ["organization", { organizationId: "org_ffffffffffffffff" }],
+    ["node", { nodeId: "nod_ffffffffffffffff" }],
+    ["owner", { ownerPrincipalId: "usr_ffffffffffffffff" }],
+    ["creator", { createdByPrincipalId: "usr_ffffffffffffffff" }],
+  ] as const)("rejects a noncanonical Agent content %s", (_field, replacement) => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace(workspaceRecord);
+    owners.registerAgent(agentContentRow);
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+
+    expect(
+      authorization.prefilterAgentContentRows(ctx, [{ ...agentContentRow, ...replacement }]),
+    ).toEqual([]);
+  });
+
+  test.each([
+    ["organization", { ...owner, organizationId: "org_ffffffffffffffff" }],
+    ["node", { ...owner, nodeId: "nod_ffffffffffffffff" }],
+  ] as const)("rejects a canonical Agent outside the runtime %s", (_field, canonicalOwner) => {
+    const owners = new OwnerRegistry();
+    const row = { id: "agent_a", workspaceId: "wks_a", ...canonicalOwner };
+    owners.registerWorkspace({ id: "wks_a", ...canonicalOwner });
+    owners.registerAgent(row);
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+
+    expect(authorization.prefilterAgentContentRows(ctx, [row])).toEqual([]);
+  });
+
+  test("prefilter rejects missing and malformed minimal rows", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace(workspaceRecord);
+    owners.registerAgent(agentContentRow);
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    const invalidRows = [
+      { id: "agent_a", workspaceId: "wks_a" },
+      { ...agentContentRow, organizationId: "malformed" },
+      { ...agentContentRow, id: "missing" },
+    ] as unknown as readonly EnterpriseAgentContentAuthorizationRow[];
+
+    expect(authorization.prefilterAgentContentRows(ctx, invalidRows)).toEqual([]);
+  });
+
+  test("prefilter fails closed for false, throwing, and post-call stale guards", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace(workspaceRecord);
+    owners.registerAgent(agentContentRow);
+    const withGuard = (grantVersionGuard: { isCurrent(ctx: PrincipalContext): boolean }) =>
+      new ResourceAuthorizationService({
+        owners,
+        nodeId: owner.nodeId,
+        grantVersionGuard,
+      });
+
+    expect(
+      withGuard({ isCurrent: () => false }).prefilterAgentContentRows(ctx, [agentContentRow]),
+    ).toEqual([]);
+    expect(
+      withGuard({
+        isCurrent: () => {
+          throw new Error("guard unavailable");
+        },
+      }).prefilterAgentContentRows(ctx, [agentContentRow]),
+    ).toEqual([]);
+    let checks = 0;
+    expect(
+      withGuard({ isCurrent: () => ++checks === 1 }).prefilterAgentContentRows(ctx, [
+        agentContentRow,
+      ]),
+    ).toEqual([]);
+    expect(checks).toBe(2);
+  });
+
+  test("prefilter rechecks canonical ownership instead of caching a shortlist", () => {
+    const owners = new OwnerRegistry();
+    owners.registerWorkspace(workspaceRecord);
+    owners.registerAgent(agentContentRow);
+    const authorization = new ResourceAuthorizationService({
+      owners,
+      nodeId: owner.nodeId,
+      grantVersionGuard: guard,
+    });
+    expect(authorization.prefilterAgentContentRows(ctx, [agentContentRow])).toEqual([
+      agentContentRow,
+    ]);
+
+    const reboundOwner = {
+      ...owner,
+      ownerPrincipalId: "usr_ffffffffffffffff",
+      createdByPrincipalId: "usr_ffffffffffffffff",
+    } as const;
+    owners.registerWorkspace({ id: workspaceRecord.id, ...reboundOwner });
+    owners.registerAgent({ ...agentContentRow, ...reboundOwner });
+
+    expect(authorization.prefilterAgentContentRows(ctx, [agentContentRow])).toEqual([]);
+  });
+
   test("permits only an exact empty organization projection with empty resource context", async () => {
     const authorization = new ResourceAuthorizationService({
       owners: new OwnerRegistry(),

@@ -6,6 +6,7 @@ import type {
   EnterpriseAction,
 } from "@getpaseo/protocol/messages";
 import type { EnterpriseAgentAuthorizationRecord } from "./owner-registry.js";
+import type { EnterpriseAgentContentAuthorizationRow } from "./resource-authorization.js";
 import { isCurrentProductionAuthorizationRuntime } from "./production-authorization-runtime.js";
 
 const legacyBrand = Symbol("enterprise-legacy-resource-authorization");
@@ -19,6 +20,9 @@ export interface EnterpriseLegacyResourceAuthorization {
     action: "workspace.metadata.read" | "workspace.content.read",
     rows: readonly T[],
   ): Promise<readonly T[]>;
+  prefilterAgentContentRows<T extends EnterpriseAgentContentAuthorizationRow>(
+    rows: readonly T[],
+  ): readonly T[];
   assertWorkspace(action: EnterpriseAction, id: string): Promise<AuthorizedWorkspace | null>;
   assertAgent(action: EnterpriseAction, id: string): Promise<AuthorizedAgent | null>;
 }
@@ -85,6 +89,20 @@ export function createEnterpriseLegacyResourceAuthorization(
               }
             }
             return isCurrentProductionAuthorizationRuntime(runtime) ? out : [];
+          },
+          prefilterAgentContentRows: <T extends EnterpriseAgentContentAuthorizationRow>(
+            rows: readonly T[],
+          ) => {
+            if (!isCurrentProductionAuthorizationRuntime(runtime)) return [];
+            try {
+              const result = runtime.resourceAuthorization.prefilterAgentContentRows(
+                runtime.principal,
+                rows,
+              );
+              return isCurrentProductionAuthorizationRuntime(runtime) ? result : [];
+            } catch {
+              return [];
+            }
           },
           assertWorkspace: async (action: EnterpriseAction, id: string) => {
             if (!isCurrentProductionAuthorizationRuntime(runtime)) return null;

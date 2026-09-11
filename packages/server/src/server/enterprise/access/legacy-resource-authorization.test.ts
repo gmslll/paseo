@@ -12,14 +12,25 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
   test("binds the real runtime and fails closed after release", async () => {
     const fixture = await createProductionRuntimeFixture("legacy");
     try {
+      const row = {
+        id: "agt_0123456789abcdef",
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        nodeId: fixture.context.enterpriseContext.node.nodeId,
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        workspaceId: "wks_0123456789abcdef",
+      } as const;
+      fixture.provider.owners.registerAgent(row);
       const authorization = createEnterpriseLegacyResourceAuthorization({
         authorizationRuntime: fixture.runtime,
       });
       expect(authorization).not.toBeNull();
       expect(isEnterpriseLegacyResourceAuthorization(authorization)).toBe(true);
       expect(authorization?.isCurrent()).toBe(true);
+      expect(authorization?.prefilterAgentContentRows([row])).toEqual([row]);
       await fixture.runtime.release();
       expect(authorization?.isCurrent()).toBe(false);
+      expect(authorization?.prefilterAgentContentRows([row])).toEqual([]);
       expect(
         await authorization?.assertWorkspace("workspace.metadata.read", "wks_missing"),
       ).toBeNull();
@@ -108,6 +119,15 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
           ])
         ).length,
       ).toBe(0);
+      const canonicalRow = {
+        id: "agt_0123456789abcdef",
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        nodeId: fixture.context.enterpriseContext.node.nodeId,
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        workspaceId: "wks_0123456789abcdef",
+      } as const;
+      expect(authorization.prefilterAgentContentRows([canonicalRow])).toEqual([canonicalRow]);
     } finally {
       await closeProductionRuntimeFixture();
     }
@@ -191,6 +211,43 @@ describe.runIf(process.platform === "darwin")("legacy resource authorization", (
       await fixture.runtime.release();
       await expect(pendingWorkspace).resolves.toBeNull();
       await expect(pendingAgents).resolves.toEqual([]);
+    } finally {
+      await closeProductionRuntimeFixture();
+    }
+  });
+
+  test("runs the async Agent filter on a shortlist and rejects it after grant revocation", async () => {
+    const fixture = await createProductionRuntimeFixture("legacy-shortlist-revoke");
+    try {
+      const row = {
+        id: "agt_0123456789abcdef",
+        organizationId: fixture.context.enterpriseContext.principal.organizationId,
+        nodeId: fixture.context.enterpriseContext.node.nodeId,
+        ownerPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        createdByPrincipalId: fixture.context.enterpriseContext.principal.principalId,
+        workspaceId: "wks_0123456789abcdef",
+      } as const;
+      fixture.provider.owners.registerAgent(row);
+      const authorization = createEnterpriseLegacyResourceAuthorization({
+        authorizationRuntime: fixture.runtime,
+      });
+      if (!authorization) throw new Error("authorization");
+      const shortlist = authorization.prefilterAgentContentRows([row]);
+      expect(shortlist).toEqual([row]);
+
+      await fixture.provider.grantStore.update({
+        organizationId: fixture.runtime.principal.organizationId,
+        principalId: fixture.runtime.principal.principalId,
+        expectedVersion: fixture.runtime.principal.grantVersion,
+        grants: [],
+        actor: fixture.runtime.principal,
+      });
+
+      expect(authorization.isCurrent()).toBe(false);
+      await expect(
+        authorization.filterAgents("workspace.content.read", shortlist),
+      ).resolves.toEqual([]);
+      expect(authorization.prefilterAgentContentRows([row])).toEqual([]);
     } finally {
       await closeProductionRuntimeFixture();
     }

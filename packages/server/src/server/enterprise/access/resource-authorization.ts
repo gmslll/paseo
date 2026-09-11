@@ -38,6 +38,15 @@ export interface OwnerAuthorizationRegistry {
   getAgent(agentId: string): ReturnType<OwnerRegistry["getAgent"]>;
 }
 
+export interface EnterpriseAgentContentAuthorizationRow {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly organizationId: string;
+  readonly nodeId: string;
+  readonly ownerPrincipalId: string;
+  readonly createdByPrincipalId: string;
+}
+
 export interface ResourceAuthorizationDependencies {
   owners: OwnerAuthorizationRegistry;
   browserProfiles?: BrowserProfileRegistry;
@@ -172,6 +181,35 @@ export class ResourceAuthorizationService implements ResourceAuthorizationContra
       return this.isCurrent(ctx);
     } catch {
       return false;
+    }
+  }
+
+  prefilterAgentContentRows<T extends EnterpriseAgentContentAuthorizationRow>(
+    ctx: PrincipalContext,
+    rows: readonly T[],
+  ): readonly T[] {
+    try {
+      if (!this.isCurrent(ctx)) return [];
+      const result = rows.filter((row) => {
+        try {
+          const canonical = this.owners.getAgent(row.id);
+          const normalized = normalizeEnterpriseResourceOwner(row);
+          return Boolean(
+            canonical &&
+            canonical.agentId === row.id &&
+            canonical.workspaceId === row.workspaceId &&
+            canonical.nodeId === this.nodeId &&
+            normalized &&
+            ownersMatch(normalized, canonical) &&
+            grantAllows(ctx, "workspace.content.read", canonical, canonical.workspaceId),
+          );
+        } catch {
+          return false;
+        }
+      });
+      return this.isCurrent(ctx) ? result : [];
+    } catch {
+      return [];
     }
   }
 
