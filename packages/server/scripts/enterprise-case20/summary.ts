@@ -3,10 +3,13 @@ import {
   CASE20_PART_A_CLIENT_COUNT,
   CASE20_THRESHOLDS,
   type Case20Failure,
+  type Case20RetainedRssCheckpointPlan,
+  type Case20RetainedRssSample,
   type Case20ResourceSample,
   type Case20RunMeasurements,
   type Case20Summary,
 } from "./model.js";
+import { CASE20_GC_ACK_TIMEOUT_MS, case20RetainedRssScheduledSeconds } from "./retained-rss.js";
 
 interface Distribution {
   readonly p50: number;
@@ -153,9 +156,349 @@ function activeTail(samples: readonly Case20ResourceSample[]): readonly Case20Re
   return samples.filter((sample) => sample.tSec >= end - 20 * 60);
 }
 
+interface RetainedRssSummaryResult {
+  readonly valid: boolean;
+  readonly summary?: NonNullable<Case20Summary["resources"]["rss"]["retained"]>;
+}
+
+interface RetainedRssScheduleValidation {
+  readonly valid: boolean;
+  readonly plannedDurationSec: number;
+}
+
+function isValidRetainedRssScheduleCheckpoint(
+  checkpoint: Case20RetainedRssCheckpointPlan | undefined,
+  index: number,
+  expectedScheduledTSec: number,
+  requestIds: ReadonlySet<string>,
+): checkpoint is Case20RetainedRssCheckpointPlan {
+  return Boolean(
+    checkpoint &&
+    checkpoint.index === index &&
+    checkpoint.scheduledTSec === expectedScheduledTSec &&
+    typeof checkpoint.requestId === "string" &&
+    checkpoint.requestId.length > 0 &&
+    !requestIds.has(checkpoint.requestId),
+  );
+}
+
+function validateRetainedRssSchedule(
+  schedule: NonNullable<Case20RunMeasurements["retainedRssSchedule"]>,
+  durationSec: number,
+  required: boolean,
+  failures: Case20Failure[],
+): RetainedRssScheduleValidation {
+  let valid = true;
+  const plannedDurationSec = schedule.at(-1)?.scheduledTSec;
+  const minimumDurationSec = required ? CASE20_MINIMUM_DURATION_SEC : 1;
+  const durationValid =
+    typeof plannedDurationSec === "number" &&
+    Number.isInteger(plannedDurationSec) &&
+    plannedDurationSec >= minimumDurationSec &&
+    plannedDurationSec <= durationSec;
+  if (!durationValid) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_schedule_invalid",
+        "resources.rss.retained.schedule.durationSec",
+        plannedDurationSec ?? "missing",
+        `${minimumDurationSec}..${durationSec}`,
+        "raw.jsonl",
+      ),
+    );
+  }
+  const expectedSeconds = durationValid
+    ? case20RetainedRssScheduledSeconds(plannedDurationSec)
+    : [];
+  if (schedule.length !== expectedSeconds.length) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_schedule_invalid",
+        "resources.rss.retained.schedule.length",
+        schedule.length,
+        expectedSeconds.length,
+        "raw.jsonl",
+      ),
+    );
+  }
+  const requestIds = new Set<string>();
+  for (const [index, expectedScheduledTSec] of expectedSeconds.entries()) {
+    const checkpoint = schedule[index];
+    if (
+      !isValidRetainedRssScheduleCheckpoint(checkpoint, index, expectedScheduledTSec, requestIds)
+    ) {
+      valid = false;
+      failures.push(
+        failure(
+          "retained_rss_schedule_invalid",
+          `resources.rss.retained.schedule.${index}`,
+          checkpoint
+            ? `${checkpoint.index}:${checkpoint.scheduledTSec}:${checkpoint.requestId.length}`
+            : "missing",
+          `${index}:${expectedScheduledTSec}:unique requestId`,
+          "raw.jsonl",
+        ),
+      );
+    }
+    if (typeof checkpoint?.requestId === "string" && checkpoint.requestId)
+      requestIds.add(checkpoint.requestId);
+  }
+  return {
+    valid,
+    plannedDurationSec: durationValid ? plannedDurationSec : 0,
+  };
+}
+
+function isConsistentRetainedRssOsSample(
+  sample: Case20RetainedRssSample,
+  main: Case20ResourceSample["processes"][number] | undefined,
+): boolean {
+  return (
+    sample.sample.tSec === sample.actualTSec &&
+    Number.isFinite(sample.treeRssMiB) &&
+    sample.treeRssMiB >= 0 &&
+    Number.isFinite(sample.daemonMainRssMiB) &&
+    sample.daemonMainRssMiB >= 0 &&
+    typeof sample.daemonMainIdentity === "string" &&
+    sample.daemonMainIdentity.length > 0 &&
+    sample.sample.rssMiB === sample.treeRssMiB &&
+    Boolean(main) &&
+    main?.rssMiB === sample.daemonMainRssMiB
+  );
+}
+
+function validateRetainedRssSample(input: {
+  readonly sample: Case20RetainedRssSample;
+  readonly index: number;
+  readonly previousActualTSec: number;
+  readonly daemonMainIdentity: string;
+  readonly failures: Case20Failure[];
+}): boolean {
+  const { sample, index, failures } = input;
+  let valid = true;
+  if (!Number.isFinite(sample.actualTSec) || sample.actualTSec <= input.previousActualTSec) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_actual_time_not_monotonic",
+        `resources.rss.retained.samples.${index}.actualTSec`,
+        sample.actualTSec,
+        `>${input.previousActualTSec}`,
+        "raw.jsonl",
+      ),
+    );
+  }
+  if (
+    !Number.isFinite(sample.acknowledgedInMs) ||
+    sample.acknowledgedInMs < 0 ||
+    sample.acknowledgedInMs > CASE20_GC_ACK_TIMEOUT_MS
+  ) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_ack_timeout",
+        `resources.rss.retained.samples.${index}.acknowledgedInMs`,
+        sample.acknowledgedInMs,
+        `0..${CASE20_GC_ACK_TIMEOUT_MS}`,
+        "raw.jsonl",
+      ),
+    );
+  }
+  if (
+    !Number.isFinite(sample.gcDurationMs) ||
+    sample.gcDurationMs < 0 ||
+    sample.gcDurationMs > sample.acknowledgedInMs
+  ) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_gc_duration_invalid",
+        `resources.rss.retained.samples.${index}.gcDurationMs`,
+        sample.gcDurationMs,
+        `0..${sample.acknowledgedInMs}`,
+        "raw.jsonl",
+      ),
+    );
+  }
+  const main = sample.sample.processes.find(
+    (process) => process.identity === sample.daemonMainIdentity,
+  );
+  if (!isConsistentRetainedRssOsSample(sample, main)) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_sample_invalid",
+        `resources.rss.retained.samples.${index}.sample`,
+        "inconsistent",
+        "OS sample matches retained metadata",
+        "raw.jsonl",
+      ),
+    );
+  }
+  if (sample.daemonMainIdentity !== input.daemonMainIdentity) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_main_identity_changed",
+        `resources.rss.retained.samples.${index}.daemonMainIdentity`,
+        sample.daemonMainIdentity,
+        input.daemonMainIdentity,
+        "raw.jsonl",
+      ),
+    );
+  }
+  if (sample.sample.sessions !== CASE20_PART_A_CLIENT_COUNT) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_active_sessions_invalid",
+        `resources.rss.retained.samples.${index}.sessions`,
+        String(sample.sample.sessions),
+        CASE20_PART_A_CLIENT_COUNT,
+        "raw.jsonl",
+      ),
+    );
+  }
+  if (sample.sample.sockets !== CASE20_PART_A_CLIENT_COUNT) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_active_sockets_invalid",
+        `resources.rss.retained.samples.${index}.sockets`,
+        String(sample.sample.sockets),
+        CASE20_PART_A_CLIENT_COUNT,
+        "raw.jsonl",
+      ),
+    );
+  }
+  return valid;
+}
+
+function validateRetainedRssSamples(
+  schedule: NonNullable<Case20RunMeasurements["retainedRssSchedule"]>,
+  samples: NonNullable<Case20RunMeasurements["retainedRssSamples"]>,
+  failures: Case20Failure[],
+): boolean {
+  let valid = true;
+  if (samples.length !== schedule.length) {
+    valid = false;
+    failures.push(
+      failure(
+        "retained_rss_checkpoint_count",
+        "resources.rss.retained.samples.length",
+        samples.length,
+        schedule.length,
+        "raw.jsonl",
+      ),
+    );
+  }
+  let previousActualTSec = Number.NEGATIVE_INFINITY;
+  let daemonMainIdentity: string | null = null;
+  for (const [index, checkpoint] of schedule.entries()) {
+    const sample = samples[index];
+    if (
+      !sample ||
+      sample.index !== checkpoint.index ||
+      sample.requestId !== checkpoint.requestId ||
+      sample.scheduledTSec !== checkpoint.scheduledTSec
+    ) {
+      valid = false;
+      failures.push(
+        failure(
+          "retained_rss_checkpoint_mismatch",
+          `resources.rss.retained.samples.${index}`,
+          sample ? `${sample.index}:${sample.scheduledTSec}:${sample.requestId}` : "missing",
+          `${checkpoint.index}:${checkpoint.scheduledTSec}:${checkpoint.requestId}`,
+          "raw.jsonl",
+        ),
+      );
+      continue;
+    }
+    daemonMainIdentity ??= sample.daemonMainIdentity;
+    valid =
+      validateRetainedRssSample({
+        sample,
+        index,
+        previousActualTSec,
+        daemonMainIdentity,
+        failures,
+      }) && valid;
+    previousActualTSec = sample.actualTSec;
+  }
+  return valid;
+}
+
+function buildRetainedRssSummary(
+  measurements: Case20RunMeasurements,
+  failures: Case20Failure[],
+): RetainedRssSummaryResult {
+  const schedule = measurements.retainedRssSchedule;
+  const samples = measurements.retainedRssSamples;
+  const required = measurements.part === "A" && measurements.mode === "formal";
+  if (!schedule || !samples) {
+    if (required && !schedule)
+      failures.push(
+        failure(
+          "retained_rss_schedule_missing",
+          "resources.rss.retained.schedule",
+          "missing",
+          "fixed before measurement",
+          "raw.jsonl",
+        ),
+      );
+    if (required && !samples)
+      failures.push(
+        failure(
+          "retained_rss_samples_missing",
+          "resources.rss.retained.samples",
+          "missing",
+          "complete fixed schedule",
+          "raw.jsonl",
+        ),
+      );
+    return { valid: false };
+  }
+
+  const scheduleValidation = validateRetainedRssSchedule(
+    schedule,
+    measurements.durationSec,
+    required,
+    failures,
+  );
+  const samplesValid = validateRetainedRssSamples(schedule, samples, failures);
+
+  const finalTwentyStart = Math.max(0, scheduleValidation.plannedDurationSec - 20 * 60);
+  const finalTwenty = samples.filter((sample) => sample.scheduledTSec >= finalTwentyStart);
+  const summary = {
+    series: samples.map((sample) => ({
+      index: sample.index,
+      requestId: sample.requestId,
+      scheduledTSec: sample.scheduledTSec,
+      actualTSec: sample.actualTSec,
+      acknowledgedInMs: sample.acknowledgedInMs,
+      gcDurationMs: sample.gcDurationMs,
+      treeMiB: sample.treeRssMiB,
+      daemonMainMiB: sample.daemonMainRssMiB,
+    })),
+    last20MinTreeTheilSenMiBPerMin: theilSenSlopePerMinute(
+      finalTwenty.map((sample) => ({ tSec: sample.scheduledTSec, value: sample.treeRssMiB })),
+    ),
+    last20MinDaemonMainTheilSenMiBPerMin: theilSenSlopePerMinute(
+      finalTwenty.map((sample) => ({
+        tSec: sample.scheduledTSec,
+        value: sample.daemonMainRssMiB,
+      })),
+    ),
+  };
+  return { valid: scheduleValidation.valid && samplesValid, summary };
+}
+
 function buildResourceSummary(
   samples: readonly Case20ResourceSample[],
   postClose: Case20ResourceSample | undefined,
+  retained: RetainedRssSummaryResult["summary"],
 ) {
   const first = samples[0] ?? {
     tSec: 0,
@@ -180,6 +523,8 @@ function buildResourceSummary(
       warmupMiB: first.rssMiB,
       series: samples.map((sample) => ({ tSec: sample.tSec, MiB: sample.rssMiB })),
       last20MinTheilSenMiBPerMin: rssSlope,
+      rawLast20MinTheilSenMiBPerMin: rssSlope,
+      ...(retained ? { retained } : {}),
       endMiB: last.rssMiB,
       endLimitMiB: first.rssMiB + CASE20_THRESHOLDS.rssEndDeltaMiB,
     },
@@ -577,21 +922,31 @@ export function buildCase20Summary(measurements: Case20RunMeasurements): Case20S
       );
     }
   }
+  const retainedRss = buildRetainedRssSummary(measurements, failures);
   const resourcesBase = buildResourceSummary(
     measurements.resourceSamples,
     measurements.postCloseResourceSample,
+    retainedRss.summary,
   );
   const resources = {
     ...resourcesBase,
     providerSessionsClosed: measurements.providerSessionsClosed ?? null,
   } as const;
   addSamplingFailures(failures, measurements);
-  if (resources.rss.last20MinTheilSenMiBPerMin > CASE20_THRESHOLDS.rssSlopeMiBPerMin)
+  let gatedRssSlope: number | undefined;
+  if (measurements.part === "A") {
+    if (retainedRss.valid) gatedRssSlope = retainedRss.summary?.last20MinTreeTheilSenMiBPerMin;
+  } else {
+    gatedRssSlope = resources.rss.rawLast20MinTheilSenMiBPerMin;
+  }
+  if (gatedRssSlope !== undefined && gatedRssSlope > CASE20_THRESHOLDS.rssSlopeMiBPerMin)
     failures.push(
       failure(
         "rss_slope",
-        "resources.rss.last20MinTheilSenMiBPerMin",
-        resources.rss.last20MinTheilSenMiBPerMin,
+        measurements.part === "A"
+          ? "resources.rss.retained.last20MinTreeTheilSenMiBPerMin"
+          : "resources.rss.rawLast20MinTheilSenMiBPerMin",
+        gatedRssSlope,
         CASE20_THRESHOLDS.rssSlopeMiBPerMin,
         "raw.jsonl",
       ),

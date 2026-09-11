@@ -1,11 +1,14 @@
-import { execFile } from "node:child_process";
+import { execFile, fork } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter, once } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, test } from "vitest";
+import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 
 import {
   assertCase20ArtifactSecretFree,
@@ -19,15 +22,29 @@ import {
   PartAManifestSchema,
   PartBManifestSchema,
   type Case20Counts,
+  type Case20RetainedRssCheckpointPlan,
+  type Case20RetainedRssSample,
+  type Case20ResourceSample,
   type Case20RunMeasurements,
 } from "./model.js";
 import { assertCase20PartBProviderPreflight } from "./provider-preflight.js";
 import {
   case20ConcurrentBaselineForeignAgentIds,
   classifyCase20AgentList,
+  cleanupCase20TimelineClients,
   isCase20AccessDenial,
   isUnexpectedCase20ConnectionTerminal,
 } from "./part-a.js";
+import { case20PartAChildExecArgv } from "./part-a-fixture.js";
+import {
+  case20RetainedRssCheckpointDelayMs,
+  captureCase20FinalCheckpointBeforeCanary,
+  captureCase20RetainedRssCheckpoint,
+  createCase20GarbageCollectionController,
+  createCase20RetainedRssSchedule,
+  installCase20ChildMessageHandler,
+  type Case20GarbageCollectionRequest,
+} from "./retained-rss.js";
 import {
   case20ProviderOptions,
   isCompleteCase20ProviderProbe,
@@ -69,10 +86,13 @@ function counts(overrides: Partial<Case20Counts> = {}): Case20Counts {
   };
 }
 
+// oxlint-disable-next-line complexity -- this fixture builds the complete cross-field evidence model.
 function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20RunMeasurements {
   const startedAt = "2026-09-11T00:00:00.000Z";
   const endedAt = overrides.endedAt ?? "2026-09-11T00:30:00.000Z";
   const measurementEndedAt = overrides.measurementEndedAt ?? endedAt;
+  const durationSec = overrides.durationSec ?? 1_800;
+  const part = overrides.part ?? "A";
   const clients =
     overrides.clients ??
     Array.from({ length: CASE20_PART_A_CLIENT_COUNT }, (_, index) => ({
@@ -93,7 +113,50 @@ function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20Run
       sockets: 10,
       processes: [],
     }));
-  const part = overrides.part ?? "A";
+  const retainedRssSchedule: readonly Case20RetainedRssCheckpointPlan[] | undefined =
+    overrides.retainedRssSchedule ??
+    (part === "A"
+      ? createCase20RetainedRssSchedule(
+          durationSec,
+          (() => {
+            let sequence = 0;
+            return () => `gc-request-${sequence++}`;
+          })(),
+        )
+      : undefined);
+  const retainedRssSamples: readonly Case20RetainedRssSample[] | undefined =
+    overrides.retainedRssSamples ??
+    retainedRssSchedule?.map((checkpoint) => {
+      const actualTSec = checkpoint.scheduledTSec + checkpoint.index / 100;
+      const sample: Case20ResourceSample = {
+        tSec: actualTSec,
+        rssMiB: 100,
+        fdCount: 20,
+        swapMiB: 0,
+        eventLoopP99Ms: 10,
+        sessions: 10,
+        sockets: 10,
+        processes: [
+          {
+            pid: 42,
+            parentPid: 1,
+            identity: "f".repeat(64),
+            rssMiB: 80,
+            fdCount: 10,
+          },
+        ],
+      };
+      return {
+        ...checkpoint,
+        actualTSec,
+        acknowledgedInMs: 5,
+        gcDurationMs: 2,
+        treeRssMiB: sample.rssMiB,
+        daemonMainIdentity: sample.processes[0]!.identity,
+        daemonMainRssMiB: sample.processes[0]!.rssMiB,
+        sample,
+      };
+    });
   const finalActiveSample =
     overrides.finalActiveSample ??
     (resourceSamples.at(-1)
@@ -118,7 +181,7 @@ function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20Run
     startedAt,
     endedAt,
     measurementEndedAt,
-    durationSec: 1_800,
+    durationSec,
     part,
     mode: "formal",
     provenance: {
@@ -146,6 +209,8 @@ function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20Run
       foreign_fetch_agent_denial: [100, 100, 100],
     },
     resourceSamples,
+    ...(retainedRssSchedule ? { retainedRssSchedule } : {}),
+    ...(retainedRssSamples ? { retainedRssSamples } : {}),
     ...(finalActiveSample ? { finalActiveSample } : {}),
     ...(part === "A"
       ? {
@@ -163,7 +228,362 @@ function measurements(overrides: Partial<Case20RunMeasurements> = {}): Case20Run
   };
 }
 
+function retainedMemorySample(
+  checkpoint: Case20RetainedRssSample,
+  input: {
+    readonly treeRssMiB: number;
+    readonly daemonMainRssMiB: number;
+    readonly actualTSec?: number;
+    readonly daemonMainIdentity?: string;
+    readonly sessions?: number;
+    readonly sockets?: number;
+  },
+): Case20RetainedRssSample {
+  const actualTSec = input.actualTSec ?? checkpoint.actualTSec;
+  const daemonMainIdentity = input.daemonMainIdentity ?? checkpoint.daemonMainIdentity;
+  return {
+    ...checkpoint,
+    actualTSec,
+    treeRssMiB: input.treeRssMiB,
+    daemonMainIdentity,
+    daemonMainRssMiB: input.daemonMainRssMiB,
+    sample: {
+      ...checkpoint.sample,
+      tSec: actualTSec,
+      rssMiB: input.treeRssMiB,
+      sessions: input.sessions ?? checkpoint.sample.sessions,
+      sockets: input.sockets ?? checkpoint.sample.sockets,
+      processes: Array.from(checkpoint.sample.processes, (process) => ({
+        ...process,
+        identity: daemonMainIdentity,
+        rssMiB: input.daemonMainRssMiB,
+      })),
+    },
+  };
+}
+
 describe("Case20 evidence helpers", () => {
+  test("fixes retained RSS checkpoints before a run and always includes the end", () => {
+    let sequence = 0;
+    const schedule = createCase20RetainedRssSchedule(1_901, () => `gc-${sequence++}`);
+
+    expect(schedule).toEqual([
+      { index: 0, requestId: "gc-0", scheduledTSec: 0 },
+      { index: 1, requestId: "gc-1", scheduledTSec: 300 },
+      { index: 2, requestId: "gc-2", scheduledTSec: 600 },
+      { index: 3, requestId: "gc-3", scheduledTSec: 900 },
+      { index: 4, requestId: "gc-4", scheduledTSec: 1_200 },
+      { index: 5, requestId: "gc-5", scheduledTSec: 1_500 },
+      { index: 6, requestId: "gc-6", scheduledTSec: 1_800 },
+      { index: 7, requestId: "gc-7", scheduledTSec: 1_901 },
+    ]);
+    expect(case20RetainedRssCheckpointDelayMs(1_000, 300, 1_100)).toBe(299_900);
+    expect(case20RetainedRssCheckpointDelayMs(1_000, 300, 400_000)).toBe(0);
+  });
+
+  test("collects each planned GC checkpoint exactly once before sampling OS RSS", async () => {
+    let gcCalls = 0;
+    let clock = 10;
+    const schedule = createCase20RetainedRssSchedule(
+      301,
+      (() => {
+        let sequence = 0;
+        return () => `gc-${sequence++}`;
+      })(),
+    );
+    const controller = createCase20GarbageCollectionController({
+      schedule,
+      collectGarbage: () => {
+        gcCalls += 1;
+      },
+      monotonicNow: () => clock++,
+    });
+    const events: string[] = [];
+    const first = await captureCase20RetainedRssCheckpoint({
+      plan: schedule[0]!,
+      daemonPid: 42,
+      measurementStartedAtMs: 1_000,
+      collectGarbage: async (request) => {
+        events.push("gc");
+        return controller.run(request);
+      },
+      sample: async (tSec) => {
+        events.push("sample");
+        return {
+          tSec,
+          rssMiB: 125,
+          fdCount: 20,
+          swapMiB: 0,
+          eventLoopP99Ms: 12,
+          sessions: 10,
+          sockets: 10,
+          processes: [
+            {
+              pid: 42,
+              parentPid: 1,
+              identity: "a".repeat(64),
+              rssMiB: 100,
+              fdCount: 10,
+            },
+            {
+              pid: 43,
+              parentPid: 42,
+              identity: "b".repeat(64),
+              rssMiB: 25,
+              fdCount: 10,
+            },
+          ],
+        };
+      },
+      wallNow: () => 1_250,
+      monotonicNow: (() => {
+        let value = 20;
+        return () => value++;
+      })(),
+    });
+
+    expect(events).toEqual(["gc", "sample"]);
+    expect(gcCalls).toBe(1);
+    expect(first).toMatchObject({
+      index: 0,
+      requestId: "gc-0",
+      scheduledTSec: 0,
+      actualTSec: 0.25,
+      acknowledgedInMs: 1,
+      gcDurationMs: 1,
+      treeRssMiB: 125,
+      daemonMainIdentity: "a".repeat(64),
+      daemonMainRssMiB: 100,
+    });
+    expect(() => controller.run({ type: "gc_checkpoint", ...schedule[0]! })).toThrow(
+      "out of order",
+    );
+    expect(() => controller.run({ type: "gc_checkpoint", ...schedule[2]! })).toThrow(
+      "out of order",
+    );
+    expect(gcCalls).toBe(1);
+    expect(controller.run({ type: "gc_checkpoint", ...schedule[1]! })).toMatchObject({
+      type: "gc_checkpoint_ack",
+      index: 1,
+      requestId: "gc-1",
+      scheduledTSec: 300,
+    });
+    expect(gcCalls).toBe(2);
+  });
+
+  test("handles multiple child GC checkpoints and removes the message listener on shutdown", () => {
+    const source = new EventEmitter();
+    const schedule = createCase20RetainedRssSchedule(
+      300,
+      (() => {
+        let sequence = 0;
+        return () => `gc-child-${sequence++}`;
+      })(),
+    );
+    const sent: unknown[] = [];
+    let shutdowns = 0;
+    const release = installCase20ChildMessageHandler({
+      source: {
+        on: (_event, listener) => source.on("message", listener),
+        off: (_event, listener) => source.off("message", listener),
+      },
+      parseGarbageCollectionRequest: (message) => message as Case20GarbageCollectionRequest,
+      garbageCollection: createCase20GarbageCollectionController({
+        schedule,
+        collectGarbage: () => undefined,
+      }),
+      isClosing: () => false,
+      send: (message) => sent.push(message),
+      shutdown: () => {
+        shutdowns += 1;
+      },
+    });
+
+    expect(source.listenerCount("message")).toBe(1);
+    for (const checkpoint of schedule)
+      source.emit("message", { type: "gc_checkpoint", ...checkpoint });
+    expect(sent).toMatchObject([
+      { type: "gc_checkpoint_ack", ...schedule[0] },
+      { type: "gc_checkpoint_ack", ...schedule[1] },
+    ]);
+    source.emit("message", { type: "shutdown" });
+    expect(shutdowns).toBe(1);
+    expect(source.listenerCount("message")).toBe(0);
+    source.emit("message", { type: "gc_checkpoint", ...schedule[0] });
+    expect(sent).toHaveLength(2);
+    release();
+    expect(source.listenerCount("message")).toBe(0);
+  });
+
+  test("forks with explicit GC, acknowledges multiple checkpoints, and exits after shutdown", async () => {
+    const schedule = createCase20RetainedRssSchedule(
+      300,
+      (() => {
+        let sequence = 0;
+        return () => `gc-smoke-${sequence++}`;
+      })(),
+    );
+    const child = fork(
+      fileURLToPath(new URL("./retained-rss-smoke-child.ts", import.meta.url)),
+      [],
+      {
+        execArgv: [...case20PartAChildExecArgv({ runningFromTypeScript: true, mode: "smoke" })],
+        env: {
+          CASE20_RETAINED_RSS_SCHEDULE: JSON.stringify(schedule),
+        },
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+      },
+    );
+    const send = (message: object) =>
+      new Promise<void>((resolve, reject) => {
+        child.send(message, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    try {
+      const [ready] = await once(child, "message");
+      expect(ready).toEqual({ type: "smoke_ready" });
+      for (const checkpoint of schedule) {
+        const response = once(child, "message");
+        await send({ type: "gc_checkpoint", ...checkpoint });
+        const [acknowledgement] = await response;
+        expect(acknowledgement).toMatchObject({
+          type: "gc_checkpoint_ack",
+          ...checkpoint,
+        });
+      }
+      const closed = once(child, "message");
+      const exited = once(child, "exit");
+      await send({ type: "shutdown" });
+      expect((await closed)[0]).toEqual({ type: "smoke_closed" });
+      expect(await exited).toEqual([0, null]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    }
+  });
+
+  test("captures the forced final retained checkpoint before the final stream canary", async () => {
+    const events: string[] = [];
+    const result = await captureCase20FinalCheckpointBeforeCanary({
+      captureCheckpoint: async () => {
+        events.push("retained-final");
+      },
+      captureFinalActive: async () => {
+        events.push("final-canary");
+        return "final-active";
+      },
+    });
+
+    expect(events).toEqual(["retained-final", "final-canary"]);
+    expect(result).toBe("final-active");
+  });
+
+  test("always exposes explicit GC to the formal Part A child", () => {
+    expect(case20PartAChildExecArgv({ runningFromTypeScript: true, mode: "formal" })).toEqual([
+      "--import",
+      "tsx",
+      "--expose-gc",
+    ]);
+    expect(case20PartAChildExecArgv({ runningFromTypeScript: false, mode: "formal" })).toEqual([
+      "--expose-gc",
+    ]);
+  });
+
+  test("does not sample RSS when the GC acknowledgement mismatches the plan", async () => {
+    const plan = { index: 0, requestId: "gc-exact", scheduledTSec: 0 } as const;
+    let samples = 0;
+    await expect(
+      captureCase20RetainedRssCheckpoint({
+        plan,
+        daemonPid: 42,
+        measurementStartedAtMs: 0,
+        collectGarbage: async () => ({
+          type: "gc_checkpoint_ack",
+          ...plan,
+          requestId: "gc-wrong",
+          gcDurationMs: 1,
+        }),
+        sample: async () => {
+          samples += 1;
+          throw new Error("must not sample");
+        },
+      }),
+    ).rejects.toThrow("acknowledgement mismatch");
+    expect(samples).toBe(0);
+  });
+
+  test("awaits every empty timeline acknowledgement before closing clients", async () => {
+    const events: string[] = [];
+    const listeners = new Map<string, (message: SessionOutboundMessage) => void>();
+    const targets = Array.from({ length: CASE20_PART_A_CLIENT_COUNT }, (_, index) => {
+      const clientId = `client-${index}`;
+      return {
+        clientId,
+        daemonClient: {
+          subscribeRawMessages(handler: (message: SessionOutboundMessage) => void) {
+            events.push(`armed:${clientId}`);
+            listeners.set(clientId, handler);
+            return () => listeners.delete(clientId);
+          },
+          async close() {
+            events.push(`closed:${clientId}`);
+          },
+        },
+        releaseTimeline() {
+          events.push(`released:${clientId}`);
+        },
+      };
+    });
+    const cleanup = cleanupCase20TimelineClients(targets, 1_000);
+    await Promise.resolve();
+    expect(events.filter((event) => event.startsWith("armed:"))).toHaveLength(10);
+    expect(events.filter((event) => event.startsWith("released:"))).toHaveLength(10);
+    expect(events.filter((event) => event.startsWith("closed:"))).toEqual([]);
+    for (const target of targets) {
+      listeners.get(target.clientId)?.({
+        type: "agent.timeline.set_subscription.response",
+        payload: { requestId: `ack-${target.clientId}`, agentIds: [] },
+      });
+    }
+    const results = await cleanup;
+
+    expect(results).toEqual(
+      targets.map((target) => ({
+        clientId: target.clientId,
+        timelineError: null,
+        closeError: null,
+      })),
+    );
+    expect(events.filter((event) => event.startsWith("closed:"))).toHaveLength(10);
+  });
+
+  test("still closes every client after an empty timeline acknowledgement timeout", async () => {
+    let closed = 0;
+    const [result] = await cleanupCase20TimelineClients(
+      [
+        {
+          clientId: "client-timeout",
+          daemonClient: {
+            subscribeRawMessages() {
+              return () => undefined;
+            },
+            async close() {
+              closed += 1;
+            },
+          },
+          releaseTimeline() {},
+        },
+      ],
+      5,
+    );
+
+    expect(result?.clientId).toBe("client-timeout");
+    expect(result?.timelineError).toBeInstanceOf(Error);
+    expect(result?.closeError).toBeNull();
+    expect(closed).toBe(1);
+  });
+
   test("accepts a complete Part A summary and reports every breached gate", () => {
     expect(buildCase20Summary(measurements()).pass).toBe(true);
 
@@ -239,6 +659,178 @@ describe("Case20 evidence helpers", () => {
     ]);
     expect(slope).toBeCloseTo(7 / 6);
     expect(slope).toBeGreaterThan(1);
+  });
+
+  test("gates formal Part A on fixed retained tree RSS while preserving raw RSS", () => {
+    const raw = Array.from(measurements().resourceSamples, (sample) => ({
+      ...sample,
+      rssMiB: 100 + sample.tSec / 30,
+    }));
+    const retained = Array.from(measurements().retainedRssSamples!, (checkpoint) =>
+      retainedMemorySample(checkpoint, {
+        treeRssMiB: 100 + checkpoint.scheduledTSec / 120,
+        daemonMainRssMiB: 80 + checkpoint.scheduledTSec / 240,
+      }),
+    );
+    const summary = buildCase20Summary(
+      measurements({ resourceSamples: raw, retainedRssSamples: retained }),
+    );
+
+    expect(summary.resources.rss).toMatchObject({
+      rawLast20MinTheilSenMiBPerMin: 2,
+      last20MinTheilSenMiBPerMin: 2,
+      retained: {
+        last20MinTreeTheilSenMiBPerMin: 0.5,
+        last20MinDaemonMainTheilSenMiBPerMin: 0.25,
+      },
+    });
+    expect(summary.failures.map((failure) => failure.code)).not.toContain("rss_slope");
+  });
+
+  test("fails formal Part A instead of falling back when retained RSS is absent", () => {
+    const {
+      retainedRssSchedule: _schedule,
+      retainedRssSamples: _samples,
+      ...withoutRetainedRss
+    } = measurements();
+    const summary = buildCase20Summary(withoutRetainedRss);
+
+    expect(summary.pass).toBe(false);
+    expect(summary.failures.map((failure) => failure.code)).toEqual(
+      expect.arrayContaining(["retained_rss_schedule_missing", "retained_rss_samples_missing"]),
+    );
+    expect(summary.resources.rss.retained).toBeUndefined();
+  });
+
+  test("fails closed on every malformed formal retained sequence without raw RSS fallback", () => {
+    const base = measurements();
+    const rawWithFailingSlope = Array.from(base.resourceSamples, (sample) => ({
+      ...sample,
+      rssMiB: 100 + sample.tSec / 30,
+    }));
+    const schedule = base.retainedRssSchedule!;
+    const samples = base.retainedRssSamples!;
+    const changedIdentity = retainedMemorySample(samples[1]!, {
+      treeRssMiB: samples[1]!.treeRssMiB,
+      daemonMainRssMiB: samples[1]!.daemonMainRssMiB,
+      daemonMainIdentity: "9".repeat(64),
+    });
+    const inactive = retainedMemorySample(samples[1]!, {
+      treeRssMiB: samples[1]!.treeRssMiB,
+      daemonMainRssMiB: samples[1]!.daemonMainRssMiB,
+      sessions: 9,
+      sockets: 9,
+    });
+    const cases = [
+      {
+        name: "missing checkpoint",
+        measurements: { retainedRssSamples: samples.slice(0, -1) },
+        codes: ["retained_rss_checkpoint_count"],
+      },
+      {
+        name: "duplicate checkpoint",
+        measurements: { retainedRssSamples: [samples[0]!, samples[0]!, ...samples.slice(2)] },
+        codes: ["retained_rss_checkpoint_mismatch"],
+      },
+      {
+        name: "out-of-order checkpoint",
+        measurements: {
+          retainedRssSamples: [samples[1]!, samples[0]!, ...samples.slice(2)],
+        },
+        codes: ["retained_rss_checkpoint_mismatch"],
+      },
+      {
+        name: "non-monotonic actual time",
+        measurements: {
+          retainedRssSamples: [
+            samples[0]!,
+            retainedMemorySample(samples[1]!, {
+              actualTSec: samples[0]!.actualTSec,
+              treeRssMiB: samples[1]!.treeRssMiB,
+              daemonMainRssMiB: samples[1]!.daemonMainRssMiB,
+            }),
+            ...samples.slice(2),
+          ],
+        },
+        codes: ["retained_rss_actual_time_not_monotonic"],
+      },
+      {
+        name: "ack timeout",
+        measurements: {
+          retainedRssSamples: [{ ...samples[0]!, acknowledgedInMs: 10_001 }, ...samples.slice(1)],
+        },
+        codes: ["retained_rss_ack_timeout"],
+      },
+      {
+        name: "main identity change",
+        measurements: {
+          retainedRssSamples: [samples[0]!, changedIdentity, ...samples.slice(2)],
+        },
+        codes: ["retained_rss_main_identity_changed"],
+      },
+      {
+        name: "inactive sessions and sockets",
+        measurements: {
+          retainedRssSamples: [samples[0]!, inactive, ...samples.slice(2)],
+        },
+        codes: ["retained_rss_active_sessions_invalid", "retained_rss_active_sockets_invalid"],
+      },
+      {
+        name: "duplicate fixed request id",
+        measurements: {
+          retainedRssSchedule: [
+            schedule[0]!,
+            { ...schedule[1]!, requestId: schedule[0]!.requestId },
+            ...schedule.slice(2),
+          ],
+        },
+        codes: ["retained_rss_schedule_invalid"],
+      },
+    ] as const;
+
+    for (const malformed of cases) {
+      const summary = buildCase20Summary(
+        measurements({ resourceSamples: rawWithFailingSlope, ...malformed.measurements }),
+      );
+      const codes = summary.failures.map((failure) => failure.code);
+      for (const code of malformed.codes) expect(codes, malformed.name).toContain(code);
+      expect(codes, malformed.name).not.toContain("rss_slope");
+      expect(summary.pass, malformed.name).toBe(false);
+    }
+  });
+
+  test("uses only fixed scheduled times for the retained slope window", () => {
+    const base = measurements();
+    const retainedRssSamples = Array.from(base.retainedRssSamples!, (checkpoint, index) => {
+      const actualTSec = index + 1;
+      const treeRssMiB = 100 + checkpoint.scheduledTSec / 120;
+      return retainedMemorySample(checkpoint, {
+        actualTSec,
+        treeRssMiB,
+        daemonMainRssMiB: treeRssMiB - 20,
+      });
+    });
+    const summary = buildCase20Summary(measurements({ retainedRssSamples }));
+
+    expect(summary.resources.rss.retained).toMatchObject({
+      last20MinTreeTheilSenMiBPerMin: 0.5,
+      series: retainedRssSamples.map((sample) => ({
+        index: sample.index,
+        scheduledTSec: sample.scheduledTSec,
+        actualTSec: sample.actualTSec,
+      })),
+    });
+  });
+
+  test("rejects a formal retained schedule that does not cover the full minimum interval", () => {
+    let sequence = 0;
+    const retainedRssSchedule = createCase20RetainedRssSchedule(600, () => `short-${sequence++}`);
+    const summary = buildCase20Summary(measurements({ retainedRssSchedule }));
+
+    expect(summary.failures.map((failure) => failure.code)).toContain(
+      "retained_rss_schedule_invalid",
+    );
+    expect(summary.failures.map((failure) => failure.code)).not.toContain("rss_slope");
   });
 
   test("uses only active samples for duration and resource gates", () => {
@@ -394,6 +986,7 @@ describe("Case20 evidence helpers", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "case20-artifact-"));
     temporaryRoots.push(root);
     const writer = await createCase20ArtifactWriter({ artifactRoot: root, runId: "artifact" });
+    const artifactMeasurements = measurements({ runId: "artifact" });
     await writer.append({
       type: "run_started",
       at: "2026-09-11T00:00:00.000Z",
@@ -401,6 +994,22 @@ describe("Case20 evidence helpers", () => {
       mode: "smoke",
       runId: "artifact",
     });
+    await writer.append(
+      {
+        type: "retained_rss_schedule",
+        at: "2026-09-11T00:00:00.000Z",
+        checkpoints: artifactMeasurements.retainedRssSchedule!,
+      },
+      { durable: true },
+    );
+    await writer.append(
+      {
+        type: "retained_resource",
+        at: "2026-09-11T00:00:00.000Z",
+        checkpoint: artifactMeasurements.retainedRssSamples![0]!,
+      },
+      { durable: true },
+    );
     expect(() =>
       writer.append({
         type: "client_connected",
@@ -409,9 +1018,12 @@ describe("Case20 evidence helpers", () => {
         principalId: "usr_0000000000000001",
       }),
     ).toThrow("credential-like");
-    await writer.finish(buildCase20Summary(measurements({ runId: "artifact" })));
+    await writer.finish(buildCase20Summary(artifactMeasurements));
     await writer.close();
-    expect(await readFile(writer.rawPath, "utf8")).toContain('"type":"run_started"');
+    const raw = await readFile(writer.rawPath, "utf8");
+    expect(raw).toContain('"type":"run_started"');
+    expect(raw).toContain('"type":"retained_rss_schedule"');
+    expect(raw).toContain('"type":"retained_resource"');
     const inventory = JSON.parse(await readFile(writer.inventoryPath, "utf8")) as {
       readonly entries: readonly {
         readonly name: string;

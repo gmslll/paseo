@@ -118,6 +118,22 @@ export interface Case20ResourceSample {
   }[];
 }
 
+export interface Case20RetainedRssCheckpointPlan {
+  readonly index: number;
+  readonly requestId: string;
+  readonly scheduledTSec: number;
+}
+
+export interface Case20RetainedRssSample extends Case20RetainedRssCheckpointPlan {
+  readonly actualTSec: number;
+  readonly acknowledgedInMs: number;
+  readonly gcDurationMs: number;
+  readonly treeRssMiB: number;
+  readonly daemonMainIdentity: string;
+  readonly daemonMainRssMiB: number;
+  readonly sample: Case20ResourceSample;
+}
+
 export interface Case20PrincipalStreamActivity {
   readonly clientId: string;
   readonly principalId: string;
@@ -155,6 +171,8 @@ export interface Case20RunMeasurements {
   readonly rpcLatencyMs: Readonly<Record<string, readonly number[]>>;
   readonly rpcBaselineLatencyMs: Readonly<Record<string, readonly number[]>>;
   readonly resourceSamples: readonly Case20ResourceSample[];
+  readonly retainedRssSchedule?: readonly Case20RetainedRssCheckpointPlan[];
+  readonly retainedRssSamples?: readonly Case20RetainedRssSample[];
   readonly finalActiveSample?: Case20FinalActiveSample;
   readonly postCloseResourceSample?: Case20ResourceSample;
   readonly streamCoverageStartedAt?: string;
@@ -210,6 +228,21 @@ export interface Case20Summary {
       readonly warmupMiB: number;
       readonly series: readonly { readonly tSec: number; readonly MiB: number }[];
       readonly last20MinTheilSenMiBPerMin: number;
+      readonly rawLast20MinTheilSenMiBPerMin: number;
+      readonly retained?: {
+        readonly series: readonly {
+          readonly index: number;
+          readonly requestId: string;
+          readonly scheduledTSec: number;
+          readonly actualTSec: number;
+          readonly acknowledgedInMs: number;
+          readonly gcDurationMs: number;
+          readonly treeMiB: number;
+          readonly daemonMainMiB: number;
+        }[];
+        readonly last20MinTreeTheilSenMiBPerMin: number;
+        readonly last20MinDaemonMainTheilSenMiBPerMin: number;
+      };
       readonly endMiB: number;
       readonly endLimitMiB: number;
     };
@@ -352,6 +385,16 @@ export type Case20RawEvent =
       readonly restored: true;
       readonly filesScanned: number;
       readonly auditFiles: number;
+    }
+  | {
+      readonly type: "retained_rss_schedule";
+      readonly at: string;
+      readonly checkpoints: readonly Case20RetainedRssCheckpointPlan[];
+    }
+  | {
+      readonly type: "retained_resource";
+      readonly at: string;
+      readonly checkpoint: Case20RetainedRssSample;
     }
   | { readonly type: "resource"; readonly at: string; readonly sample: Case20ResourceSample }
   | ({

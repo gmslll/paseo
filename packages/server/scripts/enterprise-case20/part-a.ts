@@ -15,6 +15,8 @@ import {
   type Case20Counts,
   type Case20Failure,
   type Case20FinalActiveSample,
+  type Case20RetainedRssCheckpointPlan,
+  type Case20RetainedRssSample,
   type Case20ResourceSample,
   PartAManifestSchema,
   type PartAManifest,
@@ -25,6 +27,12 @@ import {
   type Case20PartAFixture,
 } from "./part-a-fixture.js";
 import { createCase20Provenance } from "./provenance.js";
+import {
+  case20RetainedRssCheckpointDelayMs,
+  captureCase20FinalCheckpointBeforeCanary,
+  captureCase20RetainedRssCheckpoint,
+  createCase20RetainedRssSchedule,
+} from "./retained-rss.js";
 import { buildCase20Summary } from "./summary.js";
 
 interface ConnectionLifecycle {
@@ -41,6 +49,18 @@ interface ConnectedClient {
   readonly releaseConnection: () => void;
   readonly lifecycle: ConnectionLifecycle;
   readonly connectedAt: string;
+}
+
+export interface Case20TimelineCleanupTarget {
+  readonly clientId: string;
+  readonly daemonClient: Pick<DaemonClient, "subscribeRawMessages" | "close">;
+  readonly releaseTimeline: () => void;
+}
+
+export interface Case20TimelineCleanupResult {
+  readonly clientId: string;
+  readonly timelineError: Error | null;
+  readonly closeError: Error | null;
 }
 
 interface StreamCounter {
@@ -67,6 +87,7 @@ interface PartAMeasurementState {
   readonly rpcLatencyMs: Record<string, number[]>;
   readonly rpcBaselineLatencyMs: Record<string, number[]>;
   readonly resourceSamples: Case20ResourceSample[];
+  readonly retainedRssSamples: Case20RetainedRssSample[];
   readonly evidenceFailures: Case20Failure[];
   readonly streamCounters: Map<string, StreamCounter>;
   readonly canaryWaiters: Map<string, CanaryWaiter>;
@@ -95,6 +116,75 @@ function createCounts(): Case20Counts {
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function case20Error(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function releaseCase20TimelineAndWaitForEmpty(
+  target: Case20TimelineCleanupTarget,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let releaseRawMessages: (() => void) | null = null;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      releaseRawMessages?.();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`Case20 timeline cleanup timed out for ${target.clientId}`)),
+      timeoutMs,
+    );
+    try {
+      releaseRawMessages = target.daemonClient.subscribeRawMessages((message) => {
+        if (
+          message.type === "agent.timeline.set_subscription.response" &&
+          message.payload.agentIds.length === 0
+        )
+          finish();
+      });
+      target.releaseTimeline();
+    } catch (error) {
+      finish(case20Error(error));
+    }
+  });
+}
+
+export async function cleanupCase20TimelineClients(
+  targets: readonly Case20TimelineCleanupTarget[],
+  timeoutMs = 10_000,
+): Promise<readonly Case20TimelineCleanupResult[]> {
+  const timelineErrors = await Promise.all(
+    targets.map(async (target) => {
+      try {
+        await releaseCase20TimelineAndWaitForEmpty(target, timeoutMs);
+        return null;
+      } catch (error) {
+        return case20Error(error);
+      }
+    }),
+  );
+  const closeErrors = await Promise.all(
+    targets.map(async (target) => {
+      try {
+        await target.daemonClient.close();
+        return null;
+      } catch (error) {
+        return case20Error(error);
+      }
+    }),
+  );
+  return targets.map((target, index) => ({
+    clientId: target.clientId,
+    timelineError: timelineErrors[index] ?? null,
+    closeError: closeErrors[index] ?? null,
+  }));
 }
 
 function recordDurableFailure(state: PartAMeasurementState, failure: Case20Failure): void {
@@ -635,6 +725,44 @@ async function sampleDuringRun(
   await flushStreamAggregates(state);
 }
 
+async function captureRetainedRss(
+  plan: Case20RetainedRssCheckpointPlan,
+  fixture: Case20PartAFixture,
+  startedAtMs: number,
+  state: PartAMeasurementState,
+): Promise<void> {
+  try {
+    const checkpoint = await captureCase20RetainedRssCheckpoint({
+      plan,
+      daemonPid: fixture.daemonPid,
+      measurementStartedAtMs: startedAtMs,
+      collectGarbage: (request) => fixture.collectGarbage(request),
+      sample: (tSec) =>
+        sampleDaemonResources({
+          daemonPid: fixture.daemonPid,
+          daemonLogPath: fixture.daemonLogPath,
+          tSec,
+        }),
+    });
+    state.retainedRssSamples.push(checkpoint);
+    await state.artifact.append(
+      { type: "retained_resource", at: new Date().toISOString(), checkpoint },
+      { durable: true },
+    );
+  } catch (error) {
+    recordDurableFailure(state, {
+      code:
+        error instanceof Error && /acknowledgement timed out/i.test(error.message)
+          ? "retained_rss_ack_timeout"
+          : "retained_rss_checkpoint_failed",
+      metric: `resources.rss.retained.checkpoint.${plan.index}`,
+      observed: error instanceof Error ? error.message : "failed",
+      threshold: `${plan.index}:${plan.scheduledTSec}:${plan.requestId}`,
+      evidenceRef: "raw.jsonl",
+    });
+  }
+}
+
 async function waitForClosedSessions(
   fixture: Case20PartAFixture,
   startedAtMs: number,
@@ -717,8 +845,10 @@ async function runMeasuredWorkload(input: {
   readonly clients: readonly ConnectedClient[];
   readonly state: PartAMeasurementState;
   readonly startedAtMs: number;
+  readonly retainedRssSchedule: readonly Case20RetainedRssCheckpointPlan[];
 }): Promise<void> {
   let sampleTail = Promise.resolve();
+  let retainedTail = Promise.resolve();
   const sample = () => {
     sampleTail = sampleTail
       .then(() => sampleDuringRun(input.fixture, input.startedAtMs, input.state))
@@ -734,6 +864,21 @@ async function runMeasuredWorkload(input: {
   };
   sample();
   const sampler = setInterval(sample, input.manifest.sampleIntervalMs);
+  const retainedTimers = input.retainedRssSchedule
+    .filter(
+      (checkpoint) =>
+        checkpoint.scheduledTSec > 0 && checkpoint.scheduledTSec < input.manifest.durationSec,
+    )
+    .map((checkpoint) =>
+      setTimeout(
+        () => {
+          retainedTail = retainedTail.then(() =>
+            captureRetainedRss(checkpoint, input.fixture, input.startedAtMs, input.state),
+          );
+        },
+        case20RetainedRssCheckpointDelayMs(input.startedAtMs, checkpoint.scheduledTSec),
+      ),
+    );
   const deadline = input.startedAtMs + input.manifest.durationSec * 1_000;
   try {
     while (Date.now() < deadline) {
@@ -742,12 +887,15 @@ async function runMeasuredWorkload(input: {
     }
   } finally {
     clearInterval(sampler);
+    for (const timer of retainedTimers) clearTimeout(timer);
     await sampleTail;
+    await retainedTail;
   }
 }
 
 // oxlint-disable-next-line complexity -- orchestration records each independent cleanup failure.
 export async function runCase20PartA(manifest: PartAManifest) {
+  const retainedRssSchedule = createCase20RetainedRssSchedule(manifest.durationSec);
   await assertCase20MetricsPreflight();
   const provenance = await createCase20Provenance({ manifest });
   const artifact = await createCase20ArtifactWriter({
@@ -761,6 +909,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
     rpcLatencyMs: {},
     rpcBaselineLatencyMs: {},
     resourceSamples: [],
+    retainedRssSamples: [],
     evidenceFailures: [],
     streamCounters: new Map(),
     canaryWaiters: new Map(),
@@ -793,12 +942,21 @@ export async function runCase20PartA(manifest: PartAManifest) {
       mode: manifest.mode,
       runId: manifest.runId,
     });
+    await artifact.append(
+      {
+        type: "retained_rss_schedule",
+        at: new Date().toISOString(),
+        checkpoints: retainedRssSchedule,
+      },
+      { durable: true },
+    );
     await artifact.append({ type: "provenance", at: new Date().toISOString(), value: provenance });
     try {
       fixture = await createCase20PartAFixture({
         daemonLogPath,
         childLogPath,
         mode: manifest.mode,
+        retainedRssSchedule,
       });
       await waitForInitialMetrics(fixture);
       if (fixture.clients.length < 2) throw new Error("Case20 Part A fixture is incomplete");
@@ -824,18 +982,35 @@ export async function runCase20PartA(manifest: PartAManifest) {
       );
       await startConversations(clients, state);
       measurementStartedAt = new Date();
+      await captureRetainedRss(
+        retainedRssSchedule[0]!,
+        fixture,
+        measurementStartedAt.getTime(),
+        state,
+      );
       await runMeasuredWorkload({
         manifest,
         fixture,
         clients,
         state,
         startedAtMs: measurementStartedAt.getTime(),
+        retainedRssSchedule,
       });
-      finalActiveSample = await captureFinalActiveSample({
-        fixture,
-        clients,
-        state,
-        startedAtMs: measurementStartedAt.getTime(),
+      finalActiveSample = await captureCase20FinalCheckpointBeforeCanary({
+        captureCheckpoint: () =>
+          captureRetainedRss(
+            retainedRssSchedule.at(-1)!,
+            fixture!,
+            measurementStartedAt.getTime(),
+            state,
+          ),
+        captureFinalActive: () =>
+          captureFinalActiveSample({
+            fixture: fixture!,
+            clients,
+            state,
+            startedAtMs: measurementStartedAt.getTime(),
+          }),
       });
       measurementEndedAt = new Date(finalActiveSample.at);
     } catch (error) {
@@ -849,23 +1024,9 @@ export async function runCase20PartA(manifest: PartAManifest) {
       });
     } finally {
       measurementEndedAt ??= new Date();
-      const disconnectedAt = new Date().toISOString();
       for (const waiter of state.canaryWaiters.values()) waiter.cancel();
       for (const client of clients) {
         client.lifecycle.intentionalClose = true;
-        try {
-          client.releaseTimeline();
-        } catch (error) {
-          primaryError ??= error;
-          state.counts.auditErrors += 1;
-          state.evidenceFailures.push({
-            code: "timeline_cleanup_failed",
-            metric: "agent_stream.unsubscribe",
-            observed: "failed",
-            threshold: "closed",
-            evidenceRef: "raw.jsonl",
-          });
-        }
       }
       for (const client of clients) {
         if (!state.observedCanaries.has(client.config.clientId))
@@ -885,26 +1046,42 @@ export async function runCase20PartA(manifest: PartAManifest) {
             evidenceRef: "raw.jsonl",
           });
       }
-      const clientCloseResults = await Promise.allSettled(
-        clients.map((client) => client.daemonClient.close()),
+      const clientCleanupResults = await cleanupCase20TimelineClients(
+        clients.map((client) => ({
+          clientId: client.config.clientId,
+          daemonClient: client.daemonClient,
+          releaseTimeline: client.releaseTimeline,
+        })),
       );
-      for (const result of clientCloseResults) {
-        if (result.status === "fulfilled") continue;
-        primaryError ??= result.reason;
-        state.counts.auditErrors += 1;
-        state.evidenceFailures.push({
-          code: "client_cleanup_failed",
-          metric: "client.close",
-          observed: "failed",
-          threshold: "closed",
-          evidenceRef: "raw.jsonl",
-        });
+      for (const result of clientCleanupResults) {
+        if (result.timelineError) {
+          primaryError ??= result.timelineError;
+          state.evidenceFailures.push({
+            code: "timeline_cleanup_failed",
+            metric: "agent_stream.unsubscribe",
+            observed: result.clientId,
+            threshold: "empty subscription acknowledged",
+            evidenceRef: "raw.jsonl",
+          });
+        }
+        if (result.closeError) {
+          primaryError ??= result.closeError;
+          state.counts.auditErrors += 1;
+          state.evidenceFailures.push({
+            code: "client_cleanup_failed",
+            metric: "client.close",
+            observed: result.clientId,
+            threshold: "closed",
+            evidenceRef: "raw.jsonl",
+          });
+        }
       }
       for (const client of clients) client.releaseConnection();
       await flushStreamAggregates(state).catch((error) => {
         primaryError ??= error;
         state.counts.auditErrors += 1;
       });
+      const disconnectedAt = new Date().toISOString();
       for (const client of clients) {
         await artifact
           .append({
@@ -981,6 +1158,8 @@ export async function runCase20PartA(manifest: PartAManifest) {
       rpcLatencyMs: state.rpcLatencyMs,
       rpcBaselineLatencyMs: state.rpcBaselineLatencyMs,
       resourceSamples: state.resourceSamples,
+      retainedRssSchedule,
+      retainedRssSamples: state.retainedRssSamples,
       finalActiveSample,
       postCloseResourceSample,
       ...(streamCoverageStartedAt

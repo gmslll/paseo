@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 
 import { hash } from "bcryptjs";
@@ -18,6 +19,11 @@ import { createProductionEnterpriseWorkspaceFilesProvider } from "../../src/serv
 
 import { CASE20_PART_A_CLIENT_COUNT, type Case20Mode } from "./model.js";
 import type { Case20AuditVerification, Case20PartAClientFixture } from "./part-a-fixture.js";
+import {
+  createCase20GarbageCollectionController,
+  installCase20ChildMessageHandler,
+  type Case20GarbageCollectionRequest,
+} from "./retained-rss.js";
 import { assertFileContainsNoSecrets } from "./secret-scan.js";
 
 const ORGANIZATION_ID = "org_20ca5e0000000000";
@@ -43,6 +49,55 @@ interface StartState {
   destination: ReturnType<typeof pino.destination> | null;
   logger: pino.Logger | null;
   readonly knownSecrets: string[];
+}
+
+function parseRetainedRssSchedule(value: string | undefined) {
+  if (!value) throw new Error("Case20 retained RSS schedule missing");
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed) || parsed.length === 0)
+    throw new Error("Case20 retained RSS schedule invalid");
+  return parsed.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      throw new Error(`Case20 retained RSS schedule entry ${index} invalid`);
+    const record = entry as Record<string, unknown>;
+    if (
+      Reflect.ownKeys(record).length !== 3 ||
+      record.index !== index ||
+      typeof record.requestId !== "string" ||
+      record.requestId.length === 0 ||
+      typeof record.scheduledTSec !== "number" ||
+      !Number.isInteger(record.scheduledTSec) ||
+      record.scheduledTSec < 0
+    )
+      throw new Error(`Case20 retained RSS schedule entry ${index} invalid`);
+    return {
+      index,
+      requestId: record.requestId,
+      scheduledTSec: record.scheduledTSec,
+    };
+  });
+}
+
+function parseGarbageCollectionRequest(value: unknown): Case20GarbageCollectionRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Case20 GC checkpoint request invalid");
+  const record = value as Record<string, unknown>;
+  if (
+    Reflect.ownKeys(record).length !== 4 ||
+    record.type !== "gc_checkpoint" ||
+    typeof record.index !== "number" ||
+    !Number.isInteger(record.index) ||
+    typeof record.requestId !== "string" ||
+    typeof record.scheduledTSec !== "number" ||
+    !Number.isInteger(record.scheduledTSec)
+  )
+    throw new Error("Case20 GC checkpoint request invalid");
+  return {
+    type: "gc_checkpoint",
+    index: record.index,
+    requestId: record.requestId,
+    scheduledTSec: record.scheduledTSec,
+  };
 }
 
 function suffix(index: number): string {
@@ -487,6 +542,14 @@ async function main(): Promise<void> {
   const mode = process.env.CASE20_MODE;
   if (!daemonLogPath || (mode !== "formal" && mode !== "smoke"))
     throw new Error("Case20 child environment invalid");
+  const retainedRssSchedule = parseRetainedRssSchedule(process.env.CASE20_RETAINED_RSS_SCHEDULE);
+  const collectGarbage = (globalThis as { readonly gc?: () => void }).gc;
+  if (!collectGarbage) throw new Error("Case20 child explicit GC is unavailable");
+  const garbageCollection = createCase20GarbageCollectionController({
+    schedule: retainedRssSchedule,
+    collectGarbage,
+    monotonicNow: performance.now.bind(performance),
+  });
   const state: StartState = {
     root: null,
     paseoHome: null,
@@ -514,9 +577,11 @@ async function main(): Promise<void> {
     return;
   }
   let closing = false;
+  let releaseMessageHandler = () => undefined;
   const close = (report: boolean) => {
     if (closing) return;
     closing = true;
+    releaseMessageHandler();
     void closeDaemon(started, daemonLogPath)
       .then((audit) => {
         if (report) process.send?.({ type: "closed", audit });
@@ -533,14 +598,18 @@ async function main(): Promise<void> {
       })
       .finally(() => process.disconnect?.());
   };
-  process.once("message", (message: unknown) => {
-    if (
-      !message ||
-      typeof message !== "object" ||
-      (message as { readonly type?: unknown }).type !== "shutdown"
-    )
-      return;
-    close(true);
+  releaseMessageHandler = installCase20ChildMessageHandler({
+    source: {
+      on: (_event, listener) => process.on("message", listener),
+      off: (_event, listener) => process.off("message", listener),
+    },
+    parseGarbageCollectionRequest,
+    garbageCollection,
+    isClosing: () => closing,
+    send: (message) => {
+      process.send?.(message);
+    },
+    shutdown: () => close(true),
   });
   process.once("disconnect", () => close(false));
   process.once("SIGTERM", () => close(false));
