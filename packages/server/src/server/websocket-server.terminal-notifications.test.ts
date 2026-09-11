@@ -39,8 +39,7 @@ vi.mock("ws", () => ({
   WebSocketServer: wsModuleMock.MockWebSocketServer,
 }));
 
-vi.mock("./session.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./session.js")>()),
+vi.mock("./session.js", () => ({
   Session: function Session() {
     return {};
   },

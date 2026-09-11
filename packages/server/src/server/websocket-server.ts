@@ -38,9 +38,7 @@ import {
   type SessionOptions,
   type SessionRpcDiagnosticObservation,
   type SessionRuntimeMetrics,
-  type EnterpriseFetchAgentsStartScheduler,
 } from "./session.js";
-import { createFetchAgentsStartBatcher } from "./fetch-agents-start-batcher.js";
 
 type WebSocketDiagnosticRequestType = "fetch_agents_request" | "fetch_agent_request";
 type WebSocketDiagnosticResponseType =
@@ -939,10 +937,6 @@ export class VoiceAssistantWebSocketServer {
   private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
   private readonly rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
   private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
-  private readonly enterpriseFetchAgentsStartScheduler: EnterpriseFetchAgentsStartScheduler;
-  private readonly enterpriseFetchAgentsStartBatcher: ReturnType<
-    typeof createFetchAgentsStartBatcher
-  >;
 
   constructor(
     server: HTTPServer,
@@ -1003,8 +997,6 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.enterpriseRuntime = enterpriseRuntime;
     this.rpcDiagnosticObserver = rpcDiagnosticObserver;
-    this.enterpriseFetchAgentsStartBatcher = createFetchAgentsStartBatcher();
-    this.enterpriseFetchAgentsStartScheduler = this.enterpriseFetchAgentsStartBatcher.scheduler;
     this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
     this.enterpriseDispatcher = enterpriseDispatcher;
     this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
@@ -1632,7 +1624,6 @@ export class VoiceAssistantWebSocketServer {
       );
     }
 
-    this.enterpriseFetchAgentsStartBatcher.close();
     await Promise.all(cleanupPromises);
     await Promise.all(this.authenticationTasks.values());
     await Promise.all(this.pendingMessageTasks.values());
@@ -2112,7 +2103,6 @@ export class VoiceAssistantWebSocketServer {
       ...(options.sessionAuthorization
         ? { sessionAuthorization: options.sessionAuthorization }
         : {}),
-      enterpriseFetchAgentsStartScheduler: this.enterpriseFetchAgentsStartScheduler,
       ...(this.rpcDiagnosticObserver
         ? {
             rpcDiagnosticObserver: (observation: SessionRpcDiagnosticObservation) =>
