@@ -27,6 +27,8 @@ import {
   CASE20_PART_A_CLIENT_COUNT,
   PartAManifestSchema,
   PartBManifestSchema,
+  type Case20ClientRpcTraceEvent,
+  type Case20ClientRuntimeMetricsEvent,
   type Case20Counts,
   type Case20RawEvent,
   type Case20RetainedRssCheckpointPlan,
@@ -43,12 +45,18 @@ import {
   createCase20ClientObservationController,
   createCase20ObservationBuffer,
   createCase20ObservedRpcTiming,
+  createCase20RpcDiagnosticJoiner,
   createCase20RunnerEventLoopDelayObserver,
   establishCase20PartAMeasurementBoundary,
   isCase20AccessDenial,
   isUnexpectedCase20ConnectionTerminal,
+  prepareCase20ObservedRpc,
 } from "./part-a.js";
-import { case20PartAChildExecArgv } from "./part-a-fixture.js";
+import {
+  CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT,
+  case20PartAChildExecArgv,
+  createCase20DaemonRpcDiagnosticCollector,
+} from "./part-a-fixture.js";
 import {
   case20RetainedRssCheckpointDelayMs,
   captureCase20FinalCheckpointBeforeCanary,
@@ -76,6 +84,7 @@ import { buildCase20Summary, theilSenSlopePerMinute } from "./summary.js";
 
 const temporaryRoots: string[] = [];
 const executeFile = promisify(execFile);
+type Case20ClientObservationTestEvent = Case20ClientRuntimeMetricsEvent | Case20ClientRpcTraceEvent;
 
 afterEach(async () => {
   await Promise.all(
@@ -355,7 +364,475 @@ function emitCase20TraceFrame(trace: DaemonClientTrace, messageType: string): vo
   trace.endSection();
 }
 
+const CASE20_TEST_RPC_PHASES = [
+  "frame.received",
+  "session.call",
+  "session.enter",
+  "response.deliver.begin",
+  "response.stringify.begin",
+  "response.stringify.return",
+  "response.send.begin",
+  "response.send.return",
+  "response.deliver.return",
+] as const;
+
+function observeCompleteCase20DaemonRpc(input: {
+  readonly collector: ReturnType<typeof createCase20DaemonRpcDiagnosticCollector>;
+  readonly requestId: string;
+  readonly requestType: "fetch_agents_request" | "fetch_agent_request";
+  readonly responseType: "fetch_agents_response" | "fetch_agent_response" | "rpc_error";
+  readonly startedAtUnixMs: number;
+}): void {
+  for (const [index, phase] of CASE20_TEST_RPC_PHASES.entries()) {
+    input.collector.observe({
+      phase,
+      requestId: input.requestId,
+      ...(index < 3 ? { requestType: input.requestType } : { responseType: input.responseType }),
+      atUnixMs: input.startedAtUnixMs + index,
+    });
+  }
+}
+
+function case20TestDaemonDiagnostic(input: {
+  readonly requestId: string;
+  readonly requestType: "fetch_agents_request" | "fetch_agent_request";
+  readonly responseType: "fetch_agents_response" | "fetch_agent_response" | "rpc_error";
+  readonly startedAtUnixMs: number;
+}) {
+  return {
+    requestId: input.requestId,
+    requestType: input.requestType,
+    responseType: input.responseType,
+    phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+      phase,
+      monotonicUnixMs: input.startedAtUnixMs + index,
+    })),
+  };
+}
+
+function case20TestClientTrace(input: {
+  readonly requestId: string;
+  readonly clientId?: string;
+  readonly sequence?: number;
+  readonly baseline?: boolean;
+  readonly name?: "fetch_agents" | "foreign_fetch_agent_denial";
+  readonly rpcStartedMonotonicUnixMs?: number;
+  readonly frameBeginMonotonicUnixMs?: number;
+}): Case20ClientRpcTraceEvent {
+  const name = input.name ?? "fetch_agents";
+  const rpcStartedMonotonicUnixMs = input.rpcStartedMonotonicUnixMs ?? 100;
+  const frameBeginMonotonicUnixMs = input.frameBeginMonotonicUnixMs ?? 120;
+  return {
+    type: "client_rpc_trace",
+    at: "2026-09-11T00:00:00.000Z",
+    clientId: input.clientId ?? "case20-client-01",
+    sequence: input.sequence ?? 1,
+    baseline: input.baseline ?? false,
+    name,
+    messageType: name === "fetch_agents" ? "fetch_agents_response" : "rpc_error",
+    requestId: input.requestId,
+    rpcStartedMonotonicUnixMs,
+    frameBeginMonotonicUnixMs,
+    frameEndMonotonicUnixMs: frameBeginMonotonicUnixMs + 10,
+    promiseResumedMonotonicUnixMs: frameBeginMonotonicUnixMs + 11,
+    callbackTotalMs: 10,
+    decodeBeforeParseMs: 1,
+    jsonParseMs: 2,
+    aotValidateMs: 3,
+    dispatchAndWaiterMs: 4,
+    frameEndToPromiseResumeMs: 1,
+  };
+}
+
 describe("Case20 evidence helpers", () => {
+  test("collects complete daemon RPC phases in bounded batches for success and rpc_error", () => {
+    const collector = createCase20DaemonRpcDiagnosticCollector({ capacity: 4 });
+    observeCompleteCase20DaemonRpc({
+      collector,
+      requestId: "case20-rpc-00000000000000000000000000000001",
+      requestType: "fetch_agents_request",
+      responseType: "fetch_agents_response",
+      startedAtUnixMs: 100,
+    });
+    observeCompleteCase20DaemonRpc({
+      collector,
+      requestId: "case20-rpc-00000000000000000000000000000002",
+      requestType: "fetch_agent_request",
+      responseType: "rpc_error",
+      startedAtUnixMs: 200,
+    });
+
+    expect(collector.drain({ limit: 1, final: true })).toEqual({
+      diagnostics: [
+        {
+          requestId: "case20-rpc-00000000000000000000000000000001",
+          requestType: "fetch_agents_request",
+          responseType: "fetch_agents_response",
+          phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+            phase,
+            monotonicUnixMs: 100 + index,
+          })),
+        },
+      ],
+      failures: [],
+      done: false,
+    });
+    expect(collector.drain({ limit: 1, final: false })).toEqual({
+      diagnostics: [
+        {
+          requestId: "case20-rpc-00000000000000000000000000000002",
+          requestType: "fetch_agent_request",
+          responseType: "rpc_error",
+          phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+            phase,
+            monotonicUnixMs: 200 + index,
+          })),
+        },
+      ],
+      failures: [],
+      done: true,
+    });
+  });
+
+  test("fails closed for missing, duplicate, out-of-order, overflow, and unknown daemon fields", () => {
+    const requestId = "case20-rpc-00000000000000000000000000000003";
+    const missing = createCase20DaemonRpcDiagnosticCollector({ capacity: 2 });
+    missing.observe({
+      phase: "frame.received",
+      requestId,
+      requestType: "fetch_agents_request",
+      atUnixMs: 1,
+    });
+    expect(missing.drain({ limit: 2, final: true })).toEqual({
+      diagnostics: [],
+      failures: ["daemon_rpc_diagnostic_missing"],
+      done: true,
+    });
+
+    const duplicate = createCase20DaemonRpcDiagnosticCollector({ capacity: 2 });
+    duplicate.observe({
+      phase: "frame.received",
+      requestId,
+      requestType: "fetch_agents_request",
+      atUnixMs: 1,
+    });
+    duplicate.observe({
+      phase: "frame.received",
+      requestId,
+      requestType: "fetch_agents_request",
+      atUnixMs: 2,
+    });
+    expect(duplicate.drain({ limit: 2, final: true })).toEqual({
+      diagnostics: [],
+      failures: ["daemon_rpc_diagnostic_duplicate"],
+      done: true,
+    });
+
+    const outOfOrder = createCase20DaemonRpcDiagnosticCollector({ capacity: 2 });
+    outOfOrder.observe({
+      phase: "frame.received",
+      requestId,
+      requestType: "fetch_agents_request",
+      atUnixMs: 1,
+    });
+    outOfOrder.observe({
+      phase: "session.enter",
+      requestId,
+      requestType: "fetch_agents_request",
+      atUnixMs: 2,
+    });
+    expect(outOfOrder.drain({ limit: 2, final: true })).toEqual({
+      diagnostics: [],
+      failures: ["daemon_rpc_diagnostic_out_of_order"],
+      done: true,
+    });
+
+    const overflow = createCase20DaemonRpcDiagnosticCollector({ capacity: 1 });
+    observeCompleteCase20DaemonRpc({
+      collector: overflow,
+      requestId,
+      requestType: "fetch_agents_request",
+      responseType: "fetch_agents_response",
+      startedAtUnixMs: 10,
+    });
+    overflow.observe({
+      phase: "frame.received",
+      requestId: "case20-rpc-00000000000000000000000000000004",
+      requestType: "fetch_agent_request",
+      atUnixMs: 30,
+    });
+    expect(overflow.drain({ limit: 1, final: true })).toEqual({
+      diagnostics: [
+        {
+          requestId,
+          requestType: "fetch_agents_request",
+          responseType: "fetch_agents_response",
+          phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+            phase,
+            monotonicUnixMs: 10 + index,
+          })),
+        },
+      ],
+      failures: [],
+      done: false,
+    });
+    expect(overflow.drain({ limit: 1, final: false })).toEqual({
+      diagnostics: [],
+      failures: ["daemon_rpc_diagnostic_overflow"],
+      done: true,
+    });
+
+    const unknown = createCase20DaemonRpcDiagnosticCollector({ capacity: 2 });
+    unknown.observe({
+      phase: "frame.received",
+      requestId,
+      requestType: "fetch_agents_request",
+      atUnixMs: 1,
+      personalAccessToken: "pso_u_private.secret-material-that-must-never-persist",
+      privatePath: "/private/runner/home",
+    });
+    const unknownResult = unknown.drain({ limit: 2, final: true });
+    expect(unknownResult).toEqual({
+      diagnostics: [],
+      failures: ["daemon_rpc_diagnostic_invalid"],
+      done: true,
+    });
+    expect(JSON.stringify(unknownResult)).not.toContain("secret-material");
+    expect(JSON.stringify(unknownResult)).not.toContain("/private/runner/home");
+  });
+
+  test("drains daemon RPC diagnostics through bounded child IPC batches", async () => {
+    const child = fork(
+      fileURLToPath(new URL("./rpc-diagnostic-smoke-child.ts", import.meta.url)),
+      [],
+      {
+        execArgv: ["--import", "tsx"],
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+      },
+    );
+    const send = (message: object) =>
+      new Promise<void>((resolve, reject) => {
+        child.send(message, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    try {
+      expect((await once(child, "message"))[0]).toEqual({ type: "smoke_ready" });
+      const response = once(child, "message");
+      await send({
+        type: "rpc_diagnostics_drain",
+        batchId: "case20-diagnostic-batch-0",
+        batchIndex: 0,
+        limit: CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT,
+        final: true,
+      });
+      const firstBatch = (await response)[0] as {
+        readonly diagnostics: readonly unknown[];
+        readonly failures: readonly unknown[];
+        readonly done: boolean;
+      };
+      expect(firstBatch.diagnostics).toHaveLength(CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT);
+      expect(firstBatch.failures).toEqual([]);
+      expect(firstBatch.done).toBe(false);
+      const finalResponse = once(child, "message");
+      await send({
+        type: "rpc_diagnostics_drain",
+        batchId: "case20-diagnostic-batch-1",
+        batchIndex: 1,
+        limit: CASE20_DAEMON_RPC_DIAGNOSTIC_BATCH_LIMIT,
+        final: false,
+      });
+      expect((await finalResponse)[0]).toEqual({
+        type: "rpc_diagnostic_batch",
+        batchId: "case20-diagnostic-batch-1",
+        batchIndex: 1,
+        diagnostics: [
+          {
+            requestId: "case20-rpc-00000000000000000000000000000101",
+            requestType: "fetch_agents_request",
+            responseType: "fetch_agents_response",
+            phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+              phase,
+              monotonicUnixMs: 25_700 + index,
+            })),
+          },
+        ],
+        failures: [],
+        done: true,
+      });
+      const closed = once(child, "message");
+      const exited = once(child, "exit");
+      await send({ type: "shutdown" });
+      expect((await closed)[0]).toEqual({ type: "smoke_closed" });
+      expect(await exited).toEqual([0, null]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    }
+  });
+
+  test("joins registered client and daemon success and rpc_error diagnostics into raw events", () => {
+    const events: Case20RawEvent[] = [];
+    const failures: string[] = [];
+    const joiner = createCase20RpcDiagnosticJoiner({
+      record: (event) => events.push(event),
+      onFailure: (code) => failures.push(code),
+      nowIso: () => "2026-09-11T00:00:01.000Z",
+    });
+    const listRequestId = "case20-rpc-00000000000000000000000000000021";
+    joiner.expect({
+      clientId: "case20-client-01",
+      sequence: 1,
+      baseline: true,
+      name: "fetch_agents",
+      requestId: listRequestId,
+      rpcStartedMonotonicUnixMs: 100,
+    });
+    joiner.recordClient(case20TestClientTrace({ requestId: listRequestId, baseline: true }));
+    joiner.recordDaemon(
+      case20TestDaemonDiagnostic({
+        requestId: listRequestId,
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        startedAtUnixMs: 101,
+      }),
+    );
+    const denialRequestId = "case20-rpc-00000000000000000000000000000022";
+    joiner.expect({
+      clientId: "case20-client-01",
+      sequence: 2,
+      baseline: false,
+      name: "foreign_fetch_agent_denial",
+      requestId: denialRequestId,
+      rpcStartedMonotonicUnixMs: 200,
+    });
+    joiner.recordClient(
+      case20TestClientTrace({
+        requestId: denialRequestId,
+        sequence: 2,
+        name: "foreign_fetch_agent_denial",
+        rpcStartedMonotonicUnixMs: 200,
+        frameBeginMonotonicUnixMs: 220,
+      }),
+    );
+    joiner.recordDaemon(
+      case20TestDaemonDiagnostic({
+        requestId: denialRequestId,
+        requestType: "fetch_agent_request",
+        responseType: "rpc_error",
+        startedAtUnixMs: 201,
+      }),
+    );
+    joiner.recordDaemon(
+      case20TestDaemonDiagnostic({
+        requestId: "case20-rpc-00000000000000000000000000000029",
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        startedAtUnixMs: 300,
+      }),
+    );
+    joiner.finish();
+
+    expect(events).toHaveLength(2);
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "rpc_diagnostic",
+        clientId: "case20-client-01",
+        sequence: 1,
+        baseline: true,
+        name: "fetch_agents",
+        requestId: listRequestId,
+        requestType: "fetch_agents_request",
+        responseType: "fetch_agents_response",
+        client: expect.objectContaining({
+          rpcStartedMonotonicUnixMs: 100,
+          frameBeginMonotonicUnixMs: 120,
+          frameEndMonotonicUnixMs: 130,
+          promiseResumedMonotonicUnixMs: 131,
+        }),
+        daemon: {
+          phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+            phase,
+            monotonicUnixMs: 101 + index,
+          })),
+        },
+      }),
+      expect.objectContaining({
+        type: "rpc_diagnostic",
+        sequence: 2,
+        name: "foreign_fetch_agent_denial",
+        requestId: denialRequestId,
+        requestType: "fetch_agent_request",
+        responseType: "rpc_error",
+      }),
+    ]);
+    expect(failures).toEqual(["rpc_diagnostic_join_invalid"]);
+    expect(JSON.stringify(events)).not.toContain("private/");
+    expect(JSON.stringify(events)).not.toContain("secret");
+  });
+
+  test("fails closed on missing, duplicate, out-of-order, cross-clock, and overflow joins", () => {
+    const run = (
+      exercise: (joiner: ReturnType<typeof createCase20RpcDiagnosticJoiner>) => void,
+      capacity = 4,
+    ) => {
+      const events: Case20RawEvent[] = [];
+      const failures: string[] = [];
+      const joiner = createCase20RpcDiagnosticJoiner({
+        record: (event) => events.push(event),
+        onFailure: (code) => failures.push(code),
+        capacity,
+      });
+      exercise(joiner);
+      joiner.finish();
+      expect(events).toEqual([]);
+      return failures;
+    };
+    const expected = (requestId: string, sequence = 1, clientId = "case20-client-01") => ({
+      clientId,
+      sequence,
+      baseline: false,
+      name: "fetch_agents" as const,
+      requestId,
+      rpcStartedMonotonicUnixMs: 100,
+    });
+    const first = "case20-rpc-00000000000000000000000000000031";
+    const second = "case20-rpc-00000000000000000000000000000032";
+
+    expect(run((joiner) => joiner.expect(expected(first)))).toEqual([
+      "rpc_diagnostic_join_missing",
+    ]);
+    expect(
+      run((joiner) => {
+        joiner.expect(expected(first));
+        joiner.expect(expected(first));
+      }),
+    ).toEqual(["rpc_diagnostic_join_duplicate", "rpc_diagnostic_join_missing"]);
+    expect(run((joiner) => joiner.expect(expected(first, 2)))).toEqual([
+      "rpc_diagnostic_join_out_of_order",
+    ]);
+    expect(
+      run((joiner) => {
+        joiner.expect(expected(first));
+        joiner.recordClient(case20TestClientTrace({ requestId: first }));
+        joiner.recordDaemon(
+          case20TestDaemonDiagnostic({
+            requestId: first,
+            requestType: "fetch_agents_request",
+            responseType: "fetch_agents_response",
+            startedAtUnixMs: 115,
+          }),
+        );
+      }),
+    ).toEqual(["rpc_diagnostic_join_out_of_order"]);
+    expect(
+      run((joiner) => {
+        joiner.expect(expected(first));
+        joiner.expect(expected(second, 1, "case20-client-02"));
+      }, 1),
+    ).toEqual(["rpc_diagnostic_join_overflow", "rpc_diagnostic_join_missing"]);
+  });
+
   test("caps buffered observations and reserves a durable fail-closed marker", () => {
     const overflowSignals: string[] = [];
     const failure: Case20RawEvent = {
@@ -537,19 +1014,26 @@ describe("Case20 evidence helpers", () => {
   });
 
   test("records only the armed target frame with nested LIFO trace timings", () => {
-    const events: Case20RawEvent[] = [];
+    const events: Case20ClientObservationTestEvent[] = [];
     const failures: string[] = [];
     const times = [0, 1, 3, 5, 6, 10, 20, 21, 23, 25, 26, 30];
     const controller = createCase20ClientObservationController({
       clientId: "case20-client-02",
       record: (event) => events.push(event),
       onFailure: (code) => failures.push(code),
-      nowMs: () => times.shift()!,
+      nowMonotonicUnixMs: () => times.shift()!,
       nowIso: () => "2026-09-11T00:00:02.000Z",
       delegateLogger: noopLogger(),
     });
 
-    expect(controller.armRpc({ name: "fetch_agents", baseline: true })).toBe(1);
+    expect(
+      controller.armRpc({
+        name: "fetch_agents",
+        baseline: true,
+        requestId: "case20-rpc-00000000000000000000000000000011",
+        rpcStartedMonotonicUnixMs: 0,
+      }),
+    ).toBe(1);
     expect(controller.trace.isEnabled()).toBe(true);
     emitCase20TraceFrame(controller.trace, "agent_stream");
     emitCase20TraceFrame(controller.trace, "fetch_agents_response");
@@ -565,6 +1049,11 @@ describe("Case20 evidence helpers", () => {
         baseline: true,
         name: "fetch_agents",
         messageType: "fetch_agents_response",
+        requestId: "case20-rpc-00000000000000000000000000000011",
+        rpcStartedMonotonicUnixMs: 0,
+        frameBeginMonotonicUnixMs: 20,
+        frameEndMonotonicUnixMs: 30,
+        promiseResumedMonotonicUnixMs: 32,
         callbackTotalMs: 10,
         decodeBeforeParseMs: 1,
         jsonParseMs: 2,
@@ -577,38 +1066,81 @@ describe("Case20 evidence helpers", () => {
   });
 
   test("keeps observation work outside the existing RPC latency duration", async () => {
-    let clock = 10;
-    let clockReads = 0;
+    let durationClock = 10;
+    let monotonicClock = 1_010;
+    let durationClockReads = 0;
+    let monotonicClockReads = 0;
     let recordedDuration = -1;
     let tracedPromiseResume = -1;
+    const registrationEvents: string[] = [];
+    const prepared = prepareCase20ObservedRpc({
+      clientId: "case20-client-02",
+      name: "fetch_agents",
+      baseline: true,
+      requestId: "case20-rpc-00000000000000000000000000000015",
+      observation: {
+        armRpc: (input) => {
+          registrationEvents.push(`arm:${input.rpcStartedMonotonicUnixMs}`);
+          durationClock += 10;
+          return 1;
+        },
+      },
+      joiner: {
+        expect: (input) => {
+          registrationEvents.push(`expect:${input.rpcStartedMonotonicUnixMs}`);
+          durationClock += 20;
+        },
+      },
+      nowMonotonicUnixMs: () => {
+        registrationEvents.push("diagnostic-start");
+        return monotonicClock;
+      },
+      nowDurationMs: () => {
+        registrationEvents.push("measured-start");
+        return durationClock;
+      },
+    });
     const timing = createCase20ObservedRpcTiming({
-      startedAtMs: clock,
+      startedAtMs: prepared.measuredStartedAtMs,
       nowMs: () => {
-        clockReads += 1;
-        return clock;
+        durationClockReads += 1;
+        return durationClock;
+      },
+      nowMonotonicUnixMs: () => {
+        monotonicClockReads += 1;
+        return monotonicClock;
       },
       finishRpc: (promiseResumedAtMs) => {
         tracedPromiseResume = promiseResumedAtMs;
-        clock = 200;
+        durationClock = 200;
       },
     });
 
-    clock = 20;
+    expect(prepared.measuredStartedAtMs).toBe(40);
+    expect(registrationEvents).toEqual([
+      "diagnostic-start",
+      "arm:1010",
+      "expect:1010",
+      "measured-start",
+    ]);
+    durationClock = 60;
+    monotonicClock = 1_020;
     timing.markPromiseResumed();
-    clock = 30;
+    durationClock = 60;
     await timing.finish(async (durationMs) => {
       recordedDuration = durationMs;
-      clock = 100;
+      durationClock = 100;
     });
 
     expect(recordedDuration).toBe(20);
-    expect(tracedPromiseResume).toBe(20);
-    expect(clockReads).toBe(2);
-    expect(clock).toBe(200);
+    expect(tracedPromiseResume).toBe(1_020);
+    expect(durationClockReads).toBe(1);
+    expect(monotonicClockReads).toBe(1);
+    expect(durationClock).toBe(200);
   });
 
   test("fails closed when an armed trace receives no target response frame", () => {
-    const events: Case20RawEvent[] = [];
+    const events: Case20ClientObservationTestEvent[] = [];
     const failures: string[] = [];
     const controller = createCase20ClientObservationController({
       clientId: "case20-client-02",
@@ -617,17 +1149,22 @@ describe("Case20 evidence helpers", () => {
       delegateLogger: noopLogger(),
     });
 
-    controller.armRpc({ name: "foreign_fetch_agent_denial", baseline: false });
+    controller.armRpc({
+      name: "foreign_fetch_agent_denial",
+      baseline: false,
+      requestId: "case20-rpc-00000000000000000000000000000012",
+      rpcStartedMonotonicUnixMs: performance.timeOrigin + performance.now(),
+    });
     emitCase20TraceFrame(controller.trace, "agent_stream");
-    controller.finishRpc(performance.now());
-    controller.finishRpc(performance.now());
+    controller.finishRpc(performance.timeOrigin + performance.now());
+    controller.finishRpc(performance.timeOrigin + performance.now());
 
     expect(events).toEqual([]);
     expect(failures).toEqual(["client_rpc_trace_invalid"]);
   });
 
   test("observes real DaemonClient fetch and denial responses through a fake transport", async () => {
-    const events: Case20RawEvent[] = [];
+    const events: Case20ClientObservationTestEvent[] = [];
     const failures: string[] = [];
     const observation = createCase20ClientObservationController({
       clientId: "case20-client-03",
@@ -651,9 +1188,18 @@ describe("Case20 evidence helpers", () => {
       fake.triggerOpen();
       await connectPromise;
 
-      expect(observation.armRpc({ name: "fetch_agents", baseline: true })).toBe(1);
-      const listPromise = client.fetchAgents({ page: { limit: 1 } });
+      const listRequestId = "case20-rpc-00000000000000000000000000000013";
+      expect(
+        observation.armRpc({
+          name: "fetch_agents",
+          baseline: true,
+          requestId: listRequestId,
+          rpcStartedMonotonicUnixMs: performance.timeOrigin + performance.now(),
+        }),
+      ).toBe(1);
+      const listPromise = client.fetchAgents({ requestId: listRequestId, page: { limit: 1 } });
       const listRequest = parseCase20ObservationRequest(fake.sent.at(-1)!);
+      expect(listRequest.requestId).toBe(listRequestId);
       queueMicrotask(() =>
         fake.triggerSessionMessage({
           type: "fetch_agents_response",
@@ -665,11 +1211,20 @@ describe("Case20 evidence helpers", () => {
         }),
       );
       await listPromise;
-      observation.finishRpc(performance.now());
+      observation.finishRpc(performance.timeOrigin + performance.now());
 
-      expect(observation.armRpc({ name: "foreign_fetch_agent_denial", baseline: false })).toBe(2);
-      const denialPromise = client.fetchAgent("agt_foreign");
+      const denialRequestId = "case20-rpc-00000000000000000000000000000014";
+      expect(
+        observation.armRpc({
+          name: "foreign_fetch_agent_denial",
+          baseline: false,
+          requestId: denialRequestId,
+          rpcStartedMonotonicUnixMs: performance.timeOrigin + performance.now(),
+        }),
+      ).toBe(2);
+      const denialPromise = client.fetchAgent("agt_foreign", denialRequestId);
       const denialRequest = parseCase20ObservationRequest(fake.sent.at(-1)!);
+      expect(denialRequest.requestId).toBe(denialRequestId);
       queueMicrotask(() =>
         fake.triggerSessionMessage({
           type: "rpc_error",
@@ -687,7 +1242,7 @@ describe("Case20 evidence helpers", () => {
       } catch (error) {
         denial = error;
       }
-      observation.finishRpc(performance.now());
+      observation.finishRpc(performance.timeOrigin + performance.now());
       expect(isCase20AccessDenial(denial)).toBe(true);
     } finally {
       await client.close();
@@ -703,6 +1258,7 @@ describe("Case20 evidence helpers", () => {
           name: event.name,
           baseline: event.baseline,
           messageType: event.messageType,
+          requestId: event.requestId,
         })),
     ).toEqual([
       {
@@ -710,12 +1266,14 @@ describe("Case20 evidence helpers", () => {
         name: "fetch_agents",
         baseline: true,
         messageType: "fetch_agents_response",
+        requestId: "case20-rpc-00000000000000000000000000000013",
       },
       {
         sequence: 2,
         name: "foreign_fetch_agent_denial",
         baseline: false,
         messageType: "rpc_error",
+        requestId: "case20-rpc-00000000000000000000000000000014",
       },
     ]);
     const runtime = events.filter((event) => event.type === "client_runtime_metrics");
@@ -1720,19 +2278,33 @@ describe("Case20 evidence helpers", () => {
       ],
     });
     await writer.append({
-      type: "client_rpc_trace",
+      type: "rpc_diagnostic",
       at: "2026-09-11T00:00:01.500Z",
       clientId: "case20-client-01",
       sequence: 1,
       baseline: false,
       name: "foreign_fetch_agent_denial",
-      messageType: "rpc_error",
-      callbackTotalMs: 4,
-      decodeBeforeParseMs: 0.1,
-      jsonParseMs: 0.2,
-      aotValidateMs: 0.3,
-      dispatchAndWaiterMs: 0.4,
-      frameEndToPromiseResumeMs: 0.1,
+      requestId: "case20-rpc-00000000000000000000000000000041",
+      requestType: "fetch_agent_request",
+      responseType: "rpc_error",
+      client: {
+        rpcStartedMonotonicUnixMs: 100,
+        frameBeginMonotonicUnixMs: 120,
+        frameEndMonotonicUnixMs: 124,
+        promiseResumedMonotonicUnixMs: 124.1,
+        callbackTotalMs: 4,
+        decodeBeforeParseMs: 0.1,
+        jsonParseMs: 0.2,
+        aotValidateMs: 0.3,
+        dispatchAndWaiterMs: 0.4,
+        frameEndToPromiseResumeMs: 0.1,
+      },
+      daemon: {
+        phases: CASE20_TEST_RPC_PHASES.map((phase, index) => ({
+          phase,
+          monotonicUnixMs: 101 + index,
+        })),
+      },
     });
     await writer.append({
       type: "runner_event_loop_delay",
@@ -1762,7 +2334,7 @@ describe("Case20 evidence helpers", () => {
     expect(raw).toContain('"type":"retained_rss_schedule"');
     expect(raw).toContain('"type":"retained_resource"');
     expect(raw).toContain('"type":"client_runtime_metrics"');
-    expect(raw).toContain('"type":"client_rpc_trace"');
+    expect(raw).toContain('"type":"rpc_diagnostic"');
     expect(raw).toContain('"type":"runner_event_loop_delay"');
     const inventory = JSON.parse(await readFile(writer.inventoryPath, "utf8")) as {
       readonly entries: readonly {

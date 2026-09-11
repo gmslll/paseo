@@ -18,7 +18,13 @@ import { createProductionEnterpriseRuntimeFactory } from "../../src/server/enter
 import { createProductionEnterpriseWorkspaceFilesProvider } from "../../src/server/enterprise/runtime/production-workspace-files-runtime-provider.js";
 
 import { CASE20_PART_A_CLIENT_COUNT, type Case20Mode } from "./model.js";
-import type { Case20AuditVerification, Case20PartAClientFixture } from "./part-a-fixture.js";
+import {
+  createCase20DaemonRpcDiagnosticCollector,
+  installCase20DaemonRpcDiagnosticDrainHandler,
+  type Case20AuditVerification,
+  type Case20DaemonRpcDiagnosticCollector,
+  type Case20PartAClientFixture,
+} from "./part-a-fixture.js";
 import {
   createCase20GarbageCollectionController,
   installCase20ChildMessageHandler,
@@ -257,6 +263,7 @@ async function startDaemon(
   daemonLogPath: string,
   mode: Case20Mode,
   state: StartState,
+  rpcDiagnostics: Case20DaemonRpcDiagnosticCollector,
 ): Promise<StartedDaemon> {
   if (process.platform !== "darwin") throw new Error("Case20 Part A requires Darwin");
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paseo-case20-a-daemon-")));
@@ -410,6 +417,7 @@ async function startDaemon(
           workspaceRoots,
           nativeAddonPath: workspaceAddonPath,
         }),
+      rpcDiagnosticObserver: (observation) => rpcDiagnostics.observe(observation),
     },
   );
   state.daemon = daemon;
@@ -550,6 +558,7 @@ async function main(): Promise<void> {
     collectGarbage,
     monotonicNow: performance.now.bind(performance),
   });
+  const rpcDiagnostics = createCase20DaemonRpcDiagnosticCollector();
   const state: StartState = {
     root: null,
     paseoHome: null,
@@ -560,7 +569,7 @@ async function main(): Promise<void> {
   };
   let started: StartedDaemon;
   try {
-    started = await startDaemon(daemonLogPath, mode, state);
+    started = await startDaemon(daemonLogPath, mode, state, rpcDiagnostics);
   } catch (error) {
     const cleanupError = await cleanupFailedStart(state, daemonLogPath).then(
       () => null,
@@ -577,11 +586,13 @@ async function main(): Promise<void> {
     return;
   }
   let closing = false;
-  let releaseMessageHandler = () => undefined;
+  let releaseMessageHandler: () => void = () => undefined;
+  let releaseRpcDiagnosticHandler: () => void = () => undefined;
   const close = (report: boolean) => {
     if (closing) return;
     closing = true;
     releaseMessageHandler();
+    releaseRpcDiagnosticHandler();
     void closeDaemon(started, daemonLogPath)
       .then((audit) => {
         if (report) process.send?.({ type: "closed", audit });
@@ -610,6 +621,17 @@ async function main(): Promise<void> {
       process.send?.(message);
     },
     shutdown: () => close(true),
+  });
+  releaseRpcDiagnosticHandler = installCase20DaemonRpcDiagnosticDrainHandler({
+    source: {
+      on: (_event, listener) => process.on("message", listener),
+      off: (_event, listener) => process.off("message", listener),
+    },
+    collector: rpcDiagnostics,
+    isClosing: () => closing,
+    send: (message) => {
+      process.send?.(message);
+    },
   });
   process.once("disconnect", () => close(false));
   process.once("SIGTERM", () => close(false));

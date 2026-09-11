@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { monitorEventLoopDelay, performance, type IntervalHistogram } from "node:perf_hooks";
 
 import { createPaseoApi, type PaseoApi } from "@getpaseo/client";
@@ -17,6 +18,10 @@ import {
 } from "./metrics.js";
 import {
   CASE20_PART_A_CLIENT_COUNT,
+  CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES,
+  CASE20_RPC_REQUEST_ID_PATTERN,
+  type Case20DaemonRpcDiagnostic,
+  type Case20DaemonRpcDiagnosticFailureCode,
   type Case20ClientRpcTraceEvent,
   type Case20ClientRuntimeMetricsEvent,
   type Case20ClientRecord,
@@ -27,6 +32,8 @@ import {
   type Case20ObservedRpcName,
   type Case20ObservedRpcResponseType,
   type Case20RawEvent,
+  type Case20RpcDiagnosticEvent,
+  type Case20RpcDiagnosticJoinFailureCode,
   type Case20RetainedRssCheckpointPlan,
   type Case20RetainedRssSample,
   type Case20ResourceSample,
@@ -111,6 +118,7 @@ interface PartAMeasurementState {
   readonly finalAgentCanaries: Set<string>;
   readonly finalTimelineCanaries: Set<string>;
   readonly observationBuffer: Case20ObservationBuffer;
+  readonly rpcDiagnosticJoiner: Case20RpcDiagnosticJoiner;
   readonly observationFailureKeys: Set<string>;
   canarySequence: number;
 }
@@ -124,13 +132,16 @@ type Case20ObservationFailureCode =
   | "client_runtime_metrics_invalid"
   | "client_rpc_trace_invalid"
   | "observation_buffer_limit_exceeded"
-  | "runner_event_loop_delay_invalid";
+  | "runner_event_loop_delay_invalid"
+  | Case20DaemonRpcDiagnosticFailureCode
+  | Case20RpcDiagnosticJoinFailureCode;
 
 const CASE20_OBSERVATION_EVENT_CAPACITY = 100_000;
-const CASE20_OBSERVATION_FAILURE_RESERVE = 64;
+const CASE20_OBSERVATION_FAILURE_RESERVE = 128;
 const CASE20_TRACE_DEPTH_LIMIT = 16;
 const CASE20_TRACE_CHILD_LIMIT = 16;
 const CASE20_TRACE_TARGET_FRAME_LIMIT = 2;
+const CASE20_RPC_DIAGNOSTIC_JOIN_CAPACITY = 50_000;
 
 export interface Case20ObservationBuffer {
   readonly size: number;
@@ -187,6 +198,260 @@ export function createCase20ObservationBuffer(input: {
   };
 }
 
+interface Case20ExpectedRpcDiagnostic {
+  readonly clientId: string;
+  readonly sequence: number;
+  readonly baseline: boolean;
+  readonly name: Case20ObservedRpcName;
+  readonly requestId: string;
+  readonly rpcStartedMonotonicUnixMs: number;
+  clientTrace: Case20ClientRpcTraceEvent | null;
+  daemonDiagnostic: Case20DaemonRpcDiagnostic | null;
+}
+
+export interface Case20RpcDiagnosticJoiner {
+  expect(input: {
+    readonly clientId: string;
+    readonly sequence: number;
+    readonly baseline: boolean;
+    readonly name: Case20ObservedRpcName;
+    readonly requestId: string;
+    readonly rpcStartedMonotonicUnixMs: number;
+  }): void;
+  recordClient(trace: Case20ClientRpcTraceEvent): void;
+  recordDaemon(diagnostic: Case20DaemonRpcDiagnostic): void;
+  recordDaemonFailure(failure: Case20DaemonRpcDiagnosticFailureCode): void;
+  finish(): void;
+}
+
+function expectedDaemonTypes(name: Case20ObservedRpcName): {
+  readonly requestType: Case20DaemonRpcDiagnostic["requestType"];
+  readonly responseType: Case20DaemonRpcDiagnostic["responseType"];
+} {
+  return name === "fetch_agents"
+    ? { requestType: "fetch_agents_request", responseType: "fetch_agents_response" }
+    : { requestType: "fetch_agent_request", responseType: "rpc_error" };
+}
+
+function validClientRpcTrace(trace: Case20ClientRpcTraceEvent): boolean {
+  const finiteFields = [
+    trace.rpcStartedMonotonicUnixMs,
+    trace.frameBeginMonotonicUnixMs,
+    trace.frameEndMonotonicUnixMs,
+    trace.promiseResumedMonotonicUnixMs,
+    trace.callbackTotalMs,
+    trace.decodeBeforeParseMs,
+    trace.jsonParseMs,
+    trace.aotValidateMs,
+    trace.dispatchAndWaiterMs,
+    trace.frameEndToPromiseResumeMs,
+  ];
+  return (
+    Reflect.ownKeys(trace).length === 18 &&
+    trace.type === "client_rpc_trace" &&
+    typeof trace.at === "string" &&
+    /^case20-client-[0-9]{2}$/.test(trace.clientId) &&
+    Number.isInteger(trace.sequence) &&
+    trace.sequence > 0 &&
+    typeof trace.baseline === "boolean" &&
+    (trace.name === "fetch_agents" || trace.name === "foreign_fetch_agent_denial") &&
+    trace.messageType === targetMessageType(trace.name) &&
+    CASE20_RPC_REQUEST_ID_PATTERN.test(trace.requestId) &&
+    finiteFields.every(isFiniteNonNegative) &&
+    trace.rpcStartedMonotonicUnixMs <= trace.frameBeginMonotonicUnixMs &&
+    trace.frameBeginMonotonicUnixMs <= trace.frameEndMonotonicUnixMs &&
+    trace.frameEndMonotonicUnixMs <= trace.promiseResumedMonotonicUnixMs
+  );
+}
+
+function validDaemonRpcDiagnostic(diagnostic: Case20DaemonRpcDiagnostic): boolean {
+  let previous = -1;
+  return (
+    Reflect.ownKeys(diagnostic).length === 4 &&
+    CASE20_RPC_REQUEST_ID_PATTERN.test(diagnostic.requestId) &&
+    diagnostic.phases.length === CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES.length &&
+    diagnostic.phases.every((sample, index) => {
+      const valid =
+        Reflect.ownKeys(sample).length === 2 &&
+        sample.phase === CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES[index] &&
+        isFiniteNonNegative(sample.monotonicUnixMs) &&
+        sample.monotonicUnixMs >= previous;
+      previous = sample.monotonicUnixMs;
+      return valid;
+    })
+  );
+}
+
+export function createCase20RpcDiagnosticJoiner(input: {
+  readonly record: (event: Case20RpcDiagnosticEvent) => void;
+  readonly onFailure: (code: Case20ObservationFailureCode, clientId?: string) => void;
+  readonly capacity?: number;
+  readonly nowIso?: () => string;
+}): Case20RpcDiagnosticJoiner {
+  const capacity = input.capacity ?? CASE20_RPC_DIAGNOSTIC_JOIN_CAPACITY;
+  if (!Number.isInteger(capacity) || capacity <= 0)
+    throw new Error("Case20 RPC diagnostic join capacity is invalid");
+  const expected = new Map<string, Case20ExpectedRpcDiagnostic>();
+  const knownRequestIds = new Set<string>();
+  const nextClientSequence = new Map<string, number>();
+  const nextDaemonSequence = new Map<string, number>();
+  let finished = false;
+  const fail = (code: Case20ObservationFailureCode, clientId?: string) => {
+    try {
+      input.onFailure(code, clientId);
+    } catch {
+      // Diagnostic failures cannot change the measured RPC Promise path.
+    }
+  };
+  const discard = (requestId: string) => {
+    expected.delete(requestId);
+  };
+  const tryJoin = (entry: Case20ExpectedRpcDiagnostic) => {
+    const client = entry.clientTrace;
+    const daemon = entry.daemonDiagnostic;
+    if (!client || !daemon) return;
+    const daemonTypes = expectedDaemonTypes(entry.name);
+    const daemonSequence = nextDaemonSequence.get(entry.clientId) ?? 1;
+    if (
+      daemon.requestType !== daemonTypes.requestType ||
+      daemon.responseType !== daemonTypes.responseType ||
+      daemon.phases[0]!.monotonicUnixMs < entry.rpcStartedMonotonicUnixMs ||
+      daemon.phases.at(-1)!.monotonicUnixMs > client.frameBeginMonotonicUnixMs ||
+      entry.sequence !== daemonSequence
+    ) {
+      fail("rpc_diagnostic_join_out_of_order", entry.clientId);
+      discard(entry.requestId);
+      return;
+    }
+    nextDaemonSequence.set(entry.clientId, daemonSequence + 1);
+    try {
+      input.record({
+        type: "rpc_diagnostic",
+        at: input.nowIso?.() ?? new Date().toISOString(),
+        clientId: entry.clientId,
+        sequence: entry.sequence,
+        baseline: entry.baseline,
+        name: entry.name,
+        requestId: entry.requestId,
+        requestType: daemon.requestType,
+        responseType: daemon.responseType,
+        client: {
+          rpcStartedMonotonicUnixMs: client.rpcStartedMonotonicUnixMs,
+          frameBeginMonotonicUnixMs: client.frameBeginMonotonicUnixMs,
+          frameEndMonotonicUnixMs: client.frameEndMonotonicUnixMs,
+          promiseResumedMonotonicUnixMs: client.promiseResumedMonotonicUnixMs,
+          callbackTotalMs: client.callbackTotalMs,
+          decodeBeforeParseMs: client.decodeBeforeParseMs,
+          jsonParseMs: client.jsonParseMs,
+          aotValidateMs: client.aotValidateMs,
+          dispatchAndWaiterMs: client.dispatchAndWaiterMs,
+          frameEndToPromiseResumeMs: client.frameEndToPromiseResumeMs,
+        },
+        daemon: { phases: daemon.phases },
+      });
+    } catch {
+      fail("rpc_diagnostic_join_invalid", entry.clientId);
+    }
+    discard(entry.requestId);
+  };
+  return {
+    expect(value) {
+      if (
+        finished ||
+        !/^case20-client-[0-9]{2}$/.test(value.clientId) ||
+        !Number.isInteger(value.sequence) ||
+        value.sequence <= 0 ||
+        typeof value.baseline !== "boolean" ||
+        (value.name !== "fetch_agents" && value.name !== "foreign_fetch_agent_denial") ||
+        !CASE20_RPC_REQUEST_ID_PATTERN.test(value.requestId) ||
+        !isFiniteNonNegative(value.rpcStartedMonotonicUnixMs)
+      ) {
+        fail("rpc_diagnostic_join_invalid", value.clientId);
+        return;
+      }
+      if (knownRequestIds.has(value.requestId)) {
+        fail("rpc_diagnostic_join_duplicate", value.clientId);
+        return;
+      }
+      if (knownRequestIds.size >= capacity) {
+        fail("rpc_diagnostic_join_overflow", value.clientId);
+        return;
+      }
+      const expectedSequence = nextClientSequence.get(value.clientId) ?? 1;
+      if (value.sequence !== expectedSequence) {
+        fail("rpc_diagnostic_join_out_of_order", value.clientId);
+        return;
+      }
+      nextClientSequence.set(value.clientId, expectedSequence + 1);
+      knownRequestIds.add(value.requestId);
+      expected.set(value.requestId, {
+        clientId: value.clientId,
+        sequence: value.sequence,
+        baseline: value.baseline,
+        name: value.name,
+        requestId: value.requestId,
+        rpcStartedMonotonicUnixMs: value.rpcStartedMonotonicUnixMs,
+        clientTrace: null,
+        daemonDiagnostic: null,
+      });
+    },
+    recordClient(trace) {
+      const entry = expected.get(trace.requestId);
+      if (!entry) {
+        fail("rpc_diagnostic_join_invalid", trace.clientId);
+        return;
+      }
+      if (entry.clientTrace) {
+        fail("rpc_diagnostic_join_duplicate", entry.clientId);
+        discard(entry.requestId);
+        return;
+      }
+      if (
+        !validClientRpcTrace(trace) ||
+        trace.clientId !== entry.clientId ||
+        trace.sequence !== entry.sequence ||
+        trace.baseline !== entry.baseline ||
+        trace.name !== entry.name ||
+        trace.rpcStartedMonotonicUnixMs !== entry.rpcStartedMonotonicUnixMs
+      ) {
+        fail("rpc_diagnostic_join_out_of_order", entry.clientId);
+        discard(entry.requestId);
+        return;
+      }
+      entry.clientTrace = trace;
+      tryJoin(entry);
+    },
+    recordDaemon(diagnostic) {
+      const entry = expected.get(diagnostic.requestId);
+      if (!entry) {
+        fail("rpc_diagnostic_join_invalid");
+        return;
+      }
+      if (entry.daemonDiagnostic) {
+        fail("rpc_diagnostic_join_duplicate", entry.clientId);
+        discard(entry.requestId);
+        return;
+      }
+      if (!validDaemonRpcDiagnostic(diagnostic)) {
+        fail("rpc_diagnostic_join_out_of_order", entry.clientId);
+        discard(entry.requestId);
+        return;
+      }
+      entry.daemonDiagnostic = diagnostic;
+      tryJoin(entry);
+    },
+    recordDaemonFailure(failure) {
+      fail(failure);
+    },
+    finish() {
+      if (finished) return;
+      finished = true;
+      for (const entry of expected.values()) fail("rpc_diagnostic_join_missing", entry.clientId);
+      expected.clear();
+    },
+  };
+}
+
 interface Case20CompletedTraceSection {
   readonly name: string;
   readonly args?: Record<string, string>;
@@ -207,38 +472,74 @@ interface Case20ArmedRpcTrace {
   readonly baseline: boolean;
   readonly name: Case20ObservedRpcName;
   readonly messageType: Case20ObservedRpcResponseType;
+  readonly requestId: string;
+  readonly rpcStartedMonotonicUnixMs: number;
 }
 
 export interface Case20ClientObservationController {
   readonly logger: Logger;
   readonly trace: DaemonClientTrace;
-  armRpc(input: { readonly name: Case20ObservedRpcName; readonly baseline: boolean }): number;
-  finishRpc(promiseResumedAtMs: number): void;
+  armRpc(input: {
+    readonly name: Case20ObservedRpcName;
+    readonly baseline: boolean;
+    readonly requestId: string;
+    readonly rpcStartedMonotonicUnixMs: number;
+  }): number;
+  finishRpc(promiseResumedMonotonicUnixMs: number): void;
   seal(): void;
 }
 
 export function createCase20ObservedRpcTiming(input: {
   readonly startedAtMs: number;
   readonly nowMs: () => number;
-  readonly finishRpc: (promiseResumedAtMs: number) => void;
+  readonly nowMonotonicUnixMs: () => number;
+  readonly finishRpc: (promiseResumedMonotonicUnixMs: number) => void;
 }): {
   markPromiseResumed(): void;
   finish(recordDuration: (durationMs: number) => Promise<void>): Promise<void>;
 } {
-  let promiseResumedAtMs: number | null = null;
+  let promiseResumedMonotonicUnixMs: number | null = null;
   return {
     markPromiseResumed() {
-      promiseResumedAtMs ??= input.nowMs();
+      promiseResumedMonotonicUnixMs ??= input.nowMonotonicUnixMs();
     },
     async finish(recordDuration) {
       const durationMs = input.nowMs() - input.startedAtMs;
       try {
         await recordDuration(durationMs);
       } finally {
-        input.finishRpc(promiseResumedAtMs ?? Number.NaN);
+        input.finishRpc(promiseResumedMonotonicUnixMs ?? Number.NaN);
       }
     },
   };
+}
+
+export function prepareCase20ObservedRpc(input: {
+  readonly clientId: string;
+  readonly name: Case20ObservedRpcName;
+  readonly baseline: boolean;
+  readonly requestId: string;
+  readonly observation: Pick<Case20ClientObservationController, "armRpc">;
+  readonly joiner: Pick<Case20RpcDiagnosticJoiner, "expect">;
+  readonly nowMonotonicUnixMs: () => number;
+  readonly nowDurationMs: () => number;
+}): { readonly measuredStartedAtMs: number } {
+  const rpcStartedMonotonicUnixMs = input.nowMonotonicUnixMs();
+  const sequence = input.observation.armRpc({
+    name: input.name,
+    baseline: input.baseline,
+    requestId: input.requestId,
+    rpcStartedMonotonicUnixMs,
+  });
+  input.joiner.expect({
+    clientId: input.clientId,
+    sequence,
+    baseline: input.baseline,
+    name: input.name,
+    requestId: input.requestId,
+    rpcStartedMonotonicUnixMs,
+  });
+  return { measuredStartedAtMs: input.nowDurationMs() };
 }
 
 const CASE20_OBSERVED_MESSAGE_TYPES = [
@@ -253,6 +554,12 @@ const CASE20_CONNECTION_STATUSES = [
   "disconnected",
   "disposed",
 ] as const;
+
+function isCase20ConnectionStatus(
+  value: unknown,
+): value is Case20ClientRuntimeMetricsEvent["connectionStatus"] {
+  return CASE20_CONNECTION_STATUSES.some((status) => status === value);
+}
 
 const case20ConsoleLogger: Logger = {
   debug() {},
@@ -334,7 +641,7 @@ function parseCase20ClientRuntimeMetrics(
     !isNonNegativeInteger(value.bucketCount) ||
     typeof value.final !== "boolean" ||
     (value.connectionPath !== "direct" && value.connectionPath !== "relay") ||
-    !CASE20_CONNECTION_STATUSES.some((status) => status === value.connectionStatus)
+    !isCase20ConnectionStatus(value.connectionStatus)
   )
     throw new Error("Case20 client runtime metric envelope is invalid");
   const counts = parseObservedCountRows(value.inboundMessageTypesTop);
@@ -396,11 +703,12 @@ export function createCase20ClientObservationController(input: {
   readonly clientId: string;
   readonly record: (event: Case20ObservationEvent) => void;
   readonly onFailure: (code: Case20ObservationFailureCode) => void;
-  readonly nowMs?: () => number;
+  readonly nowMonotonicUnixMs?: () => number;
   readonly nowIso?: () => string;
   readonly delegateLogger?: Logger;
 }): Case20ClientObservationController {
-  const nowMs = input.nowMs ?? performance.now.bind(performance);
+  const nowMonotonicUnixMs =
+    input.nowMonotonicUnixMs ?? (() => performance.timeOrigin + performance.now());
   const nowIso = input.nowIso ?? (() => new Date().toISOString());
   const delegate = input.delegateLogger ?? case20ConsoleLogger;
   const traceStack: Case20OpenTraceSection[] = [];
@@ -462,7 +770,7 @@ export function createCase20ClientObservationController(input: {
           reportFailure("client_rpc_trace_invalid");
           return;
         }
-        traceStack.push({ name, args, startedAtMs: nowMs(), children: [] });
+        traceStack.push({ name, args, startedAtMs: nowMonotonicUnixMs(), children: [] });
       } catch {
         reportFailure("client_rpc_trace_invalid");
       }
@@ -478,7 +786,7 @@ export function createCase20ClientObservationController(input: {
         if (!open) throw new Error("Case20 client trace stack underflow");
         const completed: Case20CompletedTraceSection = {
           ...open,
-          endedAtMs: nowMs(),
+          endedAtMs: nowMonotonicUnixMs(),
         };
         const parent = traceStack.at(-1);
         if (parent) {
@@ -507,21 +815,27 @@ export function createCase20ClientObservationController(input: {
     trace,
     armRpc(rpc) {
       sequence += 1;
-      if (sealed || armed || traceStack.length > 0) {
+      const invalidIdentity =
+        !CASE20_RPC_REQUEST_ID_PATTERN.test(rpc.requestId) ||
+        !isFiniteNonNegative(rpc.rpcStartedMonotonicUnixMs);
+      if (sealed || armed || traceStack.length > 0 || invalidIdentity) {
         reportFailure("client_rpc_trace_invalid");
         traceStack.length = 0;
         targetFrames.length = 0;
         suppressedTraceDepth = 0;
       }
+      if (invalidIdentity) return sequence;
       armed = {
         sequence,
         name: rpc.name,
         baseline: rpc.baseline,
         messageType: targetMessageType(rpc.name),
+        requestId: rpc.requestId,
+        rpcStartedMonotonicUnixMs: rpc.rpcStartedMonotonicUnixMs,
       };
       return sequence;
     },
-    finishRpc(promiseResumedAtMs) {
+    finishRpc(promiseResumedMonotonicUnixMs) {
       const target = armed;
       armed = null;
       try {
@@ -547,12 +861,17 @@ export function createCase20ClientObservationController(input: {
           baseline: target.baseline,
           name: target.name,
           messageType: target.messageType,
+          requestId: target.requestId,
+          rpcStartedMonotonicUnixMs: target.rpcStartedMonotonicUnixMs,
+          frameBeginMonotonicUnixMs: frame.startedAtMs,
+          frameEndMonotonicUnixMs: frame.endedAtMs,
+          promiseResumedMonotonicUnixMs,
           callbackTotalMs: finiteDuration(frame.endedAtMs, frame.startedAtMs),
           decodeBeforeParseMs: finiteDuration(parse.startedAtMs, frame.startedAtMs),
           jsonParseMs: finiteDuration(parse.endedAtMs, parse.startedAtMs),
           aotValidateMs: finiteDuration(message.startedAtMs, parse.endedAtMs),
           dispatchAndWaiterMs: finiteDuration(frame.endedAtMs, message.endedAtMs),
-          frameEndToPromiseResumeMs: finiteDuration(promiseResumedAtMs, frame.endedAtMs),
+          frameEndToPromiseResumeMs: finiteDuration(promiseResumedMonotonicUnixMs, frame.endedAtMs),
         });
       } catch {
         reportFailure("client_rpc_trace_invalid");
@@ -858,6 +1177,8 @@ function recordDurableFailure(state: PartAMeasurementState, failure: Case20Failu
 function case20ObservationFailureMetric(code: Case20ObservationFailureCode): string {
   if (code === "observation_buffer_limit_exceeded") return "runner.observation_buffer";
   if (code.startsWith("runner_")) return "runner.event_loop_delay";
+  if (code.startsWith("daemon_rpc_")) return "daemon.rpc_diagnostic";
+  if (code.startsWith("rpc_diagnostic_join_")) return "rpc.diagnostic_join";
   return "client.observation";
 }
 
@@ -1011,7 +1332,8 @@ async function connectClient(
   const observation = createCase20ClientObservationController({
     clientId: config.clientId,
     record: (event) => {
-      state.observationBuffer.record(event);
+      if (event.type === "client_rpc_trace") state.rpcDiagnosticJoiner.recordClient(event);
+      else state.observationBuffer.record(event);
     },
     onFailure: (code) => bufferCase20ObservationFailure(state, code, config.clientId),
   });
@@ -1176,21 +1498,36 @@ async function recordRpc(input: {
   });
 }
 
+function createCase20RpcRequestId(): string {
+  return `case20-rpc-${randomBytes(16).toString("hex")}`;
+}
+
 async function measureAgentList(
   connected: ConnectedClient,
   state: PartAMeasurementState,
   baseline: boolean,
 ): Promise<readonly string[]> {
-  const started = performance.now();
-  connected.observation.armRpc({ name: "fetch_agents", baseline });
+  const requestId = createCase20RpcRequestId();
+  const prepared = prepareCase20ObservedRpc({
+    clientId: connected.config.clientId,
+    name: "fetch_agents",
+    baseline,
+    requestId,
+    observation: connected.observation,
+    joiner: state.rpcDiagnosticJoiner,
+    nowMonotonicUnixMs: () => performance.timeOrigin + performance.now(),
+    nowDurationMs: () => performance.now(),
+  });
   const timing = createCase20ObservedRpcTiming({
-    startedAtMs: started,
+    startedAtMs: prepared.measuredStartedAtMs,
     nowMs: () => performance.now(),
-    finishRpc: (promiseResumedAtMs) => connected.observation.finishRpc(promiseResumedAtMs),
+    nowMonotonicUnixMs: () => performance.timeOrigin + performance.now(),
+    finishRpc: (promiseResumedMonotonicUnixMs) =>
+      connected.observation.finishRpc(promiseResumedMonotonicUnixMs),
   });
   let ok = false;
   try {
-    const response = await connected.client.agents.list({ page: { limit: 200 } });
+    const response = await connected.client.agents.list({ requestId, page: { limit: 200 } });
     timing.markPromiseResumed();
     ok = true;
     return response.entries.map((entry) => entry.agent.id);
@@ -1217,16 +1554,27 @@ async function measureWrongRoute(
   state: PartAMeasurementState,
   baseline: boolean,
 ): Promise<boolean> {
-  const started = performance.now();
-  connected.observation.armRpc({ name: "foreign_fetch_agent_denial", baseline });
+  const requestId = createCase20RpcRequestId();
+  const prepared = prepareCase20ObservedRpc({
+    clientId: connected.config.clientId,
+    name: "foreign_fetch_agent_denial",
+    baseline,
+    requestId,
+    observation: connected.observation,
+    joiner: state.rpcDiagnosticJoiner,
+    nowMonotonicUnixMs: () => performance.timeOrigin + performance.now(),
+    nowDurationMs: () => performance.now(),
+  });
   const timing = createCase20ObservedRpcTiming({
-    startedAtMs: started,
+    startedAtMs: prepared.measuredStartedAtMs,
     nowMs: () => performance.now(),
-    finishRpc: (promiseResumedAtMs) => connected.observation.finishRpc(promiseResumedAtMs),
+    nowMonotonicUnixMs: () => performance.timeOrigin + performance.now(),
+    finishRpc: (promiseResumedMonotonicUnixMs) =>
+      connected.observation.finishRpc(promiseResumedMonotonicUnixMs),
   });
   let denied = false;
   try {
-    const agent = await connected.client.agents.ref(foreignAgentId).refresh();
+    const agent = await connected.client.agents.ref(foreignAgentId).refresh(requestId);
     timing.markPromiseResumed();
     denied = agent === null;
   } catch (error) {
@@ -1636,6 +1984,12 @@ export async function runCase20PartA(manifest: PartAManifest) {
   const observationBuffer = createCase20ObservationBuffer({
     onOverflow: () => bufferCase20ObservationFailure(state, "observation_buffer_limit_exceeded"),
   });
+  const rpcDiagnosticJoiner = createCase20RpcDiagnosticJoiner({
+    record: (event) => {
+      state.observationBuffer.record(event);
+    },
+    onFailure: (code, clientId) => bufferCase20ObservationFailure(state, code, clientId),
+  });
   state = {
     artifact,
     counts: createCounts(),
@@ -1653,6 +2007,7 @@ export async function runCase20PartA(manifest: PartAManifest) {
     finalAgentCanaries: new Set(),
     finalTimelineCanaries: new Set(),
     observationBuffer,
+    rpcDiagnosticJoiner,
     observationFailureKeys: new Set(),
     canarySequence: 0,
   };
@@ -1833,6 +2188,19 @@ export async function runCase20PartA(manifest: PartAManifest) {
         }
       }
       for (const client of clients) client.releaseConnection();
+      if (fixture) {
+        await fixture
+          .collectRpcDiagnostics((batch) => {
+            for (const failure of batch.failures)
+              state.rpcDiagnosticJoiner.recordDaemonFailure(failure);
+            for (const diagnostic of batch.diagnostics)
+              state.rpcDiagnosticJoiner.recordDaemon(diagnostic);
+          })
+          .catch(() => {
+            bufferCase20ObservationFailure(state, "daemon_rpc_diagnostic_invalid");
+          });
+      }
+      state.rpcDiagnosticJoiner.finish();
       await flushCase20ObservationEvents(state).catch((error) => {
         primaryError ??= error;
         state.counts.auditErrors += 1;

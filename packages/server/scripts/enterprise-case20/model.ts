@@ -300,6 +300,58 @@ export type Case20ObservedRpcResponseType = Exclude<
   "agent_stream"
 >;
 
+export const CASE20_RPC_REQUEST_ID_PATTERN = /^case20-rpc-[0-9a-f]{32}$/;
+
+export const CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES = [
+  "frame.received",
+  "session.call",
+  "session.enter",
+  "response.deliver.begin",
+  "response.stringify.begin",
+  "response.stringify.return",
+  "response.send.begin",
+  "response.send.return",
+  "response.deliver.return",
+] as const;
+
+export type Case20DaemonRpcDiagnosticPhase = (typeof CASE20_DAEMON_RPC_DIAGNOSTIC_PHASES)[number];
+export type Case20DaemonRpcDiagnosticRequestType = "fetch_agents_request" | "fetch_agent_request";
+export type Case20DaemonRpcDiagnosticResponseType =
+  | "fetch_agents_response"
+  | "fetch_agent_response"
+  | "rpc_error";
+export type Case20DaemonRpcDiagnosticFailureCode =
+  | "daemon_rpc_diagnostic_invalid"
+  | "daemon_rpc_diagnostic_missing"
+  | "daemon_rpc_diagnostic_duplicate"
+  | "daemon_rpc_diagnostic_out_of_order"
+  | "daemon_rpc_diagnostic_overflow";
+
+export type Case20RpcDiagnosticJoinFailureCode =
+  | "rpc_diagnostic_join_invalid"
+  | "rpc_diagnostic_join_missing"
+  | "rpc_diagnostic_join_duplicate"
+  | "rpc_diagnostic_join_out_of_order"
+  | "rpc_diagnostic_join_overflow";
+
+export interface Case20DaemonRpcDiagnosticPhaseSample {
+  readonly phase: Case20DaemonRpcDiagnosticPhase;
+  readonly monotonicUnixMs: number;
+}
+
+export interface Case20DaemonRpcDiagnostic {
+  readonly requestId: string;
+  readonly requestType: Case20DaemonRpcDiagnosticRequestType;
+  readonly responseType: Case20DaemonRpcDiagnosticResponseType;
+  readonly phases: readonly Case20DaemonRpcDiagnosticPhaseSample[];
+}
+
+export interface Case20DaemonRpcDiagnosticBatch {
+  readonly diagnostics: readonly Case20DaemonRpcDiagnostic[];
+  readonly failures: readonly Case20DaemonRpcDiagnosticFailureCode[];
+  readonly done: boolean;
+}
+
 export interface Case20ClientRuntimeMessageMetric {
   readonly messageType: Case20ObservedInboundMessageType;
   readonly count: number;
@@ -331,12 +383,44 @@ export interface Case20ClientRpcTraceEvent {
   readonly baseline: boolean;
   readonly name: Case20ObservedRpcName;
   readonly messageType: Case20ObservedRpcResponseType;
+  readonly requestId: string;
+  readonly rpcStartedMonotonicUnixMs: number;
+  readonly frameBeginMonotonicUnixMs: number;
+  readonly frameEndMonotonicUnixMs: number;
+  readonly promiseResumedMonotonicUnixMs: number;
   readonly callbackTotalMs: number;
   readonly decodeBeforeParseMs: number;
   readonly jsonParseMs: number;
   readonly aotValidateMs: number;
   readonly dispatchAndWaiterMs: number;
   readonly frameEndToPromiseResumeMs: number;
+}
+
+export interface Case20RpcDiagnosticEvent {
+  readonly type: "rpc_diagnostic";
+  readonly at: string;
+  readonly clientId: string;
+  readonly sequence: number;
+  readonly baseline: boolean;
+  readonly name: Case20ObservedRpcName;
+  readonly requestId: string;
+  readonly requestType: Case20DaemonRpcDiagnosticRequestType;
+  readonly responseType: Case20DaemonRpcDiagnosticResponseType;
+  readonly client: {
+    readonly rpcStartedMonotonicUnixMs: number;
+    readonly frameBeginMonotonicUnixMs: number;
+    readonly frameEndMonotonicUnixMs: number;
+    readonly promiseResumedMonotonicUnixMs: number;
+    readonly callbackTotalMs: number;
+    readonly decodeBeforeParseMs: number;
+    readonly jsonParseMs: number;
+    readonly aotValidateMs: number;
+    readonly dispatchAndWaiterMs: number;
+    readonly frameEndToPromiseResumeMs: number;
+  };
+  readonly daemon: {
+    readonly phases: readonly Case20DaemonRpcDiagnosticPhaseSample[];
+  };
 }
 
 export interface Case20RunnerEventLoopDelayEvent {
@@ -390,7 +474,7 @@ export type Case20RawEvent =
       readonly baseline: boolean;
     }
   | Case20ClientRuntimeMetricsEvent
-  | Case20ClientRpcTraceEvent
+  | Case20RpcDiagnosticEvent
   | Case20RunnerEventLoopDelayEvent
   | {
       readonly type: "feedback";
