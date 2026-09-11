@@ -4490,10 +4490,8 @@ export class Session {
         return [];
       }
     });
-    const authorized = await authorization.filterAgents("workspace.content.read", [
-      ...liveRows,
-      ...persistedRows,
-    ]);
+    const shortlisted = authorization.prefilterAgentContentRows([...liveRows, ...persistedRows]);
+    const authorized = await authorization.filterAgents("workspace.content.read", shortlisted);
     if (!authorization.isCurrent()) {
       throw new SessionRequestError("access_denied", "Resource unavailable");
     }

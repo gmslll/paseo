@@ -59,6 +59,7 @@ import {
   createEnterpriseAuthorizationRuntime,
   isCurrentProductionAuthorizationRuntime,
 } from "./enterprise/access/production-authorization-runtime.js";
+import { ResourceAuthorizationService } from "./enterprise/access/resource-authorization.js";
 import {
   createProductionAuthorizationRuntimeForSession,
   createProductionAuthorizationRuntimeProvider,
@@ -203,6 +204,10 @@ interface SessionHandlerInternals {
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
   emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void>;
+  filterEnterpriseAgentProjectionSources(
+    liveAgents: readonly ManagedAgent[],
+    persistedRecords: readonly StoredAgentRecord[],
+  ): Promise<{ liveAgents: ManagedAgent[]; persistedRecords: StoredAgentRecord[] }>;
   emitEnterpriseBrowserLeaseWaiting(
     notice: {
       requestId: string;
@@ -2166,6 +2171,7 @@ async function createBinaryAuthorizationFixture(
   if (!runtime) throw new Error("Expected production authorization runtime");
   return {
     audit,
+    grantStore,
     issuer,
     handle,
     runtime,
@@ -10360,6 +10366,169 @@ describe("enterprise dispatcher integration seam", () => {
     await session.cleanup();
   });
 
+  test("enterprise fetch and history asynchronously authorize only a ten-row synchronous shortlist", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-ten-row-shortlist");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    const ownedWorkspaceId = "wks_aaaaaaaaaaaaaaaa";
+    const foreignWorkspaceId = "wks_bbbbbbbbbbbbbbbb";
+    const ownedAgentId = "agt_shortlist_owned_a";
+    const foreignAgentIds = Array.from(
+      { length: 9 },
+      (_, index) => `agt_shortlist_foreign_${index}`,
+    );
+    fixture.owners.registerWorkspace({
+      id: ownedWorkspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: foreignWorkspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    fixture.owners.registerAgent({
+      id: ownedAgentId,
+      workspaceId: ownedWorkspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    for (const id of foreignAgentIds) {
+      fixture.owners.registerAgent({
+        id,
+        workspaceId: foreignWorkspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      });
+    }
+    const agents = [
+      makeEnterpriseDirectoryManagedAgent({
+        id: ownedAgentId,
+        workspaceId: ownedWorkspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+      }),
+      ...foreignAgentIds.map((id) =>
+        makeEnterpriseDirectoryManagedAgent({
+          id,
+          workspaceId: foreignWorkspaceId,
+          organizationId,
+          nodeId,
+          ownerPrincipalId: foreignPrincipalId,
+        }),
+      ),
+    ];
+    const records = agents.map((agent) =>
+      createStoredAgentRecord({
+        id: agent.id,
+        cwd: agent.cwd,
+        workspaceId: agent.workspaceId,
+        organizationId: agent.enterpriseOwnership?.organizationId,
+        nodeId: agent.enterpriseOwnership?.nodeId,
+        ownerPrincipalId: agent.enterpriseOwnership?.ownerPrincipalId,
+        createdByPrincipalId: agent.enterpriseOwnership?.createdByPrincipalId,
+      }),
+    );
+    const recordById = new Map(records.map((record) => [record.id, record] as const));
+    const getStorage = vi.fn(async (id: string) => recordById.get(id));
+    const prefilterAgentContentRows = vi.spyOn(
+      fixture.runtime.resourceAuthorization,
+      "prefilterAgentContentRows",
+    );
+    const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { listAgents: vi.fn(() => agents) },
+      agentStorage: { get: getStorage, list: vi.fn(async () => records) },
+      workspaceRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === ownedWorkspaceId
+            ? {
+                workspaceId: ownedWorkspaceId,
+                projectId: "project-shortlist",
+                cwd: "/tmp/enterprise-agent-events",
+                kind: "checkout" as const,
+                displayName: "shortlist",
+                archivedAt: null,
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      projectRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === "project-shortlist"
+            ? {
+                projectId: "project-shortlist",
+                rootPath: "/tmp/enterprise-agent-events",
+                kind: "git" as const,
+                displayName: "shortlist",
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const fetch = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-ten-row-shortlist",
+      page: { limit: 200 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+    const history = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-history-ten-row-shortlist",
+      page: { limit: 200 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+
+    expect(fetch.entries.map((entry) => entry.agent.id)).toEqual([ownedAgentId]);
+    expect(history.entries.map((entry) => entry.agent.id)).toEqual([ownedAgentId]);
+    expect(prefilterAgentContentRows).toHaveBeenCalledTimes(2);
+    for (const [, rows] of prefilterAgentContentRows.mock.calls) {
+      expect(rows).toHaveLength(10);
+      expect(rows.map((row) => row.id)).toEqual([ownedAgentId, ...foreignAgentIds]);
+      expect(Object.keys(rows[0] ?? {}).sort()).toEqual([
+        "createdByPrincipalId",
+        "id",
+        "nodeId",
+        "organizationId",
+        "ownerPrincipalId",
+        "workspaceId",
+      ]);
+    }
+    expect(assertAgent.mock.calls.map(([, , agentId]) => agentId)).toEqual([
+      ownedAgentId,
+      ownedAgentId,
+    ]);
+    expect(getStorage.mock.calls).toEqual([[ownedAgentId], [ownedAgentId]]);
+    await session.cleanup();
+  });
+
   test("enterprise agent lists authorize mixed raw rows before live-agent enrichment", async () => {
     if (process.platform !== "darwin") return;
     const fixture = await createBinaryAuthorizationFixture("fetch-agents-raw-prefilter");
@@ -10498,6 +10667,10 @@ describe("enterprise dispatcher integration seam", () => {
     const getStorage = vi.fn(async (id: string) => recordById.get(id));
     const messages: SessionOutboundMessage[] = [];
     const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const prefilterAgentContentRows = vi.spyOn(
+      fixture.runtime.resourceAuthorization,
+      "prefilterAgentContentRows",
+    );
     const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
     const providerSnapshot = createProviderSnapshotManagerStub();
     providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
@@ -10555,11 +10728,16 @@ describe("enterprise dispatcher integration seam", () => {
     });
 
     expect(getStorage.mock.calls).toEqual([[ownedLiveId]]);
-    expect(assertAgent.mock.calls.map(([, , agentId]) => agentId)).toEqual([
+    expect(prefilterAgentContentRows).toHaveBeenCalledTimes(1);
+    expect(prefilterAgentContentRows.mock.calls[0]?.[1].map((row) => row.id)).toEqual([
       ownedLiveId,
       foreignLiveId,
       ownedPersistedId,
       foreignPersistedId,
+    ]);
+    expect(assertAgent.mock.calls.map(([, , agentId]) => agentId)).toEqual([
+      ownedLiveId,
+      ownedPersistedId,
     ]);
     expect(messages).toContainEqual({
       type: "fetch_agents_response",
@@ -10579,6 +10757,99 @@ describe("enterprise dispatcher integration seam", () => {
     );
     await session.cleanup();
   });
+
+  test.each(["owner", "grant"] as const)(
+    "enterprise agent shortlist is rechecked asynchronously after a %s change",
+    async (change) => {
+      if (process.platform !== "darwin") return;
+      const fixture = await createBinaryAuthorizationFixture(`fetch-agents-${change}-recheck`);
+      const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+      const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+      const principalId = fixture.enterpriseSessionContext.principal.principalId;
+      const workspaceId = "wks_aaaaaaaaaaaaaaaa";
+      const agentId = `agt_async_recheck_${change}`;
+      fixture.owners.registerWorkspace({
+        id: workspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+        createdByPrincipalId: principalId,
+      });
+      fixture.owners.registerAgent({
+        id: agentId,
+        workspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+        createdByPrincipalId: principalId,
+      });
+      const liveAgent = makeEnterpriseDirectoryManagedAgent({
+        id: agentId,
+        workspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+      });
+      const prefilterAgentContentRows = vi.spyOn(
+        fixture.runtime.resourceAuthorization,
+        "prefilterAgentContentRows",
+      );
+      const originalAssertAgent = fixture.runtime.resourceAuthorization.assertAgent.bind(
+        fixture.runtime.resourceAuthorization,
+      );
+      const assertAgent = vi
+        .spyOn(fixture.runtime.resourceAuthorization, "assertAgent")
+        .mockImplementationOnce(async (principal, action, candidateAgentId) => {
+          if (change === "owner") {
+            fixture.owners.registerWorkspace({
+              id: workspaceId,
+              organizationId,
+              nodeId,
+              ownerPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+              createdByPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+            });
+          } else {
+            await fixture.grantStore.update({
+              organizationId,
+              principalId,
+              expectedVersion: fixture.runtime.principal.grantVersion,
+              grants: [],
+              actor: fixture.runtime.principal,
+            });
+          }
+          return originalAssertAgent(principal, action, candidateAgentId);
+        });
+      const session = createSessionForTest({
+        clientId: "client-test",
+        enterpriseContext: fixture.enterpriseSessionContext,
+        enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+        authorityReceiptState: fixture.authorityState,
+        principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+        resourceAuthorization: fixture.runtime.resourceAuthorization,
+        sessionId: fixture.sessionId,
+        sessionAuthorization: fixture.sessionAuthorization,
+        admissionAuthorizationIssuer: fixture.issuer,
+        admissionAuthorizationHandle: fixture.handle,
+        enterpriseAuthorizationRuntime: fixture.runtime,
+      });
+
+      const filtering = asSessionInternals(session).filterEnterpriseAgentProjectionSources(
+        [liveAgent],
+        [],
+      );
+      if (change === "grant") {
+        await expect(filtering).rejects.toMatchObject({ code: "access_denied" });
+      } else {
+        await expect(filtering).resolves.toEqual({ liveAgents: [], persistedRecords: [] });
+      }
+      expect(prefilterAgentContentRows).toHaveBeenCalledTimes(1);
+      expect(prefilterAgentContentRows.mock.results[0]?.value).toEqual([
+        expect.objectContaining({ id: agentId, workspaceId }),
+      ]);
+      expect(assertAgent).toHaveBeenCalledTimes(1);
+      await session.cleanup();
+    },
+  );
 
   test("enterprise agent lists fail closed when authorization changes during live projection", async () => {
     if (process.platform !== "darwin") return;
@@ -10661,6 +10932,10 @@ describe("enterprise dispatcher integration seam", () => {
   });
 
   test("legacy agent lists retain live and persisted projection behavior", async () => {
+    const prefilterAgentContentRows = vi.spyOn(
+      ResourceAuthorizationService.prototype,
+      "prefilterAgentContentRows",
+    );
     const workspaceId = "workspace-legacy-list";
     const liveAgentIds = ["agent-legacy-live-a", "agent-legacy-live-b"];
     const liveAgents = liveAgentIds.map((id) => makeEnterpriseEventManagedAgent(id, workspaceId));
@@ -10715,6 +10990,8 @@ describe("enterprise dispatcher integration seam", () => {
       [...liveAgentIds, "agent-legacy-persisted"].sort(),
     );
     expect(getStorage.mock.calls).toEqual(liveAgentIds.map((id) => [id]));
+    expect(prefilterAgentContentRows).not.toHaveBeenCalled();
+    prefilterAgentContentRows.mockRestore();
     await session.cleanup();
   });
 
