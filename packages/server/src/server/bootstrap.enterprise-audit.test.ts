@@ -63,6 +63,64 @@ describe.runIf(process.platform === "darwin")("enterprise audit bootstrap snapsh
     expect(factory).not.toHaveBeenCalled();
   });
 
+  test("issues managed audit authority with the configured node mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bootstrap-managed-audit-"));
+    let issuedAudit: unknown;
+    const issue = vi.fn(
+      async (input: {
+        node: {
+          nodeId: string;
+          paseoServerId: string;
+          mode: "standalone" | "managed";
+        };
+        auditRoot: string;
+      }) => {
+        expect(input.node).toMatchObject({
+          nodeId: "nod_0123456789abcdef",
+          mode: "managed",
+        });
+        issuedAudit = await productionAuditCapabilityIssuer.issue({
+          ...input,
+          nativeAddonPath: addonPath,
+        });
+        return issuedAudit;
+      },
+    );
+    const factory = vi.fn(async (input: { audit: unknown }) => {
+      expect(productionAuditCapabilityIssuer.requireCurrent(input.audit).node.mode).toBe("managed");
+      throw new Error("managed factory sentinel");
+    });
+
+    await expect(
+      createPaseoDaemon(
+        {
+          paseoHome: root,
+          enterpriseMultiUser: {
+            enabled: true,
+            organizationId: "org_0123456789abcdef",
+            nodeId: "nod_0123456789abcdef",
+            managementMode: "managed",
+            legacyRecords: "owner_only",
+            management: {
+              baseUrl: "https://management.test:17443",
+              caCertificatePath: path.join(root, "management-ca.pem"),
+              relationshipPath: path.join(root, "relationship.json"),
+            },
+          },
+        },
+        logger,
+        {
+          issueProductionAuditCapability: issue,
+          createEnterpriseAdmissionRuntime: factory as never,
+        },
+      ),
+    ).rejects.toThrow("managed factory sentinel");
+    expect(issue).toHaveBeenCalledOnce();
+    expect(factory).toHaveBeenCalledOnce();
+    expect(() => productionAuditCapabilityIssuer.requireCurrent(issuedAudit)).toThrow();
+    await rm(root, { recursive: true, force: true });
+  });
+
   test("deferred issue uses the first frozen snapshot", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "bootstrap-enterprise-"));
     const attackerRoot = path.join(root, "attacker");

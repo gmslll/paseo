@@ -599,7 +599,11 @@ async function resolveEnterpriseRuntime(
   if (!factory) throw new Error("enterprise admission runtime factory is required");
   const issueCapability = issue ?? productionAuditCapabilityIssuer.issue;
   const audit = await issueCapability({
-    node: { nodeId: enterpriseConfig.nodeId, paseoServerId: serverId, mode: "standalone" },
+    node: {
+      nodeId: enterpriseConfig.nodeId,
+      paseoServerId: serverId,
+      mode: enterpriseConfig.managementMode,
+    },
     auditRoot: path.join(paseoHome, "enterprise", "audit"),
   });
   productionAuditCapabilityIssuer.requireCurrent(audit);

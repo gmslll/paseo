@@ -80,7 +80,7 @@ describe("production audit capability boundaries", () => {
 
     for (const invalidNode of [
       { ...node, nodeId: "wrong" },
-      { ...node, mode: "managed" },
+      { ...node, mode: "wrong" },
       { ...node, extra: true },
     ]) {
       expect(() =>
@@ -178,6 +178,28 @@ describe.runIf(process.platform === "darwin")(
 
     afterAll(async () => {
       if (buildDirectory) await rm(buildDirectory, { recursive: true, force: true });
+    });
+
+    it("issues a managed capability with its exact node identity", async () => {
+      const parent = await temporaryDirectory("paseo-audit-runtime-managed-");
+      const managedNode: NodeContext = { ...node, mode: "managed" };
+      let capability: Awaited<ReturnType<typeof createProductionAuditRuntime>> | undefined;
+      try {
+        capability = await createProductionAuditRuntime({
+          node: managedNode,
+          auditRoot: path.join(parent, "audit"),
+          nativeAddonPath: addonPath,
+          ...deterministicPorts("evt_runtime_managed", "2026-01-01T00:00:02.000Z"),
+        });
+
+        expect(capability.node).toEqual(managedNode);
+        expect(Object.isFrozen(capability.node)).toBe(true);
+        const event = await capability.append(input, { durability: "required" });
+        expect(event.nodeId).toBe(managedNode.nodeId);
+      } finally {
+        await capability?.close();
+        await rm(parent, { recursive: true, force: true });
+      }
     });
 
     it("issues only after restore and captures caller inputs and dependency ports", async () => {

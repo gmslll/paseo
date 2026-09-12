@@ -7,10 +7,9 @@ import type {
   AuditEventInput,
   AuditHash,
   AuditIdSource,
+  AuditSink,
   AuditSequence,
-  LocalAuditSinkContract,
   NodeContext,
-  StandaloneNodeContext,
 } from "@getpaseo/protocol/messages";
 import {
   DARWIN_AUDIT_STORAGE_UNAVAILABLE_REASON,
@@ -61,8 +60,10 @@ const PRODUCTION_AUDIT_CAPABILITY_BRAND: unique symbol = Symbol(
  * A capability issued only after the Darwin dirfd storage has restored and verified its complete
  * chain. The private symbol makes the type nominal; the issuer registry is the runtime authority.
  */
-export interface ProductionAuditCapability extends LocalAuditSinkContract {
+export interface ProductionAuditCapability extends AuditSink {
   readonly [PRODUCTION_AUDIT_CAPABILITY_BRAND]: true;
+  readonly adapterKind: "local";
+  readonly node: NodeContext;
   readonly releaseReady: boolean;
   readonly unsupportedReason?: string;
   ready(): Promise<void>;
@@ -144,12 +145,9 @@ function captureOptions(options: ProductionAuditRuntimeOptions): ProductionAudit
   }
 }
 
-function parseStandaloneNode(value: NodeContext): StandaloneNodeContext {
+function parseProductionNode(value: NodeContext): NodeContext {
   const parsed = NodeContextSchema.strict().parse(structuredClone(value));
-  if (parsed.mode !== "standalone") {
-    throw new Error("production local audit runtime requires standalone node context");
-  }
-  return Object.freeze({ ...parsed, mode: "standalone" });
+  return Object.freeze(parsed);
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -216,9 +214,9 @@ function recordFor(value: object): RuntimeRecord {
 class IssuedProductionAuditCapability implements ProductionAuditCapability {
   readonly [PRODUCTION_AUDIT_CAPABILITY_BRAND] = true as const;
   readonly adapterKind = "local" as const;
-  readonly node: StandaloneNodeContext;
+  readonly node: NodeContext;
 
-  constructor(node: StandaloneNodeContext, sink: LocalAuditSink) {
+  constructor(node: NodeContext, sink: LocalAuditSink) {
     this.node = node;
     runtimeRecords.set(this, {
       state: { status: "initializing" },
@@ -369,7 +367,7 @@ export function createProductionAuditRuntime(
   options: ProductionAuditRuntimeOptions,
 ): Promise<ProductionAuditCapability> {
   const captured = captureOptions(options);
-  const node = parseStandaloneNode(captured.node);
+  const node = parseProductionNode(captured.node);
   const auditRoot = parseTrustedAbsolutePath(captured.auditRoot, "audit root");
   const nativeAddonPath =
     captured.nativeAddonPath === undefined
@@ -401,7 +399,17 @@ export function createProductionAuditRuntime(
   if (storageReason) throw unavailable(storageReason);
 
   const sink = new LocalAuditSink(
-    { node, clock, idSource, hash, sequence, storage },
+    {
+      // LocalAuditSink's public contract represents the standalone adapter. The production
+      // capability above retains the exact managed/standalone authority while this private sink
+      // persists only the shared nodeId audit chain.
+      node: { ...node, mode: "standalone" },
+      clock,
+      idSource,
+      hash,
+      sequence,
+      storage,
+    },
     maxBuffered,
     observer,
   );
