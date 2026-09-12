@@ -1244,7 +1244,7 @@ export class HostRuntimeController {
         if (serverId !== this.host.serverId || signal.aborted) {
           throw new DOMException("Aborted", "AbortError");
         }
-        const connectionId = this.snapshot.activeConnectionId;
+        const connectionId = this.snapshot.activeConnectionId ?? this.host.preferredConnectionId;
         const connection = findConnectionById(this.host, connectionId);
         if (!connection || !connectionId || connection.type !== "directTcp") {
           throw new Error("Enterprise authentication requires a direct node connection");
@@ -1362,7 +1362,10 @@ export class HostRuntimeController {
   async discoverEnterpriseManagement(input?: {
     readonly signal?: AbortSignal;
   }): Promise<EnterpriseManagementBootstrap | null> {
-    const connection = findConnectionById(this.host, this.snapshot.activeConnectionId);
+    const connection = findConnectionById(
+      this.host,
+      this.snapshot.activeConnectionId ?? this.host.preferredConnectionId,
+    );
     if (!connection || connection.type !== "directTcp") return null;
     const bootstrapResponse = await fetch(
       new URL(

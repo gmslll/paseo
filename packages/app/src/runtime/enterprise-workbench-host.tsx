@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   createBrowserProfileProjectionHydrator,
   isEnterpriseBrowserProfilesEnabled,
@@ -132,7 +132,6 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   useEffect(() => {
     const controller = new AbortController();
     setManagedNodeDiscovered(false);
-    if (runtimeSnapshot?.activeConnection?.type !== "directTcp") return () => controller.abort();
     void getHostRuntimeStore()
       .discoverEnterpriseManagement(serverId, { signal: controller.signal })
       .then((value) => {
@@ -149,9 +148,7 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
     managedNodeDiscovered || isEnterpriseIdentityEnabled(capability);
 
   if (
-    !models ||
-    !bundle ||
-    !patModel ||
+    !lifecycle ||
     (identitySnapshot?.target === "legacy_passthrough" && !managedNodeDiscovered) ||
     !enterpriseIdentityAvailable
   )
@@ -160,11 +157,13 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
     return (
       <>
         <EnterprisePasswordLoginForm authenticate={authenticatePassword} />
-        <EnterprisePatLoginForm model={patModel} authenticate={authenticatePat} />
+        {patModel && bundle ? (
+          <EnterprisePatLoginForm model={patModel} authenticate={authenticatePat} />
+        ) : null}
       </>
     );
   }
-  if (!bossStore) return null;
+  if (!models || !bundle || !patModel || !bossStore) return null;
   return (
     <EnterpriseWorkbenchContainer
       {...models}

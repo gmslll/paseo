@@ -788,13 +788,11 @@ describe("HostRuntimeController", () => {
     await controller.stop();
   });
 
-  it("exchanges an account password for a node ticket without retaining the password", async () => {
+  it("recovers a disconnected managed node with an account password", async () => {
     const host = makeHost({
       serverId: "srv_password_login",
       preferredConnectionId: "direct:lan:6767",
     });
-    const anonymous = new FakeDaemonClient();
-    anonymous.serverInfo = { serverId: host.serverId, features: { enterpriseIdentityV1: true } };
     const authenticated = new FakeDaemonClient();
     authenticated.serverInfo = {
       serverId: host.serverId,
@@ -811,7 +809,7 @@ describe("HostRuntimeController", () => {
       navigation: [],
       allowedOperations: [],
     };
-    const clients = [anonymous, authenticated];
+    const createdConnections: HostConnection[] = [];
     const request = vi.fn<typeof fetch>(async (url) => {
       if (String(url).endsWith("/api/enterprise/bootstrap")) {
         return new Response(
@@ -838,7 +836,10 @@ describe("HostRuntimeController", () => {
     const controller = new HostRuntimeController({
       host,
       deps: {
-        createClient: () => clients.shift()! as unknown as DaemonClient,
+        createClient: ({ connection }) => {
+          createdConnections.push(connection);
+          return authenticated as unknown as DaemonClient;
+        },
         connectToDaemon: async () => {
           throw new Error("probe unavailable");
         },
@@ -855,7 +856,7 @@ describe("HostRuntimeController", () => {
         createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
       },
     });
-    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(controller.getSnapshot().activeConnectionId).toBeNull();
     await expect(controller.discoverEnterpriseManagement()).resolves.toMatchObject({
       mode: "managed",
       paseoServerId: host.serverId,
@@ -869,6 +870,13 @@ describe("HostRuntimeController", () => {
       state: "signed_in",
       projection: { principalId: "usr_bbbbbbbbbbbbbbbb" },
     });
+    expect(controller.getSnapshot().activeConnectionId).toBe("direct:lan:6767");
+    expect(createdConnections).toEqual([
+      expect.objectContaining({
+        id: "direct:lan:6767",
+        password: "pmt_v1.short-lived-ticket",
+      }),
+    ]);
     expect(String(request.mock.calls[0]?.[0])).toBe("http://lan:6767/api/enterprise/bootstrap");
     expect(String(request.mock.calls[2]?.[0])).toBe(
       "https://management.test:17443/v1/auth/password/session",
