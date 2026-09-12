@@ -31,7 +31,10 @@ describe("managed node production channel", () => {
     const { certificatePath, privateKeyPath } = createLocalhostCertificate(directory);
     const port = await reservePort();
     const managementBaseUrl = `https://localhost:${port}`;
-    const plane = createPlane(managementBaseUrl);
+    let managementClockOffsetMs = 0;
+    const plane = createPlane(managementBaseUrl, {
+      nowMs: () => Date.now() + managementClockOffsetMs,
+    });
     cleanup.push(() => plane.close());
     const server = createManagementHttpsServer({
       plane,
@@ -133,11 +136,13 @@ describe("managed node production channel", () => {
         },
       ]),
     ).resolves.toHaveLength(1);
+    managementClockOffsetMs = 5_000;
     const issued = await plane.issueSessionTicket(employeeCredential.token, {
       workspaceId: "workspace-a",
       clientId: "client-a",
       ttlMs: 60_000,
     });
+    managementClockOffsetMs = 0;
     const authenticator = new ManagedTicketAuthenticator({ client });
     const connection = {
       node: {
@@ -161,6 +166,25 @@ describe("managed node production channel", () => {
         ...connection,
         node: { ...connection.node, nodeId: "nod_0123456789abcdef" },
       }),
+    ).toBeNull();
+
+    managementClockOffsetMs = 120_000;
+    const notYetValid = await plane.issueSessionTicket(employeeCredential.token, {
+      workspaceId: "workspace-a",
+      clientId: "client-future",
+      ttlMs: 60_000,
+    });
+    managementClockOffsetMs = 0;
+    expect(
+      await authenticator.authenticateSessionTicket(notYetValid.ticket, connection),
+    ).toBeNull();
+
+    const expiredAuthenticator = new ManagedTicketAuthenticator({
+      client,
+      clock: { nowMs: () => Date.now() + 130_000 },
+    });
+    expect(
+      await expiredAuthenticator.authenticateSessionTicket(issued.ticket, connection),
     ).toBeNull();
 
     await plane.revokePersonalAccessToken(administrator, employeeCredential.credentialId);
@@ -201,7 +225,10 @@ function createLocalhostCertificate(directory: string): {
   return { certificatePath, privateKeyPath };
 }
 
-function createPlane(issuer: string): EnterpriseManagementPlane {
+function createPlane(
+  issuer: string,
+  clock?: { readonly nowMs: () => number },
+): EnterpriseManagementPlane {
   const ticketKeys = generateKeyPairSync("ed25519");
   return new EnterpriseManagementPlane({
     databasePath: ":memory:",
@@ -211,6 +238,7 @@ function createPlane(issuer: string): EnterpriseManagementPlane {
     bootstrapSecret: BOOTSTRAP_SECRET,
     ticketPrivateKey: ticketKeys.privateKey,
     ticketPublicKey: ticketKeys.publicKey,
+    ...(clock ? { clock } : {}),
   });
 }
 

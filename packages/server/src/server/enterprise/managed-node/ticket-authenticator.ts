@@ -13,6 +13,8 @@ import {
 
 import type { ManagedNodeControlPlaneClient } from "./management-client.js";
 
+const MANAGED_TICKET_CLOCK_SKEW_MS = 60_000;
+
 export interface ManagedTicketAuthenticatorOptions {
   readonly client: ManagedNodeControlPlaneClient;
   readonly maxPolicyStalenessMs?: number;
@@ -109,14 +111,15 @@ export class ManagedTicketAuthenticator {
     } catch {
       return null;
     }
+    const nowMs = this.clock.nowMs();
     if (
       claims.kind !== "session" ||
       claims.issuer !== this.options.client.relationship.managementBaseUrl ||
       claims.organizationId !== this.configuredOrganizationId ||
       claims.nodeId !== this.node.nodeId ||
       claims.paseoServerId !== this.node.paseoServerId ||
-      this.clock.nowMs() < claims.notBeforeMs ||
-      this.clock.nowMs() >= claims.expiresAtMs
+      nowMs + MANAGED_TICKET_CLOCK_SKEW_MS < claims.notBeforeMs ||
+      nowMs - MANAGED_TICKET_CLOCK_SKEW_MS >= claims.expiresAtMs
     ) {
       return null;
     }
