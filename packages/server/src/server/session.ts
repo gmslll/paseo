@@ -1,5 +1,6 @@
 import type {
   GlobalResourceRef,
+  EnterpriseResourceOwner,
   OutboundAuthorizationContext,
   ResourceAuthorization,
   SessionEventSubscription,
@@ -4592,6 +4593,17 @@ export class Session {
     else this.onMessage(message);
   }
 
+  private enterpriseWorkspaceOwnership(): EnterpriseResourceOwner | undefined {
+    const context = this.enterpriseContext;
+    if (!context) return undefined;
+    return {
+      organizationId: context.principal.organizationId,
+      nodeId: context.node.nodeId,
+      ownerPrincipalId: context.principal.principalId,
+      createdByPrincipalId: context.principal.principalId,
+    };
+  }
+
   private async filterEnterpriseAgentProjectionSources(
     liveAgents: readonly ManagedAgent[],
     persistedRecords: readonly StoredAgentRecord[],
@@ -5601,6 +5613,7 @@ export class Session {
           createdWorktree: null,
           cwd: config.cwd,
           initialTitle: input.workspacePromptTitle,
+          ownership: this.enterpriseWorkspaceOwnership(),
         }),
         cwd: config.cwd,
       }),
@@ -5734,6 +5747,7 @@ export class Session {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
+        ownership: this.enterpriseWorkspaceOwnership(),
       });
       if (createdWorkspace) {
         await this.registerWorkspaceForImportedAgent(createdWorkspace);
@@ -7300,14 +7314,21 @@ export class Session {
       resolveDefaultBranch?: (repoRoot: string) => Promise<string>;
     },
   ): Promise<CreatePaseoWorktreeResult> {
-    const result = await createPaseoWorktree(input, {
-      github: this.github,
-      ...(options?.resolveDefaultBranch
-        ? { resolveDefaultBranch: options.resolveDefaultBranch }
-        : {}),
-      workspaceGitService: this.workspaceGitService,
-      workspaceProvisioning: this.workspaceProvisioning,
-    });
+    const ownership = this.enterpriseWorkspaceOwnership();
+    const result = await createPaseoWorktree(
+      {
+        ...input,
+        ...(ownership ? { ownership } : {}),
+      },
+      {
+        github: this.github,
+        ...(options?.resolveDefaultBranch
+          ? { resolveDefaultBranch: options.resolveDefaultBranch }
+          : {}),
+        workspaceGitService: this.workspaceGitService,
+        workspaceProvisioning: this.workspaceProvisioning,
+      },
+    );
     void Promise.all([
       this.gitMutation.notifyGitMutation(input.cwd, "create-worktree"),
       this.gitMutation.notifyGitMutation(result.worktree.worktreePath, "create-worktree"),
@@ -8198,7 +8219,10 @@ export class Session {
       cwd,
       explicitTitle ?? promptTitle,
       request.source.projectId,
-      { expectsInitialAgent: Boolean(request.firstAgentContext) },
+      {
+        expectsInitialAgent: Boolean(request.firstAgentContext),
+        ownership: this.enterpriseWorkspaceOwnership(),
+      },
     );
     await this.syncWorkspaceGitObserverForWorkspace(workspace);
     const descriptor = await this.describeWorkspaceRecord(workspace);
@@ -8334,7 +8358,9 @@ export class Session {
       for (const workspaceRecord of await this.workspaceRegistry.list()) {
         workspacesBefore.set(workspaceRecord.workspaceId, workspaceRecord);
       }
-      const workspace = await this.workspaceProvisioning.findOrCreateWorkspaceForDirectory(cwd);
+      const workspace = await this.workspaceProvisioning.findOrCreateWorkspaceForDirectory(cwd, {
+        ownership: this.enterpriseWorkspaceOwnership(),
+      });
       const project = await this.projectRegistry.get(workspace.projectId);
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
       const descriptor = await this.describeWorkspaceRecord(workspace);

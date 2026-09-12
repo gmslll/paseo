@@ -1445,6 +1445,10 @@ export async function createPaseoDaemon(
         audit: enterpriseRuntime.audit,
         principalSource: enterpriseRuntime.principalSource,
       });
+      if (!resourceBundle) {
+        throw new Error("enterprise resource bundle unavailable");
+      }
+      constructionCleanupStack.push(() => resourceBundle.close());
       const auditRegistration = createProductionAuditDispatcherRegistration({
         audit: enterpriseRuntime.audit,
         provider: authorizationRuntimeProvider,
@@ -1494,9 +1498,6 @@ export async function createPaseoDaemon(
       await browserBundle.profiles.initialize();
       await browserBundle.bindings.initialize();
       await browserBundle.leases.initialize();
-      if (!resourceBundle) {
-        throw new Error("enterprise resource production bundle unavailable");
-      }
       if (enterpriseRuntime.managedPlacementSource) {
         await enterpriseRuntime.managedPlacementSource.install(
           createManagedPlacementSnapshotSource({

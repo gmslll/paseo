@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   EnterpriseResourceOwnerWireSchema,
   normalizeEnterpriseResourceOwner,
+  type EnterpriseResourceOwner,
 } from "@getpaseo/protocol/messages";
 
 import { writeJsonFileAtomic } from "./atomic-file.js";
@@ -785,6 +786,7 @@ export function resolveProjectDisplayName(record: PersistedProjectRecord): strin
 
 export function createPersistedWorkspaceRecord(input: {
   workspaceId: string;
+  ownership?: EnterpriseResourceOwner;
   projectId: string;
   cwd: string;
   kind: PersistedWorkspaceKind;
@@ -803,8 +805,10 @@ export function createPersistedWorkspaceRecord(input: {
   labels?: string[];
   untrustedSource?: UntrustedWorkspaceSource;
 }): PersistedWorkspaceRecord {
+  const { ownership, ...record } = input;
   return PersistedWorkspaceRecordSchema.parse({
-    ...input,
+    ...record,
+    ...(ownership ? { ...ownership, ownershipRevision: "0" } : {}),
     title: input.title ?? null,
     branch: input.branch ?? null,
     worktreeRoot: input.worktreeRoot ?? null,

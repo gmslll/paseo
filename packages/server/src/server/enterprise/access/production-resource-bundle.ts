@@ -51,6 +51,7 @@ export interface ProductionResourceBundle {
   readonly placement: PlacementResolver;
   readonly organizationResources: EnterpriseOrganizationResourceSource;
   readonly workspaceTransfers?: WorkspaceTransfer;
+  readonly close: () => void;
 }
 
 interface CapturedProductionResourceBundleOptions {
@@ -106,11 +107,21 @@ export async function createProductionResourceBundle(
       ...(workspaceTransfers ? { workspaceTransfers } : {}),
     });
     if (!dispatcherFactory) return null;
+    let closed = false;
+    const unsubscribeWorkspaceOwners = bundle.workspaceRegistry.subscribeToMutations((mutation) => {
+      if (closed || mutation.kind !== "upsert" || !mutation.workspace) return;
+      registerPersistedWorkspaceOwner(bundle, mutation.workspace);
+    });
     return Object.freeze({
       dispatcherFactory,
       placement,
       organizationResources,
       ...(workspaceTransfers ? { workspaceTransfers } : {}),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        unsubscribeWorkspaceOwners();
+      },
     });
   } catch {
     return null;
@@ -122,21 +133,26 @@ function registerPersistedWorkspaceOwners(
   records: readonly PersistedWorkspaceRecord[],
 ): boolean {
   for (const record of records) {
-    if (record.nodeId !== bundle.nodeId || record.archivedAt !== null) continue;
-    const existing = getAuthoritativeWorkspace(bundle.provider.owners, record.workspaceId);
-    if (existing) {
-      if (!sameOwner(existing, record)) return false;
-      continue;
-    }
-    bundle.provider.owners.registerWorkspace({
-      id: record.workspaceId,
-      organizationId: record.organizationId,
-      nodeId: record.nodeId,
-      ownerPrincipalId: record.ownerPrincipalId,
-      createdByPrincipalId: record.createdByPrincipalId,
-    });
+    if (!registerPersistedWorkspaceOwner(bundle, record)) return false;
   }
   return true;
+}
+
+function registerPersistedWorkspaceOwner(
+  bundle: CapturedProductionResourceBundleOptions,
+  record: PersistedWorkspaceRecord,
+): boolean {
+  if (record.nodeId !== bundle.nodeId || record.archivedAt !== null) return true;
+  const existing = getAuthoritativeWorkspace(bundle.provider.owners, record.workspaceId);
+  if (existing) return sameOwner(existing, record);
+  bundle.provider.owners.registerWorkspace({
+    id: record.workspaceId,
+    organizationId: record.organizationId,
+    nodeId: record.nodeId,
+    ownerPrincipalId: record.ownerPrincipalId,
+    createdByPrincipalId: record.createdByPrincipalId,
+  });
+  return getAuthoritativeWorkspace(bundle.provider.owners, record.workspaceId) !== null;
 }
 
 function createBundleWorkspaceTransfer(

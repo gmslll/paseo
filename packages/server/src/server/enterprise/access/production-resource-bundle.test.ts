@@ -23,6 +23,7 @@ import {
   createProductionPrincipalProvisioning,
 } from "../identity/principal-source.js";
 import { createProductionAuthorizationRuntimeProvider } from "./production-authorization-runtime-provider.js";
+import { getAuthoritativeWorkspace } from "./owner-registry.js";
 
 const nodeId = "nod_0123456789abcdef" as const;
 const organizationId = "org_0123456789abcdef" as const;
@@ -178,6 +179,31 @@ describe("production resource bundle ports", () => {
             resourceKinds: ["workspace"],
           }),
         ).resolves.toMatchObject({ resources: [{ workspaceId: "workspace-bundle" }] });
+        const lateWorkspace = createPersistedWorkspaceRecord({
+          workspaceId: "workspace-created-after-bundle",
+          ownership: {
+            organizationId,
+            nodeId,
+            ownerPrincipalId: "usr_0123456789abcdef",
+            createdByPrincipalId: "usr_0123456789abcdef",
+          },
+          projectId: "project-created-after-bundle",
+          cwd: "/tmp/workspace-created-after-bundle",
+          kind: "directory",
+          displayName: "Created after bundle",
+          createdAt: "2026-09-10T00:02:00.000Z",
+          updatedAt: "2026-09-10T00:02:00.000Z",
+        });
+        await registry.upsert(lateWorkspace);
+        expect(getAuthoritativeWorkspace(provider.owners, lateWorkspace.workspaceId)).toMatchObject(
+          {
+            workspaceId: lateWorkspace.workspaceId,
+            organizationId,
+            nodeId,
+            ownerPrincipalId: "usr_0123456789abcdef",
+            createdByPrincipalId: "usr_0123456789abcdef",
+          },
+        );
         agentRecords.push({
           id: "agent-bundle",
           provider: "test",
@@ -224,6 +250,27 @@ describe("production resource bundle ports", () => {
             audit,
           }),
         ).resolves.toBeNull();
+        bundle?.close();
+        transferBundle?.close();
+        const afterCloseWorkspace = createPersistedWorkspaceRecord({
+          workspaceId: "workspace-after-close",
+          ownership: {
+            organizationId,
+            nodeId,
+            ownerPrincipalId: "usr_0123456789abcdef",
+            createdByPrincipalId: "usr_0123456789abcdef",
+          },
+          projectId: "project-after-close",
+          cwd: "/tmp/workspace-after-close",
+          kind: "directory",
+          displayName: "After close",
+          createdAt: "2026-09-10T00:03:00.000Z",
+          updatedAt: "2026-09-10T00:03:00.000Z",
+        });
+        await registry.upsert(afterCloseWorkspace);
+        expect(
+          getAuthoritativeWorkspace(provider.owners, afterCloseWorkspace.workspaceId),
+        ).toBeNull();
       } finally {
         await audit.close();
         await rm(root, { recursive: true, force: true });

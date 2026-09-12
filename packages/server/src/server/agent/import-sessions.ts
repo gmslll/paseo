@@ -14,6 +14,7 @@ import { toRecentProviderSessionDescriptorPayload } from "./agent-projections.js
 import type { WorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type {
+  EnterpriseResourceOwner,
   FetchRecentProviderSessionsRequestMessage,
   ImportAgentRequestMessageSchema,
   RecentProviderSessionDescriptorPayload,
@@ -80,6 +81,7 @@ export interface ImportProviderSessionInput {
   agentManager: ImportSessionAgentManager;
   agentStorage: AgentStorage;
   logger: Logger;
+  ownership?: EnterpriseResourceOwner;
 }
 
 export interface ImportProviderSessionResult {
@@ -192,7 +194,7 @@ export async function importProviderSession(
   const key = await resolveProviderSessionImportMutationKey(input);
   return serializeProviderSessionImport(input.agentManager, key, async () => {
     const placement = await input.workspaceProvisioning.runInImportWorkspace(
-      { cwd, requestedWorkspaceId: input.request.workspaceId },
+      { cwd, requestedWorkspaceId: input.request.workspaceId, ownership: input.ownership },
       (workspace) => importProviderSessionNow(input, cwd, workspace.workspaceId),
     );
     return { ...placement.value, createdWorkspace: placement.createdWorkspace };

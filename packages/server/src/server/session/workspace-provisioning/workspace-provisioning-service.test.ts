@@ -29,6 +29,12 @@ import {
 
 const logger = createTestLogger();
 const ARCHIVED_AT = "2026-01-01T00:00:00.000Z";
+const enterpriseOwnership = {
+  organizationId: "org_0123456789abcdef",
+  nodeId: "nod_0123456789abcdef",
+  ownerPrincipalId: "usr_0123456789abcdef",
+  createdByPrincipalId: "usr_0123456789abcdef",
+} as const;
 const directorySymlinkType = process.platform === "win32" ? "junction" : "dir";
 
 let tmpDir: string;
@@ -504,6 +510,55 @@ test("directory creation persists the live branch and a trimmed title", async ()
   gitRoots.add(repo);
   const workspace = await provisioning.createWorkspaceForDirectory(repo, "  Focused work  ");
   expect(workspace).toMatchObject({ branch: "main", title: "Focused work" });
+});
+
+test("enterprise directory creation persists the complete owner envelope on every new path", async () => {
+  const direct = await provisioning.createWorkspaceForDirectory(
+    path.join(tmpDir, "enterprise-direct"),
+    "Direct",
+    undefined,
+    { ownership: enterpriseOwnership },
+  );
+  const discovered = await provisioning.findOrCreateWorkspaceForDirectory(
+    path.join(tmpDir, "enterprise-discovered"),
+    { ownership: enterpriseOwnership },
+  );
+  const agentWorkspaceId = await provisioning.resolveOrCreateWorkspaceIdForCreateAgent({
+    createdWorktree: null,
+    cwd: path.join(tmpDir, "enterprise-agent"),
+    initialTitle: "Agent",
+    ownership: enterpriseOwnership,
+  });
+  const agentWorkspace = await workspaceRegistry.get(agentWorkspaceId);
+
+  for (const workspace of [direct, discovered, agentWorkspace]) {
+    expect(workspace).toMatchObject({
+      ...enterpriseOwnership,
+      ownershipRevision: "0",
+    });
+  }
+});
+
+test("enterprise worktree creation persists the complete owner envelope", async () => {
+  const repo = path.join(tmpDir, "enterprise-worktree-repo");
+  const worktree = path.join(tmpDir, "enterprise-worktree");
+  gitRoots.add(repo);
+  gitRoots.add(worktree);
+  const workspace = await provisioning.createWorkspaceForWorktree({
+    sourceCwd: repo,
+    repoRoot: repo,
+    cwd: worktree,
+    worktreeRoot: worktree,
+    branch: "feature/enterprise",
+    baseBranch: "main",
+    title: "Enterprise worktree",
+    ownership: enterpriseOwnership,
+  });
+
+  expect(workspace).toMatchObject({
+    ...enterpriseOwnership,
+    ownershipRevision: "0",
+  });
 });
 
 test("createWorkspaceForDirectory honors an explicit active project without cwd containment", async () => {
