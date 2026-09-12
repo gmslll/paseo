@@ -24,6 +24,12 @@ import {
   createEnterpriseUiBundle,
   type EnterpriseContentReaders,
 } from "@/screens/enterprise/enterprise-ui-port";
+import { createGrantEditorFormModel } from "@/screens/enterprise/forms/grant-editor-form-model";
+import { createBrowserBindingFormModel } from "@/screens/enterprise/forms/browser-binding-form-model";
+import type {
+  EnterpriseBrowserBindingFactory,
+  EnterpriseGrantEditorFactory,
+} from "@/screens/enterprise/enterprise-admin-controls";
 
 const unavailableContentReaders: EnterpriseContentReaders<string, never> = {
   workspace: async () => Promise.reject(new Error("enterprise.content.unavailable")),
@@ -75,6 +81,45 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   ]);
 
   const bundle = useMemo(() => (models ? createEnterpriseUiBundle(models) : null), [models]);
+  const isCurrentGeneration = useCallback(
+    (generation: string) => {
+      const snapshot = lifecycle?.readSnapshot();
+      return snapshot?.state === "signed_in" && String(snapshot.generation) === generation;
+    },
+    [lifecycle],
+  );
+  const createGrantEditor = useCallback<EnterpriseGrantEditorFactory<string>>(
+    (principalId) => {
+      const snapshot = lifecycle?.readSnapshot();
+      if (!bundle || !snapshot || snapshot.state !== "signed_in" || !snapshot.generation) {
+        throw new Error("identity.generation_changed");
+      }
+      return createGrantEditorFormModel({
+        principalId,
+        sessionGeneration: String(snapshot.generation),
+        port: bundle.grantPort,
+        isCurrentSessionGeneration: isCurrentGeneration,
+      });
+    },
+    [bundle, isCurrentGeneration, lifecycle],
+  );
+  const createBrowserBinding = useCallback<EnterpriseBrowserBindingFactory<string>>(
+    (workspace) => {
+      const snapshot = lifecycle?.readSnapshot();
+      if (!bundle || !snapshot || snapshot.state !== "signed_in" || !snapshot.generation) {
+        throw new Error("identity.generation_changed");
+      }
+      return createBrowserBindingFormModel({
+        workspaceId: workspace.workspaceId,
+        organizationId: workspace.organizationId,
+        nodeId: workspace.nodeId,
+        sessionGeneration: String(snapshot.generation),
+        port: bundle.browserPort,
+        isCurrentSessionGeneration: isCurrentGeneration,
+      });
+    },
+    [bundle, isCurrentGeneration, lifecycle],
+  );
   const authenticatePat = useCallback(
     (token: string, signal: AbortSignal) => {
       if (!bundle) {
@@ -170,6 +215,9 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
       capability={capability}
       patModel={patModel}
       bossStore={bossStore}
+      principalPort={bundle.principalPort}
+      createGrantEditor={createGrantEditor}
+      createBrowserBinding={createBrowserBinding}
       legacyContent={null}
       browserProfilesEnabled={browserProfilesEnabled}
       hydrateBrowserProfileAuthorizations={hydrateBrowserProfileAuthorizations}

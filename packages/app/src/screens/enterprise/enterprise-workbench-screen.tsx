@@ -21,6 +21,12 @@ import type { PatLoginFormModel } from "@/stores/enterprise/pat-login-form-model
 import type { BrowserBindingFormModel } from "./forms/browser-binding-form-model";
 import type { GrantEditorFormModel } from "./forms/grant-editor-form-model";
 import type { EnterpriseUiPort } from "./enterprise-ui-port";
+import type { EnterprisePrincipalDirectoryPort } from "./enterprise-ui-port";
+import {
+  EnterpriseAdminControls,
+  type EnterpriseBrowserBindingFactory,
+  type EnterpriseGrantEditorFactory,
+} from "./enterprise-admin-controls";
 import {
   createEnterpriseUiBundle,
   type EnterpriseBrowserAuthorizationHydrator,
@@ -48,6 +54,9 @@ export interface EnterpriseWorkbenchScreenProps<TGeneration extends string, TCon
   readonly uiPort: EnterpriseUiPort<TGeneration>;
   readonly grantEditor?: GrantEditorFormModel<TGeneration>;
   readonly browserBinding?: BrowserBindingFormModel<TGeneration>;
+  readonly principalPort?: EnterprisePrincipalDirectoryPort<TGeneration>;
+  readonly createGrantEditor?: EnterpriseGrantEditorFactory<TGeneration>;
+  readonly createBrowserBinding?: EnterpriseBrowserBindingFactory<TGeneration>;
   readonly legacyContent: ReactNode;
   readonly renderContent?: (content: TContent) => ReactNode;
   readonly onNavigate?: (destination: string) => void;
@@ -463,6 +472,9 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
   uiPort,
   grantEditor,
   browserBinding,
+  principalPort,
+  createGrantEditor,
+  createBrowserBinding,
   legacyContent,
   renderContent,
   onNavigate,
@@ -520,10 +532,17 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
     normalizedCapability.enterpriseResourceAuthorizationV1 &&
     (policy.allowedOperations.includes("access.grants.view") ||
       policy.allowedOperations.includes("access.grants.manage"));
+  const canManageGrants =
+    normalizedCapability.enterpriseResourceAuthorizationV1 &&
+    policy.allowedOperations.includes("access.grants.manage");
+  const canViewPrincipals = policy.allowedOperations.includes("identity.principals.view");
   const canViewProfiles =
     normalizedCapability.enterpriseBrowserProfilesV1 &&
     (policy.allowedOperations.includes("browser.profiles.view") ||
       policy.allowedOperations.includes("browser.profiles.bind"));
+  const canBindProfiles =
+    normalizedCapability.enterpriseBrowserProfilesV1 &&
+    policy.allowedOperations.includes("browser.profiles.bind");
   const canLogoutAll = policy.allowedOperations.includes("identity.logout_all");
   const clearSensitiveState = () => {
     bossStore.clearSensitiveState();
@@ -535,6 +554,39 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
     grantEditor?.refreshScope(generation);
     browserBinding?.refreshScope(generation);
   };
+  let administration: ReactNode = null;
+  if (
+    principalPort &&
+    (createGrantEditor || createBrowserBinding) &&
+    (canViewGrants || canViewProfiles)
+  ) {
+    administration = (
+      <EnterpriseAdminControls
+        principalPort={principalPort}
+        bossStore={bossStore}
+        generation={generation}
+        currentPrincipalId={identity.projection.principalId}
+        organizationId={identity.projection.organizationId}
+        createGrantEditor={canViewGrants ? createGrantEditor : undefined}
+        createBrowserBinding={canViewProfiles ? createBrowserBinding : undefined}
+        canViewPrincipals={canViewPrincipals}
+        canViewGrants={canViewGrants}
+        canManageGrants={canManageGrants}
+        canViewProfiles={canViewProfiles}
+        canBindProfiles={canBindProfiles}
+        createRequestId={createRequestId}
+      />
+    );
+  } else if (canViewGrants || canViewProfiles) {
+    administration = (
+      <AdminProjectionPanel
+        grantEditor={canViewGrants ? grantEditor : undefined}
+        browserBinding={canViewProfiles ? browserBinding : undefined}
+        generation={generation}
+        createRequestId={createRequestId}
+      />
+    );
+  }
   return (
     <View style={styles.container} testID="enterprise-workbench-screen">
       <EnterpriseIdentityNavigation projection={identity.projection} onNavigate={onNavigate} />
@@ -548,14 +600,7 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
           renderContent={renderContent}
         />
       ) : null}
-      {canViewGrants || canViewProfiles ? (
-        <AdminProjectionPanel
-          grantEditor={canViewGrants ? grantEditor : undefined}
-          browserBinding={canViewProfiles ? browserBinding : undefined}
-          generation={generation}
-          createRequestId={createRequestId}
-        />
-      ) : null}
+      {administration}
       <Button
         variant="ghost"
         onPress={() => {

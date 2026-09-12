@@ -41,6 +41,16 @@ export interface EnterpriseUiPort<TSessionGeneration extends string> {
   refreshScope(sessionGeneration: TSessionGeneration): Promise<void>;
 }
 
+export interface EnterprisePrincipalDirectoryPortInput<TGeneration extends string> {
+  readonly requestId: string;
+  readonly sessionGeneration: TGeneration;
+  readonly signal: AbortSignal;
+}
+
+export interface EnterprisePrincipalDirectoryPort<TGeneration extends string> {
+  listPrincipals(input: EnterprisePrincipalDirectoryPortInput<TGeneration>): Promise<unknown>;
+}
+
 export interface EnterpriseContentReaders<TGeneration extends string, TContent> {
   readonly workspace: (
     input: BossResourceContentReadInput<TGeneration>,
@@ -60,6 +70,7 @@ export interface EnterpriseContentReaders<TGeneration extends string, TContent> 
 export interface EnterpriseUiBundle<TGeneration extends string, TContent> {
   readonly lifecycle: EnterpriseIdentityLifecycle;
   readonly uiPort: EnterpriseUiPort<TGeneration>;
+  readonly principalPort: EnterprisePrincipalDirectoryPort<TGeneration>;
   readonly resourcePort: BossResourceStorePort<TGeneration>;
   readonly grantPort: GrantEditorPort<TGeneration>;
   readonly browserPort: BrowserBindingFormPort<TGeneration>;
@@ -253,6 +264,20 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
     readAppSlotContent: contentReaders.appSlot,
   };
 
+  const principalPort: EnterprisePrincipalDirectoryPort<TGeneration> = {
+    listPrincipals: ({ requestId, sessionGeneration, signal }) => {
+      if (!generationMatches(lifecycle, sessionGeneration))
+        return Promise.reject(new Error("identity.generation_changed"));
+      return request(
+        "enterprise.identity.list_principals.request",
+        { requestId },
+        requestId,
+        signal,
+        sessionGeneration,
+      );
+    },
+  };
+
   const grantPort: GrantEditorPort<TGeneration> = {
     listGrants: ({ requestId, principalId, sessionGeneration, signal }) => {
       if (!generationMatches(lifecycle, sessionGeneration))
@@ -362,6 +387,7 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
   return Object.freeze({
     lifecycle,
     uiPort,
+    principalPort,
     resourcePort,
     grantPort,
     browserPort,

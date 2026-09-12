@@ -142,6 +142,15 @@ describe("createEnterpriseUiBundle", () => {
       type: "enterprise.organization.list_resources.request",
       payload: { requestId: "request-1" },
     });
+    await bundle.principalPort.listPrincipals({
+      requestId: "request-principals",
+      sessionGeneration: generation,
+      signal: new AbortController().signal,
+    });
+    expect(requests[1]).toEqual({
+      type: "enterprise.identity.list_principals.request",
+      payload: { requestId: "request-principals" },
+    });
     await expect(bundle.uiPort.refreshScope(generation)).rejects.toThrow(
       "identity.invalid_response",
     );

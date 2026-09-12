@@ -16,7 +16,7 @@ const { theme } = vi.hoisted(() => ({
       foreground: "#fff",
       foregroundMuted: "#aaa",
       surface2: "#222",
-      palette: { red: { 300: "#f66" } },
+      palette: { red: { 300: "#f66" }, green: { 400: "#4ade80" } },
     },
   },
 }));
@@ -25,6 +25,8 @@ vi.mock("react-native-unistyles", () => ({
   StyleSheet: {
     create: (factory: unknown) => (typeof factory === "function" ? factory(theme) : factory),
   },
+  withUnistyles: (component: unknown) => component,
+  useUnistyles: () => ({ theme }),
 }));
 
 vi.mock("@/components/ui/button", () => ({
@@ -48,6 +50,12 @@ vi.mock("@/components/ui/button", () => ({
 }));
 vi.mock("@/components/ui/status-badge", () => ({
   StatusBadge: ({ label }: { label: string }) => <span>{label}</span>,
+}));
+vi.mock("@/components/ui/select-field", () => ({
+  SelectField: () => null,
+}));
+vi.mock("@/components/ui/switch", () => ({
+  Switch: () => null,
 }));
 vi.mock("@/components/enterprise/enterprise-identity-ui", () => ({
   EnterpriseIdentityNavigation: ({
