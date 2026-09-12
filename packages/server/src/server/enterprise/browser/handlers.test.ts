@@ -1,0 +1,1758 @@
+import { describe, expect, test } from "vitest";
+import type {
+  AuthorizedAgent,
+  AuthorizedBrowserProfile,
+  AuthorizedWorkspace,
+  BrowserProfileBinding,
+  BrowserProfileRecord,
+  EnterpriseAction,
+  FencedLease,
+  PrincipalContext,
+  SessionInboundMessage,
+  SessionOutboundMessage,
+} from "@getpaseo/protocol/messages";
+import {
+  createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseAgentContextHandle,
+  type EnterpriseSessionContext,
+} from "../../session/enterprise-agent-session-context-registry.js";
+import {
+  EnterpriseBrowserLeaseHandler,
+  type EnterpriseBrowserLeaseAuthorityPort,
+  type EnterpriseBrowserLeasePort,
+  type EnterpriseBrowserProfileBindingPort,
+  type EnterpriseBrowserProfileReadPort,
+} from "./handlers.js";
+import { isStableBrowserProfileBinding } from "./factory.js";
+import {
+  ENTERPRISE_BROWSER_LEASE_OPERATIONS,
+  createEnterpriseBrowserLeaseDispatcherRegistration,
+  createEnterpriseBrowserLeaseSessionRuntime,
+} from "./factory.js";
+import type { BrowserProfileLeaseAuthorization } from "./lease-manager.js";
+
+const ORGANIZATION_ID = "org_1111111111111111";
+const FOREIGN_ORGANIZATION_ID = "org_2222222222222222";
+const NODE_ID = "nod_1111111111111111";
+const PRINCIPAL_ID = "usr_1111111111111111";
+const FOREIGN_PRINCIPAL_ID = "usr_2222222222222222";
+const WORKSPACE_ID = "workspace-1";
+const AGENT_ID = "agent-1";
+const PROFILE_ID = "brp_1111111111111111";
+const FOREIGN_PROFILE_ID = "brp_2222222222222222";
+
+function principal(): PrincipalContext {
+  return {
+    organizationId: ORGANIZATION_ID,
+    principalType: "human",
+    principalId: PRINCIPAL_ID,
+    grants: [],
+    credentialId: "credential-1",
+    grantVersion: "grant-version-1",
+  };
+}
+
+function sessionContext(
+  overrides: {
+    organizationId?: string;
+    principalId?: string;
+    nodeId?: string;
+    generation?: string;
+  } = {},
+): EnterpriseSessionContext {
+  return {
+    principal: {
+      ...principal(),
+      organizationId: overrides.organizationId ?? ORGANIZATION_ID,
+      principalId: overrides.principalId ?? PRINCIPAL_ID,
+    },
+    node: {
+      nodeId: overrides.nodeId ?? NODE_ID,
+      paseoServerId: "server-1",
+      mode: "managed",
+    },
+    sessionBindingGeneration: overrides.generation ?? "session-generation-1",
+  };
+}
+
+function workspace(overrides: Partial<AuthorizedWorkspace> = {}): AuthorizedWorkspace {
+  return {
+    organizationId: ORGANIZATION_ID,
+    nodeId: NODE_ID,
+    ownerPrincipalId: PRINCIPAL_ID,
+    createdByPrincipalId: PRINCIPAL_ID,
+    workspaceId: WORKSPACE_ID,
+    ...overrides,
+  };
+}
+
+function agent(overrides: Partial<AuthorizedAgent> = {}): AuthorizedAgent {
+  return {
+    ...workspace(),
+    agentId: AGENT_ID,
+    workspaceId: WORKSPACE_ID,
+    ...overrides,
+  };
+}
+
+function profile(overrides: Partial<BrowserProfileRecord> = {}): AuthorizedBrowserProfile {
+  return {
+    browserProfileId: PROFILE_ID,
+    organizationId: ORGANIZATION_ID,
+    homeNodeId: NODE_ID,
+    businessIdentityId: "bid_1111111111111111",
+    ownerPrincipalId: PRINCIPAL_ID,
+    platform: "generic",
+    businessAccountKey: "opaque-account",
+    label: "Authorized profile",
+    partitionKey: `persist:paseo-enterprise-${PROFILE_ID}`,
+    downloadRoot: `/profiles/${PROFILE_ID}/downloads`,
+    credentialRef: "keychain-profile-1",
+    status: "ready",
+    createdAt: "2026-09-10T00:00:00.000Z",
+    updatedAt: "2026-09-10T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function binding(overrides: Partial<BrowserProfileBinding> = {}): BrowserProfileBinding {
+  return {
+    organizationId: ORGANIZATION_ID,
+    nodeId: NODE_ID,
+    workspaceId: WORKSPACE_ID,
+    browserProfileId: PROFILE_ID,
+    boundByPrincipalId: PRINCIPAL_ID,
+    boundAt: "2026-09-10T01:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function lease(overrides: Partial<FencedLease> = {}): FencedLease {
+  return {
+    organizationId: ORGANIZATION_ID,
+    nodeId: NODE_ID,
+    businessIdentityId: "bid_1111111111111111",
+    resourceKind: "browser_profile",
+    resourceId: PROFILE_ID,
+    leaseId: "lea_11111111-1111-1111-1111-111111111111",
+    holderPrincipalId: PRINCIPAL_ID,
+    holderAgentId: AGENT_ID,
+    fencingToken: 1,
+    mode: "write",
+    acquiredAt: "2026-09-10T01:00:00.000Z",
+    heartbeatAt: "2026-09-10T01:00:00.000Z",
+    expiresAt: "2026-09-10T01:01:00.000Z",
+    leaseRevision: "1",
+    ...overrides,
+  };
+}
+
+class MemoryProfiles implements EnterpriseBrowserProfileReadPort {
+  public listCalls = 0;
+  public getCalls = 0;
+
+  public constructor(public records: BrowserProfileRecord[]) {}
+
+  public async list(): Promise<BrowserProfileRecord[]> {
+    this.listCalls++;
+    return structuredClone(this.records);
+  }
+
+  public async get(browserProfileId: string): Promise<BrowserProfileRecord | null> {
+    this.getCalls++;
+    return structuredClone(
+      this.records.find((record) => record.browserProfileId === browserProfileId) ?? null,
+    );
+  }
+}
+
+class MemoryBindings implements EnterpriseBrowserProfileBindingPort {
+  public readonly bound: BrowserProfileBinding[] = [];
+  public listCalls = 0;
+
+  public constructor(public records: BrowserProfileBinding[]) {}
+
+  public async list(): Promise<BrowserProfileBinding[]> {
+    this.listCalls++;
+    return structuredClone(this.records);
+  }
+
+  public async bind(input: {
+    workspace: AuthorizedWorkspace;
+    profile: AuthorizedBrowserProfile;
+    actor: PrincipalContext;
+  }): Promise<BrowserProfileBinding> {
+    const next = binding({
+      organizationId: input.workspace.organizationId,
+      nodeId: input.workspace.nodeId,
+      workspaceId: input.workspace.workspaceId,
+      browserProfileId: input.profile.browserProfileId,
+      boundByPrincipalId: input.actor.principalId,
+    });
+    this.bound.push(next);
+    this.records = [next];
+    return structuredClone(next);
+  }
+}
+
+class MemoryLeases implements EnterpriseBrowserLeasePort {
+  public readonly acquired: Parameters<EnterpriseBrowserLeasePort["acquire"]>[0][] = [];
+  public readonly renewed: Parameters<EnterpriseBrowserLeasePort["renew"]>[0][] = [];
+  public readonly released: Parameters<EnterpriseBrowserLeasePort["releaseLease"]>[0][] = [];
+  public current = lease();
+  public onAcquire: (() => void) | null = null;
+  public onRelease: (() => void) | null = null;
+
+  public async acquire(
+    input: Parameters<EnterpriseBrowserLeasePort["acquire"]>[0],
+  ): Promise<FencedLease> {
+    this.acquired.push(input);
+    this.onAcquire?.();
+    return structuredClone(this.current);
+  }
+
+  public async renew(
+    input: Parameters<EnterpriseBrowserLeasePort["renew"]>[0],
+  ): Promise<FencedLease> {
+    this.renewed.push(input);
+    this.current = lease({ leaseRevision: "2" });
+    return structuredClone(this.current);
+  }
+
+  public async releaseLease(
+    input: Parameters<EnterpriseBrowserLeasePort["releaseLease"]>[0],
+  ): Promise<void> {
+    this.onRelease?.();
+    this.released.push(input);
+  }
+}
+
+class MemoryAuthority implements EnterpriseBrowserLeaseAuthorityPort {
+  public readonly registry = createEnterpriseAgentSessionContextRegistry();
+  public readonly handle: EnterpriseAgentContextHandle;
+  public workspaceRecord = workspace();
+  public profileRecord = profile();
+  public resolvedHandle: EnterpriseAgentContextHandle | null;
+  public workspaceAvailable = true;
+  public profileAvailable = true;
+  public leaseAuthorizationAvailable = true;
+  public resolveLeaseAuthorizationCalls = 0;
+  public readonly releasedHandles: EnterpriseAgentContextHandle[] = [];
+  public bindingRevision = "binding-revision-1";
+
+  public constructor() {
+    this.handle = this.registry.bind({ agentId: AGENT_ID, context: sessionContext() });
+    this.resolvedHandle = this.handle;
+  }
+
+  public async assertWorkspace(
+    context: PrincipalContext,
+    _action: EnterpriseAction,
+    workspaceId: string,
+  ): Promise<AuthorizedWorkspace> {
+    if (
+      !this.workspaceAvailable ||
+      context.organizationId !== ORGANIZATION_ID ||
+      context.principalId !== PRINCIPAL_ID ||
+      workspaceId !== this.workspaceRecord.workspaceId
+    ) {
+      throw new Error("Resource unavailable");
+    }
+    return structuredClone(this.workspaceRecord);
+  }
+
+  public async assertBrowserProfile(
+    context: PrincipalContext,
+    _action: EnterpriseAction,
+    browserProfileId: string,
+  ): Promise<AuthorizedBrowserProfile> {
+    if (
+      !this.profileAvailable ||
+      context.organizationId !== ORGANIZATION_ID ||
+      context.principalId !== PRINCIPAL_ID ||
+      browserProfileId !== this.profileRecord.browserProfileId
+    ) {
+      throw new Error("Resource unavailable");
+    }
+    return structuredClone(this.profileRecord);
+  }
+
+  public resolveAgentHandle(input: {
+    sessionContext: EnterpriseSessionContext;
+    agentId: string;
+  }): EnterpriseAgentContextHandle | null {
+    if (
+      input.agentId !== AGENT_ID ||
+      input.sessionContext.sessionBindingGeneration !== this.handle.context.sessionBindingGeneration
+    ) {
+      return null;
+    }
+    return this.resolvedHandle;
+  }
+
+  public releaseAgentHandle(handle: EnterpriseAgentContextHandle): void {
+    this.releasedHandles.push(handle);
+    if (this.registry.resolve(handle.agentId) !== handle) return;
+    this.registry.release({
+      agentId: handle.agentId,
+      sessionBindingGeneration: handle.context.sessionBindingGeneration,
+    });
+  }
+
+  public isCurrentHandle(handle: EnterpriseAgentContextHandle): boolean {
+    return this.registry.isCurrentHandle(handle);
+  }
+
+  public resolveLeaseAuthorization(
+    handle: EnterpriseAgentContextHandle,
+  ): BrowserProfileLeaseAuthorization {
+    this.resolveLeaseAuthorizationCalls++;
+    if (!this.leaseAuthorizationAvailable) throw new Error("Resource unavailable");
+    return {
+      workspace: structuredClone(this.workspaceRecord),
+      agent: agent({ agentId: handle.agentId }),
+      profile: structuredClone(this.profileRecord),
+      bindingRevision: this.bindingRevision,
+    };
+  }
+}
+
+function createHandler(
+  input: {
+    profiles?: MemoryProfiles;
+    bindings?: MemoryBindings;
+    leases?: MemoryLeases;
+    authority?: MemoryAuthority;
+    isCurrentSession?: NonNullable<
+      ConstructorParameters<typeof EnterpriseBrowserLeaseHandler>[0]["isCurrentSession"]
+    >;
+  } = {},
+): {
+  handler: EnterpriseBrowserLeaseHandler;
+  profiles: MemoryProfiles;
+  bindings: MemoryBindings;
+  leases: MemoryLeases;
+  authority: MemoryAuthority;
+} {
+  const profiles = input.profiles ?? new MemoryProfiles([profile()]);
+  const bindings = input.bindings ?? new MemoryBindings([binding()]);
+  const leases = input.leases ?? new MemoryLeases();
+  const authority = input.authority ?? new MemoryAuthority();
+  return {
+    handler: new EnterpriseBrowserLeaseHandler({
+      profiles,
+      bindings,
+      leases,
+      authority,
+      leaseTtlMs: 60_000,
+      isCurrentSession: input.isCurrentSession,
+    }),
+    profiles,
+    bindings,
+    leases,
+    authority,
+  };
+}
+
+function dispatchContext(context: EnterpriseSessionContext = sessionContext()) {
+  return {
+    sessionId: "session-1",
+    clientId: "client-1",
+    credentialId: context.principal.credentialId,
+    sessionBindingGeneration: context.sessionBindingGeneration,
+    enterpriseContext: context,
+  };
+}
+
+type LeaseOperation = "acquire" | "renew" | "release";
+
+function leaseResourceRefs() {
+  return [
+    {
+      organizationId: ORGANIZATION_ID,
+      nodeId: NODE_ID,
+      resourceKind: "workspace" as const,
+      localResourceId: WORKSPACE_ID,
+    },
+    {
+      organizationId: ORGANIZATION_ID,
+      nodeId: NODE_ID,
+      resourceKind: "agent" as const,
+      localResourceId: AGENT_ID,
+    },
+    {
+      organizationId: ORGANIZATION_ID,
+      nodeId: NODE_ID,
+      resourceKind: "browser_profile" as const,
+      localResourceId: PROFILE_ID,
+    },
+  ];
+}
+
+function leaseReceipt(response: SessionOutboundMessage) {
+  return {
+    response,
+    receiptClassification: "resources",
+    authorizationContext: { kind: "resources", resources: leaseResourceRefs() },
+  };
+}
+
+async function issueLeaseOperation(
+  operation: LeaseOperation,
+  requestSuffix: string,
+  input: Parameters<typeof createHandler>[0] = {},
+): Promise<{
+  handler: EnterpriseBrowserLeaseHandler;
+  leases: MemoryLeases;
+  authority: MemoryAuthority;
+  context: ReturnType<typeof dispatchContext>;
+  message: SessionInboundMessage;
+  response: SessionOutboundMessage;
+}> {
+  const created = createHandler(input);
+  const context = dispatchContext();
+  const acquireMessage = {
+    type: "enterprise.resource.acquire_lease.request" as const,
+    requestId: `request-acquire-${requestSuffix}`,
+    workspaceId: WORKSPACE_ID,
+    agentId: AGENT_ID,
+    resourceKind: "browser_profile" as const,
+    mode: "write" as const,
+  };
+  const acquireResponse = await created.handler.handle({
+    sessionContext: context,
+    message: acquireMessage,
+  });
+  if (acquireResponse === false) throw new Error("expected acquire response");
+  if (operation === "acquire") {
+    return { ...created, context, message: acquireMessage, response: acquireResponse };
+  }
+  if (
+    !created.handler.consumeResponse({
+      sessionContext: context,
+      message: acquireMessage,
+      response: acquireResponse,
+    })
+  ) {
+    throw new Error("expected acquire receipt");
+  }
+  const message: SessionInboundMessage =
+    operation === "renew"
+      ? {
+          type: "enterprise.resource.renew_lease.request",
+          requestId: `request-renew-${requestSuffix}`,
+          leaseId: lease().leaseId,
+          fencingToken: lease().fencingToken,
+        }
+      : {
+          type: "enterprise.resource.release_lease.request",
+          requestId: `request-release-${requestSuffix}`,
+          leaseId: lease().leaseId,
+          fencingToken: lease().fencingToken,
+        };
+  const response = await created.handler.handle({ sessionContext: context, message });
+  if (response === false) throw new Error(`expected ${operation} response`);
+  return { ...created, context, message, response };
+}
+
+describe("EnterpriseBrowserLeaseHandler", () => {
+  test("classifies all Browser Profile and lease responses as resources", () => {
+    const { handler } = createHandler();
+    expect(handler.requestPolicyForType("enterprise.browser.list_profiles.request")).toBe(
+      "resources",
+    );
+    expect(handler.requestPolicyForType("enterprise.browser.bind_profile.request")).toBe(
+      "resources",
+    );
+    expect(handler.requestPolicyForType("enterprise.resource.acquire_lease.request")).toBe(
+      "resources",
+    );
+    expect(handler.requestPolicyForType("enterprise.resource.renew_lease.request")).toBe(
+      "resources",
+    );
+    expect(handler.requestPolicyForType("enterprise.resource.release_lease.request")).toBe(
+      "resources",
+    );
+  });
+
+  test("rejects deferred A to B rebinding after authorization await", async () => {
+    const first = {
+      organizationId: "org-a",
+      nodeId: "node-a",
+      workspaceId: "ws",
+      browserProfileId: "profile-a",
+      boundAt: "a",
+    };
+    const second = { ...first, browserProfileId: "profile-b", boundAt: "b" };
+    let current = first;
+    const duringAuthorization = Promise.resolve().then(() => {
+      current = second;
+      return undefined;
+    });
+    await duringAuthorization;
+    expect(isStableBrowserProfileBinding(first, current)).toBe(false);
+  });
+  test("lists only canonical profiles and binding projections for the authorized Workspace", async () => {
+    const profiles = new MemoryProfiles([
+      profile(),
+      profile({
+        browserProfileId: FOREIGN_PROFILE_ID,
+        organizationId: FOREIGN_ORGANIZATION_ID,
+        ownerPrincipalId: FOREIGN_PRINCIPAL_ID,
+        businessIdentityId: "bid_2222222222222222",
+      }),
+    ]);
+    const bindings = new MemoryBindings([
+      binding(),
+      binding({
+        organizationId: FOREIGN_ORGANIZATION_ID,
+        browserProfileId: FOREIGN_PROFILE_ID,
+      }),
+    ]);
+    const { handler } = createHandler({ profiles, bindings });
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.browser.list_profiles.request",
+          requestId: "request-list",
+          workspaceId: WORKSPACE_ID,
+        },
+      }),
+    ).resolves.toEqual({
+      type: "enterprise.browser.list_profiles.response",
+      payload: {
+        requestId: "request-list",
+        profiles: [
+          {
+            browserProfileId: PROFILE_ID,
+            organizationId: ORGANIZATION_ID,
+            homeNodeId: NODE_ID,
+            ownerPrincipalId: PRINCIPAL_ID,
+            platform: "generic",
+            label: "Authorized profile",
+            status: "ready",
+          },
+        ],
+        bindings: [
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            workspaceId: WORKSPACE_ID,
+            browserProfileId: PROFILE_ID,
+            boundAt: "2026-09-10T01:00:00.000Z",
+          },
+        ],
+      },
+    });
+  });
+
+  test("lists a manage-only profile while content permissions remain separate", async () => {
+    const authority = new MemoryAuthority();
+    const original = authority.assertBrowserProfile.bind(authority);
+    authority.assertBrowserProfile = async (context, action, profileId) => {
+      if (action === "browser.use") throw new Error("use denied");
+      return original(context, action, profileId);
+    };
+    const { handler } = createHandler({ authority });
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-manage-only-list",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    expect(response).toMatchObject({ type: "enterprise.browser.list_profiles.response" });
+    if (response === false) throw new Error("expected list response");
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toEqual({
+      response,
+      receiptClassification: "resources",
+      authorizationContext: {
+        kind: "resources",
+        resources: [
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "workspace",
+            localResourceId: WORKSPACE_ID,
+          },
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "browser_profile",
+            localResourceId: PROFILE_ID,
+          },
+        ],
+      },
+    });
+  });
+
+  test("accepts only the exact list response once and burns an identity mismatch", async () => {
+    const { handler } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-list-exact",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message,
+        response: structuredClone(response),
+      }),
+    ).toBeNull();
+    expect(
+      handler.consumeResponse({ sessionContext: context, message, response })
+        ?.receiptClassification,
+    ).toBe("resources");
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+
+    const nextMessage = { ...message, requestId: "request-list-cloned-message" };
+    const nextResponse = await handler.handle({ sessionContext: context, message: nextMessage });
+    if (nextResponse === false) throw new Error("expected next list response");
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message: { ...nextMessage },
+        response: nextResponse,
+      }),
+    ).toBeNull();
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message: nextMessage,
+        response: nextResponse,
+      }),
+    ).toBeNull();
+
+    const finalMessage = { ...message, requestId: "request-list-cloned-context" };
+    const finalResponse = await handler.handle({ sessionContext: context, message: finalMessage });
+    if (finalResponse === false) throw new Error("expected final list response");
+    expect(
+      handler.consumeResponse({
+        sessionContext: { ...context },
+        message: finalMessage,
+        response: finalResponse,
+      }),
+    ).toBeNull();
+    expect(
+      handler.consumeResponse({
+        sessionContext: context,
+        message: finalMessage,
+        response: finalResponse,
+      }),
+    ).toBeNull();
+  });
+
+  test("burns a pending list response when runtime currentness is lost", async () => {
+    let current = true;
+    const { handler } = createHandler({ isCurrentSession: () => current });
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-list-stale",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+    current = false;
+
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+    current = true;
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+  });
+
+  test("clears pending list responses on close", async () => {
+    const { handler } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-list-close",
+      workspaceId: WORKSPACE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+
+    await handler.close();
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+  });
+
+  test("denies an unavailable Workspace before reading Profile registries", async () => {
+    const { handler, profiles, bindings } = createHandler();
+
+    const response = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.browser.list_profiles.request",
+        requestId: "request-foreign-workspace",
+        workspaceId: "foreign-workspace",
+      },
+    });
+
+    expect(profiles.listCalls).toBe(0);
+    expect(bindings.listCalls).toBe(0);
+    expect(response).toEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "request-foreign-workspace",
+        requestType: "enterprise.browser.list_profiles.request",
+        error: "Enterprise resource unavailable",
+        code: "access_denied",
+      },
+    });
+  });
+
+  test("binds an authorized Profile and omits binding actor authority from the response", async () => {
+    const { handler, bindings } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.browser.bind_profile.request" as const,
+      requestId: "request-bind",
+      workspaceId: WORKSPACE_ID,
+      browserProfileId: PROFILE_ID,
+    };
+    const response = await handler.handle({ sessionContext: context, message });
+
+    expect(response).toEqual({
+      type: "enterprise.browser.bind_profile.response",
+      payload: {
+        requestId: "request-bind",
+        binding: {
+          organizationId: ORGANIZATION_ID,
+          nodeId: NODE_ID,
+          workspaceId: WORKSPACE_ID,
+          browserProfileId: PROFILE_ID,
+          boundAt: "2026-09-10T01:00:00.000Z",
+        },
+      },
+    });
+    if (response === false) throw new Error("expected bind response");
+    expect(bindings.bound).toHaveLength(1);
+    const consumed = handler.consumeResponse({ sessionContext: context, message, response });
+    expect(consumed).toEqual({
+      response,
+      receiptClassification: "resources",
+      authorizationContext: {
+        kind: "resources",
+        resources: [
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "workspace",
+            localResourceId: WORKSPACE_ID,
+          },
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "browser_profile",
+            localResourceId: PROFILE_ID,
+          },
+        ],
+      },
+    });
+    expect(Object.isFrozen(response)).toBe(true);
+    expect(Object.isFrozen(consumed)).toBe(true);
+    expect(Object.isFrozen(consumed?.authorizationContext)).toBe(true);
+    expect(Object.isFrozen(consumed?.authorizationContext?.resources)).toBe(true);
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+  });
+
+  test("denies a foreign Profile without mutating bindings", async () => {
+    const { handler, bindings } = createHandler();
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.browser.bind_profile.request",
+          requestId: "request-bind-foreign",
+          workspaceId: WORKSPACE_ID,
+          browserProfileId: FOREIGN_PROFILE_ID,
+        },
+      }),
+    ).resolves.toEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "request-bind-foreign",
+        requestType: "enterprise.browser.bind_profile.request",
+        error: "Enterprise resource unavailable",
+        code: "access_denied",
+      },
+    });
+
+    expect(bindings.bound).toEqual([]);
+  });
+
+  test("acquires the server-resolved bound Browser Profile for the canonical Agent handle", async () => {
+    const { handler, leases, authority } = createHandler();
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.resource.acquire_lease.request" as const,
+      requestId: "request-acquire",
+      workspaceId: WORKSPACE_ID,
+      agentId: AGENT_ID,
+      resourceKind: "browser_profile" as const,
+      mode: "write" as const,
+    };
+
+    const response = await handler.handle({ sessionContext: context, message });
+    expect(response).toEqual({
+      type: "enterprise.resource.acquire_lease.response",
+      payload: { requestId: "request-acquire", lease: lease(), waiting: false },
+    });
+    if (response === false) throw new Error("expected acquire response");
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toEqual({
+      response,
+      receiptClassification: "resources",
+      authorizationContext: {
+        kind: "resources",
+        resources: [
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "workspace",
+            localResourceId: WORKSPACE_ID,
+          },
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "agent",
+            localResourceId: AGENT_ID,
+          },
+          {
+            organizationId: ORGANIZATION_ID,
+            nodeId: NODE_ID,
+            resourceKind: "browser_profile",
+            localResourceId: PROFILE_ID,
+          },
+        ],
+      },
+    });
+
+    expect(leases.acquired).toEqual([
+      {
+        handle: authority.handle,
+        resourceId: PROFILE_ID,
+        mode: "write",
+        ttlMs: 60_000,
+      },
+    ]);
+    expect(authority.releasedHandles).toEqual([]);
+  });
+
+  test("releases the resolved Agent handle when acquire authorization fails", async () => {
+    const authority = new MemoryAuthority();
+    authority.leaseAuthorizationAvailable = false;
+    const { handler, leases } = createHandler({ authority });
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.acquire_lease.request",
+          requestId: "request-acquire-authorization-failure",
+          workspaceId: WORKSPACE_ID,
+          agentId: AGENT_ID,
+          resourceKind: "browser_profile",
+          mode: "write",
+        },
+      }),
+    ).resolves.toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "request-acquire-authorization-failure", code: "access_denied" },
+    });
+
+    expect(leases.acquired).toEqual([]);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
+  });
+
+  test.each<LeaseOperation>(["acquire", "renew", "release"])(
+    "accepts only the exact %s response once while rejecting a response clone",
+    async (operation) => {
+      const issued = await issueLeaseOperation(operation, `${operation}-exact`);
+
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: structuredClone(issued.response),
+        }),
+      ).toBeNull();
+      const consumed = issued.handler.consumeResponse({
+        sessionContext: issued.context,
+        message: issued.message,
+        response: issued.response,
+      });
+      expect(consumed).toEqual(leaseReceipt(issued.response));
+      expect(Object.isFrozen(issued.response)).toBe(true);
+      expect(Object.isFrozen(consumed)).toBe(true);
+      expect(Object.isFrozen(consumed?.authorizationContext)).toBe(true);
+      expect(Object.isFrozen(consumed?.authorizationContext?.resources)).toBe(true);
+      for (const resource of consumed?.authorizationContext?.resources ?? []) {
+        expect(Object.isFrozen(resource)).toBe(true);
+      }
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: issued.response,
+        }),
+      ).toBeNull();
+      await issued.handler.close();
+    },
+  );
+
+  test.each<LeaseOperation>(["acquire", "renew", "release"])(
+    "burns the %s response on an exact context or message identity mismatch",
+    async (operation) => {
+      const contextMismatch = await issueLeaseOperation(operation, `${operation}-context`);
+      expect(
+        contextMismatch.handler.consumeResponse({
+          sessionContext: { ...contextMismatch.context },
+          message: contextMismatch.message,
+          response: contextMismatch.response,
+        }),
+      ).toBeNull();
+      expect(
+        contextMismatch.handler.consumeResponse({
+          sessionContext: contextMismatch.context,
+          message: contextMismatch.message,
+          response: contextMismatch.response,
+        }),
+      ).toBeNull();
+      await contextMismatch.handler.close();
+
+      const messageMismatch = await issueLeaseOperation(operation, `${operation}-message`);
+      expect(
+        messageMismatch.handler.consumeResponse({
+          sessionContext: messageMismatch.context,
+          message: structuredClone(messageMismatch.message),
+          response: messageMismatch.response,
+        }),
+      ).toBeNull();
+      expect(
+        messageMismatch.handler.consumeResponse({
+          sessionContext: messageMismatch.context,
+          message: messageMismatch.message,
+          response: messageMismatch.response,
+        }),
+      ).toBeNull();
+      await messageMismatch.handler.close();
+    },
+  );
+
+  test.each<LeaseOperation>(["acquire", "renew", "release"])(
+    "burns the %s response when its exact request no longer passes requestId validation",
+    async (operation) => {
+      const issued = await issueLeaseOperation(operation, `${operation}-request-id`);
+      const mutableMessage = issued.message as { requestId: string };
+      const requestId = mutableMessage.requestId;
+      mutableMessage.requestId = `${requestId}-changed`;
+
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: issued.response,
+        }),
+      ).toBeNull();
+      mutableMessage.requestId = requestId;
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: issued.response,
+        }),
+      ).toBeNull();
+      await issued.handler.close();
+    },
+  );
+
+  test.each<LeaseOperation>(["acquire", "renew", "release"])(
+    "burns the pending %s response when Session currentness is lost",
+    async (operation) => {
+      let current = true;
+      const issued = await issueLeaseOperation(operation, `${operation}-stale`, {
+        isCurrentSession: () => current,
+      });
+      current = false;
+
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: issued.response,
+        }),
+      ).toBeNull();
+      current = true;
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: issued.response,
+        }),
+      ).toBeNull();
+      await issued.handler.close();
+    },
+  );
+
+  test.each<LeaseOperation>(["acquire", "renew", "release"])(
+    "clears the pending %s response on close",
+    async (operation) => {
+      const issued = await issueLeaseOperation(operation, `${operation}-close`);
+      await issued.handler.close();
+
+      expect(
+        issued.handler.consumeResponse({
+          sessionContext: issued.context,
+          message: issued.message,
+          response: issued.response,
+        }),
+      ).toBeNull();
+    },
+  );
+
+  test("does not issue response sidecars for missing-handle or foreign lease denials", async () => {
+    const missingAuthority = new MemoryAuthority();
+    missingAuthority.resolvedHandle = null;
+    const missing = createHandler({ authority: missingAuthority });
+    const missingContext = dispatchContext();
+    const missingMessage = {
+      type: "enterprise.resource.acquire_lease.request" as const,
+      requestId: "request-acquire-missing-handle",
+      workspaceId: WORKSPACE_ID,
+      agentId: AGENT_ID,
+      resourceKind: "browser_profile" as const,
+      mode: "write" as const,
+    };
+    const missingResponse = await missing.handler.handle({
+      sessionContext: missingContext,
+      message: missingMessage,
+    });
+    expect(missingResponse).toMatchObject({ type: "rpc_error" });
+    if (missingResponse === false) throw new Error("expected missing-handle denial");
+    expect(
+      missing.handler.consumeResponse({
+        sessionContext: missingContext,
+        message: missingMessage,
+        response: missingResponse,
+      }),
+    ).toBeNull();
+
+    const foreign = createHandler();
+    const foreignContext = dispatchContext();
+    const foreignMessage = {
+      ...missingMessage,
+      requestId: "request-acquire-foreign",
+      workspaceId: "workspace-foreign",
+    };
+    const foreignResponse = await foreign.handler.handle({
+      sessionContext: foreignContext,
+      message: foreignMessage,
+    });
+    expect(foreignResponse).toMatchObject({ type: "rpc_error" });
+    if (foreignResponse === false) throw new Error("expected foreign denial");
+    expect(
+      foreign.handler.consumeResponse({
+        sessionContext: foreignContext,
+        message: foreignMessage,
+        response: foreignResponse,
+      }),
+    ).toBeNull();
+    expect(missing.leases.acquired).toEqual([]);
+    expect(foreign.leases.acquired).toEqual([]);
+    await missing.handler.close();
+    await foreign.handler.close();
+  });
+
+  test("denies forged Workspace and Agent tuples before acquiring a lease", async () => {
+    const { handler, leases } = createHandler();
+
+    const workspaceResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-forged-workspace",
+        workspaceId: "workspace-foreign",
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+    const agentResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-forged-agent",
+        workspaceId: WORKSPACE_ID,
+        agentId: "agent-foreign",
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+
+    expect(leases.acquired).toEqual([]);
+    expect([workspaceResponse, agentResponse]).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "request-forged-workspace",
+          requestType: "enterprise.resource.acquire_lease.request",
+          error: "Enterprise resource unavailable",
+          code: "access_denied",
+        },
+      },
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "request-forged-agent",
+          requestType: "enterprise.resource.acquire_lease.request",
+          error: "Enterprise resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test("rejects a structural fake handle before trusted authorization or lease calls", async () => {
+    const authority = new MemoryAuthority();
+    authority.resolvedHandle = {
+      agentId: AGENT_ID,
+      context: sessionContext(),
+      isCurrent: () => true,
+    } as unknown as EnterpriseAgentContextHandle;
+    const { handler, leases } = createHandler({ authority });
+
+    const response = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-fake-handle",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+
+    expect(authority.resolveLeaseAuthorizationCalls).toBe(0);
+    expect(leases.acquired).toEqual([]);
+    expect(response).toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "request-fake-handle", code: "access_denied" },
+    });
+  });
+
+  test("renews with the server-held lease and releases that renewed lease exactly once", async () => {
+    const { handler, leases, authority } = createHandler();
+    let authorizationCallsAtRelease = 0;
+    leases.onRelease = () => {
+      authorizationCallsAtRelease = authority.resolveLeaseAuthorizationCalls;
+    };
+    await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-acquire-lifecycle",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+    expect(authority.registry.resolve(AGENT_ID)).toBe(authority.handle);
+    expect(authority.releasedHandles).toEqual([]);
+    const renewResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.renew_lease.request",
+        requestId: "request-renew",
+        leaseId: lease().leaseId,
+        fencingToken: lease().fencingToken,
+      },
+    });
+    const releaseResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.release_lease.request",
+        requestId: "request-release",
+        leaseId: lease().leaseId,
+        fencingToken: lease().fencingToken,
+      },
+    });
+
+    expect(renewResponse).toEqual({
+      type: "enterprise.resource.renew_lease.response",
+      payload: { requestId: "request-renew", lease: lease({ leaseRevision: "2" }) },
+    });
+    expect(releaseResponse).toEqual({
+      type: "enterprise.resource.release_lease.response",
+      payload: { requestId: "request-release", released: true },
+    });
+    expect(leases.renewed).toEqual([{ handle: authority.handle, lease: lease(), ttlMs: 60_000 }]);
+    expect(leases.released).toEqual([
+      { handle: authority.handle, lease: lease({ leaseRevision: "2" }) },
+    ]);
+    expect(authorizationCallsAtRelease).toBe(4);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
+  });
+
+  test("denies release without current authorization and issues no response sidecar", async () => {
+    const { handler, leases, authority } = createHandler();
+    await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-acquire-before-revoke",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+    authority.workspaceAvailable = false;
+    authority.profileAvailable = false;
+    authority.leaseAuthorizationAvailable = false;
+
+    const context = dispatchContext();
+    const message = {
+      type: "enterprise.resource.release_lease.request" as const,
+      requestId: "request-release-after-revoke",
+      leaseId: lease().leaseId,
+      fencingToken: lease().fencingToken,
+    };
+    const response = await handler.handle({
+      sessionContext: context,
+      message,
+    });
+
+    expect(leases.released).toEqual([]);
+    expect(response).toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "request-release-after-revoke", code: "access_denied" },
+    });
+    if (response === false) throw new Error("expected release denial");
+    expect(handler.consumeResponse({ sessionContext: context, message, response })).toBeNull();
+    authority.leaseAuthorizationAvailable = true;
+    await handler.close();
+    expect(leases.released).toEqual([{ handle: authority.handle, lease: lease() }]);
+  });
+
+  test("foreign and stale holders cannot renew or release another holder's lease", async () => {
+    const { handler, leases, authority } = createHandler();
+    await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-acquire-guarded",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+
+    const foreignResponse = await handler.handle({
+      sessionContext: dispatchContext(
+        sessionContext({
+          organizationId: FOREIGN_ORGANIZATION_ID,
+          principalId: FOREIGN_PRINCIPAL_ID,
+        }),
+      ),
+      message: {
+        type: "enterprise.resource.renew_lease.request",
+        requestId: "request-foreign-renew",
+        leaseId: lease().leaseId,
+        fencingToken: lease().fencingToken,
+      },
+    });
+    authority.registry.bind({ agentId: AGENT_ID, context: sessionContext() });
+    const staleResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.release_lease.request",
+        requestId: "request-stale-release",
+        leaseId: lease().leaseId,
+        fencingToken: lease().fencingToken,
+      },
+    });
+
+    expect(leases.renewed).toEqual([]);
+    expect(leases.released).toEqual([]);
+    expect(foreignResponse).toMatchObject({ type: "rpc_error" });
+    expect(staleResponse).toMatchObject({ type: "rpc_error" });
+  });
+
+  test.each(["foreign_registry", "different_principal", "different_node", "different_agent"])(
+    "rejects %s handles before trusted lease authorization",
+    async (variant) => {
+      const authority = new MemoryAuthority();
+      if (variant === "foreign_registry") {
+        const registry = createEnterpriseAgentSessionContextRegistry();
+        authority.resolvedHandle = registry.bind({ agentId: AGENT_ID, context: sessionContext() });
+      } else if (variant === "different_principal") {
+        authority.resolvedHandle = authority.registry.bind({
+          agentId: AGENT_ID,
+          context: sessionContext({ principalId: FOREIGN_PRINCIPAL_ID }),
+        });
+      } else if (variant === "different_node") {
+        authority.resolvedHandle = authority.registry.bind({
+          agentId: AGENT_ID,
+          context: sessionContext({ nodeId: "nod_2222222222222222" }),
+        });
+      } else {
+        authority.resolvedHandle = authority.registry.bind({
+          agentId: "agent-foreign",
+          context: sessionContext(),
+        });
+      }
+      const { handler, leases } = createHandler({ authority });
+
+      const response = await handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.acquire_lease.request",
+          requestId: `request-${variant}`,
+          workspaceId: WORKSPACE_ID,
+          agentId: AGENT_ID,
+          resourceKind: "browser_profile",
+          mode: "write",
+        },
+      });
+
+      expect(response).toMatchObject({ type: "rpc_error" });
+      expect(authority.resolveLeaseAuthorizationCalls).toBe(0);
+      expect(leases.acquired).toEqual([]);
+    },
+  );
+
+  test("releases a newly acquired lease when its handle becomes stale after manager await", async () => {
+    const authority = new MemoryAuthority();
+    const leases = new MemoryLeases();
+    leases.onAcquire = () => {
+      authority.registry.bind({ agentId: AGENT_ID, context: sessionContext() });
+    };
+    const { handler } = createHandler({ authority, leases });
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.acquire_lease.request",
+          requestId: "request-stale-after-acquire",
+          workspaceId: WORKSPACE_ID,
+          agentId: AGENT_ID,
+          resourceKind: "browser_profile",
+          mode: "write",
+        },
+      }),
+    ).resolves.toMatchObject({ type: "rpc_error" });
+
+    expect(leases.released).toEqual([{ handle: authority.handle, lease: lease() }]);
+  });
+
+  test("releases a renewed lease when the canonical binding revision changed", async () => {
+    const { handler, leases, authority } = createHandler();
+    await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-acquire-before-rebind",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+    authority.bindingRevision = "binding-revision-2";
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.renew_lease.request",
+          requestId: "request-renew-after-rebind",
+          leaseId: lease().leaseId,
+          fencingToken: lease().fencingToken,
+        },
+      }),
+    ).resolves.toMatchObject({ type: "rpc_error" });
+
+    expect(leases.released).toEqual([
+      { handle: authority.handle, lease: lease({ leaseRevision: "2" }) },
+    ]);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
+  });
+
+  test("rejects a stale fencing token without invoking renew or release", async () => {
+    const { handler, leases } = createHandler();
+    await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.acquire_lease.request",
+        requestId: "request-acquire-for-token",
+        workspaceId: WORKSPACE_ID,
+        agentId: AGENT_ID,
+        resourceKind: "browser_profile",
+        mode: "write",
+      },
+    });
+
+    const renewResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.renew_lease.request",
+        requestId: "request-renew-stale-token",
+        leaseId: lease().leaseId,
+        fencingToken: 2,
+      },
+    });
+    const releaseResponse = await handler.handle({
+      sessionContext: dispatchContext(),
+      message: {
+        type: "enterprise.resource.release_lease.request",
+        requestId: "request-release-stale-token",
+        leaseId: lease().leaseId,
+        fencingToken: 2,
+      },
+    });
+
+    expect(renewResponse).toMatchObject({ type: "rpc_error" });
+    expect(releaseResponse).toMatchObject({ type: "rpc_error" });
+    expect(leases.renewed).toEqual([]);
+    expect(leases.released).toEqual([]);
+  });
+
+  test("captures dependency methods with their receivers at construction", async () => {
+    const profiles = new MemoryProfiles([profile()]);
+    const leases = new MemoryLeases();
+    const authority = new MemoryAuthority();
+    const { handler } = createHandler({ profiles, leases, authority });
+    profiles.list = async () => {
+      throw new Error("mutated profile dependency");
+    };
+    leases.acquire = async () => {
+      throw new Error("mutated lease dependency");
+    };
+    authority.resolveLeaseAuthorization = () => {
+      throw new Error("mutated authority dependency");
+    };
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.browser.list_profiles.request",
+          requestId: "request-list-snapshot",
+          workspaceId: WORKSPACE_ID,
+        },
+      }),
+    ).resolves.toMatchObject({ type: "enterprise.browser.list_profiles.response" });
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.acquire_lease.request",
+          requestId: "request-acquire-snapshot",
+          workspaceId: WORKSPACE_ID,
+          agentId: AGENT_ID,
+          resourceKind: "browser_profile",
+          mode: "write",
+        },
+      }),
+    ).resolves.toMatchObject({ type: "enterprise.resource.acquire_lease.response" });
+  });
+
+  test("snapshots each dependency port and the TTL exactly once at construction", async () => {
+    const profiles = new MemoryProfiles([profile()]);
+    const bindings = new MemoryBindings([binding()]);
+    const leases = new MemoryLeases();
+    const authority = new MemoryAuthority();
+    const reads = {
+      profiles: 0,
+      bindings: 0,
+      leases: 0,
+      authority: 0,
+      leaseTtlMs: 0,
+    };
+    const options = Object.defineProperties(
+      {},
+      {
+        profiles: {
+          get: () => {
+            reads.profiles++;
+            return profiles;
+          },
+        },
+        bindings: {
+          get: () => {
+            reads.bindings++;
+            return bindings;
+          },
+        },
+        leases: {
+          get: () => {
+            reads.leases++;
+            return leases;
+          },
+        },
+        authority: {
+          get: () => {
+            reads.authority++;
+            return authority;
+          },
+        },
+        leaseTtlMs: {
+          get: () => {
+            reads.leaseTtlMs++;
+            return 60_000;
+          },
+        },
+      },
+    ) as ConstructorParameters<typeof EnterpriseBrowserLeaseHandler>[0];
+
+    const handler = new EnterpriseBrowserLeaseHandler(options);
+
+    expect(reads).toEqual({
+      profiles: 1,
+      bindings: 1,
+      leases: 1,
+      authority: 1,
+      leaseTtlMs: 1,
+    });
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.browser.list_profiles.request",
+          requestId: "request-list-option-snapshot",
+          workspaceId: WORKSPACE_ID,
+        },
+      }),
+    ).resolves.toMatchObject({ type: "enterprise.browser.list_profiles.response" });
+    expect(reads).toEqual({
+      profiles: 1,
+      bindings: 1,
+      leases: 1,
+      authority: 1,
+      leaseTtlMs: 1,
+    });
+  });
+
+  test("rejects mismatched dispatcher credentials and generations before dependencies", async () => {
+    const { handler, profiles, leases, authority } = createHandler();
+    const credentialContext = { ...dispatchContext(), credentialId: "credential-foreign" };
+    const generationContext = {
+      ...dispatchContext(),
+      sessionBindingGeneration: "session-generation-foreign",
+    };
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-dispatch-context",
+      workspaceId: WORKSPACE_ID,
+    };
+
+    await expect(handler.handle({ sessionContext: credentialContext, message })).resolves.toBe(
+      false,
+    );
+    await expect(handler.handle({ sessionContext: generationContext, message })).resolves.toBe(
+      false,
+    );
+    expect(profiles.listCalls).toBe(0);
+    expect(leases.acquired).toEqual([]);
+    expect(authority.resolveLeaseAuthorizationCalls).toBe(0);
+  });
+
+  test("does not claim AppSlot or unknown lease references owned by another handler", async () => {
+    const { handler, leases } = createHandler();
+
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.acquire_lease.request",
+          requestId: "request-app-slot",
+          workspaceId: WORKSPACE_ID,
+          agentId: AGENT_ID,
+          resourceKind: "app_slot",
+          mode: "write",
+        },
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      handler.handle({
+        sessionContext: dispatchContext(),
+        message: {
+          type: "enterprise.resource.release_lease.request",
+          requestId: "request-unknown-lease",
+          leaseId: "lea_22222222-2222-2222-2222-222222222222",
+          fencingToken: 1,
+        },
+      }),
+    ).resolves.toBe(false);
+
+    expect(leases.acquired).toEqual([]);
+    expect(leases.released).toEqual([]);
+  });
+
+  test("opens a per-session dispatcher lease and closes its held leases", async () => {
+    const profiles = new MemoryProfiles([profile()]);
+    const bindings = new MemoryBindings([binding()]);
+    const leases = new MemoryLeases();
+    const authority = new MemoryAuthority();
+    const runtime = createEnterpriseBrowserLeaseSessionRuntime({
+      profiles,
+      bindings,
+      leases,
+      leaseTtlMs: 60_000,
+    });
+    const registration = createEnterpriseBrowserLeaseDispatcherRegistration({
+      runtime,
+      authority,
+    });
+
+    expect(registration?.manifest.operations).toEqual(ENTERPRISE_BROWSER_LEASE_OPERATIONS);
+    expect(() =>
+      registration?.open({
+        sessionId: "",
+        clientId: "client-1",
+        context: sessionContext(),
+      }),
+    ).toThrow(/sessionId/);
+    const openContext = sessionContext();
+    const sessionLease = registration?.open({
+      sessionId: "session-1",
+      clientId: "client-1",
+      context: openContext,
+    });
+    expect(sessionLease).toBeDefined();
+    if (!sessionLease) throw new Error("factory did not open a session lease");
+    const foreignRuntimeLease = registration?.open({
+      sessionId: "session-foreign",
+      clientId: "client-1",
+      context: sessionContext(),
+      authorizationRuntime: createEnterpriseBrowserLeaseSessionRuntime({
+        profiles,
+        bindings,
+        leases,
+        leaseTtlMs: 60_000,
+      }),
+    });
+    expect(foreignRuntimeLease).toBeDefined();
+    await foreignRuntimeLease?.close();
+    expect(
+      sessionLease.dispatcher.requestPolicyForType?.("enterprise.resource.acquire_lease.request"),
+    ).toBe("resources");
+    const context = dispatchContext(openContext);
+    const message = {
+      type: "enterprise.resource.acquire_lease.request" as const,
+      requestId: "request-factory-acquire",
+      workspaceId: WORKSPACE_ID,
+      agentId: AGENT_ID,
+      resourceKind: "browser_profile" as const,
+      mode: "write" as const,
+    };
+    const response = await sessionLease.dispatcher.handle({
+      sessionContext: context,
+      message,
+    });
+    if (response === false) throw new Error("expected factory acquire response");
+    expect(
+      sessionLease.dispatcher.consumeResponse?.({ sessionContext: context, message, response }),
+    ).toEqual(leaseReceipt(response));
+    await sessionLease.close();
+
+    expect(leases.released).toEqual([{ handle: authority.handle, lease: lease() }]);
+    expect(authority.releasedHandles).toEqual([authority.handle]);
+    expect(authority.registry.resolve(AGENT_ID)).toBeNull();
+    await expect(
+      sessionLease.dispatcher.handle({
+        sessionContext: dispatchContext(openContext),
+        message: {
+          type: "enterprise.browser.list_profiles.request",
+          requestId: "request-after-close",
+          workspaceId: WORKSPACE_ID,
+        },
+      }),
+    ).resolves.toBe(false);
+  });
+
+  test("rechecks the exact open authorization runtime and Session before consume", async () => {
+    const profiles = new MemoryProfiles([profile()]);
+    const bindings = new MemoryBindings([binding()]);
+    const leases = new MemoryLeases();
+    const authority = new MemoryAuthority();
+    const runtime = createEnterpriseBrowserLeaseSessionRuntime({
+      profiles,
+      bindings,
+      leases,
+      leaseTtlMs: 60_000,
+    });
+    const authorizationRuntime = Object.freeze({ runtime: "production-authority" });
+    const checkedRuntimes: unknown[] = [];
+    let current = true;
+    const registration = createEnterpriseBrowserLeaseDispatcherRegistration({
+      runtime,
+      authority,
+      isCurrentAuthorizationRuntime: (candidate) => {
+        checkedRuntimes.push(candidate);
+        return current;
+      },
+    });
+    const openContext = sessionContext();
+    const sessionLease = registration?.open({
+      sessionId: "session-1",
+      clientId: "client-1",
+      context: openContext,
+      authorizationRuntime,
+    });
+    if (!sessionLease) throw new Error("factory did not open a session lease");
+    const context = dispatchContext(openContext);
+    const message = {
+      type: "enterprise.browser.list_profiles.request" as const,
+      requestId: "request-runtime-current",
+      workspaceId: WORKSPACE_ID,
+    };
+
+    await expect(
+      sessionLease.dispatcher.handle({
+        sessionContext: {
+          ...context,
+          enterpriseContext: { ...context.enterpriseContext },
+        },
+        message,
+      }),
+    ).resolves.toBe(false);
+    const response = await sessionLease.dispatcher.handle({ sessionContext: context, message });
+    if (response === false) throw new Error("expected list response");
+    current = false;
+    expect(
+      sessionLease.dispatcher.consumeResponse?.({ sessionContext: context, message, response }),
+    ).toBeNull();
+    current = true;
+    expect(
+      sessionLease.dispatcher.consumeResponse?.({ sessionContext: context, message, response }),
+    ).toBeNull();
+    expect(checkedRuntimes.length).toBeGreaterThan(1);
+    expect(checkedRuntimes.every((candidate) => candidate === authorizationRuntime)).toBe(true);
+    await sessionLease.close();
+  });
+
+  test("does not register when typed runtime or authority dependencies are absent", () => {
+    expect(createEnterpriseBrowserLeaseDispatcherRegistration(null)).toBeNull();
+    expect(
+      createEnterpriseBrowserLeaseDispatcherRegistration({
+        runtime: undefined as never,
+        authority: undefined as never,
+      }),
+    ).toBeNull();
+  });
+});

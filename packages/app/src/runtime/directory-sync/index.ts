@@ -39,11 +39,53 @@ import type {
   DirectoryReplicaMutation,
 } from "@/runtime/replica-cache";
 import type { TurnLivenessTransition } from "@/timeline/turn-liveness";
+import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import {
+  blockProviderSubagentParent,
+  invalidateProviderSubagentServer,
+  resetProviderSubagentServerLifecycle,
+} from "@/subagents/provider-store";
 
 const PAGE_LIMIT = 200;
+const OWNERSHIP_TRANSFER_REPLAY_LIMIT = 4096;
 const AGENT_SORT: NonNullable<FetchAgentsOptions["sort"]> = [
   { key: "updated_at", direction: "desc" },
 ];
+
+function directoryEnterpriseIdentityKey(identity: DirectoryEnterpriseIdentity): string {
+  return JSON.stringify([
+    identity.organizationId,
+    identity.nodeId,
+    identity.paseoServerId,
+    identity.principalId,
+    identity.lifecycleGeneration,
+  ]);
+}
+
+function isCompleteDirectoryEnterpriseIdentity(
+  identity: DirectoryEnterpriseIdentity | null | undefined,
+): identity is DirectoryEnterpriseIdentity {
+  return (
+    typeof identity?.organizationId === "string" &&
+    identity.organizationId.length > 0 &&
+    typeof identity.nodeId === "string" &&
+    identity.nodeId.length > 0 &&
+    typeof identity.paseoServerId === "string" &&
+    identity.paseoServerId.length > 0 &&
+    typeof identity.principalId === "string" &&
+    identity.principalId.length > 0 &&
+    typeof identity.lifecycleGeneration === "string" &&
+    identity.lifecycleGeneration.length > 0
+  );
+}
+
+function sameDirectoryEnterpriseIdentity(
+  left: DirectoryEnterpriseIdentity | null | undefined,
+  right: DirectoryEnterpriseIdentity | null | undefined,
+): boolean {
+  if (!left || !right) return left == null && right == null;
+  return directoryEnterpriseIdentityKey(left) === directoryEnterpriseIdentityKey(right);
+}
 
 function resolveAgentNextPage(pageInfo: AgentPageInfo): {
   hasMore: boolean;
@@ -105,6 +147,16 @@ export interface DirectoryConnection {
   client: DaemonClient | null;
   status: "online" | "offline";
   source: DirectorySourceToken;
+  enterpriseTarget?: "legacy_passthrough" | "enterprise_host";
+  enterpriseIdentity?: DirectoryEnterpriseIdentity | null;
+}
+
+export interface DirectoryEnterpriseIdentity {
+  organizationId: string;
+  nodeId: string;
+  paseoServerId: string;
+  principalId: string;
+  lifecycleGeneration: string;
 }
 
 export interface DirectoryCheckpointStorage {
@@ -117,6 +169,7 @@ export interface DirectoryCheckpointStorage {
     checkpoint?: DirectoryCheckpoint,
   ): void;
   replaceDirectoryBaseline?(serverId: string, directory: CachedDirectory): void;
+  deleteTimelines?(serverId: string, agentIds: readonly string[]): void;
 }
 
 export interface RefreshAgentDirectoryInput {
@@ -157,6 +210,11 @@ export class DirectorySync {
   private demandRefresh: Promise<void> | null = null;
   private satisfiedDemandSource: DirectorySourceToken | null = null;
   private cursors: DirectoryCheckpoint = {};
+  private ownershipTransferLifecycleKey: string | null = null;
+  private readonly transferredWorkspaceRevisions = new Map<string, string>();
+  private readonly transferredAgentIds = new Set<string>();
+  private readonly consumedOwnershipTransferPairs = new Set<string>();
+  private readonly consumedOwnershipTransferOrder: string[] = [];
 
   constructor(
     private readonly serverId: string,
@@ -165,20 +223,36 @@ export class DirectorySync {
       markAgentLoading: () => void;
       markAgentReady: () => void;
       markAgentError: (error: string) => void;
+      evictAgentTimelines?: (agentIds: readonly string[]) => void;
+      resetAgentTimelineEvictions?: () => void;
     },
     private readonly checkpoints?: DirectoryCheckpointStorage,
   ) {
     const persist = (mutations: readonly DirectoryReplicaMutation[]) =>
       this.checkpoints?.commitDirectoryMutations(this.serverId, mutations);
-    this.agents = new AgentDirectoryReplica(serverId, callbacks.onAgentStoppedRunning, persist);
-    this.workspaces = new WorkspaceDirectoryReplica(serverId);
+    this.agents = new AgentDirectoryReplica(
+      serverId,
+      callbacks.onAgentStoppedRunning,
+      persist,
+      (workspaceId) => this.isWorkspacePublicationBlocked(workspaceId),
+      (agentId) => this.blockAgentPublication(agentId),
+    );
+    this.workspaces = new WorkspaceDirectoryReplica(serverId, (workspaceId) =>
+      this.isWorkspacePublicationBlocked(workspaceId),
+    );
   }
 
   connectionChanged(connection: DirectoryConnection): boolean {
+    this.updateOwnershipTransferLifecycle(connection);
     const changed =
       this.connection.client !== connection.client ||
       this.connection.source.clientGeneration !== connection.source.clientGeneration ||
-      this.connection.source.connectionEpoch !== connection.source.connectionEpoch;
+      this.connection.source.connectionEpoch !== connection.source.connectionEpoch ||
+      !sameDirectoryEnterpriseIdentity(
+        this.connection.enterpriseIdentity,
+        connection.enterpriseIdentity,
+      ) ||
+      this.connection.enterpriseTarget !== connection.enterpriseTarget;
     const wentOffline = this.connection.status === "online" && connection.status === "offline";
     if (!changed && !wentOffline) {
       this.connection = connection;
@@ -193,6 +267,9 @@ export class DirectorySync {
     if (!connection.client || connection.status !== "online") return true;
     const client = connection.client;
     const source = connection.source;
+    const enterpriseIdentity = isCompleteDirectoryEnterpriseIdentity(connection.enterpriseIdentity)
+      ? connection.enterpriseIdentity
+      : null;
     const subscriptions = [
       client.on("agent_update", (message) => {
         if (message.type !== "agent_update" || !this.isCurrent(client, source)) return;
@@ -254,6 +331,17 @@ export class DirectorySync {
           this.persistCheckpoint();
         }
       }),
+      client.on("enterprise.workspace.ownership.transfer.tombstone", (message) => {
+        if (
+          message.type !== "enterprise.workspace.ownership.transfer.tombstone" ||
+          !this.isCurrent(client, source) ||
+          !this.hasMatchingSession(client, source) ||
+          !sameDirectoryEnterpriseIdentity(this.connection.enterpriseIdentity, enterpriseIdentity)
+        ) {
+          return;
+        }
+        this.consumeWorkspaceOwnershipTransferTombstone(message.payload, enterpriseIdentity);
+      }),
     ];
     this.unsubscribe = () => {
       for (const unsubscribe of subscriptions) unsubscribe();
@@ -294,6 +382,7 @@ export class DirectorySync {
     this.unsubscribe = null;
     this.fullDemandSources.clear();
     this.routeDemandIds.clear();
+    invalidateProviderSubagentServer(this.serverId);
     workspaceLabels.disconnect(this.serverId);
   }
 
@@ -656,6 +745,139 @@ export class DirectorySync {
   removeWorkspace(workspaceId: string): void {
     const mutations = this.workspaces.removeWorkspaceSnapshot(workspaceId);
     this.checkpoints?.commitDirectoryMutations(this.serverId, mutations);
+  }
+
+  private updateOwnershipTransferLifecycle(connection: DirectoryConnection): void {
+    const identity = connection.enterpriseIdentity;
+    if (
+      connection.enterpriseTarget !== "enterprise_host" ||
+      !isCompleteDirectoryEnterpriseIdentity(identity)
+    ) {
+      this.resetOwnershipTransferLifecycle();
+      return;
+    }
+    const lifecycleKey = directoryEnterpriseIdentityKey(identity);
+    if (this.ownershipTransferLifecycleKey === lifecycleKey) return;
+    this.resetOwnershipTransferLifecycle();
+    this.ownershipTransferLifecycleKey = lifecycleKey;
+  }
+
+  private resetOwnershipTransferLifecycle(): void {
+    if (
+      this.ownershipTransferLifecycleKey === null &&
+      this.transferredWorkspaceRevisions.size === 0 &&
+      this.consumedOwnershipTransferPairs.size === 0
+    ) {
+      return;
+    }
+    this.ownershipTransferLifecycleKey = null;
+    this.transferredWorkspaceRevisions.clear();
+    this.transferredAgentIds.clear();
+    this.consumedOwnershipTransferPairs.clear();
+    this.consumedOwnershipTransferOrder.length = 0;
+    resetProviderSubagentServerLifecycle(this.serverId);
+    this.callbacks.resetAgentTimelineEvictions?.();
+  }
+
+  private consumeWorkspaceOwnershipTransferTombstone(
+    payload: Extract<
+      SessionOutboundMessage,
+      { type: "enterprise.workspace.ownership.transfer.tombstone" }
+    >["payload"],
+    identity: DirectoryEnterpriseIdentity | null,
+  ): void {
+    if (
+      !identity ||
+      this.connection.enterpriseTarget !== "enterprise_host" ||
+      this.ownershipTransferLifecycleKey !== directoryEnterpriseIdentityKey(identity) ||
+      payload.resource.resourceKind !== "workspace" ||
+      payload.resource.organizationId !== identity.organizationId ||
+      payload.resource.nodeId !== identity.nodeId ||
+      identity.paseoServerId !== this.serverId ||
+      payload.oldPrincipalId !== identity.principalId
+    ) {
+      return;
+    }
+    const pair = JSON.stringify([payload.eventId, payload.transferReceiptId]);
+    if (this.consumedOwnershipTransferPairs.has(pair)) return;
+    this.consumedOwnershipTransferPairs.add(pair);
+    this.consumedOwnershipTransferOrder.push(pair);
+    while (this.consumedOwnershipTransferOrder.length > OWNERSHIP_TRANSFER_REPLAY_LIMIT) {
+      const oldest = this.consumedOwnershipTransferOrder.shift();
+      if (oldest !== undefined) this.consumedOwnershipTransferPairs.delete(oldest);
+    }
+
+    const workspaceId = payload.resource.localResourceId;
+    this.transferredWorkspaceRevisions.set(workspaceId, payload.newRevision);
+    this.revision += 1;
+    this.workspaceRevision += 1;
+    this.flushAbortedTransactions();
+    const agentIds = this.agents.evictWorkspace(workspaceId);
+    for (const agentId of agentIds) {
+      this.transferredAgentIds.add(agentId);
+      blockProviderSubagentParent(this.serverId, agentId);
+    }
+    for (const agentId of agentIds) this.routeDemandIds.delete(agentId);
+    const workspaceMutations = this.workspaces.evictTransferredWorkspace(workspaceId);
+    this.checkpoints?.commitDirectoryMutations(this.serverId, workspaceMutations);
+    this.evictAgentTimelines(agentIds);
+    this.evictColdTransferredWorkspaceAgents({
+      lifecycleKey: this.ownershipTransferLifecycleKey,
+      workspaceId,
+      newRevision: payload.newRevision,
+    });
+  }
+
+  private evictColdTransferredWorkspaceAgents(input: {
+    lifecycleKey: string;
+    workspaceId: string;
+    newRevision: string;
+  }): void {
+    const checkpoints = this.checkpoints;
+    if (!checkpoints) return;
+    void checkpoints
+      .readDirectory(this.serverId)
+      .then((cached) => {
+        if (
+          this.ownershipTransferLifecycleKey !== input.lifecycleKey ||
+          this.transferredWorkspaceRevisions.get(input.workspaceId) !== input.newRevision
+        ) {
+          return;
+        }
+        const agentIds = [...cached.agents]
+          .filter(([, agent]) => agent.workspaceId === input.workspaceId)
+          .map(([agentId]) => agentId);
+        for (const agentId of agentIds) {
+          this.transferredAgentIds.add(agentId);
+          this.routeDemandIds.delete(agentId);
+          this.agents.remove(agentId);
+          blockProviderSubagentParent(this.serverId, agentId);
+        }
+        this.evictAgentTimelines(agentIds);
+        return undefined;
+      })
+      .catch(() => undefined);
+  }
+
+  private evictAgentTimelines(agentIds: readonly string[]): void {
+    if (agentIds.length === 0) return;
+    this.callbacks.evictAgentTimelines?.(agentIds);
+    this.checkpoints?.deleteTimelines?.(this.serverId, agentIds);
+  }
+
+  private blockAgentPublication(agentId: string): void {
+    this.transferredAgentIds.add(agentId);
+    this.routeDemandIds.delete(agentId);
+    blockProviderSubagentParent(this.serverId, agentId);
+    this.evictAgentTimelines([agentId]);
+  }
+
+  isAgentPublicationBlocked(agentId: string): boolean {
+    return this.transferredAgentIds.has(agentId);
+  }
+
+  private isWorkspacePublicationBlocked(workspaceId: string | undefined): boolean {
+    return workspaceId !== undefined && this.transferredWorkspaceRevisions.has(workspaceId);
   }
 
   markWorkspacesHydrated(hydrated: boolean): void {

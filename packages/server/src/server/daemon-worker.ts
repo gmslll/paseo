@@ -6,6 +6,7 @@ import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
+import { createProductionEnterpriseRuntimeFactory } from "./enterprise/production-runtime-factory.js";
 
 process.title = "Paseo Daemon";
 
@@ -314,6 +315,12 @@ async function main() {
         onLifecycleIntent: handleLifecycleIntent,
       },
       logger,
+      {
+        createEnterpriseAdmissionRuntime: createProductionEnterpriseRuntimeFactory({
+          paseoHome: config.paseoHome,
+          ...(config.auth?.password ? { daemonPassword: config.auth.password } : {}),
+        }),
+      },
     );
   } catch (err) {
     logger.fatal({ err }, "Daemon bootstrap failed");

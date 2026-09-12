@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyInactiveBrowserWebviewViewport,
+  type BrowserProfileAuthorizationResult,
   type BrowserWebviewProfileHost,
   clearResidentBrowserWebviewsForTests,
   ensureResidentBrowserWebview,
+  getBrowserWebviewProfile,
   getResidentBrowserWebview,
   prepareBrowserWebview,
   presentBrowserWebview,
@@ -13,17 +15,25 @@ import {
   resizeResidentBrowserWebview,
   takeResidentBrowserWebview,
 } from "./resident-webviews";
+import type { DesktopAttachedBrowserRegistration } from "@/desktop/host";
 import {
   setCommandCenterFocusRestoreElement,
   takeCommandCenterFocusRestoreElement,
 } from "../../utils/command-center-focus-restore";
 
 const RESIDENT_HOST_ID = "paseo-browser-resident-webviews";
-const attachedBrowsers: Array<{
-  browserId: string;
-  workspaceId: string;
-  webContentsId: number;
-}> = [];
+const attachedBrowsers: DesktopAttachedBrowserRegistration[] = [];
+const enterpriseProfile: BrowserProfileAuthorizationResult = {
+  authorization: {
+    organizationId: "org_1111111111111111",
+    homeNodeId: "nod_1111111111111111",
+    workspaceId: "workspace-enterprise",
+    browserProfileId: "brp_1111111111111111",
+    bindingRevision: "binding-a",
+    lifecycleGeneration: "lifecycle-a",
+  },
+  partition: "persist:paseo-enterprise-brp_1111111111111111",
+};
 const profileHost: BrowserWebviewProfileHost = {
   profilePartition: "persist:paseo-browser",
   registerAttachedBrowser: async (input) => {
@@ -248,6 +258,130 @@ describe("resident browser webviews", () => {
       { browserId: "browser-first", workspaceId: "workspace-a", webContentsId: 101 },
       { browserId: "browser-second", workspaceId: "workspace-b", webContentsId: 202 },
     ]);
+  });
+
+  it("binds an enterprise webview to its server-authorized Profile tuple", () => {
+    const webview = ensureResidentBrowserWebview({
+      browserId: "browser-enterprise",
+      workspaceId: "workspace-enterprise",
+      url: "https://example.com",
+      profile: enterpriseProfile,
+      profileHost,
+    });
+    if (!webview) {
+      throw new Error("Expected enterprise resident webview");
+    }
+    Object.assign(webview, { getWebContentsId: () => 303 });
+    webview.dispatchEvent(new Event("did-attach"));
+
+    expect(webview.getAttribute("partition")).toBe(enterpriseProfile.partition);
+    expect(webview.getAttribute("data-paseo-organization-id")).toBe("org_1111111111111111");
+    expect(webview.getAttribute("data-paseo-home-node-id")).toBe("nod_1111111111111111");
+    expect(webview.getAttribute("data-paseo-workspace-id")).toBe("workspace-enterprise");
+    expect(webview.getAttribute("data-paseo-browser-profile-id")).toBe("brp_1111111111111111");
+    expect(attachedBrowsers).toEqual([
+      {
+        browserId: "browser-enterprise",
+        workspaceId: "workspace-enterprise",
+        webContentsId: 303,
+        profile: {
+          organizationId: "org_1111111111111111",
+          homeNodeId: "nod_1111111111111111",
+          workspaceId: "workspace-enterprise",
+          browserProfileId: "brp_1111111111111111",
+          bindingRevision: "binding-a",
+          lifecycleGeneration: "lifecycle-a",
+        },
+      },
+    ]);
+  });
+
+  it("snapshots Profile authority and rejects caller-controlled partitions or accessors", () => {
+    const mutableProfile = {
+      authorization: { ...enterpriseProfile.authorization },
+      partition: enterpriseProfile.partition,
+    };
+    expect(
+      ensureResidentBrowserWebview({
+        browserId: "browser-profile-snapshot",
+        workspaceId: "workspace-enterprise",
+        url: "https://example.com",
+        profile: mutableProfile,
+        profileHost,
+      }),
+    ).not.toBeNull();
+    mutableProfile.authorization.bindingRevision = "mutated";
+    const first = getBrowserWebviewProfile("browser-profile-snapshot");
+    const second = getBrowserWebviewProfile("browser-profile-snapshot");
+    expect(first).toEqual(enterpriseProfile);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(first?.authorization)).toBe(true);
+    expect(first).not.toBe(second);
+    expect(first?.authorization).not.toBe(second?.authorization);
+
+    expect(() =>
+      ensureResidentBrowserWebview({
+        browserId: "browser-profile-partition",
+        workspaceId: "workspace-enterprise",
+        url: "https://example.com",
+        profile: { ...enterpriseProfile, partition: "persist:caller-controlled" },
+        profileHost,
+      }),
+    ).toThrow(/partition/i);
+
+    const accessorAuthorization = {
+      ...enterpriseProfile.authorization,
+    } as Record<string, unknown>;
+    let reads = 0;
+    Object.defineProperty(accessorAuthorization, "browserProfileId", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return "brp_1111111111111111";
+      },
+    });
+    expect(() =>
+      ensureResidentBrowserWebview({
+        browserId: "browser-profile-accessor",
+        workspaceId: "workspace-enterprise",
+        url: "https://example.com",
+        profile: {
+          authorization: accessorAuthorization as never,
+          partition: enterpriseProfile.partition,
+        },
+        profileHost,
+      }),
+    ).toThrow(/invalid/i);
+    expect(reads).toBe(0);
+  });
+
+  it("refuses to rebind a Browser ID to a different Profile", () => {
+    expect(
+      ensureResidentBrowserWebview({
+        browserId: "browser-bound",
+        workspaceId: "workspace-enterprise",
+        url: "https://example.com",
+        profile: enterpriseProfile,
+        profileHost,
+      }),
+    ).not.toBeNull();
+
+    expect(() =>
+      ensureResidentBrowserWebview({
+        browserId: "browser-bound",
+        workspaceId: "workspace-enterprise",
+        url: "https://example.com",
+        profile: {
+          ...enterpriseProfile,
+          authorization: {
+            ...enterpriseProfile.authorization,
+            browserProfileId: "brp_2222222222222222",
+          },
+          partition: "persist:paseo-enterprise-brp_2222222222222222",
+        },
+        profileHost,
+      }),
+    ).toThrow(/cannot change/i);
   });
 
   it("normalizes an existing resident host back to permanent parking", () => {

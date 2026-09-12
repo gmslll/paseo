@@ -58,8 +58,9 @@ import {
 import {
   BrowserAutomationExecuteRequestSchema,
   BrowserAutomationExecuteResponseSchema,
+  BrowserAutomationBrowserIdSchema,
 } from "./browser-automation/rpc-schemas.js";
-import { BrowserAutomationHostCapabilitySchema } from "./browser-automation/capabilities.js";
+import { BrowserAutomationHostCapabilityWireSchema } from "./browser-automation/capabilities.js";
 import {
   PaseoConfigRawSchema,
   PaseoLifecycleCommandRawSchema,
@@ -107,6 +108,888 @@ export const DAEMON_PERMISSIONS = [
 ] as const;
 export const DaemonPermissionSchema = z.enum(DAEMON_PERMISSIONS);
 export type DaemonPermission = z.infer<typeof DaemonPermissionSchema>;
+
+export const ENTERPRISE_FEATURE_FLAGS = [
+  "enterpriseIdentityV1",
+  "enterpriseResourceAuthorizationV1",
+  "enterpriseBrowserProfilesV1",
+  "enterpriseAuditV1",
+  "enterpriseDistributedNodeV1",
+  "enterpriseWorkspaceContentReadV1",
+  "enterpriseAgentContentReadV1",
+  "enterpriseBrowserProfileContentReadV1",
+  "enterpriseAppSlotContentReadV1",
+  "enterpriseResourceOwnershipTransferV1",
+  "enterpriseWorkspaceOwnershipTransferV1",
+  "enterpriseBrowserPageIdentityObservationV1",
+  "enterpriseBrowserPageIdentityInvalidationV1",
+] as const;
+
+export const EnterpriseFeatureFlagsWireSchema = z
+  .object({
+    enterpriseIdentityV1: z.boolean().optional(),
+    enterpriseResourceAuthorizationV1: z.boolean().optional(),
+    enterpriseBrowserProfilesV1: z.boolean().optional(),
+    enterpriseAuditV1: z.boolean().optional(),
+    enterpriseDistributedNodeV1: z.boolean().optional(),
+    enterpriseWorkspaceContentReadV1: z.boolean().optional(),
+    enterpriseAgentContentReadV1: z.boolean().optional(),
+    enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
+    enterpriseAppSlotContentReadV1: z.boolean().optional(),
+    enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
+    enterpriseWorkspaceOwnershipTransferV1: z.boolean().optional(),
+    enterpriseBrowserPageIdentityObservationV1: z.boolean().optional(),
+    enterpriseBrowserPageIdentityInvalidationV1: z.boolean().optional(),
+  })
+  .passthrough();
+
+export type EnterpriseFeatureFlagsWire = z.infer<typeof EnterpriseFeatureFlagsWireSchema>;
+export type EnterpriseFeatureFlags = Record<(typeof ENTERPRISE_FEATURE_FLAGS)[number], boolean>;
+
+export function normalizeEnterpriseFeatureFlags(
+  flags: EnterpriseFeatureFlagsWire | undefined,
+): EnterpriseFeatureFlags {
+  return {
+    enterpriseIdentityV1: flags?.enterpriseIdentityV1 === true,
+    enterpriseResourceAuthorizationV1: flags?.enterpriseResourceAuthorizationV1 === true,
+    enterpriseBrowserProfilesV1: flags?.enterpriseBrowserProfilesV1 === true,
+    enterpriseAuditV1: flags?.enterpriseAuditV1 === true,
+    enterpriseDistributedNodeV1: flags?.enterpriseDistributedNodeV1 === true,
+    enterpriseWorkspaceContentReadV1: flags?.enterpriseWorkspaceContentReadV1 === true,
+    enterpriseAgentContentReadV1: flags?.enterpriseAgentContentReadV1 === true,
+    enterpriseBrowserProfileContentReadV1: flags?.enterpriseBrowserProfileContentReadV1 === true,
+    enterpriseAppSlotContentReadV1: flags?.enterpriseAppSlotContentReadV1 === true,
+    enterpriseResourceOwnershipTransferV1: flags?.enterpriseResourceOwnershipTransferV1 === true,
+    enterpriseWorkspaceOwnershipTransferV1: flags?.enterpriseWorkspaceOwnershipTransferV1 === true,
+    enterpriseBrowserPageIdentityObservationV1:
+      flags?.enterpriseBrowserPageIdentityObservationV1 === true,
+    enterpriseBrowserPageIdentityInvalidationV1:
+      flags?.enterpriseBrowserPageIdentityInvalidationV1 === true,
+  };
+}
+
+const ORGANIZATION_ID_PATTERN = /^org_[0-9a-f]{16}$/;
+const HUMAN_PRINCIPAL_ID_PATTERN = /^usr_[0-9a-f]{16}$/;
+const SERVICE_PRINCIPAL_ID_PATTERN = /^svc_[0-9a-f]{16}$/;
+const NODE_ID_PATTERN = /^nod_[0-9a-f]{16}$/;
+const BUSINESS_IDENTITY_ID_PATTERN = /^bid_[0-9a-f]{16}$/;
+const BROWSER_PROFILE_ID_PATTERN = /^brp_[0-9a-f]{16}$/;
+const APP_SLOT_ID_PATTERN = /^aps_[0-9a-f]{16}$/;
+const LEASE_ID_PATTERN = /^lea_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const OrganizationIdSchema = z.string().regex(ORGANIZATION_ID_PATTERN);
+export const HumanPrincipalIdSchema = z.string().regex(HUMAN_PRINCIPAL_ID_PATTERN);
+export const ServicePrincipalIdSchema = z.string().regex(SERVICE_PRINCIPAL_ID_PATTERN);
+// Existing single-user direct admission permanently uses the literal "owner".
+export const PrincipalIdSchema = z.union([
+  HumanPrincipalIdSchema,
+  ServicePrincipalIdSchema,
+  z.literal("owner"),
+]);
+export const NodeIdSchema = z.string().regex(NODE_ID_PATTERN);
+export const BusinessIdentityIdSchema = z.string().regex(BUSINESS_IDENTITY_ID_PATTERN);
+export const BrowserProfileIdSchema = z.string().regex(BROWSER_PROFILE_ID_PATTERN);
+export const AppSlotIdSchema = z.string().regex(APP_SLOT_ID_PATTERN);
+export const LeaseIdSchema = z.string().regex(LEASE_ID_PATTERN);
+
+export const NodeContextSchema = z.object({
+  nodeId: NodeIdSchema,
+  paseoServerId: z.string().min(1),
+  mode: z.enum(["standalone", "managed"]),
+});
+
+export const ConnectionContextSchema = z.object({
+  node: NodeContextSchema,
+  transport: z.enum(["direct", "relay", "hub"]),
+  peer: z.enum(["loopback", "local_ipc", "external"]),
+  remoteAddress: z.string().min(1).optional(),
+  origin: z.string().min(1).optional(),
+  userAgent: z.string().min(1).optional(),
+});
+
+export const ENTERPRISE_ACTIONS = [
+  "workspace.metadata.read",
+  "workspace.content.read",
+  "workspace.write",
+  "workspace.manage",
+  "browser.use",
+  "browser.profile.manage",
+  "app.use",
+  "audit.read",
+  "identity.manage",
+  "terminal.use",
+  "provider.history.read",
+  "provider.history.import",
+  "workspace.script.execute",
+  "workspace.script.configure",
+  "workspace.editor.open",
+] as const;
+export const EnterpriseActionSchema = z.enum(ENTERPRISE_ACTIONS);
+export const ENTERPRISE_RUNTIME_ACTIONS_REQUIRING_EXPLICIT_GRANT = [
+  "terminal.use",
+  "provider.history.read",
+  "provider.history.import",
+  "workspace.script.execute",
+  "workspace.script.configure",
+  "workspace.editor.open",
+] as const satisfies readonly (typeof ENTERPRISE_ACTIONS)[number][];
+
+export const ResourceSelectorSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("self") }),
+  z.object({ kind: z.literal("organization"), organizationId: OrganizationIdSchema }),
+  z.object({ kind: z.literal("workspace"), workspaceIds: z.array(z.string().min(1)).min(1) }),
+]);
+
+export const ResourceGrantSchema = z.object({
+  action: EnterpriseActionSchema,
+  selector: ResourceSelectorSchema,
+});
+
+export const ENTERPRISE_MULTI_USER_SERVICE_PROXY_POLICY = {
+  unauthenticatedRequest: "deny",
+  legacySingleUserBehavior: "unchanged",
+} as const;
+
+export function normalizeResourceGrants(grants: readonly ResourceGrant[]): ResourceGrant[] {
+  const normalizedByKey = new Map<string, ResourceGrant>();
+  for (const input of grants) {
+    const grant = ResourceGrantSchema.parse(input);
+    const selector =
+      grant.selector.kind === "workspace"
+        ? {
+            ...grant.selector,
+            workspaceIds: [...new Set(grant.selector.workspaceIds)].sort(),
+          }
+        : grant.selector;
+    const normalized = { action: grant.action, selector } satisfies ResourceGrant;
+    normalizedByKey.set(JSON.stringify(normalized), normalized);
+  }
+  return [...normalizedByKey.values()].sort((left, right) => {
+    const leftKey = JSON.stringify(left);
+    const rightKey = JSON.stringify(right);
+    if (leftKey < rightKey) return -1;
+    if (leftKey > rightKey) return 1;
+    return 0;
+  });
+}
+
+const PrincipalContextSharedShape = {
+  organizationId: OrganizationIdSchema,
+  grants: z.array(ResourceGrantSchema),
+  credentialId: z.string().min(1),
+  grantVersion: z.string().min(1),
+};
+
+export const PrincipalContextSchema = z.discriminatedUnion("principalType", [
+  z.object({
+    ...PrincipalContextSharedShape,
+    principalType: z.literal("human"),
+    principalId: HumanPrincipalIdSchema,
+  }),
+  z.object({
+    ...PrincipalContextSharedShape,
+    principalType: z.literal("service"),
+    principalId: ServicePrincipalIdSchema,
+  }),
+  z.object({
+    ...PrincipalContextSharedShape,
+    principalType: z.literal("break_glass_owner"),
+    principalId: z.literal("owner"),
+  }),
+]);
+
+const CurrentIdentityProjectionSharedShape = {
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  paseoServerId: z.string().min(1),
+  displayName: z.string().min(1).optional(),
+  grantVersion: z.string().min(1),
+  navigation: z.array(z.string().min(1)),
+  allowedOperations: z.array(z.string().min(1)),
+};
+export const CurrentIdentityProjectionSchema = z.discriminatedUnion("principalType", [
+  z.object({
+    ...CurrentIdentityProjectionSharedShape,
+    principalType: z.literal("human"),
+    principalId: HumanPrincipalIdSchema,
+  }),
+  z.object({
+    ...CurrentIdentityProjectionSharedShape,
+    principalType: z.literal("service"),
+    principalId: ServicePrincipalIdSchema,
+  }),
+  z.object({
+    ...CurrentIdentityProjectionSharedShape,
+    principalType: z.literal("break_glass_owner"),
+    principalId: z.literal("owner"),
+  }),
+]);
+
+export function normalizeEnterpriseDisplayStrings(
+  values: readonly string[],
+  supportedValues: readonly string[],
+): string[] {
+  const supported = new Set(supportedValues);
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    if (!supported.has(value) || seen.has(value)) {
+      return false;
+    }
+    seen.add(value);
+    return true;
+  });
+}
+
+export function projectCurrentIdentity(
+  principal: z.infer<typeof PrincipalContextSchema>,
+  node: z.infer<typeof NodeContextSchema>,
+  display: {
+    displayName?: string;
+    navigation: readonly string[];
+    allowedOperations: readonly string[];
+  },
+): z.infer<typeof CurrentIdentityProjectionSchema> {
+  return CurrentIdentityProjectionSchema.parse({
+    principalId: principal.principalId,
+    organizationId: principal.organizationId,
+    nodeId: node.nodeId,
+    paseoServerId: node.paseoServerId,
+    principalType: principal.principalType,
+    displayName: display.displayName,
+    grantVersion: principal.grantVersion,
+    navigation: [...display.navigation],
+    allowedOperations: [...display.allowedOperations],
+  });
+}
+
+export const EnterpriseSessionBindingSchema = z.object({
+  organizationId: OrganizationIdSchema,
+  principalId: PrincipalIdSchema,
+  credentialId: z.string().min(1),
+  grantVersion: z.string().min(1),
+  clientId: z.string().min(1),
+});
+
+export function createEnterpriseSessionBindingKey(
+  binding: z.input<typeof EnterpriseSessionBindingSchema>,
+): string {
+  const parsed = EnterpriseSessionBindingSchema.parse(binding);
+  return JSON.stringify([
+    parsed.organizationId,
+    parsed.principalId,
+    parsed.credentialId,
+    parsed.grantVersion,
+    parsed.clientId,
+  ]);
+}
+
+export const EnterpriseResourceOwnerSchema = z.object({
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  ownerPrincipalId: PrincipalIdSchema,
+  createdByPrincipalId: PrincipalIdSchema,
+});
+
+export const EnterpriseResourceOwnerWireSchema = EnterpriseResourceOwnerSchema.partial();
+
+export const AgentOwnershipEnvelopeSchema = EnterpriseResourceOwnerSchema.extend({
+  workspaceId: z.string().min(1),
+});
+
+export function normalizeEnterpriseResourceOwner(
+  owner: z.input<typeof EnterpriseResourceOwnerWireSchema>,
+): EnterpriseResourceOwner | undefined {
+  const parsed = EnterpriseResourceOwnerWireSchema.parse(owner);
+  if (Object.values(parsed).every((value) => value === undefined)) {
+    return undefined;
+  }
+  return EnterpriseResourceOwnerSchema.parse(parsed);
+}
+
+export const BrowserProfileRecordSchema = z.object({
+  browserProfileId: BrowserProfileIdSchema,
+  organizationId: OrganizationIdSchema,
+  homeNodeId: NodeIdSchema,
+  businessIdentityId: BusinessIdentityIdSchema,
+  ownerPrincipalId: PrincipalIdSchema,
+  platform: z.enum(["douyin", "pinduoduo", "taobao", "feishu_web", "generic"]),
+  businessAccountKey: z.string().min(1),
+  label: z.string().min(1),
+  partitionKey: z.string().min(1),
+  downloadRoot: z.string().min(1),
+  credentialRef: z.string().min(1).optional(),
+  expectedIdentity: z
+    .object({
+      hostnames: z.array(z.string().min(1)).min(1),
+      accountLabelHash: z.string().min(1).optional(),
+    })
+    .optional(),
+  status: z.enum(["ready", "login_required", "mfa_required", "risk_control", "disabled"]),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
+export const BrowserProfileSummarySchema = z.object({
+  browserProfileId: BrowserProfileIdSchema,
+  organizationId: OrganizationIdSchema,
+  homeNodeId: NodeIdSchema,
+  ownerPrincipalId: PrincipalIdSchema,
+  platform: BrowserProfileRecordSchema.shape.platform,
+  label: z.string().min(1),
+  status: BrowserProfileRecordSchema.shape.status,
+});
+
+export function projectBrowserProfileSummary(
+  profile: z.infer<typeof BrowserProfileRecordSchema>,
+): z.infer<typeof BrowserProfileSummarySchema> {
+  return BrowserProfileSummarySchema.parse({
+    browserProfileId: profile.browserProfileId,
+    organizationId: profile.organizationId,
+    homeNodeId: profile.homeNodeId,
+    ownerPrincipalId: profile.ownerPrincipalId,
+    platform: profile.platform,
+    label: profile.label,
+    status: profile.status,
+  });
+}
+
+export const AppSlotRecordSchema = z.object({
+  appSlotId: AppSlotIdSchema,
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  businessIdentityId: BusinessIdentityIdSchema.optional(),
+  appBundleId: z.string().min(1),
+  accountBindingKey: z.string().min(1),
+  ownerPrincipalId: PrincipalIdSchema.optional(),
+  concurrency: z.literal(1),
+  credentialRef: z.string().min(1).optional(),
+  status: z.enum(["ready", "login_required", "busy", "disabled"]),
+});
+
+export const EnterpriseLeasableResourceKindSchema = z.enum(["browser_profile", "app_slot"]);
+const ResourceLeaseSharedShape = {
+  leaseId: LeaseIdSchema,
+  nodeId: NodeIdSchema,
+  holderPrincipalId: PrincipalIdSchema,
+  holderAgentId: z.string().min(1),
+  fencingToken: z.number().int().nonnegative(),
+  mode: z.enum(["read", "write"]),
+  acquiredAt: z.string().min(1),
+  expiresAt: z.string().min(1),
+  heartbeatAt: z.string().min(1),
+};
+
+export const ResourceLeaseSchema = z.discriminatedUnion("resourceKind", [
+  z.object({
+    ...ResourceLeaseSharedShape,
+    resourceKind: z.literal("browser_profile"),
+    resourceId: BrowserProfileIdSchema,
+  }),
+  z.object({
+    ...ResourceLeaseSharedShape,
+    resourceKind: z.literal("app_slot"),
+    resourceId: AppSlotIdSchema,
+  }),
+]);
+
+const FencedLeaseSharedShape = {
+  ...ResourceLeaseSharedShape,
+  organizationId: OrganizationIdSchema,
+  businessIdentityId: BusinessIdentityIdSchema,
+  leaseRevision: z.string().min(1),
+};
+
+export const FencedLeaseSchema = z.discriminatedUnion("resourceKind", [
+  z.object({
+    ...FencedLeaseSharedShape,
+    resourceKind: z.literal("browser_profile"),
+    resourceId: BrowserProfileIdSchema,
+  }),
+  z.object({
+    ...FencedLeaseSharedShape,
+    resourceKind: z.literal("app_slot"),
+    resourceId: AppSlotIdSchema,
+  }),
+]);
+
+const AuditMetadataValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+export const AuditEventSchema = z.object({
+  eventId: z.string().min(1),
+  occurredAt: z.string().min(1),
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  nodeEventSeq: z.number().int().nonnegative(),
+  actorPrincipalId: PrincipalIdSchema,
+  actorCredentialId: z.string().min(1).optional(),
+  sessionId: z.string().min(1).optional(),
+  action: z.string().min(1),
+  resource: z.object({ kind: z.string().min(1), id: z.string().min(1) }),
+  workspaceId: z.string().min(1).optional(),
+  agentId: z.string().min(1).optional(),
+  outcome: z.enum(["allowed", "denied", "failed"]),
+  priority: z.enum(["normal", "high"]).optional(),
+  reasonCode: z.string().min(1).optional(),
+  metadata: z.record(z.string(), AuditMetadataValueSchema).optional(),
+  previousHash: z.string().min(1).optional(),
+  eventHash: z.string().min(1).optional(),
+});
+
+// This is an internal Port input, not a WebSocket shape. Strict parsing prevents callers from
+// supplying event identity, time, node, ordering, or hash-chain fields owned by the AuditSink.
+export const AuditEventInputSchema = AuditEventSchema.omit({
+  eventId: true,
+  occurredAt: true,
+  nodeId: true,
+  nodeEventSeq: true,
+  previousHash: true,
+  eventHash: true,
+}).strict();
+
+export const AUDIT_DURABILITIES = ["required", "buffered"] as const;
+export const AuditDurabilitySchema = z.enum(AUDIT_DURABILITIES);
+export const AuditAppendOptionsSchema = z
+  .object({
+    durability: AuditDurabilitySchema,
+  })
+  .strict();
+
+export const EnterpriseNodeStatusSchema = z.enum([
+  "registered",
+  "active",
+  "draining",
+  "offline",
+  "degraded",
+  "disabled",
+  "revoked",
+]);
+
+export const EnterpriseNodeRecordSchema = NodeContextSchema.extend({
+  organizationId: OrganizationIdSchema,
+  status: EnterpriseNodeStatusSchema,
+  capabilities: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+  version: z.string().min(1).optional(),
+  lastSeenAt: z.string().min(1).optional(),
+});
+
+export const EnterpriseResourceKindSchema = z.enum([
+  "workspace",
+  "agent",
+  "browser_profile",
+  "app_slot",
+]);
+export type EnterpriseResourceKind = z.infer<typeof EnterpriseResourceKindSchema>;
+
+const GlobalResourceRefSharedShape = {
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+};
+export const GlobalResourceRefSchema = z.discriminatedUnion("resourceKind", [
+  z.object({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("workspace"),
+    localResourceId: z.string().min(1),
+  }),
+  z.object({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("agent"),
+    localResourceId: z.string().min(1),
+  }),
+  z.object({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("browser_profile"),
+    localResourceId: BrowserProfileIdSchema,
+  }),
+  z.object({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("app_slot"),
+    localResourceId: AppSlotIdSchema,
+  }),
+]);
+
+export const EnterpriseResourceStatusProjectionSchema = z.object({
+  resource: GlobalResourceRefSchema,
+  status: z.enum([
+    "ready",
+    "resource_waiting",
+    "login_required",
+    "mfa_required",
+    "risk_control",
+    "disabled",
+  ]),
+  workspaceId: z.string().min(1).optional(),
+  agentId: z.string().min(1).optional(),
+  label: z.string().min(1).optional(),
+  queue: z
+    .object({
+      queuedAt: z.string().min(1),
+      position: z.number().int().positive().optional(),
+    })
+    .optional(),
+  allowedOperations: z.array(z.string().min(1)),
+  reasonCode: z.string().min(1).optional(),
+});
+
+export const EnterprisePrincipalSummaryProjectionSchema = z.object({
+  principalId: PrincipalIdSchema,
+  displayName: z.string().min(1).optional(),
+  status: z.enum(["active", "disabled", "revoked"]),
+});
+
+const EnterpriseOrganizationResourceNodeShape = {
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+};
+export const EnterpriseOrganizationResourceProjectionSchema = z.discriminatedUnion("resourceKind", [
+  z.object({
+    ...EnterpriseOrganizationResourceNodeShape,
+    resourceKind: z.literal("workspace"),
+    workspaceId: z.string().min(1),
+    ownerPrincipalId: PrincipalIdSchema,
+    label: z.string().min(1),
+    status: z.string().min(1),
+    updatedAt: z.string().min(1),
+  }),
+  z.object({
+    ...EnterpriseOrganizationResourceNodeShape,
+    resourceKind: z.literal("agent"),
+    agentId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    ownerPrincipalId: PrincipalIdSchema,
+    label: z.string().min(1),
+    status: z.string().min(1),
+    provider: z.string().min(1),
+    model: z.string().min(1).nullable(),
+    startedAt: z.string().min(1),
+    lastActivityAt: z.string().min(1),
+    durationMs: z.number().int().nonnegative(),
+    failureCategory: z.string().min(1).optional(),
+    resourcePressure: z
+      .object({
+        waitingCount: z.number().int().nonnegative(),
+        unavailableCount: z.number().int().nonnegative(),
+      })
+      .optional(),
+    resourceStatuses: z.array(EnterpriseResourceStatusProjectionSchema).optional(),
+  }),
+  z.object({
+    ...EnterpriseOrganizationResourceNodeShape,
+    resourceKind: z.literal("browser_profile"),
+    browserProfileId: BrowserProfileIdSchema,
+    ownerPrincipalId: PrincipalIdSchema,
+    label: z.string().min(1),
+    status: z.string().min(1),
+    occupancy: z.string().min(1),
+    workspaceId: z.string().min(1).optional(),
+    agentId: z.string().min(1).optional(),
+  }),
+  z.object({
+    ...EnterpriseOrganizationResourceNodeShape,
+    resourceKind: z.literal("app_slot"),
+    appSlotId: AppSlotIdSchema,
+    ownerPrincipalId: PrincipalIdSchema.optional(),
+    label: z.string().min(1),
+    status: z.string().min(1),
+    occupancy: z.string().min(1),
+    workspaceId: z.string().min(1).optional(),
+    agentId: z.string().min(1).optional(),
+  }),
+]);
+
+export const ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST = ["pong", "server_info"] as const;
+export const ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST = [
+  "enterprise.identity.get_current.response",
+  "enterprise.identity.logout_all.response",
+  "enterprise.identity.scope_refreshed",
+  "enterprise.identity.credential_revoked",
+] as const;
+
+const OutboundSessionBindingAuthorityShape = {
+  sessionBindingKey: z.string().min(1),
+  sessionBindingGeneration: z.string().min(1),
+};
+
+const IdentitySelfOutboundMessageAuthoritySchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[0]),
+      requestId: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[1]),
+      requestId: z.string().min(1),
+    })
+    .strict(),
+  z.object({ type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[2]) }).strict(),
+  z.object({ type: z.literal(ENTERPRISE_IDENTITY_SELF_OUTBOUND_ALLOWLIST[3]) }).strict(),
+]);
+
+export const OutboundAuthoritySchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("authorized_request"),
+      // This is a server-minted lookup key. Its value has no client-visible semantics.
+      receiptId: z.string().min(1),
+      requestId: z.string().min(1),
+      // Kept open so W2 can own the exhaustive request/response authorization table.
+      requestType: z.string().min(1),
+      ...OutboundSessionBindingAuthorityShape,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("identity_self"),
+      ...OutboundSessionBindingAuthorityShape,
+      message: IdentitySelfOutboundMessageAuthoritySchema,
+    })
+    .strict(),
+]);
+
+// Internal authorization state only. Never attach this context to a Session wire message.
+export const OutboundAuthorizationContextSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("resources"),
+      resources: z.array(GlobalResourceRefSchema).min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("authority"),
+      authority: OutboundAuthoritySchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("transport_control"),
+      control: z.enum(ENTERPRISE_TRANSPORT_CONTROL_OUTBOUND_ALLOWLIST),
+    })
+    .strict(),
+]);
+
+const LeaseAcquireSharedShape = {
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  businessIdentityId: BusinessIdentityIdSchema.optional(),
+  holderPrincipalId: PrincipalIdSchema,
+  holderAgentId: z.string().min(1),
+  mode: z.enum(["read", "write"]),
+  ttlMs: z.number().int().positive(),
+};
+
+export const LeaseAcquireInputSchema = z.discriminatedUnion("resourceKind", [
+  z.object({
+    ...LeaseAcquireSharedShape,
+    resourceKind: z.literal("browser_profile"),
+    resourceId: BrowserProfileIdSchema,
+  }),
+  z.object({
+    ...LeaseAcquireSharedShape,
+    resourceKind: z.literal("app_slot"),
+    resourceId: AppSlotIdSchema,
+  }),
+]);
+
+export const LeaseRenewInputSchema = z.object({
+  leaseId: LeaseIdSchema,
+  nodeId: NodeIdSchema,
+  holderPrincipalId: PrincipalIdSchema,
+  fencingToken: z.number().int().nonnegative(),
+  ttlMs: z.number().int().positive(),
+});
+
+export const LeaseReleaseInputSchema = LeaseRenewInputSchema.omit({ ttlMs: true });
+
+export type OrganizationId = z.infer<typeof OrganizationIdSchema>;
+export type PrincipalId = z.infer<typeof PrincipalIdSchema>;
+export type NodeId = z.infer<typeof NodeIdSchema>;
+export type NodeContext = z.infer<typeof NodeContextSchema>;
+export type ConnectionContext = z.infer<typeof ConnectionContextSchema>;
+export type EnterpriseAction = z.infer<typeof EnterpriseActionSchema>;
+export type ResourceSelector = z.infer<typeof ResourceSelectorSchema>;
+export type ResourceGrant = z.infer<typeof ResourceGrantSchema>;
+export type PrincipalContext = z.infer<typeof PrincipalContextSchema>;
+export type CurrentIdentityProjection = z.infer<typeof CurrentIdentityProjectionSchema>;
+export type EnterpriseSessionBinding = z.infer<typeof EnterpriseSessionBindingSchema>;
+export type EnterpriseResourceOwner = z.infer<typeof EnterpriseResourceOwnerSchema>;
+export type EnterpriseResourceOwnerWire = z.infer<typeof EnterpriseResourceOwnerWireSchema>;
+export type AgentOwnershipEnvelope = z.infer<typeof AgentOwnershipEnvelopeSchema>;
+export type BrowserProfileRecord = z.infer<typeof BrowserProfileRecordSchema>;
+export type BrowserProfileSummary = z.infer<typeof BrowserProfileSummarySchema>;
+export type AppSlotRecord = z.infer<typeof AppSlotRecordSchema>;
+export type EnterpriseResourceStatusProjection = z.infer<
+  typeof EnterpriseResourceStatusProjectionSchema
+>;
+export type ResourceLease = z.infer<typeof ResourceLeaseSchema>;
+export type FencedLease = z.infer<typeof FencedLeaseSchema>;
+export type AuditEvent = z.infer<typeof AuditEventSchema>;
+export type AuditEventInput = z.infer<typeof AuditEventInputSchema>;
+export type AuditDurability = z.infer<typeof AuditDurabilitySchema>;
+export type AuditAppendOptions = z.infer<typeof AuditAppendOptionsSchema>;
+export type EnterpriseNodeRecord = z.infer<typeof EnterpriseNodeRecordSchema>;
+export type GlobalResourceRef = z.infer<typeof GlobalResourceRefSchema>;
+export type OutboundAuthorizationContext = z.infer<typeof OutboundAuthorizationContextSchema>;
+export type EnterpriseOrganizationResourceProjection = z.infer<
+  typeof EnterpriseOrganizationResourceProjectionSchema
+>;
+export type EnterprisePrincipalSummaryProjection = z.infer<
+  typeof EnterprisePrincipalSummaryProjectionSchema
+>;
+export type LeaseAcquireInput = z.infer<typeof LeaseAcquireInputSchema>;
+export type LeaseRenewInput = z.infer<typeof LeaseRenewInputSchema>;
+export type LeaseReleaseInput = z.infer<typeof LeaseReleaseInputSchema>;
+
+export type EnterpriseWorkspaceAuthorizationRecord = EnterpriseResourceOwnerWire & {
+  id: string;
+};
+export type AuthorizedWorkspace = EnterpriseResourceOwner & {
+  workspaceId: string;
+};
+export type AuthorizedAgent = EnterpriseResourceOwner & {
+  agentId: string;
+  workspaceId: string;
+};
+export type AuthorizedBrowserProfile = BrowserProfileRecord;
+export type AuthorizedAppSlot = AppSlotRecord;
+
+export interface IdentityResolver {
+  resolveCredential(token: string, node: NodeContext): Promise<PrincipalContext | null>;
+}
+
+export interface PrincipalAuthenticator {
+  authenticateBearer(token: string, context: ConnectionContext): Promise<PrincipalContext | null>;
+}
+
+export interface ResourceAuthorization {
+  filterWorkspaces<T extends EnterpriseWorkspaceAuthorizationRecord>(
+    ctx: PrincipalContext,
+    rows: readonly T[],
+  ): T[];
+  assertWorkspace(
+    ctx: PrincipalContext,
+    action: EnterpriseAction,
+    workspaceId: string,
+  ): Promise<AuthorizedWorkspace>;
+  assertAgent(
+    ctx: PrincipalContext,
+    action: EnterpriseAction,
+    agentId: string,
+  ): Promise<AuthorizedAgent>;
+  assertBrowserProfile(
+    ctx: PrincipalContext,
+    action: EnterpriseAction,
+    browserProfileId: string,
+  ): Promise<AuthorizedBrowserProfile>;
+  assertAppSlot(
+    ctx: PrincipalContext,
+    action: EnterpriseAction,
+    appSlotId: string,
+  ): Promise<AuthorizedAppSlot>;
+  resolveWorkspacePath(
+    ctx: PrincipalContext,
+    workspaceId: string,
+    requestedPath: string,
+  ): Promise<string>;
+  canEmit(
+    ctx: PrincipalContext,
+    event: SessionOutboundMessage,
+    context: OutboundAuthorizationContext,
+  ): Promise<boolean>;
+}
+
+export interface PlacementResolver {
+  resolveWorkspace(workspaceId: string): Promise<GlobalResourceRef | null>;
+}
+
+export interface LeaseCoordinator {
+  acquire(input: LeaseAcquireInput): Promise<FencedLease>;
+  renew(input: LeaseRenewInput): Promise<FencedLease>;
+  release(input: LeaseReleaseInput): Promise<void>;
+  validate?(input: LeaseReleaseInput): Promise<FencedLease>;
+}
+
+export type AuditHashInput = Omit<AuditEvent, "eventHash">;
+
+export interface AuditClock {
+  now(): string;
+}
+
+export interface AuditIdSource {
+  next(): string;
+}
+
+export interface AuditHash {
+  hash(event: Readonly<AuditHashInput>): Promise<string>;
+}
+
+export interface AuditSequence {
+  next(previousSequence: number | null): Promise<number>;
+}
+
+export interface AuditStorage {
+  readAll(): Promise<readonly AuditEvent[]>;
+  append(event: Readonly<AuditEvent>): Promise<void>;
+}
+
+export interface AuditSinkDependencies {
+  readonly node: NodeContext;
+  readonly clock: AuditClock;
+  readonly idSource: AuditIdSource;
+  readonly hash: AuditHash;
+  readonly sequence: AuditSequence;
+  readonly storage: AuditStorage;
+}
+
+export interface AuditSink {
+  append(input: AuditEventInput, options: AuditAppendOptions): Promise<AuditEvent>;
+}
+
+export type StandaloneNodeContext = NodeContext & { mode: "standalone" };
+
+export interface LocalIdentityResolverContract extends IdentityResolver {
+  readonly adapterKind: "local";
+  readonly node: StandaloneNodeContext;
+}
+
+export interface LocalPrincipalAuthenticatorContract extends PrincipalAuthenticator {
+  readonly adapterKind: "local";
+  readonly node: StandaloneNodeContext;
+}
+
+export interface LocalResourceAuthorizationContract extends ResourceAuthorization {
+  readonly adapterKind: "local";
+  readonly node: StandaloneNodeContext;
+}
+
+export interface LocalPlacementResolverContract extends PlacementResolver {
+  readonly adapterKind: "local";
+  readonly node: StandaloneNodeContext;
+}
+
+export interface LocalLeaseCoordinatorContract extends LeaseCoordinator {
+  readonly adapterKind: "local";
+  readonly node: StandaloneNodeContext;
+}
+
+export interface LocalAuditSinkContract extends AuditSink {
+  readonly adapterKind: "local";
+  readonly node: StandaloneNodeContext;
+}
+
+export type LocalAuditSinkDependencies = Omit<AuditSinkDependencies, "node"> & {
+  readonly node: StandaloneNodeContext;
+};
+
+export interface LocalEnterprisePorts {
+  readonly node: StandaloneNodeContext;
+  readonly authenticator: LocalPrincipalAuthenticatorContract;
+  readonly identity: LocalIdentityResolverContract;
+  readonly authorization: LocalResourceAuthorizationContract;
+  readonly placement: LocalPlacementResolverContract;
+  readonly lease: LocalLeaseCoordinatorContract;
+  readonly audit: LocalAuditSinkContract;
+}
 
 const MutableDaemonProviderModelSchema = z
   .object({
@@ -856,6 +1739,8 @@ export const AgentSnapshotPayloadSchema = z.object({
   provider: AgentProviderSchema,
   cwd: z.string(),
   workspaceId: z.string().optional(),
+  // Owner fields stay optional on the wire so legacy single-user records remain parseable.
+  ...EnterpriseResourceOwnerWireSchema.shape,
   model: z.string().nullable(),
   features: z.array(AgentFeatureSchema).optional(),
   thinkingOptionId: z.string().nullable().optional(),
@@ -894,6 +1779,8 @@ export const AgentListItemPayloadSchema = z.object({
   effectiveThinkingOptionId: z.string().nullable().optional(),
   status: AgentStatusSchema,
   cwd: z.string(),
+  // Owner fields stay optional on the wire so legacy single-user records remain parseable.
+  ...EnterpriseResourceOwnerWireSchema.shape,
   createdAt: z.string(),
   updatedAt: z.string(),
   lastUserMessageAt: z.string().nullable(),
@@ -1193,6 +2080,9 @@ export const ReviewAttachmentSchema = z.object({
 export const UploadedFileAttachmentSchema = z.object({
   type: z.literal("uploaded_file"),
   id: z.string(),
+  // Enterprise mode resolves this server-issued opaque ID; legacy single-user attachments omit it.
+  uploadId: z.string().min(1).optional(),
+  workspaceId: z.string().min(1).optional(),
   fileName: z.string(),
   mimeType: z.string(),
   size: z.number().int().nonnegative(),
@@ -1378,6 +2268,8 @@ export const FetchAgentHistoryRequestMessageSchema = z.object({
 export const FetchRecentProviderSessionsRequestMessageSchema = z.object({
   type: z.literal("fetch_recent_provider_sessions_request"),
   requestId: z.string(),
+  // Enterprise mode validates this against the authenticated Principal and canonical registry.
+  workspaceId: z.string().min(1).optional(),
   cwd: z.string().optional(),
   providers: z.array(z.string()).optional(),
   since: z.string().optional(),
@@ -1604,12 +2496,14 @@ export const ReadProjectConfigRequestMessageSchema = z.object({
   type: z.literal("read_project_config_request"),
   requestId: z.string(),
   repoRoot: z.string(),
+  workspaceId: z.string().min(1).optional(),
 });
 
 export const WriteProjectConfigRequestMessageSchema = z.object({
   type: z.literal("write_project_config_request"),
   requestId: z.string(),
   repoRoot: z.string(),
+  workspaceId: z.string().min(1).optional(),
   config: PaseoConfigRawSchema,
   expectedRevision: PaseoConfigRevisionSchema.nullable(),
 });
@@ -1705,6 +2599,7 @@ export const ListProviderModelsRequestMessageSchema = z.object({
   type: z.literal("list_provider_models_request"),
   provider: AgentProviderSchema,
   cwd: z.string().optional(),
+  workspaceId: z.string().min(1).optional(),
   requestId: z.string(),
 });
 
@@ -1712,6 +2607,7 @@ export const ListProviderModesRequestMessageSchema = z.object({
   type: z.literal("list_provider_modes_request"),
   provider: AgentProviderSchema,
   cwd: z.string().optional(),
+  workspaceId: z.string().min(1).optional(),
   requestId: z.string(),
 });
 
@@ -1723,6 +2619,7 @@ export const ListAvailableProvidersRequestMessageSchema = z.object({
 export const GetProvidersSnapshotRequestMessageSchema = z.object({
   type: z.literal("get_providers_snapshot_request"),
   cwd: z.string().optional(),
+  workspaceId: z.string().min(1).optional(),
   // COMPAT(compactProviderSnapshots): old daemons ignore this field and return a full snapshot.
   ifNoneMatch: z.string().optional(),
   requestId: z.string(),
@@ -1731,6 +2628,7 @@ export const GetProvidersSnapshotRequestMessageSchema = z.object({
 export const RefreshProvidersSnapshotRequestMessageSchema = z.object({
   type: z.literal("refresh_providers_snapshot_request"),
   cwd: z.string().optional(),
+  workspaceId: z.string().min(1).optional(),
   providers: z.array(AgentProviderSchema).optional(),
   requestId: z.string(),
 });
@@ -2405,6 +3303,7 @@ export const DirectorySuggestionsRequestSchema = z.object({
   type: z.literal("directory_suggestions_request"),
   query: z.string(),
   cwd: z.string().optional(),
+  workspaceId: z.string().min(1).optional(),
   includeFiles: z.boolean().optional(),
   includeDirectories: z.boolean().optional(),
   matchMode: z.enum(["fuzzy", "suffix"]).optional(),
@@ -2659,6 +3558,7 @@ const FileExplorerDirectorySchema = z.object({
 export const FileExplorerRequestSchema = z.object({
   type: z.literal("file_explorer_request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string().optional(),
   mode: z.enum(["list", "file"]),
   requestId: z.string(),
@@ -2691,6 +3591,7 @@ export const FileVersionSchema = z.discriminatedUnion("status", [
 export const FileSubscribeRequestSchema = z.object({
   type: z.literal("fs.file.subscribe.request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string(),
   subscriptionId: z.string(),
   requestId: z.string(),
@@ -2705,6 +3606,7 @@ export const FileUnsubscribeRequestSchema = z.object({
 export const FileWriteRequestSchema = z.object({
   type: z.literal("fs.file.write.request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string(),
   content: z.string(),
   expectedModifiedAt: z.string(),
@@ -2715,6 +3617,7 @@ export const FileWriteRequestSchema = z.object({
 export const FileEntryCreateRequestSchema = z.object({
   type: z.literal("fs.entry.create.request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   parentPath: z.string(),
   name: z.string(),
   kind: z.enum(["file", "directory"]),
@@ -2724,6 +3627,7 @@ export const FileEntryCreateRequestSchema = z.object({
 export const FileEntryRenameRequestSchema = z.object({
   type: z.literal("fs.entry.rename.request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string(),
   name: z.string(),
   requestId: z.string(),
@@ -2732,6 +3636,7 @@ export const FileEntryRenameRequestSchema = z.object({
 export const FileEntryDuplicateRequestSchema = z.object({
   type: z.literal("fs.entry.duplicate.request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string(),
   requestId: z.string(),
 });
@@ -2739,6 +3644,7 @@ export const FileEntryDuplicateRequestSchema = z.object({
 export const FileEntryDeleteRequestSchema = z.object({
   type: z.literal("fs.entry.delete.request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string(),
   requestId: z.string(),
 });
@@ -2746,6 +3652,7 @@ export const FileEntryDeleteRequestSchema = z.object({
 export const ProjectIconRequestSchema = z.object({
   type: z.literal("project_icon_request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   requestId: z.string(),
 });
 
@@ -2758,6 +3665,7 @@ export const ProjectIconGetRequestSchema = z.object({
 export const FileDownloadTokenRequestSchema = z.object({
   type: z.literal("file_download_token_request"),
   cwd: z.string(),
+  workspaceId: z.string().min(1).optional(),
   path: z.string(),
   requestId: z.string(),
 });
@@ -2768,6 +3676,7 @@ export const FileUploadRequestSchema = z.object({
   mimeType: z.string().min(1),
   size: z.number().int().nonnegative(),
   modifiedAt: z.string(),
+  workspaceId: z.string().min(1).optional(),
   requestId: z.string(),
 });
 
@@ -2806,6 +3715,7 @@ const ListCommandsDraftConfigSchema = z.object({
 export const ListProviderFeaturesRequestMessageSchema = z.object({
   type: z.literal("list_provider_features_request"),
   draftConfig: ListCommandsDraftConfigSchema,
+  workspaceId: z.string().min(1).optional(),
   requestId: z.string(),
 });
 
@@ -3046,6 +3956,732 @@ export const HubExecutionControlRequestSchema = z.object({
 
 export type HubExecutionControlRequest = z.infer<typeof HubExecutionControlRequestSchema>;
 
+const EnterprisePrincipalRecordSharedShape = {
+  organizationId: OrganizationIdSchema,
+  displayName: z.string().min(1).optional(),
+  status: z.enum(["active", "disabled", "revoked"]),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+};
+export const EnterprisePrincipalRecordSchema = z.discriminatedUnion("principalType", [
+  z.object({
+    ...EnterprisePrincipalRecordSharedShape,
+    principalType: z.literal("human"),
+    principalId: HumanPrincipalIdSchema,
+  }),
+  z.object({
+    ...EnterprisePrincipalRecordSharedShape,
+    principalType: z.literal("service"),
+    principalId: ServicePrincipalIdSchema,
+  }),
+  z.object({
+    ...EnterprisePrincipalRecordSharedShape,
+    principalType: z.literal("break_glass_owner"),
+    principalId: z.literal("owner"),
+  }),
+]);
+
+export const BrowserProfileBindingSchema = z.object({
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  workspaceId: z.string().min(1),
+  browserProfileId: BrowserProfileIdSchema,
+  boundByPrincipalId: PrincipalIdSchema,
+  boundAt: z.string().min(1),
+});
+export const BrowserProfileBindingProjectionSchema = z.object({
+  organizationId: OrganizationIdSchema,
+  nodeId: NodeIdSchema,
+  workspaceId: z.string().min(1),
+  browserProfileId: BrowserProfileIdSchema,
+  boundAt: z.string().min(1),
+});
+
+function enterpriseRequestSchema<const Type extends `enterprise.${string}.request`>(type: Type) {
+  return z.object({ type: z.literal(type), requestId: z.string().min(1) });
+}
+
+export const EnterpriseIdentityGetCurrentRequestSchema = enterpriseRequestSchema(
+  "enterprise.identity.get_current.request",
+);
+export const EnterpriseIdentityGetCurrentResponseSchema = z.object({
+  type: z.literal("enterprise.identity.get_current.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    identity: CurrentIdentityProjectionSchema,
+  }),
+});
+
+export const EnterpriseIdentityLogoutAllRequestSchema = enterpriseRequestSchema(
+  "enterprise.identity.logout_all.request",
+);
+export const EnterpriseIdentityLogoutAllResponseSchema = z.object({
+  type: z.literal("enterprise.identity.logout_all.response"),
+  payload: z.object({ requestId: z.string().min(1), loggedOut: z.boolean() }),
+});
+export const EnterpriseIdentityScopeRefreshedMessageSchema = z.object({
+  type: z.literal("enterprise.identity.scope_refreshed"),
+  payload: z.object({ identity: CurrentIdentityProjectionSchema }),
+});
+export const EnterpriseIdentityCredentialRevokedMessageSchema = z.object({
+  type: z.literal("enterprise.identity.credential_revoked"),
+  payload: z.object({
+    revokedAt: z.string().min(1),
+    reasonCode: z.string().min(1).optional(),
+  }),
+});
+
+export const EnterpriseIdentityListPrincipalsRequestSchema = enterpriseRequestSchema(
+  "enterprise.identity.list_principals.request",
+);
+export const EnterpriseIdentityListPrincipalsResponseSchema = z.object({
+  type: z.literal("enterprise.identity.list_principals.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    principals: z.array(EnterprisePrincipalRecordSchema),
+  }),
+});
+
+const EnterpriseContentReadPageSchema = z.strictObject({
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100),
+});
+const EnterpriseContentReadResponsePageSchema = <Item extends z.ZodTypeAny>(item: Item) =>
+  z.strictObject({ items: z.array(item), nextCursor: z.string().min(1).nullable() });
+
+export const EnterpriseWorkspaceContentSelectorSchema = z.strictObject({
+  kind: z.literal("workspace"),
+  view: z.enum(["timeline", "files"]),
+});
+export const EnterpriseAgentContentSelectorSchema = z.strictObject({
+  kind: z.literal("agent"),
+  view: z.enum(["transcript", "artifacts"]),
+});
+export const EnterpriseBrowserProfileContentSelectorSchema = z.strictObject({
+  kind: z.literal("browser_profile"),
+  view: z.enum(["state", "artifacts"]),
+});
+export const EnterpriseAppSlotContentSelectorSchema = z.strictObject({
+  kind: z.literal("app_slot"),
+  view: z.enum(["state", "artifacts"]),
+});
+
+const EnterpriseContentItemIdentityShape = {
+  itemId: z.string().min(1),
+  occurredAt: z.string().min(1),
+};
+const EnterpriseContentMetadataShape = {
+  reference: z.string().min(1),
+  label: z.string().min(1),
+  mimeType: z.string().min(1).optional(),
+  size: z.number().int().nonnegative().optional(),
+};
+export const EnterpriseWorkspaceContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    kind: z.literal("message"),
+    text: z.string(),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("file"),
+  }),
+]);
+export const EnterpriseAgentContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    kind: z.literal("message"),
+    text: z.string(),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("artifact"),
+  }),
+]);
+const EnterpriseRedactedStateShape = {
+  label: z.string().min(1),
+  status: z.string().min(1),
+  origin: z.string().min(1).optional(),
+};
+export const EnterpriseBrowserProfileContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseRedactedStateShape,
+    kind: z.literal("state"),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("artifact"),
+  }),
+]);
+export const EnterpriseAppSlotContentItemSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseRedactedStateShape,
+    kind: z.literal("state"),
+  }),
+  z.strictObject({
+    ...EnterpriseContentItemIdentityShape,
+    ...EnterpriseContentMetadataShape,
+    kind: z.literal("artifact"),
+  }),
+]);
+
+function enterpriseContentReadRequestSchema<
+  const Type extends `enterprise.${string}.request`,
+  const Kind extends EnterpriseResourceKind,
+>(type: Type, resourceKind: Kind, selector: z.ZodTypeAny) {
+  return z
+    .strictObject({
+      type: z.literal(type),
+      requestId: z.string().min(1),
+      resource: GlobalResourceRefSchema,
+      selector,
+      page: EnterpriseContentReadPageSchema,
+    })
+    .superRefine((value, ctx) => {
+      if (value.resource.resourceKind !== resourceKind) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["resource", "resourceKind"],
+          message: "resource kind mismatch",
+        });
+      }
+    });
+}
+
+export const EnterpriseWorkspaceContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.workspace.content.read.request",
+  "workspace",
+  EnterpriseWorkspaceContentSelectorSchema,
+);
+export const EnterpriseAgentContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.agent.content.read.request",
+  "agent",
+  EnterpriseAgentContentSelectorSchema,
+);
+export const EnterpriseBrowserProfileContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.browser_profile.content.read.request",
+  "browser_profile",
+  EnterpriseBrowserProfileContentSelectorSchema,
+);
+export const EnterpriseAppSlotContentReadRequestSchema = enterpriseContentReadRequestSchema(
+  "enterprise.app_slot.content.read.request",
+  "app_slot",
+  EnterpriseAppSlotContentSelectorSchema,
+);
+
+function enterpriseContentReadResponseSchema<
+  const Type extends `enterprise.${string}.response`,
+  Item extends z.ZodTypeAny,
+  Selector extends z.ZodTypeAny,
+>(type: Type, resourceKind: EnterpriseResourceKind, selector: Selector, item: Item) {
+  return z
+    .strictObject({
+      type: z.literal(type),
+      payload: z.strictObject({
+        requestId: z.string().min(1),
+        resource: GlobalResourceRefSchema,
+        selector,
+        page: EnterpriseContentReadResponsePageSchema(item),
+      }),
+    })
+    .superRefine((value, ctx) => {
+      if (value.payload.resource.resourceKind !== resourceKind) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["payload", "resource", "resourceKind"],
+          message: "resource kind mismatch",
+        });
+      }
+    });
+}
+
+export const EnterpriseWorkspaceContentReadResponseSchema = enterpriseContentReadResponseSchema(
+  "enterprise.workspace.content.read.response",
+  "workspace",
+  EnterpriseWorkspaceContentSelectorSchema,
+  EnterpriseWorkspaceContentItemSchema,
+);
+export const EnterpriseAgentContentReadResponseSchema = enterpriseContentReadResponseSchema(
+  "enterprise.agent.content.read.response",
+  "agent",
+  EnterpriseAgentContentSelectorSchema,
+  EnterpriseAgentContentItemSchema,
+);
+export const EnterpriseBrowserProfileContentReadResponseSchema =
+  enterpriseContentReadResponseSchema(
+    "enterprise.browser_profile.content.read.response",
+    "browser_profile",
+    EnterpriseBrowserProfileContentSelectorSchema,
+    EnterpriseBrowserProfileContentItemSchema,
+  );
+export const EnterpriseAppSlotContentReadResponseSchema = enterpriseContentReadResponseSchema(
+  "enterprise.app_slot.content.read.response",
+  "app_slot",
+  EnterpriseAppSlotContentSelectorSchema,
+  EnterpriseAppSlotContentItemSchema,
+);
+
+const BrowserPageIdentityObservationBrowserSchema = z.strictObject({
+  browserId: BrowserAutomationBrowserIdSchema,
+  browserProfileId: BrowserProfileIdSchema,
+});
+const NormalizedBrowserHostnameSchema = z
+  .string()
+  .min(1)
+  .max(253)
+  .regex(/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/);
+const BrowserAccountLabelHashSchema = z.string().min(1);
+
+export const EnterpriseBrowserPageIdentityObservationRequestSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.observe.request"),
+  requestId: z.string().min(1),
+  browser: BrowserPageIdentityObservationBrowserSchema,
+  hostname: NormalizedBrowserHostnameSchema,
+  accountLabelHash: BrowserAccountLabelHashSchema.optional(),
+  observationRevision: z.string().min(1),
+  bindingRevision: z.string().min(1),
+  lifecycleGeneration: z.string().min(1),
+});
+
+export const EnterpriseBrowserPageIdentityObservationResponseSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.observe.response"),
+  payload: z.strictObject({
+    requestId: z.string().min(1),
+    acceptedRevision: z.string().min(1),
+  }),
+});
+
+export const EnterpriseBrowserPageIdentityInvalidationRequestSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.invalidate.request"),
+  requestId: z.string().min(1),
+  browser: BrowserPageIdentityObservationBrowserSchema,
+  bindingRevision: z.string().min(1),
+  lifecycleGeneration: z.string().min(1),
+  observationRevision: z.string().min(1),
+});
+
+export const EnterpriseBrowserPageIdentityInvalidationResponseSchema = z.strictObject({
+  type: z.literal("enterprise.browser.page_identity.invalidate.response"),
+  payload: z.strictObject({
+    requestId: z.string().min(1),
+    acceptedRevision: z.string().min(1),
+  }),
+});
+
+const EnterpriseOwnershipTransferResourceSchema = z.union([
+  z.strictObject({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("workspace"),
+    localResourceId: z.string().min(1),
+  }),
+  z.strictObject({
+    ...GlobalResourceRefSharedShape,
+    resourceKind: z.literal("agent"),
+    localResourceId: z.string().min(1),
+  }),
+]);
+
+export const EnterpriseResourceOwnershipTransferRequestSchema = z.strictObject({
+  type: z.literal("enterprise.resource.ownership.transfer.request"),
+  requestId: z.string().min(1),
+  resource: EnterpriseOwnershipTransferResourceSchema,
+  expectedOwnerPrincipalId: PrincipalIdSchema,
+  expectedRevision: z.string().min(1),
+  newPrincipalId: PrincipalIdSchema,
+});
+
+export const EnterpriseResourceOwnershipTransferResponseSchema = z.strictObject({
+  type: z.literal("enterprise.resource.ownership.transfer.response"),
+  payload: z.strictObject({
+    requestId: z.string().min(1),
+    resource: EnterpriseOwnershipTransferResourceSchema,
+    ownerPrincipalId: PrincipalIdSchema,
+    revision: z.string().min(1),
+    receiptId: z.string().min(1),
+  }),
+});
+
+export const EnterpriseWorkspaceOwnershipTransferTombstoneSchema = z.strictObject({
+  type: z.literal("enterprise.workspace.ownership.transfer.tombstone"),
+  payload: z.strictObject({
+    eventId: z.string().min(1),
+    resource: z.strictObject({
+      ...GlobalResourceRefSharedShape,
+      resourceKind: z.literal("workspace"),
+      localResourceId: z.string().min(1),
+    }),
+    oldPrincipalId: PrincipalIdSchema,
+    newRevision: z.string().min(1),
+    transferReceiptId: z.string().min(1),
+  }),
+});
+
+export const EnterpriseAccessListGrantsRequestSchema = z.object({
+  type: z.literal("enterprise.access.list_grants.request"),
+  requestId: z.string().min(1),
+  principalId: PrincipalIdSchema,
+});
+const EnterpriseGrantSetPayloadSchema = z.object({
+  requestId: z.string().min(1),
+  principalId: PrincipalIdSchema,
+  grants: z.array(ResourceGrantSchema),
+  revision: z.string().min(1),
+});
+export const EnterpriseAccessListGrantsResponseSchema = z.object({
+  type: z.literal("enterprise.access.list_grants.response"),
+  payload: EnterpriseGrantSetPayloadSchema,
+});
+export const EnterpriseAccessUpdateGrantsRequestSchema = z.object({
+  type: z.literal("enterprise.access.update_grants.request"),
+  requestId: z.string().min(1),
+  principalId: PrincipalIdSchema,
+  grants: z.array(ResourceGrantSchema),
+  expectedRevision: z.string().min(1),
+});
+export const EnterpriseAccessUpdateGrantsResponseSchema = z.object({
+  type: z.literal("enterprise.access.update_grants.response"),
+  payload: EnterpriseGrantSetPayloadSchema,
+});
+
+export const EnterpriseAuditListEventsRequestSchema = z.object({
+  type: z.literal("enterprise.audit.list_events.request"),
+  requestId: z.string().min(1),
+  workspaceId: z.string().min(1).optional(),
+  resource: z.object({ kind: z.string().min(1), id: z.string().min(1) }).optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(500).optional(),
+});
+export const EnterpriseAuditListEventsResponseSchema = z.object({
+  type: z.literal("enterprise.audit.list_events.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    events: z.array(AuditEventSchema),
+    nextCursor: z.string().min(1).nullable(),
+  }),
+});
+
+export const EnterpriseBrowserListProfilesRequestSchema = z.object({
+  type: z.literal("enterprise.browser.list_profiles.request"),
+  requestId: z.string().min(1),
+  workspaceId: z.string().min(1),
+});
+export const EnterpriseBrowserListProfilesResponseSchema = z.object({
+  type: z.literal("enterprise.browser.list_profiles.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    profiles: z.array(BrowserProfileSummarySchema),
+    bindings: z.array(BrowserProfileBindingProjectionSchema),
+  }),
+});
+export const EnterpriseBrowserBindProfileRequestSchema = z.object({
+  type: z.literal("enterprise.browser.bind_profile.request"),
+  requestId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  browserProfileId: BrowserProfileIdSchema,
+});
+export const EnterpriseBrowserBindProfileResponseSchema = z.object({
+  type: z.literal("enterprise.browser.bind_profile.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    binding: BrowserProfileBindingProjectionSchema,
+  }),
+});
+
+export const EnterpriseResourceAcquireLeaseRequestSchema = z.object({
+  type: z.literal("enterprise.resource.acquire_lease.request"),
+  requestId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  agentId: z.string().min(1),
+  resourceKind: EnterpriseLeasableResourceKindSchema,
+  mode: z.enum(["read", "write"]),
+});
+export const EnterpriseResourceAcquireLeaseResponseSchema = z.object({
+  type: z.literal("enterprise.resource.acquire_lease.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    lease: FencedLeaseSchema.nullable(),
+    waiting: z.boolean(),
+  }),
+});
+export const EnterpriseResourceRenewLeaseRequestSchema = z.object({
+  type: z.literal("enterprise.resource.renew_lease.request"),
+  requestId: z.string().min(1),
+  leaseId: LeaseIdSchema,
+  fencingToken: z.number().int().nonnegative(),
+});
+export const EnterpriseResourceRenewLeaseResponseSchema = z.object({
+  type: z.literal("enterprise.resource.renew_lease.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    lease: FencedLeaseSchema.nullable(),
+  }),
+});
+export const EnterpriseResourceReleaseLeaseRequestSchema = z.object({
+  type: z.literal("enterprise.resource.release_lease.request"),
+  requestId: z.string().min(1),
+  leaseId: LeaseIdSchema,
+  fencingToken: z.number().int().nonnegative(),
+});
+export const EnterpriseResourceReleaseLeaseResponseSchema = z.object({
+  type: z.literal("enterprise.resource.release_lease.response"),
+  payload: z.object({ requestId: z.string().min(1), released: z.boolean() }),
+});
+
+const EnterpriseResourceWaitingSharedShape = {
+  status: z.literal("resource_waiting"),
+  workspaceId: z.string().min(1),
+  agentId: z.string().min(1),
+  nodeId: NodeIdSchema,
+  mode: z.enum(["read", "write"]),
+  queuedAt: z.string().min(1),
+  position: z.number().int().positive().optional(),
+};
+export const EnterpriseResourceWaitingMessageSchema = z.object({
+  type: z.literal("enterprise.resource.waiting"),
+  payload: z.discriminatedUnion("resourceKind", [
+    z.object({
+      ...EnterpriseResourceWaitingSharedShape,
+      resourceKind: z.literal("browser_profile"),
+      resourceId: BrowserProfileIdSchema,
+    }),
+    z.object({
+      ...EnterpriseResourceWaitingSharedShape,
+      resourceKind: z.literal("app_slot"),
+      resourceId: AppSlotIdSchema,
+    }),
+  ]),
+});
+export const EnterpriseResourceStatusMessageSchema = z.object({
+  type: z.literal("enterprise.resource.status"),
+  payload: EnterpriseResourceStatusProjectionSchema,
+});
+
+export const EnterpriseNodeListNodesRequestSchema = enterpriseRequestSchema(
+  "enterprise.node.list_nodes.request",
+);
+export const EnterpriseNodeListNodesResponseSchema = z.object({
+  type: z.literal("enterprise.node.list_nodes.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    nodes: z.array(EnterpriseNodeRecordSchema),
+  }),
+});
+
+export const EnterpriseNodeSetDrainRequestSchema = z.object({
+  type: z.literal("enterprise.node.set_drain.request"),
+  requestId: z.string().min(1),
+  nodeId: NodeIdSchema,
+  draining: z.boolean(),
+});
+export const EnterpriseNodeSetDrainResponseSchema = z.object({
+  type: z.literal("enterprise.node.set_drain.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    node: EnterpriseNodeRecordSchema,
+  }),
+});
+
+export const EnterprisePlacementResolveWorkspaceRequestSchema = z.object({
+  type: z.literal("enterprise.placement.resolve_workspace.request"),
+  requestId: z.string().min(1),
+  workspaceId: z.string().min(1),
+});
+export const EnterprisePlacementResolveWorkspaceResponseSchema = z.object({
+  type: z.literal("enterprise.placement.resolve_workspace.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    resource: GlobalResourceRefSchema.nullable(),
+  }),
+});
+
+export const EnterpriseOrganizationListResourcesRequestSchema = z.object({
+  type: z.literal("enterprise.organization.list_resources.request"),
+  requestId: z.string().min(1),
+  resourceKinds: z.array(EnterpriseResourceKindSchema).optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(500).optional(),
+});
+export const EnterpriseOrganizationListResourcesResponseSchema = z.object({
+  type: z.literal("enterprise.organization.list_resources.response"),
+  payload: z.object({
+    requestId: z.string().min(1),
+    principals: z.array(EnterprisePrincipalSummaryProjectionSchema),
+    resources: z.array(EnterpriseOrganizationResourceProjectionSchema),
+    nextCursor: z.string().min(1).nullable(),
+  }),
+});
+
+export type EnterprisePrincipalRecord = z.infer<typeof EnterprisePrincipalRecordSchema>;
+export type BrowserProfileBinding = z.infer<typeof BrowserProfileBindingSchema>;
+export type BrowserProfileBindingProjection = z.infer<typeof BrowserProfileBindingProjectionSchema>;
+export type EnterpriseIdentityGetCurrentRequest = z.infer<
+  typeof EnterpriseIdentityGetCurrentRequestSchema
+>;
+export type EnterpriseIdentityGetCurrentResponse = z.infer<
+  typeof EnterpriseIdentityGetCurrentResponseSchema
+>;
+export type EnterpriseIdentityLogoutAllRequest = z.infer<
+  typeof EnterpriseIdentityLogoutAllRequestSchema
+>;
+export type EnterpriseIdentityLogoutAllResponse = z.infer<
+  typeof EnterpriseIdentityLogoutAllResponseSchema
+>;
+export type EnterpriseIdentityScopeRefreshedMessage = z.infer<
+  typeof EnterpriseIdentityScopeRefreshedMessageSchema
+>;
+export type EnterpriseIdentityCredentialRevokedMessage = z.infer<
+  typeof EnterpriseIdentityCredentialRevokedMessageSchema
+>;
+export type EnterpriseIdentityListPrincipalsRequest = z.infer<
+  typeof EnterpriseIdentityListPrincipalsRequestSchema
+>;
+export type EnterpriseIdentityListPrincipalsResponse = z.infer<
+  typeof EnterpriseIdentityListPrincipalsResponseSchema
+>;
+export type EnterpriseWorkspaceContentSelector = z.infer<
+  typeof EnterpriseWorkspaceContentSelectorSchema
+>;
+export type EnterpriseAgentContentSelector = z.infer<typeof EnterpriseAgentContentSelectorSchema>;
+export type EnterpriseBrowserProfileContentSelector = z.infer<
+  typeof EnterpriseBrowserProfileContentSelectorSchema
+>;
+export type EnterpriseAppSlotContentSelector = z.infer<
+  typeof EnterpriseAppSlotContentSelectorSchema
+>;
+export type EnterpriseWorkspaceContentItem = z.infer<typeof EnterpriseWorkspaceContentItemSchema>;
+export type EnterpriseAgentContentItem = z.infer<typeof EnterpriseAgentContentItemSchema>;
+export type EnterpriseBrowserProfileContentItem = z.infer<
+  typeof EnterpriseBrowserProfileContentItemSchema
+>;
+export type EnterpriseAppSlotContentItem = z.infer<typeof EnterpriseAppSlotContentItemSchema>;
+export type EnterpriseWorkspaceContentReadRequest = z.infer<
+  typeof EnterpriseWorkspaceContentReadRequestSchema
+>;
+export type EnterpriseWorkspaceContentReadResponse = z.infer<
+  typeof EnterpriseWorkspaceContentReadResponseSchema
+>;
+export type EnterpriseAgentContentReadRequest = z.infer<
+  typeof EnterpriseAgentContentReadRequestSchema
+>;
+export type EnterpriseAgentContentReadResponse = z.infer<
+  typeof EnterpriseAgentContentReadResponseSchema
+>;
+export type EnterpriseBrowserProfileContentReadRequest = z.infer<
+  typeof EnterpriseBrowserProfileContentReadRequestSchema
+>;
+export type EnterpriseBrowserProfileContentReadResponse = z.infer<
+  typeof EnterpriseBrowserProfileContentReadResponseSchema
+>;
+export type EnterpriseAppSlotContentReadRequest = z.infer<
+  typeof EnterpriseAppSlotContentReadRequestSchema
+>;
+export type EnterpriseAppSlotContentReadResponse = z.infer<
+  typeof EnterpriseAppSlotContentReadResponseSchema
+>;
+export type EnterpriseBrowserPageIdentityObservationRequest = z.infer<
+  typeof EnterpriseBrowserPageIdentityObservationRequestSchema
+>;
+export type EnterpriseBrowserPageIdentityObservationResponse = z.infer<
+  typeof EnterpriseBrowserPageIdentityObservationResponseSchema
+>;
+export type EnterpriseBrowserPageIdentityInvalidationRequest = z.infer<
+  typeof EnterpriseBrowserPageIdentityInvalidationRequestSchema
+>;
+export type EnterpriseBrowserPageIdentityInvalidationResponse = z.infer<
+  typeof EnterpriseBrowserPageIdentityInvalidationResponseSchema
+>;
+export type EnterpriseResourceOwnershipTransferRequest = z.infer<
+  typeof EnterpriseResourceOwnershipTransferRequestSchema
+>;
+export type EnterpriseResourceOwnershipTransferResponse = z.infer<
+  typeof EnterpriseResourceOwnershipTransferResponseSchema
+>;
+export type EnterpriseWorkspaceOwnershipTransferRequest = Omit<
+  EnterpriseResourceOwnershipTransferRequest,
+  "resource"
+> & {
+  resource: Extract<
+    EnterpriseResourceOwnershipTransferRequest["resource"],
+    { resourceKind: "workspace" }
+  >;
+};
+export type EnterpriseWorkspaceOwnershipTransferTombstone = z.infer<
+  typeof EnterpriseWorkspaceOwnershipTransferTombstoneSchema
+>;
+export type EnterpriseAccessListGrantsRequest = z.infer<
+  typeof EnterpriseAccessListGrantsRequestSchema
+>;
+export type EnterpriseAccessListGrantsResponse = z.infer<
+  typeof EnterpriseAccessListGrantsResponseSchema
+>;
+export type EnterpriseAccessUpdateGrantsRequest = z.infer<
+  typeof EnterpriseAccessUpdateGrantsRequestSchema
+>;
+export type EnterpriseAccessUpdateGrantsResponse = z.infer<
+  typeof EnterpriseAccessUpdateGrantsResponseSchema
+>;
+export type EnterpriseAuditListEventsRequest = z.infer<
+  typeof EnterpriseAuditListEventsRequestSchema
+>;
+export type EnterpriseAuditListEventsResponse = z.infer<
+  typeof EnterpriseAuditListEventsResponseSchema
+>;
+export type EnterpriseBrowserListProfilesRequest = z.infer<
+  typeof EnterpriseBrowserListProfilesRequestSchema
+>;
+export type EnterpriseBrowserListProfilesResponse = z.infer<
+  typeof EnterpriseBrowserListProfilesResponseSchema
+>;
+export type EnterpriseBrowserBindProfileRequest = z.infer<
+  typeof EnterpriseBrowserBindProfileRequestSchema
+>;
+export type EnterpriseBrowserBindProfileResponse = z.infer<
+  typeof EnterpriseBrowserBindProfileResponseSchema
+>;
+export type EnterpriseResourceAcquireLeaseRequest = z.infer<
+  typeof EnterpriseResourceAcquireLeaseRequestSchema
+>;
+export type EnterpriseResourceAcquireLeaseResponse = z.infer<
+  typeof EnterpriseResourceAcquireLeaseResponseSchema
+>;
+export type EnterpriseResourceRenewLeaseRequest = z.infer<
+  typeof EnterpriseResourceRenewLeaseRequestSchema
+>;
+export type EnterpriseResourceRenewLeaseResponse = z.infer<
+  typeof EnterpriseResourceRenewLeaseResponseSchema
+>;
+export type EnterpriseResourceReleaseLeaseRequest = z.infer<
+  typeof EnterpriseResourceReleaseLeaseRequestSchema
+>;
+export type EnterpriseResourceReleaseLeaseResponse = z.infer<
+  typeof EnterpriseResourceReleaseLeaseResponseSchema
+>;
+export type EnterpriseResourceWaitingMessage = z.infer<
+  typeof EnterpriseResourceWaitingMessageSchema
+>;
+export type EnterpriseResourceStatusMessage = z.infer<typeof EnterpriseResourceStatusMessageSchema>;
+export type EnterpriseNodeListNodesRequest = z.infer<typeof EnterpriseNodeListNodesRequestSchema>;
+export type EnterpriseNodeListNodesResponse = z.infer<typeof EnterpriseNodeListNodesResponseSchema>;
+export type EnterpriseNodeSetDrainRequest = z.infer<typeof EnterpriseNodeSetDrainRequestSchema>;
+export type EnterpriseNodeSetDrainResponse = z.infer<typeof EnterpriseNodeSetDrainResponseSchema>;
+export type EnterprisePlacementResolveWorkspaceRequest = z.infer<
+  typeof EnterprisePlacementResolveWorkspaceRequestSchema
+>;
+export type EnterprisePlacementResolveWorkspaceResponse = z.infer<
+  typeof EnterprisePlacementResolveWorkspaceResponseSchema
+>;
+export type EnterpriseOrganizationListResourcesRequest = z.infer<
+  typeof EnterpriseOrganizationListResourcesRequestSchema
+>;
+export type EnterpriseOrganizationListResourcesResponse = z.infer<
+  typeof EnterpriseOrganizationListResourcesResponseSchema
+>;
+
 // These connection event streams have no directory bootstrap or timeline membership.
 export const SessionEventSubscriptionSchema = z.enum([
   "project.update",
@@ -3066,6 +4702,28 @@ export const SessionEventsSetSubscriptionResponseSchema = z.object({
 });
 
 export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
+  EnterpriseIdentityGetCurrentRequestSchema,
+  EnterpriseIdentityLogoutAllRequestSchema,
+  EnterpriseIdentityListPrincipalsRequestSchema,
+  EnterpriseWorkspaceContentReadRequestSchema,
+  EnterpriseAgentContentReadRequestSchema,
+  EnterpriseBrowserProfileContentReadRequestSchema,
+  EnterpriseAppSlotContentReadRequestSchema,
+  EnterpriseResourceOwnershipTransferRequestSchema,
+  EnterpriseBrowserPageIdentityObservationRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationRequestSchema,
+  EnterpriseAccessListGrantsRequestSchema,
+  EnterpriseAccessUpdateGrantsRequestSchema,
+  EnterpriseAuditListEventsRequestSchema,
+  EnterpriseBrowserListProfilesRequestSchema,
+  EnterpriseBrowserBindProfileRequestSchema,
+  EnterpriseResourceAcquireLeaseRequestSchema,
+  EnterpriseResourceRenewLeaseRequestSchema,
+  EnterpriseResourceReleaseLeaseRequestSchema,
+  EnterpriseNodeListNodesRequestSchema,
+  EnterpriseNodeSetDrainRequestSchema,
+  EnterprisePlacementResolveWorkspaceRequestSchema,
+  EnterpriseOrganizationListResourcesRequestSchema,
   SessionEventsSetSubscriptionRequestSchema,
   HubExecutionAgentCreateRequestSchema,
   HubExecutionAgentValidateRequestSchema,
@@ -3589,6 +5247,40 @@ export const ServerInfoStatusPayloadSchema = z
         agentProfiles: z.boolean().optional(),
         // COMPAT(agentConfigApply): added in v0.3.2, remove gate after 2027-02-11.
         agentConfigApply: z.boolean().optional(),
+        // COMPAT(enterpriseIdentityV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires enterprise Identity V1.
+        enterpriseIdentityV1: z.boolean().optional(),
+        // COMPAT(enterpriseResourceAuthorizationV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires enterprise resource authorization V1.
+        enterpriseResourceAuthorizationV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserProfilesV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires enterprise Browser Profiles V1.
+        enterpriseBrowserProfilesV1: z.boolean().optional(),
+        // COMPAT(enterpriseAuditV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires enterprise Audit V1.
+        enterpriseAuditV1: z.boolean().optional(),
+        // COMPAT(enterpriseDistributedNodeV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires distributed Node V1.
+        enterpriseDistributedNodeV1: z.boolean().optional(),
+        // COMPAT(enterpriseWorkspaceContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseWorkspaceContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseAgentContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseAgentContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserProfileContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseBrowserProfileContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseAppSlotContentReadV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the family schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseAppSlotContentReadV1: z.boolean().optional(),
+        // COMPAT(enterpriseResourceOwnershipTransferV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until the strict transfer schema, production handler, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseResourceOwnershipTransferV1: z.boolean().optional(),
+        // COMPAT(enterpriseWorkspaceOwnershipTransferV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until Workspace-only transfer CAS, receipt/current checks, audit, and denial evidence are ready.
+        enterpriseWorkspaceOwnershipTransferV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserPageIdentityObservationV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until observer transport, bootstrap, W2 verification, publisher, and mismatch evidence are ready.
+        enterpriseBrowserPageIdentityObservationV1: z.boolean().optional(),
+        // COMPAT(enterpriseBrowserPageIdentityInvalidationV1): added in v0.9.0, remove gate after 2027-03-09.
+        // Keep absent until invalidation transport, bootstrap, W2 verification, publisher, and mismatch evidence are ready.
+        enterpriseBrowserPageIdentityInvalidationV1: z.boolean().optional(),
       })
       .optional(),
   })
@@ -3863,6 +5555,8 @@ export const WorkspaceGitHubRuntimePayloadSchema = z
 export const WorkspaceDescriptorPayloadSchema = z
   .object({
     id: z.string(),
+    // Owner fields stay optional on the wire so legacy single-user records remain parseable.
+    ...EnterpriseResourceOwnerWireSchema.shape,
     projectId: z.string(),
     projectDisplayName: z.string(),
     // COMPAT(projectCustomName): added in v0.1.76, drop the optional gate when floor >= v0.1.76.
@@ -5856,6 +7550,8 @@ export const FileUploadResponseSchema = z.object({
   type: z.literal("file.upload.response"),
   payload: z.object({
     requestId: z.string(),
+    uploadId: z.string().min(1).optional(),
+    workspaceId: z.string().min(1).optional(),
     file: UploadedFileAttachmentSchema.nullable(),
     error: z.string().nullable(),
   }),
@@ -6459,6 +8155,33 @@ export const AgentSkillsImportLegacySelectionResponseSchema = z.object({
 });
 
 export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
+  EnterpriseIdentityGetCurrentResponseSchema,
+  EnterpriseIdentityLogoutAllResponseSchema,
+  EnterpriseIdentityScopeRefreshedMessageSchema,
+  EnterpriseIdentityCredentialRevokedMessageSchema,
+  EnterpriseIdentityListPrincipalsResponseSchema,
+  EnterpriseWorkspaceContentReadResponseSchema,
+  EnterpriseAgentContentReadResponseSchema,
+  EnterpriseBrowserProfileContentReadResponseSchema,
+  EnterpriseAppSlotContentReadResponseSchema,
+  EnterpriseResourceOwnershipTransferResponseSchema,
+  EnterpriseWorkspaceOwnershipTransferTombstoneSchema,
+  EnterpriseBrowserPageIdentityObservationResponseSchema,
+  EnterpriseBrowserPageIdentityInvalidationResponseSchema,
+  EnterpriseAccessListGrantsResponseSchema,
+  EnterpriseAccessUpdateGrantsResponseSchema,
+  EnterpriseAuditListEventsResponseSchema,
+  EnterpriseBrowserListProfilesResponseSchema,
+  EnterpriseBrowserBindProfileResponseSchema,
+  EnterpriseResourceAcquireLeaseResponseSchema,
+  EnterpriseResourceRenewLeaseResponseSchema,
+  EnterpriseResourceReleaseLeaseResponseSchema,
+  EnterpriseResourceWaitingMessageSchema,
+  EnterpriseResourceStatusMessageSchema,
+  EnterpriseNodeListNodesResponseSchema,
+  EnterpriseNodeSetDrainResponseSchema,
+  EnterprisePlacementResolveWorkspaceResponseSchema,
+  EnterpriseOrganizationListResourcesResponseSchema,
   SessionEventsSetSubscriptionResponseSchema,
   HubExecutionAgentCreateResponseSchema,
   HubExecutionAgentValidateResponseSchema,
@@ -7154,7 +8877,7 @@ export const WSHelloMessageSchema = z.object({
       [CLIENT_CAPS.providerSnapshotReferences]: z.boolean().optional(),
       [CLIENT_CAPS.timelineReplacementInvalidation]: z.boolean().optional(),
       [CLIENT_CAPS.timelineNotifications]: z.boolean().optional(),
-      [CLIENT_CAPS.browserHost]: BrowserAutomationHostCapabilitySchema.optional(),
+      [CLIENT_CAPS.browserHost]: BrowserAutomationHostCapabilityWireSchema.optional(),
     })
     .passthrough()
     .optional(),

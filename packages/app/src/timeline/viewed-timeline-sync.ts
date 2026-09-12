@@ -38,6 +38,7 @@ async function prepareCachedTimeline(input: {
   agentId: string;
   storage: TimelineReplicaStorage;
   prepareAgent: (agentId: string) => Promise<void>;
+  isCurrent: () => boolean;
 }): Promise<CachedTimeline | undefined> {
   const before = useSessionStore.getState().sessions[input.serverId];
   const beforeTimeline = selectAgentTimelineState(before, input.agentId);
@@ -46,6 +47,7 @@ async function prepareCachedTimeline(input: {
     input.storage.readTimeline(input.serverId, input.agentId),
     input.prepareAgent(input.agentId),
   ]);
+  if (!input.isCurrent()) return undefined;
   if (!stored) return undefined;
   const session = useSessionStore.getState().sessions[input.serverId];
   const currentTimeline = selectAgentTimelineState(session, input.agentId);
@@ -94,11 +96,18 @@ export interface TimelineReplica {
   readCursor(agentId: string): { epoch: string; endSeq: number } | undefined;
   readRange(agentId: string): AgentTimelineCursorState | undefined;
   timelineUpdated(agentId: string): void;
+  evictAgents(agentIds: readonly string[]): void;
+  resetEvictions(): void;
+  isAgentBlocked(agentId: string): boolean;
+  subscribeEvictions(listener: (agentIds: readonly string[]) => void): () => void;
 }
 
 class TimelineReplicaOwner implements TimelineReplica {
   private readonly cachedRanges = new Map<string, AgentTimelineCursorState>();
   private readonly preparations = new Map<string, Promise<void>>();
+  private readonly lifecycleVersions = new Map<string, number>();
+  private readonly blockedAgentIds = new Set<string>();
+  private readonly evictionListeners = new Set<(agentIds: readonly string[]) => void>();
 
   constructor(
     private readonly serverId: string,
@@ -119,13 +128,18 @@ class TimelineReplicaOwner implements TimelineReplica {
   }
 
   private async load(agentId: string): Promise<void> {
+    const lifecycleVersion = this.lifecycleVersions.get(agentId) ?? 0;
+    const isCurrent = () =>
+      !this.blockedAgentIds.has(agentId) &&
+      (this.lifecycleVersions.get(agentId) ?? 0) === lifecycleVersion;
     const stored = await prepareCachedTimeline({
       serverId: this.serverId,
       agentId,
       storage: this.storage,
       prepareAgent: this.prepareAgent,
+      isCurrent,
     });
-    if (!stored) return;
+    if (!stored || !isCurrent()) return;
     if (stored.range) {
       this.cachedRanges.set(agentId, stored.range);
     }
@@ -141,6 +155,7 @@ class TimelineReplicaOwner implements TimelineReplica {
   }
 
   timelineUpdated(agentId: string): void {
+    if (this.blockedAgentIds.has(agentId)) return;
     const session = useSessionStore.getState().sessions[this.serverId];
     const timeline = selectAgentTimelineState(session, agentId);
     if (timeline.status === "cold") return;
@@ -151,6 +166,35 @@ class TimelineReplicaOwner implements TimelineReplica {
       range: timeline.status === "synced" ? timeline.range : null,
       hasOlder: timeline.status === "synced" && timeline.older === "available",
     });
+  }
+
+  evictAgents(agentIds: readonly string[]): void {
+    const evicted: string[] = [];
+    for (const agentId of new Set(agentIds)) {
+      this.lifecycleVersions.set(agentId, (this.lifecycleVersions.get(agentId) ?? 0) + 1);
+      this.blockedAgentIds.add(agentId);
+      this.cachedRanges.delete(agentId);
+      evicted.push(agentId);
+    }
+    if (evicted.length === 0) return;
+    const frozen = Object.freeze(evicted);
+    for (const listener of this.evictionListeners) listener(frozen);
+  }
+
+  resetEvictions(): void {
+    for (const agentId of this.blockedAgentIds) {
+      this.lifecycleVersions.set(agentId, (this.lifecycleVersions.get(agentId) ?? 0) + 1);
+    }
+    this.blockedAgentIds.clear();
+  }
+
+  isAgentBlocked(agentId: string): boolean {
+    return this.blockedAgentIds.has(agentId);
+  }
+
+  subscribeEvictions(listener: (agentIds: readonly string[]) => void): () => void {
+    this.evictionListeners.add(listener);
+    return () => this.evictionListeners.delete(listener);
   }
 }
 
@@ -338,6 +382,7 @@ export interface ViewedTimelineSync extends ViewedTimelineUiBridge {
   setConnected(connected: boolean): void;
   setDeliveryMode(mode: TimelineDeliveryMode): void;
   recoverGap(agentId: string, cursor: { epoch: string; endSeq: number }): void;
+  evictAgents(agentIds: readonly string[]): void;
   dispose(): void;
 }
 
@@ -372,9 +417,14 @@ export function createViewedTimelineOwner(input: {
     recoverTimelineGap: (agentId, cursor) => sync.recoverGap(agentId, cursor),
     onCommitted: (agentId) => input.replica.timelineUpdated(agentId),
   });
+  const unsubscribeEvictions = input.replica.subscribeEvictions((agentIds) => {
+    for (const agentId of agentIds) streamQueue.discardAgent(agentId);
+    sync.evictAgents(agentIds);
+  });
   return {
     ...sync,
     applyTimelineResponse(payload) {
+      if (input.replica.isAgentBlocked(payload.agentId)) return;
       const accepted = applyAuthoritativeTimelineResponse({
         serverId: input.serverId,
         payload,
@@ -385,12 +435,18 @@ export function createViewedTimelineOwner(input: {
       if (accepted) input.replica.timelineUpdated(payload.agentId);
     },
     enqueueStreamEvent(agentId, event) {
+      if (input.replica.isAgentBlocked(agentId)) return;
       streamQueue.enqueue(agentId, event);
     },
     flushStreamAgent(agentId) {
+      if (input.replica.isAgentBlocked(agentId)) {
+        streamQueue.discardAgent(agentId);
+        return;
+      }
       streamQueue.flushAgent(agentId);
     },
     dispose() {
+      unsubscribeEvictions();
       streamQueue.dispose({ flush: true });
       sync.dispose();
     },
@@ -903,6 +959,28 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
         request: planTimelineCatchUpAfter({ epoch: cursor.epoch, seq: cursor.endSeq }),
         supersede: true,
       });
+    },
+    evictAgents(agentIds) {
+      const evicted = new Set(agentIds);
+      if (evicted.size === 0) return;
+      for (const [sourceId, sourceAgentIds] of sources) {
+        const retained = sourceAgentIds.filter((agentId) => !evicted.has(agentId));
+        if (retained.length === 0) sources.delete(sourceId);
+        else if (retained.length !== sourceAgentIds.length) sources.set(sourceId, retained);
+      }
+      loadedCache.forEach((agentId) => {
+        if (evicted.has(agentId)) loadedCache.delete(agentId);
+      });
+      for (const agentId of evicted) {
+        cacheLoads.delete(agentId);
+        cancelCatchUp(agentId);
+        visibilityCatchUpPending.delete(agentId);
+        visibilityCatchUpErrors.delete(agentId);
+        manualRetries.delete(agentId);
+      }
+      acknowledged = acknowledged.filter((agentId) => !evicted.has(agentId));
+      recentlyViewedAgentIds = recentlyViewedAgentIds.filter((agentId) => !evicted.has(agentId));
+      commitDesiredMembership(desired.filter((agentId) => !evicted.has(agentId)));
     },
     dispose() {
       disposed = true;

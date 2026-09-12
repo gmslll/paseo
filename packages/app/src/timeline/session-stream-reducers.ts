@@ -1498,6 +1498,7 @@ export interface AgentStreamReducerQueue {
   enqueue: (agentId: string, event: AgentStreamReducerEvent) => void;
   flush: () => void;
   flushAgent: (agentId: string) => void;
+  discardAgent: (agentId: string) => void;
   dispose: (options?: { flush?: boolean }) => void;
 }
 
@@ -1809,6 +1810,10 @@ export function createAgentStreamReducerQueue(
     },
     flush,
     flushAgent,
+    discardAgent(agentId) {
+      pendingByAgentId.delete(agentId);
+      if (pendingByAgentId.size === 0) cancelScheduledFlush();
+    },
     dispose(options) {
       cancelScheduledFlush();
       if (options?.flush) {

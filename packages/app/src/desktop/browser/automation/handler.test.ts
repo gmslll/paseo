@@ -165,6 +165,23 @@ function browserAutomationRequest(): BrowserAutomationExecuteRequest {
   };
 }
 
+function enterpriseBrowserAutomationRequest(): BrowserAutomationExecuteRequest {
+  return {
+    type: "browser.automation.execute.request",
+    requestId: "req-enterprise",
+    agentId: "agent-enterprise",
+    workspaceId: "workspace-enterprise",
+    enterpriseContext: {
+      browserProfileId: "brp_1111111111111111",
+      nodeId: "nod_1111111111111111",
+      leaseId: "lea_11111111-1111-4111-8111-111111111111",
+      fencingToken: 7,
+      leaseRevision: "lease-revision-a",
+    },
+    command: { command: "list_tabs", args: {} },
+  };
+}
+
 function browserNewTabRequest(): BrowserAutomationExecuteRequest {
   return {
     type: "browser.automation.execute.request",
@@ -525,6 +542,120 @@ describe("mountBrowserAutomationHandler", () => {
         },
       },
     ]);
+  });
+
+  test("fails enterprise requests closed when no trusted Profile lease port is installed", async () => {
+    const browser = new BrowserAutomationHandlerHarness();
+    browser.mount();
+
+    browser.receive(enterpriseBrowserAutomationRequest());
+    await flushAsyncWork();
+
+    expect(browser.client.payloadAt(0)).toMatchObject({
+      requestId: "req-enterprise",
+      ok: false,
+      error: { code: "browser_denied" },
+    });
+    expect(browser.browser.executedRequests).toEqual([]);
+  });
+
+  test("uses only the trusted Profile lease result before executing an enterprise request", async () => {
+    const browser = new BrowserAutomationHandlerHarness();
+    const resolvedInputs: unknown[] = [];
+    Object.assign(browser.browser, {
+      resolveProfileLease: async (input: unknown) => {
+        resolvedInputs.push(input);
+        return {
+          authorization: {
+            organizationId: "org_1111111111111111",
+            homeNodeId: "nod_1111111111111111",
+            workspaceId: "workspace-enterprise",
+            browserProfileId: "brp_1111111111111111",
+            bindingRevision: "binding-a",
+            lifecycleGeneration: "lifecycle-a",
+          },
+          partition: "persist:paseo-enterprise-brp_1111111111111111",
+        };
+      },
+    });
+    browser.mount();
+    const request = enterpriseBrowserAutomationRequest();
+
+    browser.receive(request);
+    await flushAsyncWork();
+
+    expect(resolvedInputs).toEqual([
+      {
+        workspaceId: request.workspaceId,
+        enterpriseContext: request.enterpriseContext,
+      },
+    ]);
+    expect(browser.browser.executedRequests).toEqual([request]);
+    expect(browser.client.payloadAt(0)).toMatchObject({
+      requestId: "req-enterprise",
+      ok: true,
+      enterpriseContext: request.enterpriseContext,
+      result: { command: "list_tabs", tabs: [] },
+    });
+  });
+
+  test("rejects a trusted-port result for the wrong Profile before Desktop execution", async () => {
+    const browser = new BrowserAutomationHandlerHarness();
+    Object.assign(browser.browser, {
+      resolveProfileLease: async () => ({
+        authorization: {
+          organizationId: "org_1111111111111111",
+          homeNodeId: "nod_1111111111111111",
+          workspaceId: "workspace-enterprise",
+          browserProfileId: "brp_2222222222222222",
+          bindingRevision: "binding-b",
+          lifecycleGeneration: "lifecycle-a",
+        },
+        partition: "persist:paseo-enterprise-brp_2222222222222222",
+      }),
+    });
+    browser.mount();
+
+    browser.receive(enterpriseBrowserAutomationRequest());
+    await flushAsyncWork();
+
+    expect(browser.client.payloadAt(0)).toMatchObject({
+      requestId: "req-enterprise",
+      ok: false,
+      error: { code: "browser_denied" },
+    });
+    expect(browser.browser.executedRequests).toEqual([]);
+  });
+
+  test("rejects accessor Profile results without invoking authority getters", async () => {
+    const browser = new BrowserAutomationHandlerHarness();
+    let getterCalls = 0;
+    const accessorResult = Object.defineProperty(
+      { partition: "persist:paseo-enterprise-brp_1111111111111111" },
+      "authorization",
+      {
+        enumerable: true,
+        get: () => {
+          getterCalls += 1;
+          return {};
+        },
+      },
+    );
+    Object.assign(browser.browser, {
+      resolveProfileLease: async () => accessorResult,
+    });
+    browser.mount();
+
+    browser.receive(enterpriseBrowserAutomationRequest());
+    await flushAsyncWork();
+
+    expect(getterCalls).toBe(0);
+    expect(browser.client.payloadAt(0)).toMatchObject({
+      requestId: "req-enterprise",
+      ok: false,
+      error: { code: "browser_denied" },
+    });
+    expect(browser.browser.executedRequests).toEqual([]);
   });
 
   test("missing desktop bridge sends browser_unsupported", async () => {

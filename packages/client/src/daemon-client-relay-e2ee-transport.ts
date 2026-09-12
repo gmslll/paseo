@@ -19,17 +19,39 @@ export function createRelayE2eeTransportFactory(args: {
   baseFactory: DaemonTransportFactory;
   daemonPublicKeyB64: string;
   logger: TransportLogger;
+  authPreface?: { getToken(): string | Promise<string> };
 }): DaemonTransportFactory {
-  return ({ url, headers }) => {
-    const base = args.baseFactory({ url, headers });
-    return createEncryptedTransport(base, args.daemonPublicKeyB64, args.logger);
+  return ({ url, headers, protocols }) => {
+    const base = args.baseFactory({
+      url,
+      ...(args.authPreface
+        ? {
+            ...(headers ? { headers: stripOuterAuthenticationHeaders(headers) } : {}),
+            ...(protocols
+              ? { protocols: protocols.filter((protocol) => !isBearerSubprotocol(protocol)) }
+              : {}),
+          }
+        : { ...(headers ? { headers } : {}), ...(protocols ? { protocols } : {}) }),
+    });
+    return createEncryptedTransport(base, args.daemonPublicKeyB64, args.logger, args.authPreface);
   };
+}
+
+function stripOuterAuthenticationHeaders(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => name.toLowerCase() !== "authorization"),
+  );
+}
+
+function isBearerSubprotocol(protocol: string): boolean {
+  return protocol.toLowerCase().startsWith("paseo.bearer.");
 }
 
 export function createEncryptedTransport(
   base: DaemonTransport,
   daemonPublicKeyB64: string,
   logger: TransportLogger,
+  authPreface?: { getToken(): string | Promise<string> },
 ): DaemonTransport {
   let channel: EncryptedChannel | null = null;
   let opened = false;
@@ -94,12 +116,17 @@ export function createEncryptedTransport(
 
   const startHandshake = async () => {
     try {
-      channel = await createClientChannel(relayTransport, daemonPublicKeyB64, {
-        onopen: emitOpen,
-        onmessage: (data) => emitMessage(data),
-        onclose: (code, reason) => emitClose({ code, reason }),
-        onerror: (error) => emitError(error),
-      });
+      channel = await createClientChannel(
+        relayTransport,
+        daemonPublicKeyB64,
+        {
+          onopen: emitOpen,
+          onmessage: (data) => emitMessage(data),
+          onclose: (code, reason) => emitClose({ code, reason }),
+          onerror: (error) => emitError(error),
+        },
+        authPreface ? { authPreface } : undefined,
+      );
     } catch (error) {
       logger.warn({ err: normalizeTransportError(error) }, "relay_e2ee_handshake_failed");
       emitError(error);

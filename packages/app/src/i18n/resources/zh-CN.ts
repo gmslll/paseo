@@ -1936,6 +1936,7 @@ export const zhCN: TranslationResources = {
       usage: "使用情况",
       terminals: "Terminals",
       plugins: "插件",
+      enterprise: "企业",
       host: "概览",
     },
     plugins: pluginSettings["zh-CN"],

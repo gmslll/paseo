@@ -1975,6 +1975,7 @@ export const ja: TranslationResources = {
       usage: "使用状況",
       terminals: "ターミナル",
       plugins: "プラグイン",
+      enterprise: "エンタープライズ",
       host: "概要",
     },
     plugins: pluginSettings.ja,

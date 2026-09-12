@@ -58,27 +58,44 @@ import {
   BROWSER_NEW_TAB_REQUEST_EVENT,
   decideBrowserWindowOpenRequest,
   getPaseoBrowserIdForWebContents,
+  getPaseoBrowserWebContentsForProfile,
   getPaseoBrowserWebContentsForHostWindow,
   getPaseoBrowserWebviewRegistry,
   listRegisteredPaseoBrowserIds,
+  listRegisteredPaseoBrowserIdsForProfile,
   isPaseoBrowserWebviewAttach,
   preparePaseoBrowserWebContents,
   PendingBrowserWindowOpenRequests,
   registerBrowserWebviewNavigationGuards,
   unregisterPaseoBrowserFromHost,
+  unregisterPaseoBrowserProfile,
   registerAttachedPaseoBrowser,
+  registerAttachedPaseoBrowserAfterPageIdentityBarrier,
+  createBrowserPageIdentityPublisherRegistry,
+  installBrowserPageIdentityTransportRoutes,
+  installPaseoBrowserPageIdentityPublisher,
   setWorkspaceActivePaseoBrowserId,
   unregisterPaseoBrowserHost,
 } from "./features/browser-webviews/index.js";
+
 import {
   clearPaseoBrowserProfile,
+  getEnterpriseBrowserProfilePartition,
   getLegacyPaseoBrowserProfileSession,
   PASEO_BROWSER_PROFILE_PARTITION,
   getPaseoBrowserProfileSession,
   getPaseoBrowserProfileSessions,
   listPaseoBrowserProfileGuests,
+  parseBrowserProfileRuntimeSelector,
   readLegacyPaseoBrowserIds,
+  type BrowserProfileRuntimeAuthorization,
+  type BrowserProfileRuntimeSelector,
 } from "./features/browser-profile.js";
+import {
+  HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL,
+  REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL,
+} from "./features/browser-webviews/profile-authorizations.js";
+import { BrowserProfileAuthorizationRegistryRouter } from "./features/browser-webviews/profile-authorizations-handler.js";
 import { parseOpenProjectPathFromArgv } from "./open-project-routing.js";
 import {
   createDesktopWindowOwner,
@@ -101,11 +118,26 @@ import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import { installAppUpdateOnQuit } from "./features/auto-updater.js";
 import {
+  closeBrowserPageIdentityLifecycle,
+  createBrowserPageIdentityCloseBarrier,
+} from "./page-identity-lifecycle.js";
+import {
   buildAgentDeepLinkRoute,
   parseAgentDeepLink,
   type AgentDeepLinkTarget,
 } from "@getpaseo/protocol/agent-deep-link";
 import { AgentNavigationInbox, parseAgentDeepLinkFromArgv } from "./agent-navigation.js";
+
+const browserPageIdentityPublisherRegistry = createBrowserPageIdentityPublisherRegistry({
+  registry: getPaseoBrowserWebviewRegistry(),
+});
+const browserPageIdentityTransportController = installBrowserPageIdentityTransportRoutes({
+  ipcMain,
+  routeLifecycle: browserPageIdentityPublisherRegistry.routeLifecycle,
+});
+const browserPageIdentityPublisherDisposer = installPaseoBrowserPageIdentityPublisher(
+  browserPageIdentityPublisherRegistry,
+);
 
 const DEV_SERVER_URL = process.env.EXPO_DEV_URL ?? "http://localhost:8081";
 const APP_SCHEME = "paseo";
@@ -142,13 +174,21 @@ interface AttachedBrowserInput {
   browserId: string;
   workspaceId: string;
   webContentsId: number;
+  profile?: BrowserProfileRuntimeSelector;
 }
 
 function readAttachedBrowserInput(input: unknown): AttachedBrowserInput | null {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+  let record: Record<string, unknown>;
+  try {
+    record = readStableIpcRecord(
+      input,
+      ["browserId", "profile", "webContentsId", "workspaceId"],
+      ["browserId", "webContentsId", "workspaceId"],
+      "attached browser registration",
+    );
+  } catch {
     return null;
   }
-  const record = input as Record<string, unknown>;
   if (typeof record.browserId !== "string" || record.browserId.trim().length === 0) {
     return null;
   }
@@ -166,7 +206,46 @@ function readAttachedBrowserInput(input: unknown): AttachedBrowserInput | null {
     browserId: record.browserId.trim(),
     workspaceId: record.workspaceId.trim(),
     webContentsId: record.webContentsId,
+    ...(record.profile === undefined
+      ? {}
+      : { profile: parseBrowserProfileRuntimeSelector(record.profile) }),
   };
+}
+
+function readStableIpcRecord(
+  input: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const keys = Object.keys(descriptors);
+  if (
+    Object.getOwnPropertySymbols(input).length > 0 ||
+    keys.some((key) => !allowedKeys.includes(key)) ||
+    requiredKeys.some((key) => !keys.includes(key))
+  ) {
+    throw new Error(`Invalid ${label} fields.`);
+  }
+  const record: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || descriptor.get || descriptor.set || !("value" in descriptor)) {
+      throw new Error(`Invalid ${label} field.`);
+    }
+    record[key] = descriptor.value;
+  }
+  return record;
+}
+
+function readNonEmptyIpcString(input: unknown, label: string): string {
+  if (typeof input !== "string" || input.length === 0 || input.trim() !== input) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return input;
 }
 
 function readActiveBrowserInput(
@@ -185,6 +264,165 @@ function readActiveBrowserInput(
 
 const browserKeyboard = new BrowserKeyboard(getPaseoBrowserWebviewRegistry());
 browserKeyboard.registerIpc();
+
+const PROFILE_ORGANIZATION_ATTRIBUTE = "data-paseo-organization-id";
+const PROFILE_HOME_NODE_ATTRIBUTE = "data-paseo-home-node-id";
+const PROFILE_WORKSPACE_ATTRIBUTE = "data-paseo-workspace-id";
+const PROFILE_ID_ATTRIBUTE = "data-paseo-browser-profile-id";
+const PROFILE_BINDING_ATTRIBUTE = "data-paseo-binding-revision";
+const PROFILE_LIFECYCLE_ATTRIBUTE = "data-paseo-lifecycle-generation";
+const PROFILE_SELECTOR_ATTRIBUTES = [
+  PROFILE_ORGANIZATION_ATTRIBUTE,
+  PROFILE_HOME_NODE_ATTRIBUTE,
+  PROFILE_WORKSPACE_ATTRIBUTE,
+  PROFILE_ID_ATTRIBUTE,
+  PROFILE_BINDING_ATTRIBUTE,
+  PROFILE_LIFECYCLE_ATTRIBUTE,
+] as const;
+
+let browserProfileAuthorizationRegistryRouter: BrowserProfileAuthorizationRegistryRouter | null =
+  null;
+
+function readBrowserProfileSelectorFromWebviewParams(
+  params: Record<string, string>,
+): BrowserProfileRuntimeSelector | null {
+  const present = PROFILE_SELECTOR_ATTRIBUTES.filter((attribute) => attribute in params);
+  if (present.length === 0) return null;
+  if (present.length !== PROFILE_SELECTOR_ATTRIBUTES.length) {
+    throw new Error("Incomplete Browser Profile authorization attributes.");
+  }
+  return parseBrowserProfileRuntimeSelector({
+    organizationId: params[PROFILE_ORGANIZATION_ATTRIBUTE],
+    homeNodeId: params[PROFILE_HOME_NODE_ATTRIBUTE],
+    workspaceId: params[PROFILE_WORKSPACE_ATTRIBUTE],
+    browserProfileId: params[PROFILE_ID_ATTRIBUTE],
+    bindingRevision: params[PROFILE_BINDING_ATTRIBUTE],
+    lifecycleGeneration: params[PROFILE_LIFECYCLE_ATTRIBUTE],
+  });
+}
+
+function resolveBrowserProfileAuthorization(
+  hostWebContentsId: number,
+  selector: BrowserProfileRuntimeSelector,
+): BrowserProfileRuntimeAuthorization {
+  const authorization = browserProfileAuthorizationRegistryRouter?.resolveExact(
+    hostWebContentsId,
+    selector,
+  );
+  if (!authorization) {
+    throw new Error("Browser Profile authorization is unavailable or stale.");
+  }
+  return authorization;
+}
+
+function createBrowserProfileAuthorizationCleanup(hostWebContentsId: number) {
+  const guestIdsByProfile = new Map<string, readonly number[]>();
+  return {
+    async unregisterProfile(authorization: BrowserProfileRuntimeAuthorization): Promise<void> {
+      const browserIds = listRegisteredPaseoBrowserIdsForProfile({
+        hostWebContentsId,
+        authorization,
+      });
+      const registeredGuestIds = browserIds.flatMap((browserId) => {
+        const contents = getPaseoBrowserWebContentsForProfile({
+          browserId,
+          hostWebContentsId,
+          authorization,
+        });
+        return contents ? [contents.id] : [];
+      });
+      const profileSession = session.fromPartition(
+        getEnterpriseBrowserProfilePartition(authorization.browserProfileId),
+      );
+      const profileGuestIds = listPaseoBrowserProfileGuests({
+        profileSession,
+        webContents: webContents.getAllWebContents(),
+      }).map((contents) => contents.id);
+      guestIdsByProfile.set(
+        authorization.browserProfileId,
+        Object.freeze([...new Set([...registeredGuestIds, ...profileGuestIds])]),
+      );
+      await unregisterPaseoBrowserProfile({ hostWebContentsId, authorization });
+    },
+    findGuests(profileId: string): readonly unknown[] {
+      const guestIds = guestIdsByProfile.get(profileId) ?? [];
+      guestIdsByProfile.delete(profileId);
+      return guestIds;
+    },
+    destroyGuest(guest: unknown): void {
+      if (typeof guest !== "number" || !Number.isSafeInteger(guest) || guest <= 0) {
+        throw new Error("Invalid Browser Profile guest ID.");
+      }
+      const contents = webContents.fromId(guest);
+      if (contents && !contents.isDestroyed()) contents.close({ waitForBeforeUnload: false });
+    },
+    cleanupGuest(guest: unknown): void {
+      if (typeof guest !== "number" || !Number.isSafeInteger(guest) || guest <= 0) {
+        throw new Error("Invalid Browser Profile guest ID.");
+      }
+      pendingBrowserWindowOpenRequests.delete(guest);
+    },
+  };
+}
+
+function registerBrowserProfileAuthorizationIpc(): void {
+  browserProfileAuthorizationRegistryRouter = new BrowserProfileAuthorizationRegistryRouter(
+    createBrowserProfileAuthorizationCleanup,
+  );
+  ipcMain.handle(
+    HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL,
+    async (event, rawInput: unknown) => {
+      const input = readStableIpcRecord(
+        rawInput,
+        ["authorizations", "homeNodeId", "lifecycleGeneration"],
+        ["authorizations", "homeNodeId", "lifecycleGeneration"],
+        "Browser Profile authorization hydration",
+      );
+      if (!Array.isArray(input.authorizations)) {
+        throw new Error("Invalid Browser Profile authorizations.");
+      }
+      const lifecycleGeneration = readNonEmptyIpcString(
+        input.lifecycleGeneration,
+        "Browser Profile lifecycle generation",
+      );
+      const homeNodeId = readNonEmptyIpcString(input.homeNodeId, "Browser Profile home node ID");
+      return browserProfileAuthorizationRegistryRouter!.hydrate({
+        hostWebContentsId: event.sender.id,
+        homeNodeId,
+        authorizations: input.authorizations,
+        lifecycleGeneration,
+      });
+    },
+  );
+  ipcMain.handle(REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL, async (event, rawInput: unknown) => {
+    const input = readStableIpcRecord(
+      rawInput,
+      ["homeNodeId", "lifecycleGeneration"],
+      ["homeNodeId", "lifecycleGeneration"],
+      "Browser Profile generation revocation",
+    );
+    const lifecycleGeneration = readNonEmptyIpcString(
+      input.lifecycleGeneration,
+      "Browser Profile lifecycle generation",
+    );
+    const homeNodeId = readNonEmptyIpcString(input.homeNodeId, "Browser Profile home node ID");
+    return browserProfileAuthorizationRegistryRouter!.revoke({
+      hostWebContentsId: event.sender.id,
+      homeNodeId,
+      lifecycleGeneration,
+    });
+  });
+}
+
+function revokeBrowserProfileHost(hostWebContentsId: number): void {
+  if (!browserProfileAuthorizationRegistryRouter) return;
+  void browserProfileAuthorizationRegistryRouter.revokeHost(hostWebContentsId).catch((error) => {
+    log.error("[browser-profile] failed to cleanup closed host", {
+      hostWebContentsId,
+      error,
+    });
+  });
+}
 
 function showBrowserWebviewContextMenu(
   win: BrowserWindow,
@@ -383,17 +621,45 @@ ipcMain.handle("paseo:agent-navigation:ready", (event) => {
   return agentNavigationInbox.windowReady(event.sender.id);
 });
 
-ipcMain.handle("paseo:browser:register-attached", (event, rawInput: unknown) => {
+ipcMain.handle("paseo:browser:register-attached", async (event, rawInput: unknown) => {
   const input = readAttachedBrowserInput(rawInput);
   if (!input) {
     throw new Error("Invalid attached browser registration");
   }
-  const registered = registerAttachedPaseoBrowser({
-    ...input,
-    sender: event.sender,
-    profileSession: getPaseoBrowserProfileSession(session),
-    findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
-  });
+  const profileAuthorization = input.profile
+    ? resolveBrowserProfileAuthorization(event.sender.id, input.profile)
+    : null;
+  if (profileAuthorization && profileAuthorization.workspaceId !== input.workspaceId) {
+    throw new Error("Browser Profile authorization does not match the Browser Workspace.");
+  }
+  if (profileAuthorization) {
+    await browserPageIdentityPublisherDisposer;
+    const route = browserPageIdentityTransportController.getRoute(event.sender);
+    if (!route) throw new Error("Browser page identity transport route is unavailable");
+  }
+  const profileSession = profileAuthorization
+    ? session.fromPartition(
+        getEnterpriseBrowserProfilePartition(profileAuthorization.browserProfileId),
+      )
+    : getPaseoBrowserProfileSession(session);
+  const registered = profileAuthorization
+    ? await registerAttachedPaseoBrowserAfterPageIdentityBarrier({
+        browserId: input.browserId,
+        workspaceId: input.workspaceId,
+        webContentsId: input.webContentsId,
+        ...(profileAuthorization ? { profileAuthorization } : {}),
+        sender: event.sender,
+        profileSession,
+        findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
+      })
+    : registerAttachedPaseoBrowser({
+        browserId: input.browserId,
+        workspaceId: input.workspaceId,
+        webContentsId: input.webContentsId,
+        sender: event.sender,
+        profileSession,
+        findWebContents: (webContentsId) => webContents.fromId(webContentsId) ?? null,
+      });
   if (!registered) {
     throw new Error("Attached browser registration was rejected");
   }
@@ -422,7 +688,7 @@ ipcMain.handle("paseo:browser:unregister-workspace-browser", async (event, brows
       event.sender.id,
       normalizedBrowserId,
     );
-    unregisterPaseoBrowserFromHost(event.sender.id, normalizedBrowserId);
+    await unregisterPaseoBrowserFromHost(event.sender.id, normalizedBrowserId);
     // COMPAT(browserProfile): added in v0.1.108; remove after 2027-01-15.
     const legacyProfile = hasOtherHost
       ? null
@@ -705,6 +971,22 @@ async function createWindow(
   applyDesktopWindowChromeMode({ win: mainWindow, mode: DESKTOP_WINDOW_CHROME_MODE });
 
   const webContentsId = mainWindow.webContents.id;
+  let closeReleased = false;
+  const closeBarrier = createBrowserPageIdentityCloseBarrier({
+    retireRoute: () => browserPageIdentityTransportController.retireRoute(mainWindow.webContents),
+    unregisterHost: () => unregisterPaseoBrowserHost(webContentsId),
+    release: () => {
+      closeReleased = true;
+      mainWindow.close();
+    },
+    onError: (error) => {
+      log.error("[browser-page-identity] close barrier failed", error);
+    },
+  });
+  mainWindow.on("close", (event) => {
+    if (closeReleased) return;
+    closeBarrier(() => event.preventDefault());
+  });
   options.onCreated?.(webContentsId);
   mainWindow.webContents.on("did-start-navigation", (_event, _url, isSameDocument, isMainFrame) => {
     if (isMainFrame && !isSameDocument) {
@@ -714,6 +996,7 @@ async function createWindow(
   mainWindow.on("closed", () => {
     options.onClosed?.(webContentsId);
     agentNavigationInbox.removeWindow(webContentsId);
+    revokeBrowserProfileHost(webContentsId);
     unregisterPaseoBrowserHost(webContentsId);
     browserKeyboard.detachHost(webContentsId);
   });
@@ -734,7 +1017,22 @@ async function createWindow(
   setupDefaultContextMenu(mainWindow);
   setupDragDropPrevention(mainWindow);
   mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
-    if (!isPaseoBrowserWebviewAttach(params)) {
+    let profileAuthorization: BrowserProfileRuntimeAuthorization | null = null;
+    try {
+      const selector = readBrowserProfileSelectorFromWebviewParams(params);
+      profileAuthorization = selector
+        ? resolveBrowserProfileAuthorization(mainWindow.webContents.id, selector)
+        : null;
+    } catch {
+      event.preventDefault();
+      return;
+    }
+    if (
+      !isPaseoBrowserWebviewAttach({
+        ...params,
+        ...(profileAuthorization ? { profileAuthorization } : {}),
+      })
+    ) {
       event.preventDefault();
       return;
     }
@@ -966,6 +1264,7 @@ async function bootstrap(): Promise<void> {
   ipcMain.handle("paseo:opener:openUrl", (_event, value: unknown) => openExternalUrl(value));
   registerEditorTargetHandlers();
   registerBrowserAutomationIpc();
+  registerBrowserProfileAuthorizationIpc();
 
   // In-app "Open in new window": opens a window that lands on the given project
   // via the same open-project flow as a CLI launch (no move, no ownership).
@@ -1025,7 +1324,15 @@ function showDaemonShutdownDialog(): void {
 
 const quitLifecycle = createQuitLifecycle({
   app,
-  closeTransportSessions: closeAllTransportSessions,
+  closeTransportSessions: async () =>
+    closeBrowserPageIdentityLifecycle({
+      controllerClose: () => browserPageIdentityTransportController.close(),
+      disposer: async () => (await browserPageIdentityPublisherDisposer)(),
+      registryClose: () => browserPageIdentityPublisherRegistry.close(),
+      transportClose: async () => {
+        closeAllTransportSessions();
+      },
+    }),
   stopDesktopManagedDaemonIfNeeded: () =>
     stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: getDesktopSettingsStore(),

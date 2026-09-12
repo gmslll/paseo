@@ -13,6 +13,7 @@ import { createWorktreeCommand } from "./commands/worktree/index.js";
 import { createWorkspaceCommand } from "./commands/workspace/index.js";
 import { createHeartbeatCommand } from "./commands/heartbeat/index.js";
 import { createHubCommand } from "./commands/hub/index.js";
+import { createEnterpriseCommand } from "./commands/enterprise/index.js";
 import { createHooksCommand } from "./commands/hooks.js";
 import { startCommand as daemonStartCommand } from "./commands/daemon/start.js";
 import { runStatusCommand as runDaemonStatusCommand } from "./commands/daemon/status.js";
@@ -124,6 +125,7 @@ export function createCli(): Command {
   program.addCommand(onboardCommand());
   program.addCommand(daemonStartCommand());
   program.addCommand(createHooksCommand());
+  program.addCommand(createEnterpriseCommand());
 
   addJsonOption(
     program

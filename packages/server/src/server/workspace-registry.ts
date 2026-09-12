@@ -2,6 +2,11 @@ import { promises as fs } from "node:fs";
 
 import type { Logger } from "pino";
 import { z } from "zod";
+import {
+  EnterpriseResourceOwnerWireSchema,
+  normalizeEnterpriseResourceOwner,
+  type EnterpriseResourceOwner,
+} from "@getpaseo/protocol/messages";
 
 import { writeJsonFileAtomic } from "./atomic-file.js";
 import { areEquivalentPaths } from "../utils/path.js";
@@ -18,6 +23,17 @@ const UntrustedWorkspaceSourceSchema = z.object({
   number: z.number().int().positive(),
   headRepository: z.string(),
 });
+
+const OwnershipRevisionSchema = z
+  .string()
+  .regex(/^(0|[1-9][0-9]*)$/)
+  .refine((value) => {
+    try {
+      return BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+    } catch {
+      return false;
+    }
+  });
 
 const PersistedProjectRecordSchema = z.object({
   projectId: z.string(),
@@ -50,6 +66,7 @@ const PersistedProjectRecordSchema = z.object({
 
 const PersistedWorkspaceRecordSchema = z.object({
   workspaceId: z.string(),
+  ...EnterpriseResourceOwnerWireSchema.shape,
   projectId: z.string(),
   cwd: z.string(),
   kind: z.enum(["local_checkout", "worktree", "directory"]),
@@ -88,6 +105,7 @@ const PersistedWorkspaceRecordSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   archivedAt: z.string().nullable(),
+  ownershipRevision: OwnershipRevisionSchema.optional(),
   // COMPAT(autoArchivedChangeRequestUrl): added in v0.2.6, remove optional parsing after 2027-01-31.
   // Records the merged change request whose automatic archive was consumed.
   autoArchivedChangeRequestUrl: z
@@ -106,6 +124,20 @@ const PersistedWorkspaceRecordSchema = z.object({
 
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
 export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema>;
+
+function validateWorkspaceOwnership(record: PersistedWorkspaceRecord): void {
+  normalizeEnterpriseResourceOwner(record);
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const key of Reflect.ownKeys(value)) {
+      deepFreeze(Reflect.get(value, key));
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
 
 export interface WorkspaceMutation {
   kind: "upsert" | "archive" | "remove";
@@ -161,6 +193,13 @@ export interface WorkspaceRegistry {
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord | null>;
   upsert(record: PersistedWorkspaceRecord, context?: WorkspaceMutationContext): Promise<void>;
+  transferOwnership(input: {
+    workspaceId: string;
+    expectedOwnerPrincipalId: string;
+    expectedOwnershipRevision: string;
+    newOwnerPrincipalId: string;
+    beforeCommit?: (record: PersistedWorkspaceRecord) => Promise<void>;
+  }): Promise<PersistedWorkspaceRecord | null>;
   archive(
     workspaceId: string,
     archivedAt: string,
@@ -243,6 +282,29 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       records.set(id, next);
       return next;
     });
+  }
+
+  protected async mutateCacheAsync<TResult>(
+    mutator: (records: Map<string, TRecord>) => Promise<TResult>,
+  ): Promise<TResult> {
+    const previous = this.mutationQueue;
+    let resolve!: () => void;
+    this.mutationQueue = new Promise<void>((r) => (resolve = r));
+    await previous;
+    try {
+      await this.load();
+      if (this.mutationsBlockedUntilRestart)
+        throw new Error("Workspace registry mutations are blocked until daemon restart");
+      const staged = new Map(this.cache);
+      const result = await mutator(staged);
+      if (mapsEqual(this.cache, staged)) return result;
+      await this.writeRecords(this.filePath, Array.from(staged.values()));
+      this.cache.clear();
+      for (const [id, value] of staged) this.cache.set(id, value);
+      return result;
+    } finally {
+      resolve();
+    }
   }
 
   async archive(id: string, archivedAt: string): Promise<void> {
@@ -508,6 +570,50 @@ export class FileBackedWorkspaceRegistry
   extends FileBackedRegistry<PersistedWorkspaceRecord>
   implements WorkspaceRegistry
 {
+  async transferOwnership(input: {
+    workspaceId: string;
+    expectedOwnerPrincipalId: string;
+    expectedOwnershipRevision: string;
+    newOwnerPrincipalId: string;
+    beforeCommit?: (record: PersistedWorkspaceRecord) => Promise<void>;
+  }): Promise<PersistedWorkspaceRecord | null> {
+    const committed = await this.mutateCacheAsync(async (records) => {
+      const existing = records.get(input.workspaceId);
+      if (!existing) return null;
+      const revision = existing.ownershipRevision ?? "0";
+      if (BigInt(revision) >= BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      if (
+        existing.ownerPrincipalId !== input.expectedOwnerPrincipalId ||
+        revision !== input.expectedOwnershipRevision
+      )
+        return null;
+      if (input.beforeCommit)
+        await input.beforeCommit(
+          deepFreeze(PersistedWorkspaceRecordSchema.parse(structuredClone(existing))),
+        );
+      const current = records.get(input.workspaceId);
+      if (
+        !current ||
+        current.ownerPrincipalId !== input.expectedOwnerPrincipalId ||
+        (current.ownershipRevision ?? "0") !== revision
+      )
+        return null;
+      const next = PersistedWorkspaceRecordSchema.parse({
+        ...existing,
+        ownerPrincipalId: input.newOwnerPrincipalId,
+        ownershipRevision: (BigInt(revision) + 1n).toString(),
+      });
+      records.set(input.workspaceId, next);
+      return next;
+    });
+    if (committed)
+      await this.notifyMutation({
+        kind: "upsert",
+        workspaceId: committed.workspaceId,
+        workspace: committed,
+      });
+    return committed;
+  }
   private readonly mutationListeners = new Set<
     (mutation: WorkspaceMutation) => void | Promise<void>
   >();
@@ -543,7 +649,11 @@ export class FileBackedWorkspaceRegistry
     workspaceId: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord | null> {
-    const workspace = await super.update(workspaceId, updater);
+    const workspace = await super.update(workspaceId, (record) => {
+      const updated = updater(record);
+      validateWorkspaceOwnership(updated);
+      return updated;
+    });
     if (workspace) {
       await this.notifyMutation({ kind: "upsert", workspaceId, workspace });
     }
@@ -554,6 +664,7 @@ export class FileBackedWorkspaceRegistry
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
+    validateWorkspaceOwnership(record);
     await super.upsert(record);
     await this.notifyMutation({
       kind: "upsert",
@@ -568,14 +679,18 @@ export class FileBackedWorkspaceRegistry
     archivedAt: string,
     context?: WorkspaceArchiveContext,
   ): Promise<void> {
-    const workspace = await super.update(workspaceId, (existing) => ({
-      ...existing,
-      updatedAt: archivedAt,
-      archivedAt,
-      ...(context?.autoArchivedChangeRequestUrl
-        ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }
-        : {}),
-    }));
+    const workspace = await super.update(workspaceId, (existing) => {
+      const updated = {
+        ...existing,
+        updatedAt: archivedAt,
+        archivedAt,
+        ...(context?.autoArchivedChangeRequestUrl
+          ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }
+          : {}),
+      };
+      validateWorkspaceOwnership(updated);
+      return updated;
+    });
     if (!workspace) return;
     await this.notifyMutation({ kind: "archive", workspaceId, workspace });
   }
@@ -601,7 +716,11 @@ export class FileBackedWorkspaceRegistry
     const committed = await this.mutateCache(
       (records) => {
         const staged = input.stage(records);
-        changed = staged.updates.map((record) => PersistedWorkspaceRecordSchema.parse(record));
+        changed = staged.updates.map((record) => {
+          const parsed = PersistedWorkspaceRecordSchema.parse(record);
+          validateWorkspaceOwnership(parsed);
+          return parsed;
+        });
         for (const record of changed) records.set(record.workspaceId, record);
         return { result: staged.result, forcePersist: staged.forcePersist };
       },
@@ -626,7 +745,7 @@ export class FileBackedWorkspaceRegistry
     this.freezeMutationsUntilRestart();
   }
 
-  private async notifyMutation(mutation: WorkspaceMutation): Promise<void> {
+  protected async notifyMutation(mutation: WorkspaceMutation): Promise<void> {
     await Promise.all(
       [...this.mutationListeners].map(async (listener) => {
         try {
@@ -667,6 +786,7 @@ export function resolveProjectDisplayName(record: PersistedProjectRecord): strin
 
 export function createPersistedWorkspaceRecord(input: {
   workspaceId: string;
+  ownership?: EnterpriseResourceOwner;
   projectId: string;
   cwd: string;
   kind: PersistedWorkspaceKind;
@@ -685,8 +805,10 @@ export function createPersistedWorkspaceRecord(input: {
   labels?: string[];
   untrustedSource?: UntrustedWorkspaceSource;
 }): PersistedWorkspaceRecord {
+  const { ownership, ...record } = input;
   return PersistedWorkspaceRecordSchema.parse({
-    ...input,
+    ...record,
+    ...(ownership ? { ...ownership, ownershipRevision: "0" } : {}),
     title: input.title ?? null,
     branch: input.branch ?? null,
     worktreeRoot: input.worktreeRoot ?? null,

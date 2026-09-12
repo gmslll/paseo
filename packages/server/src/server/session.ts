@@ -1,8 +1,19 @@
-import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
+import type {
+  GlobalResourceRef,
+  EnterpriseResourceOwner,
+  OutboundAuthorizationContext,
+  ResourceAuthorization,
+  SessionEventSubscription,
+} from "@getpaseo/protocol/messages";
+import {
+  GlobalResourceRefSchema,
+  normalizeEnterpriseResourceOwner,
+} from "@getpaseo/protocol/messages";
 import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
+import { performance } from "node:perf_hooks";
 import { basename, resolve, sep } from "path";
 import { homedir } from "node:os";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
@@ -25,13 +36,58 @@ import {
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
 } from "./messages.js";
+import { SessionOutboundMessageSchema } from "@getpaseo/protocol/messages";
+import {
+  ENTERPRISE_UNAVAILABLE_ERROR,
+  dispatchEnterpriseRequest,
+  isIdentitySelfRequest,
+  isEnterpriseResponsePair,
+  resolveEnterpriseContentReadPolicy,
+  resolveEnterpriseReceiptPolicy,
+  isEnterpriseRequest,
+  isEnterpriseResourceRequest,
+  type EnterpriseSessionDispatcher,
+  type EnterpriseSessionDispatcherFactory,
+  type EnterpriseSessionDispatcherFactoryRegistration,
+  type EnterpriseDispatcherLease,
+  type EnterpriseDispatchContext,
+  type EnterpriseDispatchResponse,
+} from "./session/enterprise-dispatcher.js";
 import type {
   TerminalManager,
   TerminalWorkspaceContributionChangedEvent,
 } from "../terminal/terminal-manager.js";
 import { TerminalSessionController } from "../terminal/terminal-session-controller.js";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
-import type { BinaryFrame } from "@getpaseo/protocol/binary-frames/index";
+import {
+  decodeFileTransferFrame,
+  FileTransferOpcode,
+  type BinaryFrame,
+} from "@getpaseo/protocol/binary-frames/index";
+import type { ActiveFileDownloadStreamHandle } from "./enterprise/access/file-binary-outbound-authorizer.js";
+import {
+  createEnterpriseAgentEventPreauthorization,
+  type EnterpriseAgentEventPreauthorization,
+} from "./enterprise/access/agent-event-preauthorization.js";
+import {
+  isCurrentProductionAuthorizationRuntimeForSession,
+  type ProductionAuthorizationRuntime,
+  type ProductionAuthorizationRuntimeSessionInput,
+} from "./enterprise/access/production-authorization-runtime.js";
+import {
+  createProductionBrowserLeaseWaitingContext,
+  type ProductionBrowserLeaseWaitingContext,
+  type ProductionBrowserLeaseWaitingNotice,
+} from "./enterprise/browser/production-bundle.js";
+import {
+  createEnterpriseLegacyResourceAuthorization,
+  type EnterpriseLegacyResourceAuthorization,
+} from "./enterprise/access/legacy-resource-authorization.js";
+import type {
+  EnterpriseAdmissionAuthorizationHandle,
+  EnterpriseAdmissionAuthorizationIssuer,
+} from "./enterprise/identity/admission-authorization.js";
+import type { AdmissionInvalidationSink } from "./session/enterprise-admission-invalidation.js";
 import { CursorError } from "./pagination/cursor.js";
 import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
 import { describeAgentHistoryMatches, rankAgentHistoryCandidates } from "./agent-history-search.js";
@@ -157,6 +213,30 @@ import {
   type WorkspaceMutation,
   type WorkspaceRegistry,
 } from "./workspace-registry.js";
+import { createEnterpriseSessionBindingKey } from "@getpaseo/protocol/messages";
+import {
+  isEnterpriseAgentContextCurrentForSession,
+  normalizeEnterpriseSessionContext,
+  type EnterpriseAgentContextHandle,
+  type EnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "./session/enterprise-agent-session-context-registry.js";
+import type { AuthoritySessionBindingLifecycle } from "./session/enterprise-authority-receipt-state.js";
+import type {
+  AuthorityReceiptStatePort,
+  AuthoritySessionBindingRecord,
+} from "./enterprise/access/authority-receipt-verifier.js";
+import {
+  InboundAuthorityRequestAuthorizer,
+  type ActiveAuthorizedRequestHandle,
+} from "./enterprise/access/inbound-authority-request-authorizer.js";
+import { OutboundAuthorityEmissionAuthorizer } from "./enterprise/access/outbound-authority-emission-authorizer.js";
+import type { OutboundAuthorityEmissionStatePort } from "./enterprise/access/outbound-authority-emission-authorizer.js";
+import type { PrincipalGrantVersionGuard } from "./enterprise/access/resource-authorization.js";
+import {
+  OUTBOUND_INHERITED_CONTEXT_EVENTS,
+  authorityReceiptPolicyForRequestType,
+} from "./enterprise/access/event-action-map.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
@@ -165,6 +245,24 @@ import {
   setProjectCustomIcon,
 } from "../utils/project-custom-icon.js";
 import { VoiceSession } from "./session/voice/voice-session.js";
+import {
+  claimAndFanoutWorkspaceOwnershipTransferTombstone,
+  consumeWorkspaceOwnershipTransferTargetDelivery,
+  registerWorkspaceOwnershipTransferSession,
+  unregisterWorkspaceOwnershipTransferSession,
+  type WorkspaceOwnershipTransferSessionHandle,
+  type WorkspaceOwnershipTransferTargetDelivery,
+  type WorkspaceOwnershipTransferTargetResult,
+} from "./session/enterprise-workspace-ownership-transfer-fanout.js";
+
+function freezeOutbound<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value as Record<string, unknown>)) freezeOutbound(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 import { CheckoutSession } from "./session/checkout/checkout-session.js";
 import {
   createWorkspaceGitObserverService,
@@ -177,6 +275,7 @@ import {
 import { ScheduleSession } from "./session/schedule/schedule-session.js";
 import { ProviderCatalogSession } from "./session/provider/provider-catalog-session.js";
 import { WorkspaceFilesSession } from "./session/files/workspace-files-session.js";
+import type { EnterpriseWorkspaceFilesRuntime } from "./enterprise/runtime/workspace-files-runtime.js";
 import { AgentConfigSession } from "./session/agent-config/agent-config-session.js";
 import { ProjectConfigSession } from "./session/project-config/project-config-session.js";
 import { DaemonSession, type DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
@@ -208,6 +307,7 @@ import {
 import {
   createAgentUpdatesService,
   matchesAgentUpdatesFilter,
+  type AgentUpdatePublicationScope,
   type AgentUpdatesService,
 } from "./session/agent-updates/agent-updates-service.js";
 import { expandTilde } from "../utils/path.js";
@@ -256,7 +356,17 @@ import {
 } from "./worktree-session.js";
 import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
-import { SessionAuthorization, type DaemonPermission } from "./authorization/index.js";
+import {
+  SessionAuthorization,
+  activateCurrentInboundDaemonAuthorizationDecision,
+  closeActiveInboundDaemonAuthorization,
+  consumeInboundDaemonAuthorizationDecision,
+  isActiveInboundDaemonAuthorizationCurrent,
+  type ActiveInboundDaemonAuthorization,
+  type DaemonPermission,
+  type InboundDaemonAuthorizationDecision,
+} from "./authorization/index.js";
+import type { PermissionRequirement } from "./authorization/operation-permissions.js";
 
 function resolveWorkspaceSetupRuntime(
   runtime: WorkspaceSetupRuntime | undefined,
@@ -374,6 +484,15 @@ function agentDirectorySearchQuery(request: AgentDirectoryRequestMessage): strin
   if (request.type !== "fetch_agent_history_request") return "";
   return request.search?.trim() ?? "";
 }
+
+function isEnterpriseProviderBoundaryRequest(message: SessionInboundMessage): boolean {
+  return (
+    message.type === "fetch_recent_provider_sessions_request" ||
+    message.type === "forge.search.request" ||
+    message.type === "github_search_request" ||
+    message.type === "workspace.github.search_repositories.request"
+  );
+}
 type FetchAgentsRequestFilter = NonNullable<FetchAgentsRequestMessage["filter"]>;
 type FetchAgentsRequestSort = NonNullable<FetchAgentsRequestMessage["sort"]>[number];
 type FetchAgentsResponsePayload = Extract<
@@ -411,6 +530,24 @@ type WorkspaceUpdatePayload = Extract<
   SessionOutboundMessage,
   { type: "workspace_update" }
 >["payload"];
+
+function isSafeEmptyLegacyDirectoryResponse(
+  event: SessionOutboundMessage,
+  context: OutboundAuthorizationContext,
+): boolean {
+  if (context.kind !== "resources" || context.resources.length !== 0) return false;
+  switch (event.type) {
+    case "fetch_workspaces_response":
+    case "fetch_agents_response":
+    case "fetch_agent_history_response":
+      return event.payload.entries.length === 0;
+    case "workspace.create.response":
+      return event.payload.workspace === null && event.payload.error !== null;
+    default:
+      return false;
+  }
+}
+
 interface WorkspaceUpdatesSubscriptionState {
   subscriptionId: string;
   syncEnabled?: boolean;
@@ -419,6 +556,12 @@ interface WorkspaceUpdatesSubscriptionState {
   pendingUpdatesByWorkspaceId: Map<string, WorkspaceUpdatePayload>;
   lastEmittedByWorkspaceId: Map<string, WorkspaceUpdatePayload>;
   visibleEmptyProjectIds?: Set<string>;
+  excludedWorkspaceIds: Set<string>;
+}
+
+interface WorkspacePublicationFence {
+  readonly workspaceId: string;
+  readonly generation: number;
 }
 
 class SessionRequestError extends Error {
@@ -435,6 +578,38 @@ export interface SessionFileSystem {
   isDirectory(path: string): Promise<boolean>;
 }
 
+/** Scheduling-only hook supplied by the daemon runtime; it carries no authority or request data. */
+const enterpriseFetchAgentsStartSchedulerBrand: unique symbol = Symbol(
+  "EnterpriseFetchAgentsStartScheduler",
+);
+const issuedEnterpriseFetchAgentsStartSchedulers = new WeakSet<object>();
+
+export type EnterpriseFetchAgentsStartScheduler = Readonly<{
+  readonly [enterpriseFetchAgentsStartSchedulerBrand]: true;
+  waitForStart(): Promise<void>;
+}>;
+
+export function createEnterpriseFetchAgentsStartScheduler(
+  waitForStart: () => Promise<void>,
+): EnterpriseFetchAgentsStartScheduler {
+  const scheduler = Object.freeze({
+    [enterpriseFetchAgentsStartSchedulerBrand]: true as const,
+    waitForStart: () => waitForStart(),
+  });
+  issuedEnterpriseFetchAgentsStartSchedulers.add(scheduler);
+  return scheduler;
+}
+
+function isEnterpriseFetchAgentsStartScheduler(
+  scheduler: unknown,
+): scheduler is EnterpriseFetchAgentsStartScheduler {
+  return (
+    typeof scheduler === "object" &&
+    scheduler !== null &&
+    issuedEnterpriseFetchAgentsStartSchedulers.has(scheduler)
+  );
+}
+
 const nodeSessionFileSystem: SessionFileSystem = {
   async isDirectory(path) {
     const stats = await stat(path).catch(() => null);
@@ -447,6 +622,32 @@ type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
   clientId: string;
+  enterpriseContext?: EnterpriseSessionContext;
+  enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
+  authorityReceiptState?: AuthoritySessionBindingLifecycle &
+    AuthorityReceiptStatePort &
+    OutboundAuthorityEmissionStatePort;
+  principalGrantVersionGuard?: PrincipalGrantVersionGuard;
+  resourceAuthorization?: ResourceAuthorization;
+  enterpriseWorkspaceFilesRuntime?: EnterpriseWorkspaceFilesRuntime;
+  admissionInvalidationSink?: AdmissionInvalidationSink;
+  sessionId?: string;
+  sessionAuthorization?: SessionAuthorization;
+  admissionAuthorizationIssuer?: EnterpriseAdmissionAuthorizationIssuer;
+  admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
+  enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  /** W3 routing seam; domain handlers are registered by integration/owning streams. */
+  enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
+  enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
+  /** Integration/W1 supplies the current-session decision for identity-self requests. */
+  enterpriseIdentitySelfAuthorization?: SessionAuthorization["authorizeInbound"];
+  /** Optional enterprise-only start ticket. The scheduler receives no request or authority data. */
+  enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler;
+  /** Trusted server clock used to timestamp Browser Profile waiting status. */
+  now?: () => number;
+  /** Optional local-only RPC timing sink. It never participates in authorization or wire output. */
+  rpcDiagnosticObserver?: SessionRpcDiagnosticObserver;
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -600,6 +801,78 @@ function sessionRequestId(message: SessionInboundMessage): string | null {
   return null;
 }
 
+type SessionRpcDiagnosticRequestType = "fetch_agents_request" | "fetch_agent_request";
+type SessionRpcDiagnosticResponseType =
+  | "fetch_agents_response"
+  | "fetch_agent_response"
+  | "rpc_error";
+
+export type SessionRpcDiagnosticObservation =
+  | Readonly<{
+      phase: "session.enter";
+      requestId: string;
+      requestType: SessionRpcDiagnosticRequestType;
+      atUnixMs: number;
+    }>
+  | Readonly<{
+      phase: "response.deliver.begin" | "response.deliver.return";
+      requestId: string;
+      responseType: SessionRpcDiagnosticResponseType;
+      atUnixMs: number;
+    }>;
+
+export type SessionRpcDiagnosticObserver = (observation: SessionRpcDiagnosticObservation) => void;
+
+interface SessionRpcResponseIdentity {
+  readonly requestId: string;
+  readonly responseType: SessionRpcDiagnosticResponseType;
+}
+
+function sessionRpcDiagnosticUnixMs(): number {
+  return performance.timeOrigin + performance.now();
+}
+
+function sessionRpcResponseIdentity(
+  message: SessionOutboundMessage,
+): SessionRpcResponseIdentity | null {
+  if (message.type === "rpc_error") {
+    if (
+      message.payload.requestType !== "fetch_agents_request" &&
+      message.payload.requestType !== "fetch_agent_request"
+    ) {
+      return null;
+    }
+  } else if (message.type !== "fetch_agents_response" && message.type !== "fetch_agent_response") {
+    return null;
+  }
+  const requestId = message.payload.requestId;
+  if (typeof requestId !== "string" || requestId.length === 0) return null;
+  return Object.freeze({ requestId, responseType: message.type });
+}
+
+function sessionRpcRequestIdentity(
+  message: SessionInboundMessage,
+): Readonly<{ requestId: string; requestType: SessionRpcDiagnosticRequestType }> | null {
+  if (message.type !== "fetch_agents_request" && message.type !== "fetch_agent_request") {
+    return null;
+  }
+  const requestId = sessionRequestId(message);
+  return requestId ? Object.freeze({ requestId, requestType: message.type }) : null;
+}
+
+interface EnterpriseTransportRequestContext {
+  readonly sessionId: string;
+  readonly clientId: string;
+  readonly sessionBindingGeneration: string;
+  readonly enterpriseContext: EnterpriseSessionContext;
+  readonly requestId: string;
+  readonly requestType: SessionInboundMessage["type"];
+  readonly responseType: string;
+  readonly correlatedRevision?: string;
+  readonly daemonPermission: PermissionRequirement;
+  readonly activeDaemonAuthorization: ActiveInboundDaemonAuthorization;
+}
+
 interface AgentTimelineProjectionSelection {
   timeline: AgentTimelineFetchResult;
   entries: TimelineProjectionEntry[];
@@ -654,7 +927,58 @@ function workspaceLabelErrorCode(error: unknown): string {
   return "workspace_label_failed";
 }
 
+interface OpeningFileBinaryStream {
+  readonly phase: "opening";
+  readonly reservation: object;
+  readonly workspaceId: string;
+}
+
+interface ActiveFileBinaryStream {
+  readonly phase: "active";
+  readonly stream: ActiveFileDownloadStreamHandle;
+  readonly workspaceId: string;
+}
+
+type FileBinaryStreamEntry = OpeningFileBinaryStream | ActiveFileBinaryStream;
+
 export class Session {
+  private readonly enterpriseContext?: EnterpriseSessionContext;
+  private readonly enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
+  private readonly authorityReceiptState?: AuthoritySessionBindingLifecycle &
+    OutboundAuthorityEmissionStatePort;
+  private readonly resourceAuthorization?: ResourceAuthorization;
+  private readonly outboundAuthorityEmissionAuthorizer?: OutboundAuthorityEmissionAuthorizer;
+  private readonly enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  private readonly enterpriseAgentEventPreauthorization?: EnterpriseAgentEventPreauthorization;
+  private readonly productionAuthorizationSession?: ProductionAuthorizationRuntimeSessionInput;
+  private readonly enterpriseLegacyResourceAuthorization?: EnterpriseLegacyResourceAuthorization;
+  private readonly activeFileBinaryStreams = new Map<
+    object | undefined,
+    Map<string, FileBinaryStreamEntry>
+  >();
+  private readonly enterpriseSessionBindingKey?: string;
+  private admissionInvalidationUnsubscribe: (() => void) | null = null;
+  private readonly inboundAuthorityRequestAuthorizer?: InboundAuthorityRequestAuthorizer;
+  private readonly pendingAuthorityRequests = new Map<
+    string,
+    Readonly<{
+      requestId: string;
+      requestType: string;
+      sessionBindingKey: string;
+      sessionBindingGeneration: string;
+      activeRequestHandle: ActiveAuthorizedRequestHandle;
+    }>
+  >();
+  private readonly reservedAuthorityRequestIds = new Set<string>();
+  private readonly inheritedTransportRequests = new Map<
+    string,
+    EnterpriseTransportRequestContext
+  >();
+  private readonly outboundEmissionTasksByRequest = new Map<string, Set<Promise<unknown>>>();
+  private readonly outboundEmissionTailsByRequest = new Map<string, Promise<unknown>>();
+  private readonly outboundEmissionTasksWithoutRequest = new Set<Promise<unknown>>();
+  private authoritySubsystemFailed = false;
+  private authorityBindingReleased = false;
   private readonly clientId: string;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
@@ -674,6 +998,7 @@ export class Session {
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
     | null;
   private readonly sessionLogger: pino.Logger;
+  private readonly rpcDiagnosticObserver: SessionRpcDiagnosticObserver | null;
   private readonly paseoHome: string;
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
@@ -705,10 +1030,13 @@ export class Session {
   private isCleanedUp = false;
   private viewedTimelineAgentIds = new Set<string>();
   private readonly viewedTimelineAgentIdsBySource = new Map<object, Set<string>>();
+  private readonly viewedTimelineWorkspaceIdByAgentId = new Map<string, string>();
   private readonly clientCapabilitiesBySource = new Map<object, ReadonlySet<ClientCapability>>();
   private readonly defaultTimelineSubscriptionSource = {};
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
   private readonly agentUpdates: AgentUpdatesService;
+  private enterpriseAgentEventIngressSealed = false;
+  private enterpriseAgentEventTail: Promise<void> = Promise.resolve();
   private workspaceUpdatesSubscription: WorkspaceUpdatesSubscriptionState | null = null;
   private readonly workspaceLabelService: WorkspaceLabelService | null;
   private workspaceLabelSubscription: {
@@ -720,6 +1048,7 @@ export class Session {
   private readonly defaultEventSubscriptionSource = {};
   private readonly eventSubscriptions = new Map<object, Set<SessionEventSubscription>>();
   private readonly workspaceUpdateTails = new Map<string, Promise<void>>();
+  private readonly workspacePublicationGenerations = new Map<string, number>();
   private clientActivity: {
     deviceType: "web" | "mobile";
     focusedAgentId: string | null;
@@ -756,10 +1085,43 @@ export class Session {
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private enterpriseDispatcher: EnterpriseSessionDispatcher | null;
+  private readonly enterpriseDispatcherFactory: EnterpriseSessionDispatcherFactory | null;
+  private readonly enterpriseDispatcherLease: EnterpriseDispatcherLease | null;
+  private enterpriseDispatcherLeaseClosePromise: Promise<void> | null = null;
+  private enterpriseWorkspaceOwnershipTransferDispatcher: unknown = null;
+  private enterpriseWorkspaceOwnershipTransferSessionHandle: WorkspaceOwnershipTransferSessionHandle | null =
+    null;
+  private enterpriseBrowserLeaseWaitingCallbackActive = false;
+  private readonly enterpriseIdentitySelfAuthorization:
+    | SessionAuthorization["authorizeInbound"]
+    | null;
+  private readonly enterpriseFetchAgentsStartScheduler: EnterpriseFetchAgentsStartScheduler | null;
+  private readonly now: () => number;
 
+  // oxlint-disable-next-line complexity -- Session constructor wires existing ports.
   constructor(options: SessionOptions) {
     const {
       clientId,
+      enterpriseContext,
+      enterpriseAgentContextRegistry,
+      authorityReceiptState,
+      principalGrantVersionGuard,
+      resourceAuthorization,
+      enterpriseWorkspaceFilesRuntime,
+      admissionInvalidationSink,
+      sessionId,
+      sessionAuthorization,
+      admissionAuthorizationIssuer,
+      admissionAuthorizationHandle,
+      enterpriseAuthorizationRuntime,
+      enterpriseDispatcher,
+      enterpriseDispatcherFactory,
+      enterpriseDispatcherRegistration,
+      enterpriseIdentitySelfAuthorization,
+      enterpriseFetchAgentsStartScheduler,
+      now,
+      rpcDiagnosticObserver,
       permissions,
       appVersion,
       clientCapabilities,
@@ -814,13 +1176,143 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    this.enterpriseDispatcher = enterpriseDispatcher ?? null;
+    this.enterpriseDispatcherFactory = enterpriseDispatcherFactory ?? null;
+    this.enterpriseDispatcherLease = null;
+    this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization ?? null;
+    if (
+      enterpriseFetchAgentsStartScheduler !== undefined &&
+      !isEnterpriseFetchAgentsStartScheduler(enterpriseFetchAgentsStartScheduler)
+    ) {
+      throw new Error("Enterprise fetch-agents start scheduler must be created by its factory");
+    }
+    this.enterpriseFetchAgentsStartScheduler = enterpriseFetchAgentsStartScheduler ?? null;
+    this.now = now ?? Date.now;
+    const enterpriseConfigured = Boolean(
+      enterpriseContext ||
+      enterpriseAgentContextRegistry ||
+      authorityReceiptState ||
+      resourceAuthorization ||
+      admissionInvalidationSink,
+    );
+    if (
+      enterpriseConfigured &&
+      (!enterpriseContext ||
+        !enterpriseAgentContextRegistry ||
+        !authorityReceiptState ||
+        !resourceAuthorization)
+    )
+      throw new Error(
+        "Enterprise context, registry, and authority receipt state must be configured together with resource authorization",
+      );
+    if (Boolean(enterpriseContext) !== Boolean(principalGrantVersionGuard))
+      throw new Error("Enterprise grant guard must be configured with enterprise context");
+    const canonicalEnterpriseContext = enterpriseContext
+      ? normalizeEnterpriseSessionContext(enterpriseContext)
+      : undefined;
+    const canonicalSessionBindingKey = canonicalEnterpriseContext
+      ? createEnterpriseSessionBindingKey({
+          organizationId: canonicalEnterpriseContext.principal.organizationId,
+          principalId: canonicalEnterpriseContext.principal.principalId,
+          credentialId: canonicalEnterpriseContext.principal.credentialId,
+          grantVersion: canonicalEnterpriseContext.principal.grantVersion,
+          clientId,
+        })
+      : undefined;
+    const productionAuthorizationConfigured = Boolean(
+      enterpriseAuthorizationRuntime ||
+      admissionAuthorizationIssuer ||
+      admissionAuthorizationHandle ||
+      sessionAuthorization ||
+      sessionId,
+    );
+    let productionAuthorizationSession: ProductionAuthorizationRuntimeSessionInput | undefined;
+    if (productionAuthorizationConfigured) {
+      if (
+        !enterpriseAuthorizationRuntime ||
+        !admissionAuthorizationIssuer ||
+        !admissionAuthorizationHandle ||
+        !sessionAuthorization ||
+        !sessionId ||
+        !canonicalEnterpriseContext ||
+        !canonicalSessionBindingKey
+      )
+        throw new Error("Enterprise authorization runtime requires canonical session authority");
+      productionAuthorizationSession = Object.freeze({
+        admissionAuthorizationIssuer,
+        admissionAuthorizationHandle,
+        sessionAuthorization,
+        sessionId,
+        clientId,
+        sessionBindingKey: canonicalSessionBindingKey,
+        enterpriseContext: canonicalEnterpriseContext,
+      });
+      if (
+        !isCurrentProductionAuthorizationRuntimeForSession(
+          enterpriseAuthorizationRuntime,
+          productionAuthorizationSession,
+        )
+      )
+        throw new Error(
+          "Enterprise authorization runtime does not match canonical session authority",
+        );
+    }
+    if (
+      enterpriseContext &&
+      enterpriseWorkspaceFilesRuntime &&
+      (onBinaryMessage || onBinaryMessageToSource) &&
+      !enterpriseAuthorizationRuntime
+    )
+      throw new Error("Enterprise file binary channel requires production authorization runtime");
+    this.enterpriseContext = canonicalEnterpriseContext;
+    this.enterpriseAgentContextRegistry = enterpriseAgentContextRegistry;
+    this.authorityReceiptState = authorityReceiptState;
+    this.resourceAuthorization = resourceAuthorization;
+    this.enterpriseAuthorizationRuntime = enterpriseAuthorizationRuntime;
+    this.enterpriseAgentEventPreauthorization = enterpriseAuthorizationRuntime
+      ? (createEnterpriseAgentEventPreauthorization({
+          authorizationRuntime: enterpriseAuthorizationRuntime,
+        }) ?? undefined)
+      : undefined;
+    this.productionAuthorizationSession = productionAuthorizationSession;
+    this.enterpriseLegacyResourceAuthorization = enterpriseAuthorizationRuntime
+      ? (createEnterpriseLegacyResourceAuthorization({
+          authorizationRuntime: enterpriseAuthorizationRuntime,
+        }) ?? undefined)
+      : undefined;
     this.clientId = clientId;
-    this.authorization = new SessionAuthorization(permissions);
+    this.authorization = sessionAuthorization ?? new SessionAuthorization(permissions);
+    if (this.enterpriseContext && principalGrantVersionGuard)
+      this.inboundAuthorityRequestAuthorizer = new InboundAuthorityRequestAuthorizer({
+        sessionAuthorization: this.authorization,
+        principal: this.enterpriseContext.principal,
+        grantVersionGuard: principalGrantVersionGuard,
+      });
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
-    this.sessionId = uuidv4();
-    this.onMessage = onMessage;
-    this.onMessageToSource = onMessageToSource ?? null;
+    this.sessionId = sessionId ?? uuidv4();
+    if (!this.enterpriseDispatcher && this.enterpriseDispatcherFactory && this.enterpriseContext) {
+      this.enterpriseDispatcher = this.enterpriseDispatcherFactory.create({
+        sessionId: this.sessionId,
+        clientId,
+        context: this.enterpriseContext,
+        runtime: enterpriseAuthorizationRuntime,
+        filesRuntime: enterpriseWorkspaceFilesRuntime,
+      });
+    }
+    this.enterpriseWorkspaceOwnershipTransferDispatcher = this.enterpriseDispatcher;
+    this.rpcDiagnosticObserver = rpcDiagnosticObserver ?? null;
+    if (this.rpcDiagnosticObserver) {
+      this.onMessage = (message) =>
+        this.deliverWithRpcDiagnostics(message, () => onMessage(message));
+      this.onMessageToSource = onMessageToSource
+        ? (source, message) =>
+            this.deliverWithRpcDiagnostics(message, () => onMessageToSource(source, message))
+        : null;
+    } else {
+      this.onMessage = onMessage;
+      this.onMessageToSource = onMessageToSource ?? null;
+    }
     this.onBinaryMessage = onBinaryMessage ?? null;
     this.onBinaryMessageToSource = onBinaryMessageToSource ?? null;
     this.getTransportBufferedAmount = getTransportBufferedAmount ?? (() => 0);
@@ -838,16 +1330,6 @@ export class Session {
       module: "session",
       clientId: this.clientId,
       sessionId: this.sessionId,
-    });
-    this.workspaceFilesSession = new WorkspaceFilesSession({
-      host: {
-        emit: (msg, source) => this.emitForSource(msg, source),
-        emitBinary: (frame, source) => this.emitBinaryForFileTransfer(frame, source),
-        hasBinaryChannel: () => this.onBinaryMessage !== null,
-      },
-      downloadTokenStore,
-      paseoHome,
-      logger: this.sessionLogger,
     });
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
@@ -1010,7 +1492,13 @@ export class Session {
       getClientBufferedAmount: () => this.getTransportBufferedAmount(),
     });
     this.agentUpdates = createAgentUpdatesService({
-      emit: (message) => this.emit(message),
+      emit: (message, scope) => this.emitAgentUpdatePublication(message, scope),
+      ...(this.enterpriseContext
+        ? {
+            authorizeAgentId: (agentId: string) =>
+              this.authorizeCurrentAgentEventPublication(agentId),
+          }
+        : {}),
       enrichAgentPayload: (payload) => this.enrichAgentPayload(payload),
       buildStoredAgentPayload: (record) => this.buildStoredAgentPayload(record),
       isProviderVisibleToClient: (provider) => this.isProviderVisibleToClient(provider),
@@ -1129,12 +1617,232 @@ export class Session {
     this.subscribeToRegistryMutations();
 
     this.sessionLogger.trace({}, "agent.session.lifecycle.created");
+
+    if (this.enterpriseContext && this.authorityReceiptState) {
+      const { principal, node } = this.enterpriseContext;
+      const bindingKey = canonicalSessionBindingKey;
+      if (!bindingKey) throw this.rollbackConstruction(new Error("Missing session binding key"));
+      this.enterpriseSessionBindingKey = bindingKey;
+      try {
+        this.authorityReceiptState.registerSessionBinding({
+          sessionId: this.sessionId,
+          sessionBindingKey: bindingKey,
+          sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+          organizationId: principal.organizationId,
+          principalId: principal.principalId,
+          principalType: principal.principalType,
+          credentialId: principal.credentialId,
+          grantVersion: principal.grantVersion,
+          nodeId: node.nodeId,
+          clientId,
+        });
+        if (admissionInvalidationSink) {
+          this.admissionInvalidationUnsubscribe = admissionInvalidationSink.register({
+            sessionBindingKey: bindingKey,
+            generation: this.enterpriseContext.sessionBindingGeneration,
+            credentialId: principal.credentialId,
+            principalId: principal.principalId,
+            organizationId: principal.organizationId,
+            grantVersion: principal.grantVersion,
+            invalidate: (exact) => this.invalidateFromAdmission(exact),
+          });
+        }
+      } catch (error) {
+        throw this.rollbackConstruction(error);
+      }
+    }
+    if (
+      this.enterpriseContext &&
+      this.inboundAuthorityRequestAuthorizer &&
+      resourceAuthorization &&
+      authorityReceiptState
+    ) {
+      try {
+        this.outboundAuthorityEmissionAuthorizer = new OutboundAuthorityEmissionAuthorizer({
+          inboundAuthorizer: this.inboundAuthorityRequestAuthorizer,
+          sessionAuthorization: this.authorization,
+          nodeId: this.enterpriseContext.node.nodeId,
+          state: authorityReceiptState,
+        });
+      } catch (error) {
+        throw this.rollbackConstruction(error);
+      }
+    }
+    try {
+      this.workspaceFilesSession = new WorkspaceFilesSession({
+        host: {
+          emit: (msg, source) => this.emitForSource(msg, source),
+          emitBinary: (frame, source) => this.emitBinaryForFileTransfer(frame, source),
+          emitWorkspace: (msg, workspaceId, source) =>
+            this.emitForSource(msg, source, this.createWorkspaceOutboundContext(workspaceId)),
+          emitBinaryWorkspace: (frame, workspaceId, source) =>
+            this.emitAuthorizedWorkspaceBinary(frame, workspaceId, source),
+          hasBinaryChannel: () => this.onBinaryMessage !== null,
+        },
+        downloadTokenStore,
+        paseoHome,
+        logger: this.sessionLogger,
+        enterpriseRuntime: enterpriseWorkspaceFilesRuntime,
+        enterpriseRequired: Boolean(this.enterpriseContext),
+      });
+    } catch (error) {
+      throw this.rollbackConstruction(error);
+    }
+    if (enterpriseDispatcherRegistration && this.enterpriseContext) {
+      const registeredOperations = new Set(enterpriseDispatcherRegistration.manifest.operations);
+      let requestLifecycle: ProductionBrowserLeaseWaitingContext;
+      requestLifecycle = createProductionBrowserLeaseWaitingContext({
+        sessionId: this.sessionId,
+        clientId,
+        sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+        onWaiting: (notice) => this.emitEnterpriseBrowserLeaseWaiting(notice, requestLifecycle),
+      });
+      let registrationLease: EnterpriseDispatcherLease | null = null;
+      try {
+        registrationLease = enterpriseDispatcherRegistration.open({
+          sessionId: this.sessionId,
+          clientId,
+          context: this.enterpriseContext,
+          authorizationRuntime: enterpriseAuthorizationRuntime,
+          filesRuntime: enterpriseWorkspaceFilesRuntime,
+          requestLifecycle,
+        });
+        this.enterpriseDispatcherLease = registrationLease;
+        const registeredDispatcher = registrationLease.dispatcher;
+        if (registeredOperations.has("enterprise.resource.ownership.transfer.request")) {
+          this.enterpriseWorkspaceOwnershipTransferDispatcher =
+            registrationLease.dispatcherForOperation?.(
+              "enterprise.resource.ownership.transfer.request",
+            ) ?? registeredDispatcher;
+        }
+        const existingDispatcher = this.enterpriseDispatcher;
+        this.enterpriseDispatcher = existingDispatcher
+          ? Object.freeze({
+              requestPolicyForType: (type: string) =>
+                registeredOperations.has(type)
+                  ? (registeredDispatcher.requestPolicyForType?.(type) ?? null)
+                  : (existingDispatcher.requestPolicyForType?.(type) ?? null),
+              handle: (input: {
+                readonly sessionContext: EnterpriseDispatchContext;
+                readonly message: SessionInboundMessage;
+              }) =>
+                registeredOperations.has(input.message.type)
+                  ? registeredDispatcher.handle(input)
+                  : existingDispatcher.handle(input),
+              consumeResponse: (input: {
+                readonly sessionContext: EnterpriseDispatchContext;
+                readonly message: SessionInboundMessage;
+                readonly response: SessionOutboundMessage;
+              }) =>
+                registeredOperations.has(input.message.type)
+                  ? (registeredDispatcher.consumeResponse?.(input) ?? null)
+                  : (existingDispatcher.consumeResponse?.(input) ?? null),
+            })
+          : registeredDispatcher;
+        this.enterpriseBrowserLeaseWaitingCallbackActive = true;
+      } catch (error) {
+        this.enterpriseBrowserLeaseWaitingCallbackActive = false;
+        if (registrationLease) {
+          void this.closeEnterpriseDispatcherLease().catch((closeError) => {
+            this.sessionLogger.error(
+              { err: closeError },
+              "Session construction rollback dispatcher close failed",
+            );
+          });
+        }
+        throw this.rollbackConstruction(error);
+      }
+    }
+    if (this.enterpriseContext && this.enterpriseAgentContextRegistry) {
+      const binding = this.workspaceOwnershipTransferSessionBinding();
+      if (!binding)
+        throw this.rollbackConstruction(new Error("Missing Workspace transfer Session binding"));
+      try {
+        this.enterpriseWorkspaceOwnershipTransferSessionHandle =
+          registerWorkspaceOwnershipTransferSession({
+            runtimeKey: this.enterpriseAgentContextRegistry,
+            binding,
+            deliver: (delivery) => this.deliverWorkspaceOwnershipTransferTombstone(delivery),
+          });
+      } catch (error) {
+        throw this.rollbackConstruction(error);
+      }
+    }
   }
 
   updateAppVersion(appVersion: string | null): void {
     if (appVersion && appVersion !== this.appVersion) {
       this.appVersion = appVersion;
     }
+  }
+
+  private rollbackConstruction(primary: unknown): Error {
+    const cleanupErrors: unknown[] = [primary];
+    const attempt = (cleanup: () => void): void => {
+      try {
+        cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+    this.enterpriseBrowserLeaseWaitingCallbackActive = false;
+    this.enterpriseAgentEventIngressSealed = true;
+    unregisterWorkspaceOwnershipTransferSession(
+      this.enterpriseWorkspaceOwnershipTransferSessionHandle,
+    );
+    this.enterpriseWorkspaceOwnershipTransferSessionHandle = null;
+    this.isCleanedUp = true;
+    this.activeFileBinaryStreams.clear();
+    const authorityState = this.authorityReceiptState;
+    const authorityContext = this.enterpriseContext;
+    const authorityKey = this.enterpriseSessionBindingKey;
+    if (authorityContext && authorityState && authorityKey)
+      attempt(() => {
+        authorityState.releaseSession({
+          sessionId: this.sessionId,
+          sessionBindingKey: authorityKey,
+          sessionBindingGeneration: authorityContext.sessionBindingGeneration,
+        });
+        this.authorityBindingReleased = true;
+      });
+    attempt(() => this.unsubscribeAgentEvents?.());
+    this.unsubscribeAgentEvents = null;
+    attempt(() => this.unsubscribeProjectMutations?.());
+    this.unsubscribeProjectMutations = null;
+    attempt(() => this.unsubscribePluginChanges?.());
+    this.unsubscribePluginChanges = null;
+    attempt(() => this.unsubscribeWorkspaceMutations?.());
+    this.unsubscribeWorkspaceMutations = null;
+    attempt(() => this.workspaceLabelSubscription?.unsubscribe());
+    this.workspaceLabelSubscription = null;
+    attempt(() => this.agentUpdates.dispose());
+    attempt(() => this.unsubscribeTerminalWorkspaceContributionEvents?.());
+    this.unsubscribeTerminalWorkspaceContributionEvents = null;
+    attempt(() => this.providerCatalogSession.dispose());
+    this.hubExecutionController?.cleanup().catch((error) => {
+      this.sessionLogger.error({ err: error }, "Construction rollback hub cleanup failed");
+    });
+    this.voiceSession.cleanup().catch((error) => {
+      this.sessionLogger.error({ err: error }, "Construction rollback voice cleanup failed");
+    });
+    const workspaceFilesSession = this.workspaceFilesSession as WorkspaceFilesSession | undefined;
+    workspaceFilesSession?.dispose().catch((error) => {
+      this.sessionLogger.error(
+        { err: error },
+        "Construction rollback workspace files cleanup failed",
+      );
+    });
+    attempt(() => this.terminalController.dispose());
+    attempt(() => this.checkoutSession.cleanup());
+    attempt(() => this.workspaceGitObserver.dispose());
+    attempt(() =>
+      this.enterpriseAgentContextRegistry?.releaseSession(
+        this.enterpriseContext?.sessionBindingGeneration ?? "",
+      ),
+    );
+    return new AggregateError(cleanupErrors, "Session construction rollback failed", {
+      cause: primary,
+    });
   }
 
   updateClientCapabilities(capabilities: Record<string, unknown> | null, source?: object): void {
@@ -1146,6 +1854,7 @@ export class Session {
     if (!source && !this.supports(CLIENT_CAPS.selectiveAgentTimeline)) {
       this.viewedTimelineAgentIdsBySource.clear();
       this.viewedTimelineAgentIds.clear();
+      this.viewedTimelineWorkspaceIdByAgentId.clear();
     }
   }
 
@@ -1154,14 +1863,57 @@ export class Session {
     this.eventSubscriptions.delete(source);
     if (this.viewedTimelineAgentIdsBySource.delete(source)) {
       this.rebuildViewedTimelineAgentIds();
+      this.pruneViewedTimelineWorkspaceIds();
     }
   }
 
-  private replaceAgentTimelineSubscription(source: object | undefined, agentIds: string[]): void {
+  private replaceAgentTimelineSubscription(
+    source: object | undefined,
+    agentIds: string[],
+    workspaceIdByAgentId?: ReadonlyMap<string, string>,
+  ): void {
     const subscriptionSource = source ?? this.defaultTimelineSubscriptionSource;
     if (agentIds.length === 0) this.viewedTimelineAgentIdsBySource.delete(subscriptionSource);
     else this.viewedTimelineAgentIdsBySource.set(subscriptionSource, new Set(agentIds));
     this.rebuildViewedTimelineAgentIds();
+    for (const [agentId, workspaceId] of workspaceIdByAgentId ?? []) {
+      this.viewedTimelineWorkspaceIdByAgentId.set(agentId, workspaceId);
+    }
+    this.pruneViewedTimelineWorkspaceIds();
+  }
+
+  private async handleAgentTimelineSubscriptionRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.set_subscription.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const agentIds = [...new Set(msg.agentIds)].sort();
+    const workspaceIdByAgentId = new Map<string, string>();
+    if (this.enterpriseContext) {
+      for (const agentId of agentIds) {
+        const canonical = await this.resolveEnterpriseLegacyAgentResource(
+          "workspace.content.read",
+          agentId,
+        );
+        if (!canonical) {
+          this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+          return;
+        }
+        workspaceIdByAgentId.set(canonical.agentId, canonical.workspaceId);
+      }
+    }
+    if (
+      source
+        ? this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source)
+        : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
+    ) {
+      this.replaceAgentTimelineSubscription(source, agentIds, workspaceIdByAgentId);
+    }
+    const response: SessionOutboundMessage = {
+      type: "agent.timeline.set_subscription.response",
+      payload: { agentIds, requestId: msg.requestId },
+    };
+    if (source && this.onMessageToSource) this.onMessageToSource(source, response);
+    else this.emit(response);
   }
 
   private rebuildViewedTimelineAgentIds(): void {
@@ -1170,6 +1922,14 @@ export class Session {
       for (const agentId of agentIds) viewedAgentIds.add(agentId);
     }
     this.viewedTimelineAgentIds = viewedAgentIds;
+  }
+
+  private pruneViewedTimelineWorkspaceIds(): void {
+    for (const agentId of this.viewedTimelineWorkspaceIdByAgentId.keys()) {
+      if (!this.viewedTimelineAgentIds.has(agentId)) {
+        this.viewedTimelineWorkspaceIdByAgentId.delete(agentId);
+      }
+    }
   }
 
   private usesSelectiveTimelineDelivery(): boolean {
@@ -1192,6 +1952,7 @@ export class Session {
     return source ? this.supportsForSource(capability, source) : this.supports(capability);
   }
 
+  // oxlint-disable-next-line complexity -- delivery fan-out has explicit capability branches.
   private forwardAgentStream(
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
@@ -1256,6 +2017,91 @@ export class Session {
     }
   }
 
+  // Enterprise delivery awaits the resource-authorized transport so the
+  // per-Session Agent event tail preserves manager publication order.
+  // oxlint-disable-next-line complexity -- mirrors the legacy capability fan-out above.
+  private async forwardEnterpriseAgentStream(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): Promise<void> {
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (serializedEvent.type === "timeline" && !this.supportsTimelineItem(serializedEvent.item))
+        return;
+      if (this.usesSelectiveTimelineDelivery() && serializedEvent.type === "attention_required") {
+        await this.emitCurrentAgentEvent(
+          {
+            type: "agent_attention_required",
+            payload: {
+              agentId: event.agentId,
+              reason: serializedEvent.reason,
+              timestamp: serializedEvent.timestamp,
+              shouldNotify: serializedEvent.shouldNotify,
+              ...(serializedEvent.notification
+                ? { notification: serializedEvent.notification }
+                : {}),
+            },
+          },
+          event.agentId,
+        );
+      } else if (
+        !this.usesSelectiveTimelineDelivery() ||
+        this.viewedTimelineAgentIds.has(event.agentId)
+      ) {
+        await this.emitCurrentAgentEvent(
+          {
+            type: "agent_stream",
+            payload: this.buildAgentStreamPayload(event, serializedEvent),
+          },
+          event.agentId,
+        );
+      }
+      return;
+    }
+
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      if (
+        serializedEvent.type === "timeline" &&
+        !this.supportsTimelineItem(serializedEvent.item, source)
+      )
+        continue;
+      const supportsSelectiveDelivery = capabilities.has(CLIENT_CAPS.selectiveAgentTimeline);
+      if (supportsSelectiveDelivery && serializedEvent.type === "attention_required") {
+        if (!this.wantsEvent("agent_attention_required", source)) continue;
+        await this.emitCurrentAgentEvent(
+          {
+            type: "agent_attention_required",
+            payload: {
+              agentId: event.agentId,
+              reason: serializedEvent.reason,
+              timestamp: serializedEvent.timestamp,
+              shouldNotify: serializedEvent.shouldNotify,
+              ...(serializedEvent.notification
+                ? { notification: serializedEvent.notification }
+                : {}),
+            },
+          },
+          event.agentId,
+          source,
+        );
+        continue;
+      }
+      if (
+        supportsSelectiveDelivery &&
+        !this.viewedTimelineAgentIdsBySource.get(source)?.has(event.agentId)
+      ) {
+        continue;
+      }
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_stream",
+          payload: this.buildAgentStreamPayload(event, serializedEvent),
+        },
+        event.agentId,
+        source,
+      );
+    }
+  }
+
   supports(capability: ClientCapability): boolean {
     return this.clientCapabilities.has(capability);
   }
@@ -1288,7 +2134,14 @@ export class Session {
   }
 
   async syncWorkspaceGitObserverForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
+    if (this.workspaceUpdatesSubscription?.excludedWorkspaceIds.has(workspace.workspaceId)) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspace.workspaceId);
+      return;
+    }
     await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+    if (this.workspaceUpdatesSubscription?.excludedWorkspaceIds.has(workspace.workspaceId)) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspace.workspaceId);
+    }
   }
 
   async emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void> {
@@ -1339,7 +2192,7 @@ export class Session {
       Array.from(new Set(workspaceIds)).map(async (workspaceId) => {
         const workspace = await this.workspaceRegistry.get(workspaceId);
         if (workspace && !workspace.archivedAt) {
-          await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+          await this.syncWorkspaceGitObserverForWorkspace(workspace);
         }
       }),
     );
@@ -1575,7 +2428,11 @@ export class Session {
 
   private async syncWorkspaceMutationObserver(mutation: WorkspaceMutation): Promise<void> {
     const subscription = this.workspaceUpdatesSubscription;
-    if (!mutation.workspace || !subscription) {
+    if (
+      !mutation.workspace ||
+      !subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId)
+    ) {
       return;
     }
     const descriptorsByWorkspaceId = await this.buildWorkspaceDescriptorMap({
@@ -1584,6 +2441,8 @@ export class Session {
     });
     const descriptor = descriptorsByWorkspaceId.get(mutation.workspaceId);
     if (
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId) ||
       !descriptor ||
       !this.matchesWorkspaceFilter({ workspace: descriptor, filter: subscription.filter })
     ) {
@@ -1591,12 +2450,21 @@ export class Session {
       return;
     }
     const currentWorkspace = await this.workspaceRegistry.get(mutation.workspaceId);
-    if (!currentWorkspace || currentWorkspace.archivedAt) {
+    if (
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId) ||
+      !currentWorkspace ||
+      currentWorkspace.archivedAt
+    ) {
       this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
       return;
     }
     await this.workspaceGitObserver.syncObserverForWorkspace(currentWorkspace);
-    if (this.isCleanedUp) {
+    if (
+      this.isCleanedUp ||
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(mutation.workspaceId)
+    ) {
       this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
     }
   }
@@ -1656,36 +2524,7 @@ export class Session {
   private forwardProviderSubagentUpdate(
     update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
   ): void {
-    let message: SessionOutboundMessage;
-    if (update.type === "upsert") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: update.subagent },
-      };
-    } else if (update.type === "timeline") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "timeline",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-          provider: update.provider,
-          item: update.row.item,
-          timestamp: update.row.timestamp,
-          seq: update.row.seq,
-          epoch: update.epoch,
-        },
-      };
-    } else {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "remove",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-        },
-      };
-    }
+    const message = this.buildProviderSubagentUpdateMessage(update);
 
     if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
       if (
@@ -1704,6 +2543,94 @@ export class Session {
     }
   }
 
+  private buildProviderSubagentUpdateMessage(
+    update: ProviderSubagentManagerEvent,
+  ): SessionOutboundMessage {
+    if (update.type === "upsert") {
+      return {
+        type: "agent.provider_subagents.update",
+        payload: { kind: "upsert", subagent: update.subagent },
+      };
+    }
+    if (update.type === "timeline") {
+      return {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "timeline",
+          parentAgentId: update.parentAgentId,
+          subagentId: update.subagentId,
+          provider: update.provider,
+          item: update.row.item,
+          timestamp: update.row.timestamp,
+          seq: update.row.seq,
+          epoch: update.epoch,
+        },
+      };
+    }
+    return {
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "remove",
+        parentAgentId: update.parentAgentId,
+        subagentId: update.subagentId,
+      },
+    };
+  }
+
+  private providerSubagentParentAgentId(update: ProviderSubagentManagerEvent): string {
+    return update.type === "upsert" ? update.subagent.parentAgentId : update.parentAgentId;
+  }
+
+  private canonicalAgentIdForEvent(event: AgentManagerEvent): string {
+    switch (event.type) {
+      case "agent_state":
+        return event.agent.id;
+      case "provider_subagent":
+        return this.providerSubagentParentAgentId(event.event);
+      case "timeline_replacement":
+      case "agent_stream":
+        return event.agentId;
+    }
+  }
+
+  private async forwardEnterpriseProviderSubagentUpdate(
+    update: ProviderSubagentManagerEvent,
+  ): Promise<void> {
+    const parentAgentId = this.providerSubagentParentAgentId(update);
+    let current = await this.authorizeCurrentAgentEventPublication(parentAgentId);
+    if (!current) return;
+
+    if (update.type !== "timeline") {
+      try {
+        await this.emitWorkspaceUpdateForWorkspaceId(current.workspaceId);
+      } catch (error) {
+        this.sessionLogger.error(
+          { err: error, parentAgentId, workspaceId: current.workspaceId },
+          "Failed to emit provider subagent workspace update",
+        );
+      }
+      current = await this.authorizeCurrentAgentEventPublication(parentAgentId);
+      if (!current) return;
+    }
+
+    const message = this.buildProviderSubagentUpdateMessage(update);
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (
+        this.supports(CLIENT_CAPS.providerSubagents) &&
+        (update.type !== "timeline" || this.supportsTimelineItem(update.row.item))
+      ) {
+        await this.emitCurrentAgentEvent(message, parentAgentId);
+      }
+      return;
+    }
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      if (!capabilities.has(CLIENT_CAPS.providerSubagents)) continue;
+      if (update.type === "timeline" && !this.supportsTimelineItem(update.row.item, source))
+        continue;
+      await this.emitCurrentAgentEvent(message, parentAgentId, source);
+    }
+  }
+
   private subscribeToAgentEvents(): void {
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();
@@ -1711,95 +2638,194 @@ export class Session {
 
     this.unsubscribeAgentEvents = this.agentManager.subscribe(
       (event) => {
-        if (event.type === "timeline_replacement") {
-          this.deliverTimelineReplacement(event.agentId, this.rewindInitiators.get(event.agentId));
-          return;
+        if (this.enterpriseContext) {
+          const agentId = this.canonicalAgentIdForEvent(event);
+          if (this.enterpriseAgentEventPreauthorization?.allowsAgentEvent(agentId) !== true) return;
+          return this.enqueueEnterpriseAgentEvent(event);
         }
-
-        if (event.type === "agent_state") {
-          this.sessionLogger.trace(
-            {
-              agentId: event.agent.id,
-              provider: event.agent.provider,
-              providerSessionId: event.agent.persistence?.sessionId ?? undefined,
-              turnId: event.agent.activeForegroundTurnId ?? undefined,
-              lifecycle: event.agent.lifecycle,
-            },
-            "agent.session.forward_update",
-          );
-          void this.agentUpdates.forwardLiveAgent(event.agent);
-          return;
-        }
-
-        if (event.type === "provider_subagent") {
-          this.emitProviderSubagentWorkspaceUpdate(event.event);
-          this.forwardProviderSubagentUpdate(event.event);
-          return;
-        }
-
-        if (
-          this.voiceSession.isActiveForAgent(event.agentId) &&
-          event.event.type === "permission_requested" &&
-          isVoicePermissionAllowed(event.event.request)
-        ) {
-          const requestId = event.event.request.id;
-          void this.agentManager
-            .respondToPermission(event.agentId, requestId, {
-              behavior: "allow",
-            })
-            .catch((error) => {
-              this.sessionLogger.warn(
-                {
-                  err: error,
-                  agentId: event.agentId,
-                  requestId,
-                },
-                "Failed to auto-allow speak tool permission in voice mode",
-              );
-            });
-        }
-
-        const serializedEvent = serializeAgentStreamEvent(event.event);
-        if (!serializedEvent) {
-          return;
-        }
-        this.sessionLogger.trace(
-          {
-            agentId: event.agentId,
-            provider: event.event.provider,
-            turnId: getAgentStreamEventTurnId(event.event),
-            seq: event.seq,
-            epoch: event.epoch,
-            event: event.event,
-          },
-          "agent.session.forward_stream",
-        );
-
-        this.forwardAgentStream(event, serializedEvent);
-
-        if (event.event.type === "permission_requested") {
-          this.emit({
-            type: "agent_permission_request",
-            payload: {
-              agentId: event.agentId,
-              request: event.event.request,
-            },
-          });
-        } else if (event.event.type === "permission_resolved") {
-          this.emit({
-            type: "agent_permission_resolved",
-            payload: {
-              agentId: event.agentId,
-              requestId: event.event.requestId,
-              resolution: event.event.resolution,
-            },
-          });
-        }
-
-        // Title updates may be applied asynchronously after agent creation.
+        this.forwardLegacyAgentEvent(event);
       },
       { replayState: false },
     );
+  }
+
+  private enqueueEnterpriseAgentEvent(event: AgentManagerEvent): Promise<void> {
+    if (this.enterpriseAgentEventIngressSealed || this.isCleanedUp) return Promise.resolve();
+    const attempted = this.enterpriseAgentEventTail.then(() =>
+      this.enterpriseAgentEventIngressSealed || this.isCleanedUp
+        ? undefined
+        : this.forwardEnterpriseAgentEvent(event),
+    );
+    const handled = attempted.catch((error) => {
+      this.sessionLogger.error(
+        { err: error, eventType: event.type },
+        "Failed to publish enterprise agent event",
+      );
+    });
+    this.enterpriseAgentEventTail = handled;
+    return handled;
+  }
+
+  private forwardLegacyAgentEvent(event: AgentManagerEvent): void {
+    if (event.type === "timeline_replacement") {
+      this.deliverTimelineReplacement(event.agentId, this.rewindInitiators.get(event.agentId));
+      return;
+    }
+
+    if (event.type === "agent_state") {
+      this.traceAgentState(event.agent);
+      void this.agentUpdates.forwardLiveAgent(event.agent);
+      return;
+    }
+
+    if (event.type === "provider_subagent") {
+      this.emitProviderSubagentWorkspaceUpdate(event.event);
+      this.forwardProviderSubagentUpdate(event.event);
+      return;
+    }
+
+    if (
+      this.voiceSession.isActiveForAgent(event.agentId) &&
+      event.event.type === "permission_requested" &&
+      isVoicePermissionAllowed(event.event.request)
+    ) {
+      const requestId = event.event.request.id;
+      void this.agentManager
+        .respondToPermission(event.agentId, requestId, {
+          behavior: "allow",
+        })
+        .catch((error) => {
+          this.logVoiceAutoAllowFailure(error, event.agentId, requestId);
+        });
+    }
+
+    const serializedEvent = serializeAgentStreamEvent(event.event);
+    if (!serializedEvent) return;
+    this.traceAgentStream(event);
+    this.forwardAgentStream(event, serializedEvent);
+    this.forwardLegacyPermissionEvent(event);
+  }
+
+  private async forwardEnterpriseAgentEvent(event: AgentManagerEvent): Promise<void> {
+    if (event.type === "timeline_replacement") {
+      await this.deliverEnterpriseTimelineReplacement(
+        event.agentId,
+        this.rewindInitiators.get(event.agentId),
+      );
+      return;
+    }
+    if (event.type === "agent_state") {
+      this.traceAgentState(event.agent);
+      await this.agentUpdates.forwardLiveAgent(event.agent);
+      return;
+    }
+    if (event.type === "provider_subagent") {
+      await this.forwardEnterpriseProviderSubagentUpdate(event.event);
+      return;
+    }
+    await this.forwardEnterpriseAgentStreamEvent(event);
+  }
+
+  private traceAgentState(agent: ManagedAgent): void {
+    this.sessionLogger.trace(
+      {
+        agentId: agent.id,
+        provider: agent.provider,
+        providerSessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: agent.activeForegroundTurnId ?? undefined,
+        lifecycle: agent.lifecycle,
+      },
+      "agent.session.forward_update",
+    );
+  }
+
+  private traceAgentStream(event: Extract<AgentManagerEvent, { type: "agent_stream" }>): void {
+    this.sessionLogger.trace(
+      {
+        agentId: event.agentId,
+        provider: event.event.provider,
+        turnId: getAgentStreamEventTurnId(event.event),
+        seq: event.seq,
+        epoch: event.epoch,
+        event: event.event,
+      },
+      "agent.session.forward_stream",
+    );
+  }
+
+  private logVoiceAutoAllowFailure(error: unknown, agentId: string, requestId: string): void {
+    this.sessionLogger.warn(
+      { err: error, agentId, requestId },
+      "Failed to auto-allow speak tool permission in voice mode",
+    );
+  }
+
+  private forwardLegacyPermissionEvent(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+  ): void {
+    if (event.event.type === "permission_requested") {
+      this.emit({
+        type: "agent_permission_request",
+        payload: { agentId: event.agentId, request: event.event.request },
+      });
+    } else if (event.event.type === "permission_resolved") {
+      this.emit({
+        type: "agent_permission_resolved",
+        payload: {
+          agentId: event.agentId,
+          requestId: event.event.requestId,
+          resolution: event.event.resolution,
+        },
+      });
+    }
+  }
+
+  private async forwardEnterpriseAgentStreamEvent(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+  ): Promise<void> {
+    if (
+      this.voiceSession.isActiveForAgent(event.agentId) &&
+      event.event.type === "permission_requested" &&
+      isVoicePermissionAllowed(event.event.request)
+    ) {
+      const requestId = event.event.request.id;
+      const current = await this.authorizeCurrentAgentEventPublication(event.agentId);
+      if (!current) return;
+      try {
+        await this.agentManager.respondToPermission(event.agentId, requestId, {
+          behavior: "allow",
+        });
+      } catch (error) {
+        this.logVoiceAutoAllowFailure(error, event.agentId, requestId);
+      }
+    }
+
+    const serializedEvent = serializeAgentStreamEvent(event.event);
+    if (!serializedEvent) return;
+    this.traceAgentStream(event);
+    await this.forwardEnterpriseAgentStream(event, serializedEvent);
+
+    if (event.event.type === "permission_requested") {
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_permission_request",
+          payload: { agentId: event.agentId, request: event.event.request },
+        },
+        event.agentId,
+      );
+    } else if (event.event.type === "permission_resolved") {
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_permission_resolved",
+          payload: {
+            agentId: event.agentId,
+            requestId: event.event.requestId,
+            resolution: event.event.resolution,
+          },
+        },
+        event.agentId,
+      );
+    }
   }
 
   private emitProviderSubagentWorkspaceUpdate(event: ProviderSubagentManagerEvent): void {
@@ -1897,11 +2923,27 @@ export class Session {
   /**
    * Main entry point for processing session messages
    */
+  // oxlint-disable-next-line complexity -- inbound authorization and receipt lifecycle are one transaction.
   public async handleMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
+    if (this.rpcDiagnosticObserver) {
+      const request = sessionRpcRequestIdentity(msg);
+      if (request) {
+        this.observeRpcDiagnostic(
+          Object.freeze({
+            phase: "session.enter",
+            requestId: request.requestId,
+            requestType: request.requestType,
+            atUnixMs: sessionRpcDiagnosticUnixMs(),
+          }),
+        );
+      }
+    }
     this.inflightRequests++;
     if (this.inflightRequests > this.peakInflightRequests) {
       this.peakInflightRequests = this.inflightRequests;
     }
+    let registeredRequestId: string | null = null;
+    let reservedRequestId: string | null = null;
     try {
       this.sessionLogger.trace(
         {
@@ -1910,10 +2952,19 @@ export class Session {
         },
         "agent.session.inbound",
       );
-      if (!this.authorization.allowsInbound(msg)) {
+      const contentPolicy = isEnterpriseRequest(msg)
+        ? resolveEnterpriseContentReadPolicy(msg.type)
+        : null;
+      const daemonDecision =
+        isEnterpriseRequest(msg) &&
+        isIdentitySelfRequest(msg) &&
+        this.enterpriseIdentitySelfAuthorization
+          ? this.enterpriseIdentitySelfAuthorization(msg)
+          : this.authorization.authorizeInbound(msg);
+      if (!daemonDecision) {
         const requestId = sessionRequestId(msg);
         if (requestId) {
-          this.emit({
+          this.onMessage({
             type: "rpc_error",
             payload: {
               requestId,
@@ -1924,6 +2975,285 @@ export class Session {
           });
         }
         return;
+      }
+      if (this.enterpriseContext && isEnterpriseProviderBoundaryRequest(msg)) {
+        const requestId = sessionRequestId(msg);
+        if (requestId) this.emitLegacyResourceDenied(requestId, msg.type);
+        return;
+      }
+      const registeredEnterpriseRequestPolicy = isEnterpriseRequest(msg)
+        ? (this.enterpriseDispatcher?.requestPolicyForType?.(msg.type) ?? null)
+        : null;
+      if (
+        isEnterpriseRequest(msg) &&
+        (!this.enterpriseDispatcher ||
+          !this.enterpriseContext ||
+          !(
+            authorityReceiptPolicyForRequestType(msg.type) ??
+            resolveEnterpriseReceiptPolicy(msg.type) ??
+            registeredEnterpriseRequestPolicy
+          ))
+      ) {
+        const requestId = sessionRequestId(msg);
+        if (requestId) {
+          this.onMessage({
+            type: "rpc_error",
+            payload: {
+              requestId,
+              requestType: msg.type,
+              error: ENTERPRISE_UNAVAILABLE_ERROR,
+              code: "unavailable",
+            },
+          });
+        }
+        return;
+      }
+      if (
+        registeredEnterpriseRequestPolicy === "transport_control" &&
+        this.enterpriseDispatcher &&
+        this.enterpriseContext
+      ) {
+        await this.handleRegisteredEnterpriseTransportRequest(msg, daemonDecision);
+        return;
+      }
+      const registeredEnterpriseResourcePolicy = registeredEnterpriseRequestPolicy === "resources";
+      if (
+        (isEnterpriseResourceRequest(msg) || registeredEnterpriseResourcePolicy) &&
+        this.enterpriseDispatcher &&
+        this.enterpriseContext
+      ) {
+        if (!registeredEnterpriseResourcePolicy) return;
+        const requestId = sessionRequestId(msg);
+        if (!requestId || this.reservedAuthorityRequestIds.has(requestId)) return;
+        this.reservedAuthorityRequestIds.add(requestId);
+        try {
+          const unavailable = (): void => {
+            this.onMessage({
+              type: "rpc_error",
+              payload: {
+                requestId,
+                requestType: msg.type,
+                error: ENTERPRISE_UNAVAILABLE_ERROR,
+                code: "unavailable",
+              },
+            });
+          };
+          const dispatchContext = Object.freeze({
+            sessionId: this.sessionId,
+            clientId: this.clientId,
+            credentialId: this.enterpriseContext.principal.credentialId,
+            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+            enterpriseContext: this.enterpriseContext,
+          });
+          const response = await dispatchEnterpriseRequest(
+            this.enterpriseDispatcher,
+            dispatchContext,
+            msg,
+          );
+          if (response === false) {
+            unavailable();
+            return;
+          }
+          if (!isEnterpriseResponsePair(msg, response)) {
+            unavailable();
+            return;
+          }
+          const contextual = this.enterpriseDispatcher.consumeResponse?.({
+            sessionContext: dispatchContext,
+            message: msg,
+            response,
+          });
+          if (!contextual || contextual.receiptClassification !== "resources") {
+            unavailable();
+            return;
+          }
+          this.emit(contextual.response, contextual.authorizationContext);
+        } finally {
+          await this.flushOutboundEmissionTasks(requestId);
+          this.reservedAuthorityRequestIds.delete(requestId);
+        }
+        return;
+      }
+      if (
+        !contentPolicy &&
+        this.inboundAuthorityRequestAuthorizer &&
+        this.authorityReceiptState &&
+        this.enterpriseContext &&
+        this.enterpriseSessionBindingKey
+      ) {
+        const authorityDecision = daemonDecision;
+        if (!authorityDecision) return;
+        const requestId = sessionRequestId(msg);
+        const policy =
+          authorityReceiptPolicyForRequestType(msg.type) ??
+          resolveEnterpriseReceiptPolicy(msg.type);
+        if (policy) {
+          if (this.authoritySubsystemFailed) return;
+          if (
+            !requestId ||
+            this.pendingAuthorityRequests.has(requestId) ||
+            this.reservedAuthorityRequestIds.has(requestId)
+          )
+            return;
+          this.reservedAuthorityRequestIds.add(requestId);
+          reservedRequestId = requestId;
+          let emissionRegisteredHandle: ActiveAuthorizedRequestHandle | null = null;
+          try {
+            const evidence = this.inboundAuthorityRequestAuthorizer.authorize(
+              msg,
+              authorityDecision,
+            );
+            const consumed = evidence
+              ? this.inboundAuthorityRequestAuthorizer.consumeForRegistration(msg, evidence)
+              : null;
+            // oxlint-disable-next-line max-depth -- authorization transaction keeps reservation and registration adjacent.
+            if (!evidence || !consumed) {
+              this.onMessage({
+                type: "rpc_error",
+                payload: {
+                  requestId,
+                  requestType: msg.type,
+                  error: `Session is not authorized for ${msg.type}`,
+                  code: "access_denied",
+                },
+              });
+              return;
+            }
+            // oxlint-disable-next-line max-depth -- request correlation is checked inside the registration transaction.
+            if (consumed.requestId !== requestId || consumed.requestType !== policy.requestType) {
+              return;
+            }
+            const binding = this.enterpriseContext;
+            // oxlint-disable-next-line max-depth -- emission registration is part of the inbound transaction.
+            if (!this.outboundAuthorityEmissionAuthorizer)
+              throw new Error("Outbound authority unavailable");
+            const registeredEmission = await this.outboundAuthorityEmissionAuthorizer.register({
+              handle: consumed.activeRequestHandle,
+              principal: binding.principal,
+              binding: {
+                sessionId: this.sessionId,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: binding.sessionBindingGeneration,
+                organizationId: binding.principal.organizationId,
+                principalId: binding.principal.principalId,
+                principalType: binding.principal.principalType,
+                credentialId: binding.principal.credentialId,
+                grantVersion: binding.principal.grantVersion,
+                nodeId: binding.node.nodeId,
+                clientId: this.clientId,
+              },
+            });
+            // oxlint-disable-next-line max-depth -- pending correlation is committed after W2 registration.
+            if (!registeredEmission) throw new Error("Outbound authority registration failed");
+            emissionRegisteredHandle = consumed.activeRequestHandle;
+            this.pendingAuthorityRequests.set(
+              requestId,
+              Object.freeze({
+                requestId,
+                requestType: consumed.requestType,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: binding.sessionBindingGeneration,
+                activeRequestHandle: consumed.activeRequestHandle,
+              }),
+            );
+            this.reservedAuthorityRequestIds.delete(requestId);
+            reservedRequestId = null;
+            registeredRequestId = requestId;
+            // oxlint-disable-next-line max-depth -- dispatcher runs inside receipt transaction.
+            if (this.enterpriseDispatcher && this.enterpriseContext && isEnterpriseRequest(msg)) {
+              const dispatchContext = Object.freeze({
+                sessionId: this.sessionId,
+                clientId: this.clientId,
+                credentialId: this.enterpriseContext.principal.credentialId,
+                sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                enterpriseContext: this.enterpriseContext,
+              });
+              const response = await dispatchEnterpriseRequest(
+                this.enterpriseDispatcher,
+                dispatchContext,
+                msg,
+              );
+              // oxlint-disable-next-line max-depth -- unavailable response remains in transaction.
+              if (response === false) {
+                this.onMessage({
+                  type: "rpc_error",
+                  payload: {
+                    requestId,
+                    requestType: msg.type,
+                    error: ENTERPRISE_UNAVAILABLE_ERROR,
+                    code: "unavailable",
+                  },
+                });
+              } else {
+                const contextual = this.enterpriseDispatcher.consumeResponse?.({
+                  sessionContext: dispatchContext,
+                  message: msg,
+                  response,
+                });
+                // oxlint-disable-next-line max-depth -- contextual response remains inside receipt transaction.
+                if (!contextual) throw new Error("Enterprise response unavailable");
+                await this.emitEnterpriseDispatcherResponse(msg, contextual);
+              }
+              return;
+            }
+          } catch {
+            // oxlint-disable-next-line max-depth -- failed registration still closes the W2 active handle.
+            if (emissionRegisteredHandle && this.outboundAuthorityEmissionAuthorizer) {
+              await this.outboundAuthorityEmissionAuthorizer.close({
+                handle: emissionRegisteredHandle,
+                principal: this.enterpriseContext.principal,
+                binding: {
+                  sessionId: this.sessionId,
+                  sessionBindingKey: this.enterpriseSessionBindingKey,
+                  sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                  organizationId: this.enterpriseContext.principal.organizationId,
+                  principalId: this.enterpriseContext.principal.principalId,
+                  principalType: this.enterpriseContext.principal.principalType,
+                  credentialId: this.enterpriseContext.principal.credentialId,
+                  grantVersion: this.enterpriseContext.principal.grantVersion,
+                  nodeId: this.enterpriseContext.node.nodeId,
+                  clientId: this.clientId,
+                },
+                reason: "cancel",
+              });
+            }
+            // oxlint-disable-next-line max-depth -- terminal release remains inside registration rollback.
+            if (emissionRegisteredHandle) {
+              this.authoritySubsystemFailed = true;
+              // oxlint-disable-next-line max-depth -- release is nested to preserve exact binding cleanup.
+              // oxlint-disable-next-line max-depth -- exact release is nested in close failure handling.
+              try {
+                // oxlint-disable-next-line max-depth -- release guard is part of the exact-once fence.
+                if (!this.authorityBindingReleased) {
+                  this.authorityReceiptState.releaseSession({
+                    sessionId: this.sessionId,
+                    sessionBindingKey: this.enterpriseSessionBindingKey,
+                    sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+                  });
+                  this.authorityBindingReleased = true;
+                }
+              } catch {
+                // Terminal state remains fail-closed; cleanup is retried by Session cleanup.
+              }
+            }
+            this.pendingAuthorityRequests.delete(requestId);
+            this.reservedAuthorityRequestIds.delete(requestId);
+            reservedRequestId = null;
+            // oxlint-disable-next-line max-depth -- enterprise failure response is transactional.
+            if (requestId && isEnterpriseRequest(msg)) {
+              this.onMessage({
+                type: "rpc_error",
+                payload: {
+                  requestId,
+                  requestType: msg.type,
+                  error: ENTERPRISE_UNAVAILABLE_ERROR,
+                  code: "unavailable",
+                },
+              });
+            }
+            return;
+          }
+        }
       }
       try {
         await this.dispatchInboundMessage(msg, source);
@@ -1960,7 +3290,110 @@ export class Session {
         });
       }
     } finally {
+      let endError: unknown;
+      if (registeredRequestId) await this.flushOutboundEmissionTasks(registeredRequestId);
+      if (registeredRequestId && this.outboundAuthorityEmissionAuthorizer) {
+        const correlation = this.pendingAuthorityRequests.get(registeredRequestId);
+        if (correlation && this.enterpriseContext) {
+          const wasOpen = Boolean(
+            await this.authorityReceiptState?.resolveOpen({
+              handle: correlation.activeRequestHandle,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+            }),
+          );
+          const closed = await this.outboundAuthorityEmissionAuthorizer.close({
+            handle: correlation.activeRequestHandle,
+            principal: this.enterpriseContext.principal,
+            binding: {
+              sessionId: this.sessionId,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+              organizationId: this.enterpriseContext.principal.organizationId,
+              principalId: this.enterpriseContext.principal.principalId,
+              principalType: this.enterpriseContext.principal.principalType,
+              credentialId: this.enterpriseContext.principal.credentialId,
+              grantVersion: this.enterpriseContext.principal.grantVersion,
+              nodeId: this.enterpriseContext.node.nodeId,
+              clientId: this.clientId,
+            },
+            reason: "end",
+          });
+          // oxlint-disable-next-line max-depth -- terminal close cleanup is nested in request finally.
+          if (!closed) {
+            // oxlint-disable-next-line max-depth -- gate is part of terminal close cleanup.
+            if (wasOpen) this.authoritySubsystemFailed = true;
+            // oxlint-disable-next-line max-depth -- exact state close precedes binding release.
+            try {
+              await this.authorityReceiptState?.close({
+                handle: correlation.activeRequestHandle,
+                sessionBindingKey: correlation.sessionBindingKey,
+                sessionBindingGeneration: correlation.sessionBindingGeneration,
+                reason: "end",
+              });
+            } catch {
+              // Keep the terminal gate; cleanup retries the exact binding.
+            }
+            // oxlint-disable-next-line max-depth -- release is part of terminal close handling.
+            try {
+              // oxlint-disable-next-line max-depth -- exact binding guards the release.
+              if (
+                wasOpen &&
+                !this.authorityBindingReleased &&
+                this.authorityReceiptState &&
+                this.enterpriseContext
+              ) {
+                this.authorityReceiptState.releaseSession({
+                  sessionId: this.sessionId,
+                  sessionBindingKey: correlation.sessionBindingKey,
+                  sessionBindingGeneration: correlation.sessionBindingGeneration,
+                });
+                this.authorityBindingReleased = true;
+              }
+            } catch {
+              // cleanup() retries the exact binding release and preserves the terminal gate.
+            }
+          }
+        }
+      }
+      if (
+        registeredRequestId &&
+        this.authorityReceiptState &&
+        this.enterpriseContext &&
+        this.enterpriseSessionBindingKey
+      ) {
+        try {
+          this.authorityReceiptState.endRequest({
+            sessionId: this.sessionId,
+            sessionBindingKey: this.enterpriseSessionBindingKey,
+            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+            requestId: registeredRequestId,
+          });
+        } catch (error) {
+          endError = error;
+          this.authoritySubsystemFailed = true;
+          try {
+            // oxlint-disable-next-line max-depth -- release must remain inside the failure fence.
+            if (!this.authorityBindingReleased) {
+              this.authorityReceiptState.releaseSession({
+                sessionId: this.sessionId,
+                sessionBindingKey: this.enterpriseSessionBindingKey,
+                sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+              });
+              this.authorityBindingReleased = true;
+            }
+          } catch (releaseError) {
+            endError = new AggregateError([endError, releaseError], "Authority teardown failed", {
+              cause: endError,
+            });
+          }
+        }
+      }
+      if (registeredRequestId) this.pendingAuthorityRequests.delete(registeredRequestId);
+      if (reservedRequestId) this.reservedAuthorityRequestIds.delete(reservedRequestId);
       this.inflightRequests--;
+      // oxlint-disable-next-line no-unsafe-finally -- terminal authority failure must surface after cleanup.
+      if (endError) throw endError;
     }
   }
 
@@ -1991,8 +3424,8 @@ export class Session {
     return this.terminalController.hasDirectorySubscription(input);
   }
 
-  public publish(message: SessionOutboundMessage): void {
-    this.emit(message);
+  public publish(message: SessionOutboundMessage, context?: OutboundAuthorizationContext): void {
+    this.emit(message, context);
   }
 
   private async dispatchInboundMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
@@ -2349,21 +3782,7 @@ export class Session {
         return undefined;
       }
       case "agent.timeline.set_subscription.request": {
-        const agentIds = [...new Set(msg.agentIds)].sort();
-        if (
-          source
-            ? this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source)
-            : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
-        ) {
-          this.replaceAgentTimelineSubscription(source, agentIds);
-        }
-        const response: SessionOutboundMessage = {
-          type: "agent.timeline.set_subscription.response",
-          payload: { agentIds, requestId: msg.requestId },
-        };
-        if (source && this.onMessageToSource) this.onMessageToSource(source, response);
-        else this.emit(response);
-        return undefined;
+        return this.handleAgentTimelineSubscriptionRequest(msg, source);
       }
       case "agent.fork_context.request":
         return this.handleAgentForkContextRequest(msg);
@@ -2694,6 +4113,18 @@ export class Session {
   }
 
   private dispatchTerminalMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    if (msg.type === "list_terminals_request" && this.enterpriseContext && !msg.workspaceId) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: "Session is not authorized for global terminal listing",
+          code: "access_denied",
+        },
+      });
+      return undefined;
+    }
     switch (msg.type) {
       case "start_workspace_script_request":
         return this.handleStartWorkspaceScriptRequest(msg);
@@ -2830,6 +4261,10 @@ export class Session {
   }
 
   private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
+      this.emitLegacyResourceDenied(requestId, "delete_agent_request");
+      return;
+    }
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
     const knownWorkspaceId =
@@ -2875,7 +4310,368 @@ export class Session {
     }
   }
 
+  /**
+   * Legacy agent routes do not enter the enterprise dispatcher.  Keep their
+   * manager boundary fail-closed by checking the current owner runtime before
+   * loading or mutating any agent state. Legacy sessions retain their historic
+   * behavior.
+   */
+  private async assertLegacyAgentResource(
+    action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
+    agentId: string,
+  ): Promise<boolean> {
+    if (!this.enterpriseContext) return true;
+    return (await this.resolveEnterpriseLegacyAgentResource(action, agentId)) !== null;
+  }
+
+  private async resolveEnterpriseLegacyAgentResource(
+    action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
+    agentId: string,
+  ): Promise<AgentUpdatePublicationScope | null> {
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return null;
+    const canonical = await authorization.assertAgent(action, agentId);
+    if (!canonical || canonical.agentId !== agentId || !authorization.isCurrent()) return null;
+    return Object.freeze({ agentId: canonical.agentId, workspaceId: canonical.workspaceId });
+  }
+
+  private successfulOwnershipTransferWorkspaceId(
+    request: SessionInboundMessage,
+    contextual: EnterpriseDispatchResponse,
+  ): string | null {
+    if (
+      !this.enterpriseContext ||
+      request.type !== "enterprise.resource.ownership.transfer.request" ||
+      contextual.receiptClassification !== "authority" ||
+      contextual.authorizationContext !== undefined ||
+      contextual.response.type !== "enterprise.resource.ownership.transfer.response"
+    ) {
+      return null;
+    }
+    const resource = request.resource;
+    const response = contextual.response.payload;
+    if (
+      resource.resourceKind !== "workspace" ||
+      resource.organizationId !== this.enterpriseContext.principal.organizationId ||
+      resource.nodeId !== this.enterpriseContext.node.nodeId ||
+      request.expectedOwnerPrincipalId !== this.enterpriseContext.principal.principalId ||
+      response.requestId !== request.requestId ||
+      response.ownerPrincipalId !== request.newPrincipalId ||
+      response.resource.resourceKind !== "workspace" ||
+      response.resource.organizationId !== resource.organizationId ||
+      response.resource.nodeId !== resource.nodeId ||
+      response.resource.localResourceId !== resource.localResourceId
+    ) {
+      return null;
+    }
+    return resource.localResourceId;
+  }
+
+  private workspaceOwnershipTransferSessionBinding(): AuthoritySessionBindingRecord | null {
+    const context = this.enterpriseContext;
+    const sessionBindingKey = this.enterpriseSessionBindingKey;
+    if (!context || !sessionBindingKey) return null;
+    return Object.freeze({
+      sessionId: this.sessionId,
+      sessionBindingKey,
+      sessionBindingGeneration: context.sessionBindingGeneration,
+      organizationId: context.principal.organizationId,
+      principalId: context.principal.principalId,
+      principalType: context.principal.principalType,
+      credentialId: context.principal.credentialId,
+      grantVersion: context.principal.grantVersion,
+      nodeId: context.node.nodeId,
+      clientId: this.clientId,
+    });
+  }
+
+  private isWorkspaceOwnershipTransferSessionCurrent(): boolean {
+    if (this.isCleanedUp) return false;
+    const runtime = this.enterpriseAuthorizationRuntime;
+    const session = this.productionAuthorizationSession;
+    return Boolean(
+      runtime && session && isCurrentProductionAuthorizationRuntimeForSession(runtime, session),
+    );
+  }
+
+  private deliverWorkspaceOwnershipTransferTombstone(
+    delivery: WorkspaceOwnershipTransferTargetDelivery,
+  ): WorkspaceOwnershipTransferTargetResult {
+    const binding = this.workspaceOwnershipTransferSessionBinding();
+    if (!binding) return Object.freeze({ sealed: false, delivered: false });
+    const message = consumeWorkspaceOwnershipTransferTargetDelivery(delivery, binding);
+    if (!message || !this.isWorkspaceOwnershipTransferSessionCurrent())
+      return Object.freeze({ sealed: false, delivered: false });
+
+    this.invalidateTransferredWorkspaceScope(message.payload.resource.localResourceId);
+    try {
+      return Object.freeze({ sealed: true, delivered: this.deliver(message) });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error },
+        "Failed to deliver Workspace ownership transfer tombstone",
+      );
+      return Object.freeze({ sealed: true, delivered: false });
+    }
+  }
+
+  private async emitEnterpriseDispatcherResponse(
+    request: SessionInboundMessage,
+    contextual: EnterpriseDispatchResponse,
+  ): Promise<void> {
+    const transferredWorkspaceId = this.successfulOwnershipTransferWorkspaceId(request, contextual);
+    if (
+      request.type === "enterprise.resource.ownership.transfer.request" &&
+      !transferredWorkspaceId
+    ) {
+      throw new Error("Enterprise ownership transfer response unavailable");
+    }
+    if (!transferredWorkspaceId) {
+      this.emit(contextual.response, contextual.authorizationContext);
+      return;
+    }
+    let issuerSealedByFanout = false;
+    try {
+      await this.enqueueAuthorizedEmit(contextual.response, contextual.authorizationContext);
+    } finally {
+      try {
+        const fanout = claimAndFanoutWorkspaceOwnershipTransferTombstone({
+          issuerHandle: this.enterpriseWorkspaceOwnershipTransferSessionHandle,
+          dispatcher: this.enterpriseWorkspaceOwnershipTransferDispatcher,
+          contextualResponse: contextual,
+        });
+        issuerSealedByFanout = fanout.issuerSealed;
+        this.sessionLogger.trace(
+          {
+            claimed: fanout.claimed,
+            issuerSealed: fanout.issuerSealed,
+            targetedSessions: fanout.targetedSessions,
+            deliveredSessions: fanout.deliveredSessions,
+          },
+          "Workspace ownership transfer tombstone fanout completed",
+        );
+      } finally {
+        if (!issuerSealedByFanout) this.invalidateTransferredWorkspaceScope(transferredWorkspaceId);
+      }
+    }
+  }
+
+  private invalidateTransferredWorkspaceScope(workspaceId: string): void {
+    this.workspacePublicationGenerations.set(
+      workspaceId,
+      (this.workspacePublicationGenerations.get(workspaceId) ?? 0) + 1,
+    );
+
+    const workspaceSubscription = this.workspaceUpdatesSubscription;
+    if (workspaceSubscription) {
+      workspaceSubscription.excludedWorkspaceIds.add(workspaceId);
+      workspaceSubscription.pendingUpdatesByWorkspaceId.delete(workspaceId);
+      workspaceSubscription.lastEmittedByWorkspaceId.delete(workspaceId);
+    }
+    this.workspaceUpdateTails.delete(workspaceId);
+    this.agentUpdates.invalidateWorkspace(workspaceId);
+
+    for (const agentIds of this.viewedTimelineAgentIdsBySource.values()) {
+      for (const agentId of agentIds) {
+        if (this.viewedTimelineWorkspaceIdByAgentId.get(agentId) === workspaceId) {
+          agentIds.delete(agentId);
+          this.viewedTimelineWorkspaceIdByAgentId.delete(agentId);
+        }
+      }
+    }
+    this.rebuildViewedTimelineAgentIds();
+    this.pruneViewedTimelineWorkspaceIds();
+
+    try {
+      this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+    } catch (error) {
+      this.sessionLogger.warn(
+        { err: error, workspaceId },
+        "Failed to remove transferred workspace observer",
+      );
+    }
+  }
+
+  private async authorizeCurrentAgentEventPublication(
+    agentId: string,
+  ): Promise<AgentUpdatePublicationScope | null> {
+    if (!this.enterpriseContext || this.enterpriseAgentEventIngressSealed || this.isCleanedUp) {
+      return null;
+    }
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return null;
+    const canonical = await authorization.assertAgent("workspace.content.read", agentId);
+    if (
+      !canonical ||
+      canonical.agentId !== agentId ||
+      !authorization.isCurrent() ||
+      this.enterpriseAgentEventIngressSealed ||
+      this.isCleanedUp
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      agentId: canonical.agentId,
+      workspaceId: canonical.workspaceId,
+    });
+  }
+
+  private async emitCurrentAgentEvent(
+    message: SessionOutboundMessage,
+    agentId: string,
+    source?: object,
+  ): Promise<boolean> {
+    const current = await this.authorizeCurrentAgentEventPublication(agentId);
+    if (!current) return false;
+    const context = this.createWorkspaceOutboundContext(current.workspaceId);
+    if (!context || this.enterpriseAgentEventIngressSealed || this.isCleanedUp) return false;
+    return this.enqueueAuthorizedEmit(message, context, source);
+  }
+
+  private async emitAgentUpdatePublication(
+    message: SessionOutboundMessage,
+    scope?: AgentUpdatePublicationScope,
+  ): Promise<boolean | void> {
+    if (!this.enterpriseContext) {
+      this.emit(message);
+      return;
+    }
+    if (
+      !scope ||
+      this.enterpriseAgentEventIngressSealed ||
+      this.isCleanedUp ||
+      !this.isEnterpriseLegacyResourceCurrent()
+    ) {
+      return false;
+    }
+    const current = await this.authorizeCurrentAgentEventPublication(scope.agentId);
+    if (!current || current.workspaceId !== scope.workspaceId) return false;
+    const context = this.createWorkspaceOutboundContext(current.workspaceId);
+    return context ? this.enqueueAuthorizedEmit(message, context) : false;
+  }
+
+  private async assertLegacyWorkspaceResource(
+    action: "workspace.content.read" | "workspace.metadata.read" | "workspace.write",
+    workspaceId: string,
+  ): Promise<boolean> {
+    if (!this.enterpriseContext) return true;
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return false;
+    return (await authorization.assertWorkspace(action, workspaceId)) !== null;
+  }
+
+  private async authorizeCurrentAgentMutation(
+    agentId: string,
+  ): Promise<AgentUpdatePublicationScope | null> {
+    if (!this.enterpriseContext || this.isCleanedUp) return null;
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) return null;
+    const canonical = await authorization.assertAgent("workspace.write", agentId);
+    if (
+      !canonical ||
+      canonical.agentId !== agentId ||
+      !authorization.isCurrent() ||
+      this.isCleanedUp
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      agentId: canonical.agentId,
+      workspaceId: canonical.workspaceId,
+    });
+  }
+
+  private emitLegacyResourceDenied(requestId: string, requestType: string, source?: object): void {
+    const message: SessionOutboundMessage = {
+      type: "rpc_error",
+      payload: {
+        requestId,
+        requestType,
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    };
+    if (source && this.onMessageToSource) this.onMessageToSource(source, message);
+    else this.onMessage(message);
+  }
+
+  private enterpriseWorkspaceOwnership(): EnterpriseResourceOwner | undefined {
+    const context = this.enterpriseContext;
+    if (!context) return undefined;
+    return {
+      organizationId: context.principal.organizationId,
+      nodeId: context.node.nodeId,
+      ownerPrincipalId: context.principal.principalId,
+      createdByPrincipalId: context.principal.principalId,
+    };
+  }
+
+  private async filterEnterpriseAgentProjectionSources(
+    liveAgents: readonly ManagedAgent[],
+    persistedRecords: readonly StoredAgentRecord[],
+  ): Promise<{ liveAgents: ManagedAgent[]; persistedRecords: StoredAgentRecord[] }> {
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    const liveRows = liveAgents.flatMap((agent) => {
+      const ownership = agent.enterpriseOwnership;
+      if (!agent.workspaceId || !ownership || ownership.workspaceId !== agent.workspaceId)
+        return [];
+      try {
+        const owner = normalizeEnterpriseResourceOwner(ownership);
+        return owner ? [{ ...owner, id: agent.id, workspaceId: agent.workspaceId }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const persistedRows = persistedRecords.flatMap((record) => {
+      if (!record.workspaceId) return [];
+      try {
+        const owner = normalizeEnterpriseResourceOwner(record);
+        return owner ? [{ ...owner, id: record.id, workspaceId: record.workspaceId }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const shortlisted = authorization.prefilterAgentContentRows([...liveRows, ...persistedRows]);
+    const authorized = await authorization.filterAgents("workspace.content.read", shortlisted);
+    if (!authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    const authorizedIds = new Set(authorized.map((row) => row.id));
+    return {
+      liveAgents: liveAgents.filter((agent) => authorizedIds.has(agent.id)),
+      persistedRecords: persistedRecords.filter((record) => authorizedIds.has(record.id)),
+    };
+  }
+
+  private async allowedEnterpriseWorkspaceIds(): Promise<ReadonlySet<string>> {
+    if (!this.enterpriseContext) return new Set();
+    const authorization = this.enterpriseLegacyResourceAuthorization;
+    if (!authorization || !authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    const rows = (await this.workspaceRegistry.list()).flatMap((workspace) => {
+      try {
+        const owner = normalizeEnterpriseResourceOwner(workspace);
+        return owner ? [{ ...owner, id: workspace.workspaceId }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const authorized = authorization.filterWorkspaces(rows);
+    if (!authorization.isCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    return new Set(authorized.map((workspace) => workspace.id));
+  }
+
   private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
+      this.emitLegacyResourceDenied(requestId, "archive_agent_request");
+      return;
+    }
     this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
 
     const { archivedAt } = await this.archiveAgentForClose(agentId);
@@ -3048,6 +4844,10 @@ export class Session {
     labels: Record<string, string> | undefined,
     requestId: string,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.write", agentId))) {
+      this.emitLegacyResourceDenied(requestId, "update_agent_request");
+      return;
+    }
     this.sessionLogger.info(
       {
         agentId,
@@ -3358,6 +5158,16 @@ export class Session {
       "session: workspace.title.set.request",
     );
 
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", workspaceId))) {
+      this.emitLegacyResourceDenied(requestId, "workspace.title.set.request");
+      return;
+    }
+    const responseContext = this.createWorkspaceOutboundContext(workspaceId);
+    if (this.enterpriseContext && !responseContext) {
+      this.emitLegacyResourceDenied(requestId, "workspace.title.set.request");
+      return;
+    }
+
     try {
       const trimmed = title?.trim() ?? "";
       const nextTitle = trimmed.length === 0 ? null : trimmed;
@@ -3368,29 +5178,35 @@ export class Session {
         updatedAt,
       }));
       if (!updated) {
-        this.emit({
+        this.emit(
+          {
+            type: "workspace.title.set.response",
+            payload: {
+              requestId,
+              workspaceId,
+              accepted: false,
+              title: null,
+              error: "Workspace not found",
+            },
+          },
+          responseContext,
+        );
+        return;
+      }
+
+      this.emit(
+        {
           type: "workspace.title.set.response",
           payload: {
             requestId,
             workspaceId,
-            accepted: false,
-            title: null,
-            error: "Workspace not found",
+            accepted: true,
+            title: nextTitle,
+            error: null,
           },
-        });
-        return;
-      }
-
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: true,
-          title: nextTitle,
-          error: null,
         },
-      });
+        responseContext,
+      );
 
       await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
     } catch (error) {
@@ -3407,16 +5223,19 @@ export class Session {
           content: `Failed to set workspace title: ${getErrorMessage(error)}`,
         },
       });
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: false,
-          title: null,
-          error: getErrorMessageOr(error, "Failed to set workspace title"),
+      this.emit(
+        {
+          type: "workspace.title.set.response",
+          payload: {
+            requestId,
+            workspaceId,
+            accepted: false,
+            title: null,
+            error: getErrorMessageOr(error, "Failed to set workspace title"),
+          },
         },
-      });
+        responseContext,
+      );
     }
   }
 
@@ -3427,6 +5246,10 @@ export class Session {
   ): Promise<void> {
     const logContext = { workspaceId, pinned, requestId };
     this.sessionLogger.info(logContext, "session: workspace.pin.set.request");
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", workspaceId))) {
+      this.emitLegacyResourceDenied(requestId, "workspace.pin.set.request");
+      return;
+    }
     const emitResponse = (accepted: boolean, pinnedAt: string | null, error: string | null) => {
       this.emit({
         type: "workspace.pin.set.response",
@@ -3469,6 +5292,12 @@ export class Session {
   private async handleWorkspaceRecoveryInspectRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.inspect.request" }>,
   ): Promise<void> {
+    if (
+      !(await this.assertLegacyWorkspaceResource("workspace.content.read", request.workspaceId))
+    ) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     const state = await this.workspaceRecovery.inspect(request.workspaceId);
     this.emit({
       type: "workspace.recovery.inspect.response",
@@ -3482,6 +5311,10 @@ export class Session {
   private async handleWorkspaceRecoveryRestoreRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.restore.request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", request.workspaceId))) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     try {
       await this.restoreWorkspaceAndEmit(request.workspaceId);
       this.emit({
@@ -3782,6 +5615,7 @@ export class Session {
           createdWorktree: null,
           cwd: config.cwd,
           initialTitle: input.workspacePromptTitle,
+          ownership: this.enterpriseWorkspaceOwnership(),
         }),
         cwd: config.cwd,
       }),
@@ -3915,6 +5749,7 @@ export class Session {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
+        ownership: this.enterpriseWorkspaceOwnership(),
       });
       if (createdWorkspace) {
         await this.registerWorkspaceForImportedAgent(createdWorkspace);
@@ -4168,6 +6003,83 @@ export class Session {
           type: "agent_stream",
           payload: { agentId, event, timestamp: row.timestamp, seq: row.seq, epoch },
         },
+        source,
+      );
+    }
+  }
+
+  private async deliverEnterpriseTimelineReplacement(
+    agentId: string,
+    initiatingSource?: object,
+  ): Promise<void> {
+    if (!(await this.authorizeCurrentAgentEventPublication(agentId))) return;
+    const agent = this.agentManager.getAgent(agentId);
+    if (!agent) return;
+    const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });
+    const epoch = timeline.epoch;
+
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (!this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
+        await this.emitEnterpriseReconstructedTimelineRows(
+          agentId,
+          agent.provider,
+          timeline.rows,
+          epoch,
+        );
+      }
+      return;
+    }
+
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      const isInitiator = source === initiatingSource;
+      const supportsReplacement = capabilities.has(CLIENT_CAPS.timelineReplacementInvalidation);
+      const isSubscribed = this.viewedTimelineAgentIdsBySource.get(source)?.has(agentId) === true;
+      if (supportsReplacement) {
+        if (isSubscribed && !isInitiator) {
+          await this.emitCurrentAgentEvent(
+            {
+              type: "agent.timeline.replacement",
+              payload: { agentId, epoch },
+            },
+            agentId,
+            source,
+          );
+        }
+        continue;
+      }
+      await this.emitEnterpriseReconstructedTimelineRows(
+        agentId,
+        agent.provider,
+        timeline.rows,
+        epoch,
+        source,
+      );
+    }
+  }
+
+  private async emitEnterpriseReconstructedTimelineRows(
+    agentId: string,
+    provider: ManagedAgent["provider"],
+    rows: AgentTimelineFetchResult["rows"],
+    epoch: string,
+    source?: object,
+  ): Promise<void> {
+    for (const row of rows) {
+      if (!this.supportsTimelineItem(row.item, source)) continue;
+      const event = serializeAgentStreamEvent({
+        type: "timeline",
+        provider,
+        item: row.item,
+        ...(row.turnId ? { turnId: row.turnId } : {}),
+        timestamp: row.timestamp,
+      });
+      if (!event) continue;
+      await this.emitCurrentAgentEvent(
+        {
+          type: "agent_stream",
+          payload: { agentId, event, timestamp: row.timestamp, seq: row.seq, epoch },
+        },
+        agentId,
         source,
       );
     }
@@ -4590,7 +6502,16 @@ export class Session {
           filter?.includeUnavailablePersisted === true ||
           isStoredAgentProviderAvailable(record, registeredProviderIds),
       )
-      .map((record) => this.buildStoredAgentPayload(record, registeredProviderIds));
+      .flatMap((record) => {
+        try {
+          return [this.buildStoredAgentPayload(record, registeredProviderIds)];
+        } catch (error) {
+          // Enterprise directory reads quarantine malformed ownership rows. Legacy
+          // projections retain their historical failure behavior.
+          if (this.enterpriseContext) return [];
+          throw error;
+        }
+      });
 
     let agents = [...liveAgents, ...persistedAgents];
 
@@ -4606,6 +6527,58 @@ export class Session {
       );
     }
 
+    return agents;
+  }
+
+  private async listEnterpriseContentAuthorizedAgentPayloads(filter: {
+    labels?: Record<string, string>;
+    includeArchived?: boolean;
+    includeUnavailablePersisted?: boolean;
+  }): Promise<AgentSnapshotPayload[]> {
+    const includeArchived = filter.includeArchived === true;
+    const labelEntries = filter.labels ? Object.entries(filter.labels) : [];
+    const agentSnapshots = this.agentManager.listAgents();
+    const registryRecords = await this.agentStorage.list();
+    const liveIds = new Set(agentSnapshots.map((agent) => agent.id));
+    const registeredProviderIds = new Set(this.providerSnapshotManager.listRegisteredProviderIds());
+    const persistedRecords = registryRecords
+      .filter((record) => !liveIds.has(record.id) && !record.internal)
+      .filter((record) => includeArchived || !record.archivedAt)
+      .filter((record) => labelEntries.every(([key, value]) => record.labels?.[key] === value))
+      .filter(
+        (record) =>
+          filter.includeUnavailablePersisted === true ||
+          isStoredAgentProviderAvailable(record, registeredProviderIds),
+      );
+    const authorizedSources = await this.filterEnterpriseAgentProjectionSources(
+      agentSnapshots,
+      persistedRecords,
+    );
+    this.assertEnterpriseLegacyResourceCurrent();
+
+    const liveAgents = await Promise.all(
+      authorizedSources.liveAgents.map((agent) => this.buildAgentPayload(agent)),
+    );
+    this.assertEnterpriseLegacyResourceCurrent();
+    const persistedAgents = authorizedSources.persistedRecords.flatMap((record) => {
+      try {
+        return [this.buildStoredAgentPayload(record, registeredProviderIds)];
+      } catch {
+        return [];
+      }
+    });
+    this.assertEnterpriseLegacyResourceCurrent();
+
+    let agents = [...liveAgents, ...persistedAgents];
+    agents = agents.filter((agent) => this.isProviderVisibleToClient(agent.provider));
+    if (!includeArchived) {
+      agents = agents.filter((agent) => !agent.archivedAt);
+    }
+    if (labelEntries.length > 0) {
+      agents = agents.filter((agent) =>
+        labelEntries.every(([key, value]) => agent.labels[key] === value),
+      );
+    }
     return agents;
   }
 
@@ -4792,13 +6765,17 @@ export class Session {
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
-    let agents = await this.listAgentPayloads({
+    const listOptions = {
       labels: filter?.labels,
       includeArchived: filter?.includeArchived,
       includeUnavailablePersisted: request.type === "fetch_agent_history_request",
-    });
+    };
+    let agents = this.enterpriseContext
+      ? await this.listEnterpriseContentAuthorizedAgentPayloads(listOptions)
+      : await this.listAgentPayloads(listOptions);
     const activePlacementsByWorkspaceId =
       scope === "active" ? await this.buildActiveProjectPlacementsByWorkspaceId() : null;
+    this.assertEnterpriseLegacyResourceCurrent();
     if (activePlacementsByWorkspaceId) {
       agents = agents.filter(
         (agent) =>
@@ -4807,7 +6784,6 @@ export class Session {
           activePlacementsByWorkspaceId.has(agent.workspaceId),
       );
     }
-
     const placementByWorkspaceId = new Map<string, Promise<ProjectPlacementPayload | null>>();
     const getPlacement = (
       workspaceId: string | undefined,
@@ -4857,6 +6833,7 @@ export class Session {
       getPlacement,
       filter,
     });
+    this.assertEnterpriseLegacyResourceCurrent();
 
     const pagedEntries = matchedEntries.slice(0, limit);
     const hasMore = matchedEntries.length > limit;
@@ -5169,7 +7146,14 @@ export class Session {
     pageInfo: FetchWorkspacesResponsePageInfo;
   }> {
     try {
-      return await this.workspaceDirectory.listFetchEntries(request);
+      const allowedWorkspaceIds = this.enterpriseContext
+        ? await this.allowedEnterpriseWorkspaceIds()
+        : undefined;
+      const result = await this.workspaceDirectory.listFetchEntries(request, allowedWorkspaceIds);
+      if (!this.isEnterpriseLegacyResourceCurrent()) {
+        throw new SessionRequestError("access_denied", "Resource unavailable");
+      }
+      return this.enterpriseContext ? { ...result, emptyProjects: [] } : result;
     } catch (error) {
       if (error instanceof CursorError) {
         throw new SessionRequestError("invalid_cursor", error.message);
@@ -5178,10 +7162,25 @@ export class Session {
     }
   }
 
+  private workspaceEntriesVisibleToGitObserver(
+    entries: FetchWorkspacesResponseEntry[],
+  ): FetchWorkspacesResponseEntry[] {
+    const excludedWorkspaceIds = this.workspaceUpdatesSubscription?.excludedWorkspaceIds;
+    if (!excludedWorkspaceIds) return entries;
+    return entries.filter((entry) => !excludedWorkspaceIds.has(entry.id));
+  }
+
   private bufferOrEmitWorkspaceUpdate(
     subscription: WorkspaceUpdatesSubscriptionState,
     payload: WorkspaceUpdatePayload,
   ): void {
+    const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
+    if (
+      this.workspaceUpdatesSubscription !== subscription ||
+      subscription.excludedWorkspaceIds.has(workspaceId)
+    ) {
+      return;
+    }
     if (payload.kind === "upsert") {
       subscription.visibleEmptyProjectIds?.delete(payload.workspace.projectId);
     } else {
@@ -5193,16 +7192,17 @@ export class Session {
       }
     }
     if (subscription.isBootstrapping) {
-      const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
       subscription.pendingUpdatesByWorkspaceId.set(workspaceId, payload);
       return;
     }
-    const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
     subscription.lastEmittedByWorkspaceId.set(workspaceId, payload);
-    this.emit({
-      type: "workspace_update",
-      payload,
-    });
+    this.emit(
+      {
+        type: "workspace_update",
+        payload,
+      },
+      this.createWorkspaceOutboundContext(workspaceId),
+    );
   }
 
   private flushBootstrappedWorkspaceUpdates(options?: {
@@ -5221,6 +7221,8 @@ export class Session {
     subscription.pendingUpdatesByWorkspaceId.clear();
 
     for (const payload of pending) {
+      const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
       if (payload.kind === "upsert") {
         const snapshot = options?.snapshotByWorkspaceId?.get(payload.workspace.id);
         const updateActivityAtMs = payload.workspace.activityAt
@@ -5244,12 +7246,14 @@ export class Session {
           continue;
         }
       }
-      const workspaceId = payload.kind === "upsert" ? payload.workspace.id : payload.id;
       subscription.lastEmittedByWorkspaceId.set(workspaceId, payload);
-      this.emit({
-        type: "workspace_update",
-        payload,
-      });
+      this.emit(
+        {
+          type: "workspace_update",
+          payload,
+        },
+        this.createWorkspaceOutboundContext(workspaceId),
+      );
     }
   }
 
@@ -5312,14 +7316,21 @@ export class Session {
       resolveDefaultBranch?: (repoRoot: string) => Promise<string>;
     },
   ): Promise<CreatePaseoWorktreeResult> {
-    const result = await createPaseoWorktree(input, {
-      github: this.github,
-      ...(options?.resolveDefaultBranch
-        ? { resolveDefaultBranch: options.resolveDefaultBranch }
-        : {}),
-      workspaceGitService: this.workspaceGitService,
-      workspaceProvisioning: this.workspaceProvisioning,
-    });
+    const ownership = this.enterpriseWorkspaceOwnership();
+    const result = await createPaseoWorktree(
+      {
+        ...input,
+        ...(ownership ? { ownership } : {}),
+      },
+      {
+        github: this.github,
+        ...(options?.resolveDefaultBranch
+          ? { resolveDefaultBranch: options.resolveDefaultBranch }
+          : {}),
+        workspaceGitService: this.workspaceGitService,
+        workspaceProvisioning: this.workspaceProvisioning,
+      },
+    );
     void Promise.all([
       this.gitMutation.notifyGitMutation(input.cwd, "create-worktree"),
       this.gitMutation.notifyGitMutation(result.worktree.worktreePath, "create-worktree"),
@@ -5393,6 +7404,11 @@ export class Session {
     }
 
     const uniqueWorkspaceIds = new Set(Array.from(workspaceIds));
+    for (const workspaceId of uniqueWorkspaceIds) {
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) {
+        uniqueWorkspaceIds.delete(workspaceId);
+      }
+    }
     if (uniqueWorkspaceIds.size === 0) {
       return;
     }
@@ -5426,6 +7442,7 @@ export class Session {
     return next;
   }
 
+  // oxlint-disable-next-line complexity -- subscription, transfer, filter, and dedupe fences remain adjacent to publication.
   private async emitWorkspaceUpdateBatch(
     workspaceIds: ReadonlySet<string>,
     subscription: WorkspaceUpdatesSubscriptionState,
@@ -5444,6 +7461,7 @@ export class Session {
       if (this.workspaceUpdatesSubscription !== subscription) {
         return;
       }
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
       const workspace = descriptorsByWorkspaceId.get(workspaceId);
       const filteredWorkspace =
         workspace && this.matchesWorkspaceFilter({ workspace, filter: subscription.filter })
@@ -5468,6 +7486,7 @@ export class Session {
         if (this.workspaceUpdatesSubscription !== subscription) {
           return;
         }
+        if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
         subscription.lastEmittedByWorkspaceId.delete(workspaceId);
         const removePayload = await this.buildWorkspaceRemoveUpdatePayload(
           workspaceId,
@@ -5500,6 +7519,7 @@ export class Session {
         continue;
       }
 
+      if (subscription.excludedWorkspaceIds.has(workspaceId)) continue;
       this.bufferOrEmitWorkspaceUpdate(subscription, nextPayload);
     }
   }
@@ -5583,13 +7603,42 @@ export class Session {
     await this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options);
   }
 
+  private requestEnterpriseFetchAgentsStartTicket(
+    request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
+  ): Promise<boolean> | null {
+    const scheduler = this.enterpriseFetchAgentsStartScheduler;
+    if (
+      !this.enterpriseContext ||
+      !scheduler ||
+      request.subscribe !== undefined ||
+      request.sync !== undefined
+    ) {
+      return null;
+    }
+    return scheduler
+      .waitForStart()
+      .then(() => !this.isCleanedUp && this.isEnterpriseLegacyResourceCurrent());
+  }
+
+  private clearFetchAgentsSubscription(subscriptionId: string | null): void {
+    if (subscriptionId) this.agentUpdates.clearSubscription(subscriptionId);
+  }
+
   private async handleFetchAgents(
     request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
   ): Promise<void> {
-    const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
-    const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
+    let subscriptionId: string | null = null;
 
     try {
+      const startTicket = this.requestEnterpriseFetchAgentsStartTicket(request);
+      if (startTicket && !(await startTicket)) return;
+
+      const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
+      subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
       if (subscriptionId) {
         this.agentUpdates.beginSubscription({
           subscriptionId,
@@ -5609,22 +7658,35 @@ export class Session {
         }
       }
 
-      this.emit({
+      const response: SessionOutboundMessage = {
         type: "fetch_agents_response",
         payload: {
           requestId: request.requestId,
           ...(subscriptionId ? { subscriptionId } : {}),
           ...payload,
         },
-      });
+      };
+      const responseContext = this.createWorkspaceOutboundContextForIds(
+        payload.entries.map((entry) => entry.agent.workspaceId),
+      );
+      if (this.enterpriseContext) {
+        const delivered = await this.enqueueAuthorizedEmit(response, responseContext);
+        if (!delivered) {
+          this.clearFetchAgentsSubscription(subscriptionId);
+          return;
+        }
+      } else {
+        this.emit(response, responseContext);
+      }
 
       if (subscriptionId) {
-        this.agentUpdates.flushBootstrapped(subscriptionId, { snapshotUpdatedAtByAgentId });
+        await this.agentUpdates.flushBootstrapped(subscriptionId, { snapshotUpdatedAtByAgentId });
+        if (this.enterpriseContext && !this.isEnterpriseLegacyResourceCurrent()) {
+          this.agentUpdates.clearSubscription(subscriptionId);
+        }
       }
     } catch (error) {
-      if (subscriptionId) {
-        this.agentUpdates.clearSubscription(subscriptionId);
-      }
+      this.clearFetchAgentsSubscription(subscriptionId);
       const code = error instanceof SessionRequestError ? error.code : "fetch_agents_failed";
       const message = error instanceof Error ? error.message : "Failed to fetch agents";
       this.sessionLogger.error({ err: error }, "Failed to handle fetch_agents_request");
@@ -5643,15 +7705,24 @@ export class Session {
   private async handleFetchAgentHistory(
     request: Extract<SessionInboundMessage, { type: "fetch_agent_history_request" }>,
   ): Promise<void> {
+    if (this.enterpriseContext && !this.enterpriseLegacyResourceAuthorization?.isCurrent()) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     try {
       const payload = await this.listFetchAgentsEntries(request);
-      this.emit({
-        type: "fetch_agent_history_response",
-        payload: {
-          requestId: request.requestId,
-          ...payload,
+      this.emit(
+        {
+          type: "fetch_agent_history_response",
+          payload: {
+            requestId: request.requestId,
+            ...payload,
+          },
         },
-      });
+        this.createWorkspaceOutboundContextForIds(
+          payload.entries.map((entry) => entry.agent.workspaceId),
+        ),
+      );
     } catch (error) {
       const code = error instanceof SessionRequestError ? error.code : "fetch_agent_history_failed";
       const message = error instanceof Error ? error.message : "Failed to fetch agent history";
@@ -5715,6 +7786,10 @@ export class Session {
   private async handleFetchWorkspacesRequest(
     request: Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>,
   ): Promise<void> {
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
     const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
 
@@ -5738,13 +7813,16 @@ export class Session {
           pendingUpdatesByWorkspaceId: new Map(),
           lastEmittedByWorkspaceId: new Map(),
           visibleEmptyProjectIds: new Set(),
+          excludedWorkspaceIds: new Set(),
         };
       }
 
       const payload = request.sync
         ? await this.readWorkspaceDirectorySync(request)
         : await this.listFetchWorkspacesEntries(request);
-      this.workspaceGitObserver.syncObservers(payload.entries);
+      this.workspaceGitObserver.syncObservers(
+        this.workspaceEntriesVisibleToGitObserver(payload.entries),
+      );
       this.sessionLogger.debug(
         {
           requestId: request.requestId,
@@ -5762,14 +7840,17 @@ export class Session {
         payload.emptyProjects,
       );
 
-      this.emit({
-        type: "fetch_workspaces_response",
-        payload: {
-          requestId: request.requestId,
-          ...(subscriptionId ? { subscriptionId } : {}),
-          ...payload,
+      this.emit(
+        {
+          type: "fetch_workspaces_response",
+          payload: {
+            requestId: request.requestId,
+            ...(subscriptionId ? { subscriptionId } : {}),
+            ...payload,
+          },
         },
-      });
+        this.createWorkspaceOutboundContextForIds(payload.entries.map((entry) => entry.id)),
+      );
 
       if (subscriptionId && this.workspaceUpdatesSubscription?.subscriptionId === subscriptionId) {
         this.flushBootstrappedWorkspaceUpdates(snapshot);
@@ -6003,10 +8084,14 @@ export class Session {
         "Sequenced workspace directory reads do not support filters.",
       );
     }
-    return this.directorySync.synchronizeWorkspaces(
-      await this.workspaceDirectory.listDescriptors(),
-      request.sync ?? {},
-    );
+    const allowedWorkspaceIds = this.enterpriseContext
+      ? await this.allowedEnterpriseWorkspaceIds()
+      : undefined;
+    const descriptors = await this.workspaceDirectory.listDescriptors(allowedWorkspaceIds);
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+    return this.directorySync.synchronizeWorkspaces(descriptors, request.sync ?? {});
   }
 
   // Build the bootstrap snapshot used by `flushBootstrappedWorkspaceUpdates`
@@ -6047,6 +8132,7 @@ export class Session {
     if (subscriptionId && subscription.subscriptionId !== subscriptionId) return;
     if (!subscriptionId && !equal(subscription.filter, filter)) return;
     for (const entry of entries) {
+      if (subscription.excludedWorkspaceIds.has(entry.id)) continue;
       subscription.lastEmittedByWorkspaceId.set(entry.id, {
         kind: "upsert",
         workspace: entry,
@@ -6093,7 +8179,7 @@ export class Session {
         "Failed to create workspace",
       );
       const errorCode = error instanceof WorkspaceProvisioningError ? error.code : undefined;
-      this.emit({
+      this.emitWorkspaceCreateResponse({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
@@ -6116,7 +8202,7 @@ export class Session {
     const cwd = expandTilde(request.source.path);
     const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
     if (!directoryExists) {
-      this.emit({
+      this.emitWorkspaceCreateResponse({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
@@ -6135,19 +8221,25 @@ export class Session {
       cwd,
       explicitTitle ?? promptTitle,
       request.source.projectId,
-      { expectsInitialAgent: Boolean(request.firstAgentContext) },
+      {
+        expectsInitialAgent: Boolean(request.firstAgentContext),
+        ownership: this.enterpriseWorkspaceOwnership(),
+      },
     );
     await this.syncWorkspaceGitObserverForWorkspace(workspace);
     const descriptor = await this.describeWorkspaceRecord(workspace);
-    this.emit({
-      type: "workspace.create.response",
-      payload: {
-        requestId: request.requestId,
-        workspace: descriptor,
-        setupTerminalId: null,
-        error: null,
+    this.emitWorkspaceCreateResponse(
+      {
+        type: "workspace.create.response",
+        payload: {
+          requestId: request.requestId,
+          workspace: descriptor,
+          setupTerminalId: null,
+          error: null,
+        },
       },
-    });
+      workspace.workspaceId,
+    );
     await this.emitCreatedWorkspaceUpdate(
       descriptor,
       request.firstAgentContext ? "running" : undefined,
@@ -6183,7 +8275,7 @@ export class Session {
     const source = request.source;
 
     if (!source.cwd && !source.projectId) {
-      this.emit({
+      this.emitWorkspaceCreateResponse({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
@@ -6217,22 +8309,25 @@ export class Session {
     );
 
     const descriptor = await this.describeCreatedWorktreeWorkspace(result);
-    this.emit({
-      type: "workspace.create.response",
-      payload: {
-        requestId: request.requestId,
-        workspace: descriptor,
-        setupTerminalId: null,
-        ...(result.workspace.untrustedSource
-          ? {
-              setupSkippedReason: formatWorkspaceAutomationBlockedMessage(
-                result.workspace.untrustedSource,
-              ),
-            }
-          : {}),
-        error: null,
+    this.emitWorkspaceCreateResponse(
+      {
+        type: "workspace.create.response",
+        payload: {
+          requestId: request.requestId,
+          workspace: descriptor,
+          setupTerminalId: null,
+          ...(result.workspace.untrustedSource
+            ? {
+                setupSkippedReason: formatWorkspaceAutomationBlockedMessage(
+                  result.workspace.untrustedSource,
+                ),
+              }
+            : {}),
+          error: null,
+        },
       },
-    });
+      result.workspace.workspaceId,
+    );
     await this.emitCreatedWorkspaceUpdate(
       descriptor,
       request.firstAgentContext ? "running" : undefined,
@@ -6271,7 +8366,9 @@ export class Session {
       for (const workspaceRecord of await this.workspaceRegistry.list()) {
         workspacesBefore.set(workspaceRecord.workspaceId, workspaceRecord);
       }
-      const workspace = await this.workspaceProvisioning.findOrCreateWorkspaceForDirectory(cwd);
+      const workspace = await this.workspaceProvisioning.findOrCreateWorkspaceForDirectory(cwd, {
+        ownership: this.enterpriseWorkspaceOwnership(),
+      });
       const project = await this.projectRegistry.get(workspace.projectId);
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
       const descriptor = await this.describeWorkspaceRecord(workspace);
@@ -6783,6 +8880,12 @@ export class Session {
   private async handleWorkspaceSetupStatusRequest(
     request: Extract<SessionInboundMessage, { type: "workspace_setup_status_request" }>,
   ): Promise<void> {
+    if (
+      !(await this.assertLegacyWorkspaceResource("workspace.content.read", request.workspaceId))
+    ) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     return handleWorkspaceSetupStatusRequestMessage(
       {
         emit: (message) => this.emit(message),
@@ -6796,6 +8899,10 @@ export class Session {
   private async handleWorkspaceSetupRunRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.setup.run.request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", request.workspaceId))) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     return handleWorkspaceSetupRunRequestMessage(
       {
         getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
@@ -6828,6 +8935,10 @@ export class Session {
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", request.workspaceId))) {
+      this.emitLegacyResourceDenied(request.requestId, request.type);
+      return;
+    }
     try {
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
@@ -6898,6 +9009,14 @@ export class Session {
   ): Promise<void> {
     const { requestId, workspaceId } = request;
     const requestedWorkspaceIds = Array.isArray(workspaceId) ? workspaceId : [workspaceId];
+    if (this.enterpriseContext) {
+      for (const requestedWorkspaceId of requestedWorkspaceIds) {
+        if (!(await this.assertLegacyWorkspaceResource("workspace.write", requestedWorkspaceId))) {
+          this.emitLegacyResourceDenied(requestId, request.type);
+          return;
+        }
+      }
+    }
     let agents: AgentSnapshotPayload[];
     try {
       agents = await this.listAgentPayloads();
@@ -7033,6 +9152,10 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.mark_unread.request" }>,
   ): Promise<void> {
     const { requestId, workspaceId } = request;
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", workspaceId))) {
+      this.emitLegacyResourceDenied(requestId, request.type);
+      return;
+    }
     let markedAgentId: string | null = null;
     try {
       const workspace = await this.workspaceRegistry.get(workspaceId);
@@ -7088,6 +9211,44 @@ export class Session {
   }
 
   private async handleFetchAgent(agentIdOrIdentifier: string, requestId: string): Promise<void> {
+    if (this.enterpriseContext) {
+      const exactAgentId = agentIdOrIdentifier.trim();
+      const authorization = this.enterpriseLegacyResourceAuthorization;
+      const canonical =
+        authorization && authorization.isCurrent()
+          ? await authorization.assertAgent("workspace.content.read", exactAgentId)
+          : null;
+      if (!canonical) {
+        this.emitLegacyResourceDenied(requestId, "fetch_agent_request");
+        return;
+      }
+      const agent = await this.getAgentPayloadById(canonical.agentId);
+      if (!agent) {
+        this.emit({
+          type: "fetch_agent_response",
+          payload: {
+            requestId,
+            agent: null,
+            project: null,
+            error: `Agent not found: ${canonical.agentId}`,
+          },
+        });
+        return;
+      }
+      const project = agent.workspaceId
+        ? await this.buildProjectPlacementForWorkspaceId(agent.workspaceId)
+        : null;
+      const response: SessionOutboundMessage = {
+        type: "fetch_agent_response",
+        payload: { requestId, agent, project, error: null },
+      };
+      this.emit(
+        response,
+        agent.workspaceId ? this.createWorkspaceOutboundContext(agent.workspaceId) : undefined,
+      );
+      return;
+    }
+
     const resolved = await this.resolveAgentIdentifier(agentIdOrIdentifier);
     if (!resolved.ok) {
       this.emit({
@@ -7217,6 +9378,10 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+      return;
+    }
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     const projection: TimelineProjectionMode = msg.projection ?? "projected";
     const requestedLimit = msg.limit;
@@ -7234,6 +9399,10 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+        return;
+      }
       const agentPayload = await this.buildAgentPayload(snapshot);
 
       const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
@@ -7358,12 +9527,20 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.timeline.list_prompts.request" }>,
     source?: object,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+      return;
+    }
     try {
       await ensureAgentLoaded(msg.agentId, {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.agentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+        return;
+      }
       const rows = await this.agentManager.getTimelineRows(msg.agentId);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
@@ -7406,12 +9583,20 @@ export class Session {
   private async handleProviderSubagentListRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
     try {
       await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type);
+        return;
+      }
       this.emit({
         type: "agent.provider_subagents.list.response",
         payload: {
@@ -7438,6 +9623,10 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.timeline.get.request" }>,
     source?: object,
   ): Promise<void> {
+    if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+      return;
+    }
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     try {
       await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
@@ -7445,6 +9634,10 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
+      if (!(await this.assertLegacyAgentResource("workspace.content.read", msg.parentAgentId))) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type, source);
+        return;
+      }
       const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
       if (!descriptor) {
         throw new Error("Provider subagent not found");
@@ -7570,23 +9763,38 @@ export class Session {
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
-    const resolved = await this.resolveAgentIdentifier(msg.agentId);
-    if (!resolved.ok) {
-      this.emit({
-        type: "send_agent_message_response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-          accepted: false,
-          error: resolved.error,
-        },
-      });
-      return;
+    let agentId: string;
+    let responseContext: OutboundAuthorizationContext | undefined;
+    if (this.enterpriseContext) {
+      const current = await this.authorizeCurrentAgentMutation(msg.agentId);
+      if (!current) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type);
+        return;
+      }
+      agentId = current.agentId;
+      responseContext = this.createAgentOutboundContext(current);
+      if (!responseContext) {
+        this.emitLegacyResourceDenied(msg.requestId, msg.type);
+        return;
+      }
+    } else {
+      const resolved = await this.resolveAgentIdentifier(msg.agentId);
+      if (!resolved.ok) {
+        this.emit({
+          type: "send_agent_message_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            accepted: false,
+            error: resolved.error,
+          },
+        });
+        return;
+      }
+      agentId = resolved.agentId;
     }
 
     try {
-      const agentId = resolved.agentId;
-
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
       this.sessionLogger.trace(
         {
@@ -7630,26 +9838,32 @@ export class Session {
         await send();
       }
 
-      this.emit({
-        type: "send_agent_message_response",
-        payload: {
-          requestId: msg.requestId,
-          agentId,
-          accepted: true,
-          error: null,
+      this.emit(
+        {
+          type: "send_agent_message_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId,
+            accepted: true,
+            error: null,
+          },
         },
-      });
+        responseContext,
+      );
     } catch (error) {
-      this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
-      this.emit({
-        type: "send_agent_message_response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: resolved.agentId,
-          accepted: false,
-          error: errorToFriendlyMessage(error),
+      this.handleAgentRunError(agentId, error, "Failed to send agent message");
+      this.emit(
+        {
+          type: "send_agent_message_response",
+          payload: {
+            requestId: msg.requestId,
+            agentId,
+            accepted: false,
+            error: errorToFriendlyMessage(error),
+          },
         },
-      });
+        responseContext,
+      );
     }
   }
 
@@ -7775,6 +9989,18 @@ export class Session {
     }
   }
 
+  private isEnterpriseLegacyResourceCurrent(): boolean {
+    return (
+      !this.enterpriseContext || Boolean(this.enterpriseLegacyResourceAuthorization?.isCurrent())
+    );
+  }
+
+  private assertEnterpriseLegacyResourceCurrent(): void {
+    if (!this.isEnterpriseLegacyResourceCurrent()) {
+      throw new SessionRequestError("access_denied", "Resource unavailable");
+    }
+  }
+
   /**
    * Emit a message to the client
    */
@@ -7796,10 +10022,474 @@ export class Session {
     );
   }
 
-  private emit(msg: SessionOutboundMessage): void {
-    if (!this.authorization.allowsOutbound(msg)) {
+  private async handleRegisteredEnterpriseTransportRequest(
+    message: SessionInboundMessage,
+    daemonDecision: InboundDaemonAuthorizationDecision,
+  ): Promise<void> {
+    const dispatcher = this.enterpriseDispatcher;
+    if (!dispatcher) return;
+    const transportContext = this.reserveEnterpriseTransportRequest(message, daemonDecision);
+    if (!transportContext) return;
+    try {
+      let response: SessionOutboundMessage | false;
+      try {
+        response = await dispatchEnterpriseRequest(
+          dispatcher,
+          Object.freeze({
+            sessionId: this.sessionId,
+            clientId: this.clientId,
+            credentialId: transportContext.enterpriseContext.principal.credentialId,
+            sessionBindingGeneration: transportContext.sessionBindingGeneration,
+            enterpriseContext: transportContext.enterpriseContext,
+          }),
+          message,
+        );
+      } catch {
+        await this.emitEnterpriseTransportUnavailableIfCurrent(transportContext);
+        return;
+      }
+      if (!this.isEnterpriseTransportRequestCurrent(transportContext)) return;
+      const parsedResponse =
+        response === false ? null : this.parseEnterpriseTransportResponse(response);
+      if (
+        response === false ||
+        !parsedResponse ||
+        !this.isEnterpriseTransportResponsePair(transportContext, parsedResponse)
+      ) {
+        this.emitEnterpriseTransportUnavailable(transportContext);
+      } else {
+        this.emit(parsedResponse);
+      }
+      await this.flushOutboundEmissionTasks(transportContext.requestId);
+    } finally {
+      this.closeEnterpriseTransportRequest(transportContext);
+    }
+  }
+
+  private reserveEnterpriseTransportRequest(
+    message: SessionInboundMessage,
+    daemonDecision: InboundDaemonAuthorizationDecision,
+  ): EnterpriseTransportRequestContext | null {
+    const enterpriseContext = this.enterpriseContext;
+    const requestId = sessionRequestId(message);
+    const responseType = this.enterpriseResponseTypeForRequest(message.type);
+    if (
+      !enterpriseContext ||
+      !requestId ||
+      !responseType ||
+      this.isCleanedUp ||
+      this.reservedAuthorityRequestIds.has(requestId) ||
+      !this.inboundAuthorityRequestAuthorizer?.isPrincipalGrantCurrent()
+    )
+      return null;
+    this.reservedAuthorityRequestIds.add(requestId);
+    const consumedDaemonAuthorization = consumeInboundDaemonAuthorizationDecision(
+      this.authorization,
+      message,
+      daemonDecision,
+    );
+    const activeDaemonAuthorization = consumedDaemonAuthorization
+      ? activateCurrentInboundDaemonAuthorizationDecision(
+          this.authorization,
+          message,
+          message.type,
+          consumedDaemonAuthorization,
+        )
+      : null;
+    if (!consumedDaemonAuthorization || !activeDaemonAuthorization) {
+      this.reservedAuthorityRequestIds.delete(requestId);
+      return null;
+    }
+    const transportContext = Object.freeze({
+      sessionId: this.sessionId,
+      clientId: this.clientId,
+      sessionBindingGeneration: enterpriseContext.sessionBindingGeneration,
+      enterpriseContext,
+      requestId,
+      requestType: message.type,
+      responseType,
+      ...("observationRevision" in message && typeof message.observationRevision === "string"
+        ? { correlatedRevision: message.observationRevision }
+        : {}),
+      daemonPermission: consumedDaemonAuthorization.daemonPermission,
+      activeDaemonAuthorization,
+    });
+    this.inheritedTransportRequests.set(requestId, transportContext);
+    return transportContext;
+  }
+
+  private closeEnterpriseTransportRequest(context: EnterpriseTransportRequestContext): void {
+    if (this.inheritedTransportRequests.get(context.requestId) === context) {
+      this.inheritedTransportRequests.delete(context.requestId);
+    }
+    closeActiveInboundDaemonAuthorization(this.authorization, context.activeDaemonAuthorization);
+    this.reservedAuthorityRequestIds.delete(context.requestId);
+  }
+
+  private parseEnterpriseTransportResponse(
+    response: SessionOutboundMessage,
+  ): SessionOutboundMessage | null {
+    try {
+      const parsed = SessionOutboundMessageSchema.safeParse(structuredClone(response));
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async emitEnterpriseTransportUnavailableIfCurrent(
+    context: EnterpriseTransportRequestContext,
+  ): Promise<void> {
+    if (!this.isEnterpriseTransportRequestCurrent(context)) return;
+    this.emitEnterpriseTransportUnavailable(context);
+    await this.flushOutboundEmissionTasks(context.requestId);
+  }
+
+  private enterpriseResponseTypeForRequest(requestType: string): string | null {
+    const suffix = ".request";
+    if (!requestType.startsWith("enterprise.") || !requestType.endsWith(suffix)) return null;
+    return `${requestType.slice(0, -suffix.length)}.response`;
+  }
+
+  private isEnterpriseTransportRequestCurrent(context: EnterpriseTransportRequestContext): boolean {
+    return (
+      !this.isCleanedUp &&
+      this.enterpriseContext === context.enterpriseContext &&
+      this.sessionId === context.sessionId &&
+      this.clientId === context.clientId &&
+      this.enterpriseContext.sessionBindingGeneration === context.sessionBindingGeneration &&
+      this.inheritedTransportRequests.get(context.requestId) === context &&
+      this.inboundAuthorityRequestAuthorizer?.isPrincipalGrantCurrent() === true &&
+      isActiveInboundDaemonAuthorizationCurrent(
+        this.authorization,
+        context.activeDaemonAuthorization,
+        context.requestType,
+        context.daemonPermission,
+      )
+    );
+  }
+
+  private isEnterpriseTransportResponsePair(
+    context: EnterpriseTransportRequestContext,
+    response: SessionOutboundMessage,
+  ): boolean {
+    const acceptedRevision =
+      "payload" in response &&
+      response.payload &&
+      typeof response.payload === "object" &&
+      "acceptedRevision" in response.payload
+        ? response.payload.acceptedRevision
+        : undefined;
+    return (
+      response.type === context.responseType &&
+      this.outboundRequestId(response) === context.requestId &&
+      (context.correlatedRevision === undefined ||
+        acceptedRevision === context.correlatedRevision) &&
+      OUTBOUND_INHERITED_CONTEXT_EVENTS.includes(
+        response.type as (typeof OUTBOUND_INHERITED_CONTEXT_EVENTS)[number],
+      )
+    );
+  }
+
+  private isEnterpriseTransportInheritedEmission(
+    context: EnterpriseTransportRequestContext,
+    event: SessionOutboundMessage,
+  ): boolean {
+    if (!this.isEnterpriseTransportRequestCurrent(context)) return false;
+    if (event.type === "rpc_error") {
+      return (
+        event.payload.requestId === context.requestId &&
+        event.payload.requestType === context.requestType
+      );
+    }
+    return this.isEnterpriseTransportResponsePair(context, event);
+  }
+
+  private emitEnterpriseTransportUnavailable(context: EnterpriseTransportRequestContext): void {
+    this.emit({
+      type: "rpc_error",
+      payload: {
+        requestId: context.requestId,
+        requestType: context.requestType,
+        error: ENTERPRISE_UNAVAILABLE_ERROR,
+        code: "unavailable",
+      },
+    });
+  }
+
+  private emit(msg: SessionOutboundMessage, context?: OutboundAuthorizationContext): void {
+    if (!this.enterpriseContext) {
+      this.deliver(msg);
       return;
     }
+    void this.enqueueAuthorizedEmit(msg, context);
+  }
+
+  private emitWorkspaceCreateResponse(
+    message: Extract<SessionOutboundMessage, { type: "workspace.create.response" }>,
+    workspaceId?: string,
+  ): void {
+    if (!this.enterpriseContext) {
+      this.emit(message);
+      return;
+    }
+    const context = workspaceId
+      ? this.createWorkspaceOutboundContext(workspaceId)
+      : this.createWorkspaceOutboundContextForIds([]);
+    if (!context) {
+      this.emitLegacyResourceDenied(message.payload.requestId, "workspace.create.request");
+      return;
+    }
+    this.emit(message, context);
+  }
+
+  private emitForSource(
+    msg: SessionOutboundMessage,
+    source?: object,
+    context?: OutboundAuthorizationContext,
+  ): void {
+    if (!this.enterpriseContext) {
+      this.deliverForSource(msg, source);
+      return;
+    }
+    void this.enqueueAuthorizedEmit(msg, context, source);
+  }
+
+  private async emitEnterpriseBrowserLeaseWaiting(
+    notice: ProductionBrowserLeaseWaitingNotice,
+    expectedContext: ProductionBrowserLeaseWaitingContext,
+  ): Promise<void> {
+    const enterpriseContext = this.enterpriseContext;
+    if (
+      !this.enterpriseBrowserLeaseWaitingCallbackActive ||
+      this.isCleanedUp ||
+      !enterpriseContext ||
+      notice.context !== expectedContext ||
+      expectedContext.sessionId !== this.sessionId ||
+      expectedContext.clientId !== this.clientId ||
+      expectedContext.sessionBindingGeneration !== enterpriseContext.sessionBindingGeneration
+    ) {
+      throw new Error("Browser lease waiting Session is no longer current.");
+    }
+    const queuedAt = new Date(this.now()).toISOString();
+    const resource = GlobalResourceRefSchema.parse({
+      resourceKind: "browser_profile",
+      organizationId: enterpriseContext.principal.organizationId,
+      nodeId: enterpriseContext.node.nodeId,
+      localResourceId: notice.resourceId,
+    });
+    if (resource.resourceKind !== "browser_profile")
+      throw new Error("Browser lease waiting resource is invalid.");
+    const resources = [Object.freeze(resource)];
+    Object.freeze(resources);
+    const delivered = await this.enqueueAuthorizedEmit(
+      {
+        type: "enterprise.resource.waiting",
+        payload: {
+          status: "resource_waiting",
+          workspaceId: notice.workspaceId,
+          agentId: notice.agentId,
+          nodeId: enterpriseContext.node.nodeId,
+          resourceKind: "browser_profile",
+          resourceId: notice.resourceId,
+          mode: notice.mode,
+          queuedAt,
+          position: notice.position,
+        },
+      },
+      Object.freeze({ kind: "resources", resources }),
+    );
+    if (!delivered) throw new Error("Browser lease waiting status was not delivered.");
+  }
+
+  private enqueueAuthorizedEmit(
+    msg: SessionOutboundMessage,
+    context?: OutboundAuthorizationContext,
+    source?: object,
+  ): Promise<boolean> {
+    // Authority context is minted only from the active inbound handle below;
+    // callers may supply resource/identity/transport context, never a receipt.
+    if (context?.kind === "authority") return Promise.resolve(false);
+    let event: SessionOutboundMessage;
+    let authorizationContext: OutboundAuthorizationContext | undefined;
+    try {
+      event = freezeOutbound(SessionOutboundMessageSchema.parse(structuredClone(msg)));
+      authorizationContext = context ? freezeOutbound(structuredClone(context)) : undefined;
+    } catch {
+      return Promise.resolve(false);
+    }
+    const workspaceFence = this.captureWorkspacePublicationFence(authorizationContext);
+    const requestId = this.outboundRequestId(event);
+    const previous = requestId
+      ? (this.outboundEmissionTailsByRequest.get(requestId) ?? Promise.resolve())
+      : Promise.resolve();
+    const task = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (
+          !this.enterpriseContext ||
+          this.isCleanedUp ||
+          this.authoritySubsystemFailed ||
+          !this.isWorkspacePublicationFenceCurrent(workspaceFence)
+        )
+          return false;
+        let resolvedContext: OutboundAuthorizationContext | undefined = authorizationContext;
+        if (!resolvedContext) {
+          const emissionRequestId = this.outboundRequestId(event);
+          const inheritedTransportContext = emissionRequestId
+            ? this.inheritedTransportRequests.get(emissionRequestId)
+            : undefined;
+          if (inheritedTransportContext) {
+            return this.isEnterpriseTransportInheritedEmission(inheritedTransportContext, event)
+              ? this.deliverForSource(event, source)
+              : false;
+          }
+          const correlation = emissionRequestId
+            ? this.pendingAuthorityRequests.get(emissionRequestId)
+            : undefined;
+          if (!correlation || !this.outboundAuthorityEmissionAuthorizer) return false;
+          const binding = this.enterpriseContext;
+          resolvedContext =
+            (await this.outboundAuthorityEmissionAuthorizer.authorizeEmission({
+              handle: correlation.activeRequestHandle,
+              principal: binding.principal,
+              binding: {
+                sessionId: this.sessionId,
+                sessionBindingKey: correlation.sessionBindingKey,
+                sessionBindingGeneration: correlation.sessionBindingGeneration,
+                organizationId: binding.principal.organizationId,
+                principalId: binding.principal.principalId,
+                principalType: binding.principal.principalType,
+                credentialId: binding.principal.credentialId,
+                grantVersion: binding.principal.grantVersion,
+                nodeId: binding.node.nodeId,
+                clientId: this.clientId,
+              },
+              event,
+            })) ?? undefined;
+          if (!resolvedContext) return false;
+        }
+        const allowedByResourceAuthorization = await this.resourceAuthorization?.canEmit(
+          this.enterpriseContext.principal,
+          event,
+          resolvedContext,
+        );
+        const allowed =
+          allowedByResourceAuthorization ||
+          (this.isEnterpriseLegacyResourceCurrent() &&
+            isSafeEmptyLegacyDirectoryResponse(event, resolvedContext));
+        if (allowed && !this.isCleanedUp && this.isWorkspacePublicationFenceCurrent(workspaceFence))
+          return this.deliverForSource(event, source);
+        return false;
+      })
+      .catch((error) => {
+        this.sessionLogger.error({ err: error }, "Failed to authorize outbound message");
+        return false;
+      });
+    if (requestId) {
+      const tail = task.finally(() => {
+        if (this.outboundEmissionTailsByRequest.get(requestId) === tail)
+          this.outboundEmissionTailsByRequest.delete(requestId);
+      });
+      this.outboundEmissionTailsByRequest.set(requestId, tail);
+    }
+    if (!requestId) {
+      this.outboundEmissionTasksWithoutRequest.add(task);
+      void task.finally(() => this.outboundEmissionTasksWithoutRequest.delete(task));
+      return task;
+    }
+    let tasks = this.outboundEmissionTasksByRequest.get(requestId);
+    if (!tasks) {
+      tasks = new Set();
+      this.outboundEmissionTasksByRequest.set(requestId, tasks);
+    }
+    tasks.add(task);
+    void task.finally(() => {
+      const current = this.outboundEmissionTasksByRequest.get(requestId);
+      current?.delete(task);
+      if (current?.size === 0) this.outboundEmissionTasksByRequest.delete(requestId);
+    });
+    return task;
+  }
+
+  private captureWorkspacePublicationFence(
+    context: OutboundAuthorizationContext | undefined,
+  ): readonly WorkspacePublicationFence[] {
+    if (context?.kind !== "resources") return [];
+    const workspaceIds = new Set(
+      context.resources.flatMap((resource) =>
+        resource.resourceKind === "workspace" ? [resource.localResourceId] : [],
+      ),
+    );
+    return Object.freeze(
+      Array.from(workspaceIds, (workspaceId) =>
+        Object.freeze({
+          workspaceId,
+          generation: this.workspacePublicationGenerations.get(workspaceId) ?? 0,
+        }),
+      ),
+    );
+  }
+
+  private isWorkspacePublicationFenceCurrent(fence: readonly WorkspacePublicationFence[]): boolean {
+    return fence.every(
+      ({ workspaceId, generation }) =>
+        (this.workspacePublicationGenerations.get(workspaceId) ?? 0) === generation,
+    );
+  }
+
+  private async flushOutboundEmissionTasks(requestId: string): Promise<void> {
+    while (true) {
+      const tasks = this.outboundEmissionTasksByRequest.get(requestId);
+      if (!tasks || tasks.size === 0) return;
+      await Promise.allSettled(tasks);
+    }
+  }
+
+  private outboundRequestId(msg: SessionOutboundMessage): string | null {
+    if (!("payload" in msg) || !msg.payload || typeof msg.payload !== "object") return null;
+    const requestId = (msg.payload as { requestId?: unknown }).requestId;
+    return typeof requestId === "string" && requestId.length > 0 ? requestId : null;
+  }
+
+  private observeRpcDiagnostic(observation: SessionRpcDiagnosticObservation): void {
+    try {
+      this.rpcDiagnosticObserver?.(observation);
+    } catch {
+      // Diagnostics cannot affect Session authorization, delivery, or caller-visible errors.
+    }
+  }
+
+  private deliverWithRpcDiagnostics(message: SessionOutboundMessage, deliver: () => void): void {
+    const identity = sessionRpcResponseIdentity(message);
+    if (!identity) {
+      deliver();
+      return;
+    }
+    this.observeRpcDiagnostic(
+      Object.freeze({
+        phase: "response.deliver.begin",
+        requestId: identity.requestId,
+        responseType: identity.responseType,
+        atUnixMs: sessionRpcDiagnosticUnixMs(),
+      }),
+    );
+    try {
+      deliver();
+    } finally {
+      this.observeRpcDiagnostic(
+        Object.freeze({
+          phase: "response.deliver.return",
+          requestId: identity.requestId,
+          responseType: identity.responseType,
+          atUnixMs: sessionRpcDiagnosticUnixMs(),
+        }),
+      );
+    }
+  }
+
+  private deliver(msg: SessionOutboundMessage): boolean {
+    if (!this.authorization.allowsOutbound(msg)) return false;
     if (
       msg.type === "project.update" ||
       msg.type === "providers_snapshot_update" ||
@@ -7811,9 +10501,9 @@ export class Session {
         for (const source of this.clientCapabilitiesBySource.keys()) {
           if (this.wantsEvent(msg.type, source)) this.onMessageToSource(source, msg);
         }
-        return;
+        return true;
       }
-      if (!this.wantsEvent(msg.type)) return;
+      if (!this.wantsEvent(msg.type)) return false;
     }
     // JSON.stringify(msg) is only computed when trace is enabled — it runs for
     // every outbound message otherwise, and trace is disabled by default.
@@ -7832,11 +10522,12 @@ export class Session {
         for (const [source] of this.clientCapabilitiesBySource) {
           this.onMessageToSource(source, this.workspaceSetupMessageForClient(msg, source));
         }
-        return;
+        return true;
       }
       msg = this.workspaceSetupMessageForClient(msg);
     }
     this.onMessage(msg);
+    return true;
   }
 
   // COMPAT(workspaceSetupBlocked): added in v0.8.0, remove after 2027-03-07 once client floor >= v0.8.0.
@@ -7875,57 +10566,489 @@ export class Session {
     }
   }
 
+  private createWorkspaceOutboundContext(
+    workspaceId: string,
+  ): OutboundAuthorizationContext | undefined {
+    const resource = this.createWorkspaceResource(workspaceId);
+    if (!resource) return undefined;
+    const resources = [resource];
+    Object.freeze(resources);
+    return Object.freeze({ kind: "resources", resources });
+  }
+
+  private createWorkspaceOutboundContextForIds(
+    workspaceIds: readonly (string | undefined)[],
+  ): OutboundAuthorizationContext | undefined {
+    if (workspaceIds.length === 0) {
+      const resources: GlobalResourceRef[] = [];
+      Object.freeze(resources);
+      return Object.freeze({ kind: "resources", resources });
+    }
+    const resourcesByWorkspaceId = new Map<
+      string,
+      Extract<GlobalResourceRef, { resourceKind: "workspace" }>
+    >();
+    for (const workspaceId of workspaceIds) {
+      if (!workspaceId) return undefined;
+      if (resourcesByWorkspaceId.has(workspaceId)) continue;
+      const resource = this.createWorkspaceResource(workspaceId);
+      if (!resource) return undefined;
+      resourcesByWorkspaceId.set(workspaceId, resource);
+    }
+    const resources = [...resourcesByWorkspaceId.values()];
+    Object.freeze(resources);
+    return Object.freeze({ kind: "resources", resources });
+  }
+
+  private createAgentOutboundContext(
+    scope: AgentUpdatePublicationScope,
+  ): OutboundAuthorizationContext | undefined {
+    const workspace = this.createWorkspaceResource(scope.workspaceId);
+    if (!workspace || !this.enterpriseContext) return undefined;
+    try {
+      const agent = GlobalResourceRefSchema.parse({
+        resourceKind: "agent",
+        organizationId: this.enterpriseContext.principal.organizationId,
+        nodeId: this.enterpriseContext.node.nodeId,
+        localResourceId: scope.agentId,
+      });
+      if (agent.resourceKind !== "agent") return undefined;
+      const resources = [workspace, Object.freeze(agent)];
+      Object.freeze(resources);
+      return Object.freeze({ kind: "resources", resources });
+    } catch {
+      return undefined;
+    }
+  }
+
+  private createWorkspaceResource(
+    workspaceId: string,
+  ): Extract<GlobalResourceRef, { resourceKind: "workspace" }> | undefined {
+    if (!this.enterpriseContext || typeof workspaceId !== "string" || workspaceId.length === 0)
+      return undefined;
+    try {
+      const resource = GlobalResourceRefSchema.parse({
+        resourceKind: "workspace",
+        organizationId: this.enterpriseContext.principal.organizationId,
+        nodeId: this.enterpriseContext.node.nodeId,
+        localResourceId: workspaceId,
+      });
+      if (resource.resourceKind !== "workspace") return undefined;
+      return Object.freeze(resource);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private deleteActiveFileBinaryStream(
+    source: object | undefined,
+    requestId: string,
+    expected?: FileBinaryStreamEntry,
+  ): void {
+    const streams = this.activeFileBinaryStreams.get(source);
+    if (!streams) return;
+    if (expected && streams.get(requestId) !== expected) return;
+    streams.delete(requestId);
+    if (streams.size === 0 && this.activeFileBinaryStreams.get(source) === streams)
+      this.activeFileBinaryStreams.delete(source);
+  }
+
+  // oxlint-disable-next-line complexity -- the binary stream state machine fails closed at each phase.
+  private async emitAuthorizedWorkspaceBinary(
+    frame: Uint8Array,
+    workspaceId: string,
+    source?: object,
+  ): Promise<void> {
+    const runtime = this.enterpriseAuthorizationRuntime;
+    const productionAuthorizationSession = this.productionAuthorizationSession;
+    if (
+      !runtime ||
+      !productionAuthorizationSession ||
+      !isCurrentProductionAuthorizationRuntimeForSession(runtime, productionAuthorizationSession)
+    )
+      return;
+    const authorizer = runtime.fileBinaryOutboundAuthorizer;
+    const resource = this.createWorkspaceResource(workspaceId);
+    if (this.isCleanedUp || !authorizer || !resource) return;
+    const capturedFrame = new Uint8Array(frame);
+    const canonical = authorizer.canonicalizeFrame(new Uint8Array(capturedFrame));
+    const decoded = canonical ? decodeFileTransferFrame(capturedFrame) : null;
+    if (!canonical || !decoded) return;
+
+    let streams = this.activeFileBinaryStreams.get(source);
+    const existing = streams?.get(decoded.requestId);
+    let active = existing?.phase === "active" ? existing : undefined;
+    let stream = active?.stream;
+    let emission;
+    if (decoded.opcode === FileTransferOpcode.FileBegin) {
+      if (existing) {
+        if (existing.phase === "active") {
+          authorizer.close(existing.stream, "cancel");
+          this.deleteActiveFileBinaryStream(source, decoded.requestId, existing);
+        }
+        return;
+      }
+      streams ??= new Map();
+      this.activeFileBinaryStreams.set(source, streams);
+      const opening = Object.freeze({
+        phase: "opening" as const,
+        reservation: Object.freeze(Object.create(null)) as object,
+        workspaceId,
+      });
+      streams.set(decoded.requestId, opening);
+      const opened = await authorizer.open({ resource, frame: canonical });
+      if (
+        !opened ||
+        this.isCleanedUp ||
+        this.activeFileBinaryStreams.get(source)?.get(decoded.requestId) !== opening
+      ) {
+        if (opened) authorizer.close(opened.stream, "session_release");
+        this.deleteActiveFileBinaryStream(source, decoded.requestId, opening);
+        return;
+      }
+      stream = opened.stream;
+      emission = opened.emission;
+      active = Object.freeze({ phase: "active" as const, stream, workspaceId });
+      streams.set(decoded.requestId, active);
+    } else {
+      if (!stream || active?.workspaceId !== workspaceId) {
+        if (stream) authorizer.close(stream, "authorization_failed");
+        if (active) this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
+        return;
+      }
+      emission = await authorizer.authorizeNext({ stream, frame: canonical });
+      if (!emission || this.isCleanedUp) {
+        authorizer.close(stream, this.isCleanedUp ? "session_release" : "authorization_failed");
+        this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
+        return;
+      }
+    }
+
+    const bytes = authorizer.consumeForDelivery(stream, emission);
+    if (!bytes) {
+      authorizer.close(stream, "authorization_failed");
+      this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
+      return;
+    }
+    if (decoded.opcode === FileTransferOpcode.FileEnd)
+      this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
+    try {
+      const send = this.emitBinaryForFileTransfer(bytes, source);
+      await send;
+    } catch (error) {
+      authorizer.close(stream, "send_failed");
+      this.deleteActiveFileBinaryStream(source, decoded.requestId, active);
+      throw error;
+    }
+  }
+
   private async emitBinaryForFileTransfer(frame: Uint8Array, source?: object): Promise<void> {
     if (source && this.onBinaryMessageToSource) {
       await this.onBinaryMessageToSource(source, frame);
       return;
     }
-    this.emitBinary(frame);
+    if (!this.onBinaryMessage) throw new Error("File transfer binary channel is unavailable");
+    this.onBinaryMessage(frame);
   }
 
-  private emitForSource(msg: SessionOutboundMessage, source?: object): void {
+  private deliverForSource(msg: SessionOutboundMessage, source?: object): boolean {
     if (source && this.onMessageToSource) {
+      if (!this.authorization.allowsOutbound(msg)) return false;
       this.onMessageToSource(source, msg);
-      return;
+      return true;
     }
-    this.emit(msg);
+    return this.deliver(msg);
   }
 
   /**
    * Clean up session resources
    */
+  // oxlint-disable-next-line complexity -- cleanup drains authorization and all owned resources.
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
+    this.enterpriseBrowserLeaseWaitingCallbackActive = false;
+    this.enterpriseAgentEventIngressSealed = true;
+    unregisterWorkspaceOwnershipTransferSession(
+      this.enterpriseWorkspaceOwnershipTransferSessionHandle,
+    );
+    this.enterpriseWorkspaceOwnershipTransferSessionHandle = null;
+    const agentUpdatesDrain = this.agentUpdates.sealAndDrain();
     this.isCleanedUp = true;
-
-    if (this.unsubscribeAgentEvents) {
-      this.unsubscribeAgentEvents();
-      this.unsubscribeAgentEvents = null;
+    for (const context of this.inheritedTransportRequests.values()) {
+      closeActiveInboundDaemonAuthorization(this.authorization, context.activeDaemonAuthorization);
     }
-    this.unsubscribeProjectMutations?.();
+    this.inheritedTransportRequests.clear();
+    const cleanupErrors: unknown[] = [];
+    const unsubscribeAgentEvents = this.unsubscribeAgentEvents;
+    this.unsubscribeAgentEvents = null;
+    if (unsubscribeAgentEvents) {
+      try {
+        unsubscribeAgentEvents();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    const admissionInvalidationUnsubscribe = this.admissionInvalidationUnsubscribe;
+    this.admissionInvalidationUnsubscribe = null;
+    if (admissionInvalidationUnsubscribe) {
+      try {
+        admissionInvalidationUnsubscribe();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    this.activeFileBinaryStreams.clear();
+    const agentEventDrains = await Promise.allSettled([
+      this.enterpriseAgentEventTail,
+      agentUpdatesDrain,
+    ]);
+    for (const result of agentEventDrains) {
+      if (result.status === "rejected") cleanupErrors.push(result.reason);
+    }
+    // Seal the outbound ingress synchronously, then drain both existing and
+    // racing tasks. Tasks queued after the seal observe isCleanedUp and cannot
+    // deliver, but are still joined before authority binding release.
+    while (
+      this.outboundEmissionTasksByRequest.size > 0 ||
+      this.outboundEmissionTasksWithoutRequest.size > 0
+    ) {
+      await Promise.allSettled([
+        ...[...this.outboundEmissionTasksByRequest.keys()].map((requestId) =>
+          this.flushOutboundEmissionTasks(requestId),
+        ),
+        ...this.outboundEmissionTasksWithoutRequest,
+      ]);
+    }
+    try {
+      await this.enterpriseAuthorizationRuntime?.release();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      await this.workspaceFilesSession.dispose();
+    } catch (error) {
+      if (error instanceof AggregateError && error.errors.length === 1) {
+        cleanupErrors.push(error.errors[0]);
+      } else {
+        cleanupErrors.push(error);
+      }
+    }
+    if (this.outboundAuthorityEmissionAuthorizer && this.enterpriseContext) {
+      for (const correlation of this.pendingAuthorityRequests.values()) {
+        let wasOpen = false;
+        try {
+          wasOpen = Boolean(
+            await this.authorityReceiptState?.resolveOpen({
+              handle: correlation.activeRequestHandle,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+            }),
+          );
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        let closed = false;
+        try {
+          closed = await this.outboundAuthorityEmissionAuthorizer.close({
+            handle: correlation.activeRequestHandle,
+            principal: this.enterpriseContext.principal,
+            binding: {
+              sessionId: this.sessionId,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+              organizationId: this.enterpriseContext.principal.organizationId,
+              principalId: this.enterpriseContext.principal.principalId,
+              principalType: this.enterpriseContext.principal.principalType,
+              credentialId: this.enterpriseContext.principal.credentialId,
+              grantVersion: this.enterpriseContext.principal.grantVersion,
+              nodeId: this.enterpriseContext.node.nodeId,
+              clientId: this.clientId,
+            },
+            reason: "release",
+          });
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        if (!closed && wasOpen) {
+          this.authoritySubsystemFailed = true;
+          try {
+            await this.authorityReceiptState?.close({
+              handle: correlation.activeRequestHandle,
+              sessionBindingKey: correlation.sessionBindingKey,
+              sessionBindingGeneration: correlation.sessionBindingGeneration,
+              reason: "release",
+            });
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+        }
+      }
+    }
+    this.pendingAuthorityRequests.clear();
+    this.reservedAuthorityRequestIds.clear();
+    if (this.enterpriseContext) {
+      if (
+        !this.authorityBindingReleased &&
+        this.authorityReceiptState &&
+        this.enterpriseSessionBindingKey
+      ) {
+        try {
+          this.authorityReceiptState.releaseSession({
+            sessionId: this.sessionId,
+            sessionBindingKey: this.enterpriseSessionBindingKey,
+            sessionBindingGeneration: this.enterpriseContext.sessionBindingGeneration,
+          });
+          this.authorityBindingReleased = true;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      try {
+        this.enterpriseAgentContextRegistry?.releaseSession(
+          this.enterpriseContext.sessionBindingGeneration,
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    try {
+      this.unsubscribeProjectMutations?.();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.unsubscribeProjectMutations = null;
-    this.unsubscribePluginChanges?.();
+    try {
+      this.unsubscribePluginChanges?.();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.unsubscribePluginChanges = null;
-    this.unsubscribeWorkspaceMutations?.();
+    try {
+      this.unsubscribeWorkspaceMutations?.();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.unsubscribeWorkspaceMutations = null;
-    this.workspaceLabelSubscription?.unsubscribe();
+    try {
+      this.workspaceLabelSubscription?.unsubscribe();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     this.workspaceLabelSubscription = null;
-    this.agentUpdates.dispose();
-    await this.hubExecutionController?.cleanup();
+    try {
+      await this.hubExecutionController?.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     if (this.unsubscribeTerminalWorkspaceContributionEvents) {
-      this.unsubscribeTerminalWorkspaceContributionEvents();
+      try {
+        this.unsubscribeTerminalWorkspaceContributionEvents();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
       this.unsubscribeTerminalWorkspaceContributionEvents = null;
     }
-    this.providerCatalogSession.dispose();
+    try {
+      this.providerCatalogSession.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    await this.voiceSession.cleanup();
+    try {
+      await this.voiceSession.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    this.terminalController.dispose();
+    try {
+      this.terminalController.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    this.checkoutSession.cleanup();
+    try {
+      this.checkoutSession.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
 
-    this.workspaceGitObserver.dispose();
-    this.workspaceFilesSession.dispose();
+    try {
+      this.workspaceGitObserver.dispose();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (this.enterpriseDispatcher && this.enterpriseDispatcherFactory?.dispose) {
+      try {
+        await this.enterpriseDispatcherFactory.dispose(this.enterpriseDispatcher);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (this.enterpriseDispatcherLease) {
+      try {
+        await this.closeEnterpriseDispatcherLease();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1)
+      throw new AggregateError(cleanupErrors, "Session cleanup failed", {
+        cause: cleanupErrors[0],
+      });
+  }
+
+  private closeEnterpriseDispatcherLease(): Promise<void> {
+    if (!this.enterpriseDispatcherLease) return Promise.resolve();
+    if (!this.enterpriseDispatcherLeaseClosePromise) {
+      try {
+        this.enterpriseDispatcherLeaseClosePromise = Promise.resolve(
+          this.enterpriseDispatcherLease.close(),
+        );
+      } catch (error) {
+        this.enterpriseDispatcherLeaseClosePromise = Promise.reject(error);
+      }
+    }
+    return this.enterpriseDispatcherLeaseClosePromise;
+  }
+
+  public getEnterpriseSessionContext(): EnterpriseSessionContext | undefined {
+    return this.enterpriseContext;
+  }
+  public getEnterpriseSessionBindingKey(): string | undefined {
+    return this.enterpriseSessionBindingKey;
+  }
+  /** W1 admission invalidation hook; exact binding match only, no policy logic. */
+  public async invalidateFromAdmission(input: {
+    readonly sessionBindingKey: string;
+    readonly sessionBindingGeneration: string;
+  }): Promise<void> {
+    if (
+      input.sessionBindingKey !== this.enterpriseSessionBindingKey ||
+      input.sessionBindingGeneration !== this.enterpriseContext?.sessionBindingGeneration
+    )
+      return;
+    await this.cleanup();
+  }
+  public bindAgentPrincipalContext(agentId: string): EnterpriseAgentContextHandle | null {
+    if (
+      this.isCleanedUp ||
+      !this.enterpriseContext ||
+      !this.enterpriseAgentContextRegistry ||
+      !agentId
+    )
+      return null;
+    return this.enterpriseAgentContextRegistry.bind({ agentId, context: this.enterpriseContext });
+  }
+  public resolveAgentPrincipalContext(agentId: string): EnterpriseAgentContextHandle | null {
+    if (this.isCleanedUp || !this.enterpriseContext || !this.enterpriseAgentContextRegistry)
+      return null;
+    const handle = this.enterpriseAgentContextRegistry.resolve(agentId);
+    if (!handle || !this.enterpriseAgentContextRegistry.isCurrentHandle(handle)) return null;
+    return isEnterpriseAgentContextCurrentForSession(handle, this.enterpriseContext)
+      ? handle
+      : null;
   }
 }
 

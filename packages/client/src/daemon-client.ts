@@ -1,4 +1,5 @@
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
+import { NodeIdSchema, OrganizationIdSchema, PrincipalIdSchema } from "@getpaseo/protocol/messages";
 import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
 import {
   ConnectionSubscriptions,
@@ -6,6 +7,50 @@ import {
   type TimelineSubscription,
 } from "./connection/index.js";
 import type { z } from "zod";
+
+export interface PrincipalScopeKey {
+  readonly organizationId: string;
+  readonly nodeId: string;
+  readonly paseoServerId: string;
+  readonly principalId: string;
+}
+declare const lifecycleGenerationBrand: unique symbol;
+export type LifecycleGeneration = string & {
+  readonly [lifecycleGenerationBrand]: "LifecycleGeneration";
+};
+export function createLifecycleGeneration(): LifecycleGeneration {
+  if (typeof globalThis.crypto?.randomUUID !== "function")
+    throw new Error("Secure lifecycle generation unavailable");
+  return globalThis.crypto.randomUUID() as LifecycleGeneration;
+}
+export function createPrincipalScopeKey(input: PrincipalScopeKey): PrincipalScopeKey {
+  if (
+    !OrganizationIdSchema.safeParse(input.organizationId).success ||
+    !NodeIdSchema.safeParse(input.nodeId).success ||
+    !PrincipalIdSchema.safeParse(input.principalId).success ||
+    !input.paseoServerId
+  )
+    throw new Error("Invalid enterprise principal scope");
+  return Object.freeze({
+    organizationId: input.organizationId,
+    nodeId: input.nodeId,
+    paseoServerId: input.paseoServerId,
+    principalId: input.principalId,
+  });
+}
+export function samePrincipalScope(
+  a: PrincipalScopeKey | undefined,
+  b: PrincipalScopeKey | undefined,
+): boolean {
+  return (
+    !!a &&
+    !!b &&
+    a.organizationId === b.organizationId &&
+    a.nodeId === b.nodeId &&
+    a.paseoServerId === b.paseoServerId &&
+    a.principalId === b.principalId
+  );
+}
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import { parsePluginSourceReference } from "@getpaseo/protocol/plugin-source-reference";
@@ -118,6 +163,21 @@ import type {
   AgentSkillSelection,
   AgentSkillsStatus,
   AgentSkillsSaveResult,
+  EnterpriseWorkspaceContentReadRequest,
+  EnterpriseWorkspaceContentReadResponse,
+  EnterpriseAgentContentReadRequest,
+  EnterpriseAgentContentReadResponse,
+  EnterpriseBrowserProfileContentReadRequest,
+  EnterpriseBrowserProfileContentReadResponse,
+  EnterpriseAppSlotContentReadRequest,
+  EnterpriseAppSlotContentReadResponse,
+  EnterpriseResourceOwnershipTransferRequest,
+  EnterpriseResourceOwnershipTransferResponse,
+  EnterpriseWorkspaceOwnershipTransferRequest,
+  EnterpriseBrowserPageIdentityObservationRequest,
+  EnterpriseBrowserPageIdentityObservationResponse,
+  EnterpriseBrowserPageIdentityInvalidationRequest,
+  EnterpriseBrowserPageIdentityInvalidationResponse,
 } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
@@ -275,6 +335,14 @@ export type DaemonEvent =
       payload: Extract<SessionOutboundMessage, { type: "workspace_update" }>["payload"];
     }
   | {
+      type: "workspace_ownership_transfer_tombstone";
+      workspaceId: string;
+      payload: Extract<
+        SessionOutboundMessage,
+        { type: "enterprise.workspace.ownership.transfer.tombstone" }
+      >["payload"];
+    }
+  | {
       type: "project.update";
       payload: Extract<SessionOutboundMessage, { type: "project.update" }>["payload"];
     }
@@ -314,7 +382,18 @@ export type DaemonEventHandler = (event: DaemonEvent) => void;
 export type BrowserAutomationExecuteRequestMessage = BrowserAutomationExecuteRequest;
 export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteResponse;
 
+export interface EnterpriseFileRequestInput {
+  readonly serverId: string;
+  readonly workspaceId: string;
+  readonly relativePath: string;
+  readonly signal?: AbortSignal;
+  readonly scopeGeneration?: string;
+}
+export type EnterpriseFileRequest = (input: EnterpriseFileRequestInput) => Promise<Response>;
+
 export interface DaemonClientConfig {
+  /** Host-runtime-owned authenticated transport. Bearer credentials never cross this seam. */
+  enterpriseFileRequest?: EnterpriseFileRequest;
   /** Deliver compact bodies/hash references to a caller-owned snapshot cache.
    * The default keeps public SDK snapshot entries expanded. */
   providerSnapshots?: "wire";
@@ -456,6 +535,7 @@ export interface FileReadResult {
   revision?: string;
 }
 export interface FileUploadInput {
+  workspaceId?: string;
   fileName: string;
   mimeType: string;
   bytes: Uint8Array | ArrayBuffer;
@@ -1073,6 +1153,168 @@ interface PingProbe {
 }
 
 export class DaemonClient {
+  public enterpriseFileDownload(input: EnterpriseFileRequestInput): Promise<Response> {
+    if (!this.config.enterpriseFileRequest) {
+      return Promise.reject(new Error("Enterprise file download unavailable"));
+    }
+    if (
+      typeof input.serverId !== "string" ||
+      input.serverId.length === 0 ||
+      typeof input.workspaceId !== "string" ||
+      input.workspaceId.length === 0 ||
+      typeof input.relativePath !== "string" ||
+      input.relativePath.length === 0 ||
+      input.relativePath.includes("\0") ||
+      input.relativePath.startsWith("/") ||
+      typeof input.scopeGeneration !== "string" ||
+      input.scopeGeneration.length === 0
+    ) {
+      return Promise.reject(new Error("Invalid enterprise file download scope"));
+    }
+    let snapshot: Omit<EnterpriseFileRequestInput, "signal">;
+    try {
+      snapshot = structuredClone({
+        serverId: input.serverId,
+        workspaceId: input.workspaceId,
+        relativePath: input.relativePath,
+        scopeGeneration: input.scopeGeneration,
+      });
+    } catch {
+      return Promise.reject(new Error("Invalid enterprise file download scope"));
+    }
+    return this.config.enterpriseFileRequest({ ...snapshot, signal: input.signal });
+  }
+  /**
+   * Batch A enterprise RPC wrapper. Domain-specific methods are added by the
+   * owning workstream; this wrapper only snapshots payloads and correlates the
+   * dotted request/response pair.
+   */
+  public requestEnterprise(
+    type: string,
+    payload: Readonly<Record<string, unknown>> = {},
+    requestId?: string,
+  ): Promise<Readonly<Record<string, unknown>>> {
+    if (!type.startsWith("enterprise.") || !type.endsWith(".request")) {
+      return Promise.reject(new Error("Invalid enterprise request type"));
+    }
+    let snapshot: Record<string, unknown>;
+    try {
+      snapshot = structuredClone(payload);
+    } catch {
+      return Promise.reject(new Error("Invalid enterprise request payload"));
+    }
+    const responseType = `${type.slice(0, -".request".length)}.response` as CorrelatedResponseType;
+    return this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: type as SessionInboundMessage["type"], ...snapshot },
+      responseType,
+    }) as Promise<Readonly<Record<string, unknown>>>;
+  }
+
+  public readWorkspaceContent(
+    input: Omit<EnterpriseWorkspaceContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseWorkspaceContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.workspace.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseWorkspaceContentReadResponse>;
+  }
+
+  public readAgentContent(
+    input: Omit<EnterpriseAgentContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseAgentContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.agent.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseAgentContentReadResponse>;
+  }
+
+  public readBrowserProfileContent(
+    input: Omit<EnterpriseBrowserProfileContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserProfileContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.browser_profile.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseBrowserProfileContentReadResponse>;
+  }
+
+  public readAppSlotContent(
+    input: Omit<EnterpriseAppSlotContentReadRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseAppSlotContentReadResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.app_slot.content.read.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseAppSlotContentReadResponse>;
+  }
+
+  public transferResourceOwnership(
+    input: Omit<EnterpriseResourceOwnershipTransferRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseResourceOwnershipTransferResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.resource.ownership.transfer.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseResourceOwnershipTransferResponse>;
+  }
+
+  public transferWorkspaceOwnership(
+    input: Omit<EnterpriseWorkspaceOwnershipTransferRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseResourceOwnershipTransferResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.resource.ownership.transfer.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseResourceOwnershipTransferResponse>;
+  }
+
+  public observeBrowserPageIdentity(
+    input: Omit<EnterpriseBrowserPageIdentityObservationRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserPageIdentityObservationResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.browser.page_identity.observe.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseBrowserPageIdentityObservationResponse>;
+  }
+
+  public invalidateBrowserPageIdentity(
+    input: Omit<EnterpriseBrowserPageIdentityInvalidationRequest, "type" | "requestId"> & {
+      requestId?: string;
+    },
+  ): Promise<EnterpriseBrowserPageIdentityInvalidationResponse> {
+    const { requestId, ...payload } = input;
+    return this.requestEnterprise(
+      "enterprise.browser.page_identity.invalidate.request",
+      payload,
+      requestId,
+    ) as Promise<EnterpriseBrowserPageIdentityInvalidationResponse>;
+  }
+
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({
     fetch: (cwd) => this.requestProvidersSnapshot({ cwd }),
     emit: (message) => this.deliverSessionMessage(message),
@@ -1115,7 +1357,7 @@ export class DaemonClient {
   private terminalDirectorySubscriptions = new Map<string, { cwd: string; workspaceId?: string }>();
   private fileSubscriptions = new Map<
     string,
-    { cwd: string; path: string; onUpdate: (version: FileVersion) => void }
+    { cwd: string; path: string; workspaceId?: string; onUpdate: (version: FileVersion) => void }
   >();
   private readonly terminalStreams = new TerminalStreamRouter();
   private pendingBinaryFileReads = new Map<string, PendingBinaryFileRead>();
@@ -1249,6 +1491,7 @@ export class DaemonClient {
           baseFactory: baseTransportFactory,
           daemonPublicKeyB64,
           logger: this.logger,
+          ...(password ? { authPreface: { getToken: () => password } } : {}),
         });
       }
       const transportUrl = this.resolveTransportUrlForAttempt();
@@ -2534,6 +2777,9 @@ export class DaemonClient {
           cwd: subscription.cwd,
           path: subscription.path,
           subscriptionId,
+          ...(subscription.workspaceId === undefined
+            ? {}
+            : { workspaceId: subscription.workspaceId }),
         },
         responseType: "fs.file.subscribe.response",
       })
@@ -4527,18 +4773,20 @@ export class DaemonClient {
   }
 
   async subscribeFile(
-    input: { cwd: string; path: string },
+    input: { cwd: string; path: string; workspaceId?: string },
     onUpdate: (version: FileVersion) => void,
   ): Promise<{ initial: FileVersion; unsubscribe: () => void }> {
+    const { cwd, path, workspaceId } = input;
     const subscriptionId = this.createRequestId();
-    this.fileSubscriptions.set(subscriptionId, { ...input, onUpdate });
+    this.fileSubscriptions.set(subscriptionId, { cwd, path, workspaceId, onUpdate });
     try {
       const payload = await this.sendCorrelatedSessionRequest({
         message: {
           type: "fs.file.subscribe.request",
-          cwd: input.cwd,
-          path: input.path,
+          cwd,
+          path,
           subscriptionId,
+          ...(workspaceId === undefined ? {} : { workspaceId }),
         },
         responseType: "fs.file.subscribe.response",
       });
@@ -4621,18 +4869,25 @@ export class DaemonClient {
   }
 
   async uploadFile(input: FileUploadInput): Promise<FileUploadResult> {
-    const bytes = asUint8Array(input.bytes);
+    const workspaceId = input.workspaceId;
+    const fileName = input.fileName;
+    const mimeTypeValue = input.mimeType;
+    const modifiedAt = input.modifiedAt ?? new Date().toISOString();
+    const requestId = input.requestId;
+    const chunkSize = input.chunkSize ?? 1024 * 1024;
+    const sourceBytes = asUint8Array(input.bytes);
+    const bytes = sourceBytes ? new Uint8Array(sourceBytes) : null;
     if (!bytes) {
       throw new Error("File bytes are required.");
     }
-    const resolvedRequestId = this.createRequestId(input.requestId);
-    const modifiedAt = input.modifiedAt ?? new Date().toISOString();
+    const resolvedRequestId = this.createRequestId(requestId);
     const responsePromise = this.sendCorrelatedRequest({
       requestId: resolvedRequestId,
       message: {
         type: "file.upload.request",
-        fileName: input.fileName,
-        mimeType: input.mimeType,
+        fileName,
+        mimeType: mimeTypeValue,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
         size: bytes.byteLength,
         modifiedAt,
         requestId: resolvedRequestId,
@@ -4646,16 +4901,15 @@ export class DaemonClient {
         opcode: FileTransferOpcode.FileBegin,
         requestId: resolvedRequestId,
         metadata: {
-          mime: input.mimeType,
+          mime: mimeTypeValue,
           size: bytes.byteLength,
           encoding: "binary",
           modifiedAt,
-          fileName: input.fileName,
+          fileName,
         },
       }),
     );
 
-    const chunkSize = input.chunkSize ?? 1024 * 1024;
     for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
       this.sendBinaryFrame(
         encodeFileTransferFrame({
@@ -4680,13 +4934,16 @@ export class DaemonClient {
     cwd: string,
     path: string,
     requestId?: string,
+    options?: { workspaceId?: string },
   ): Promise<FileDownloadTokenPayload> {
+    const workspaceId = options?.workspaceId;
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "file_download_token_request",
         cwd,
         path,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
       },
       responseType: "file_download_token_response",
     });
@@ -6340,6 +6597,12 @@ export class DaemonClient {
         return {
           type: "workspace_update",
           workspaceId: msg.payload.kind === "upsert" ? msg.payload.workspace.id : msg.payload.id,
+          payload: msg.payload,
+        };
+      case "enterprise.workspace.ownership.transfer.tombstone":
+        return {
+          type: "workspace_ownership_transfer_tombstone",
+          workspaceId: msg.payload.resource.localResourceId,
           payload: msg.payload,
         };
       case "project.update":

@@ -91,6 +91,7 @@
         webview.id = `target-webview-${index + 1}`;
         webview.className = "capture-harness-webview";
         webview.setAttribute("data-paseo-browser-id", browserId);
+        webview.setAttribute("name", browserId);
         webview.setAttribute("partition", partition);
         webview.setAttribute("allowpopups", "true");
         webview.setAttribute("spellcheck", "false");
@@ -116,7 +117,7 @@
         const webview = createHarnessWebview({ browserId, partition, sourceUrl });
         const attached = new Promise((resolve) => {
           webview.addEventListener(
-            "did-attach",
+            "dom-ready",
             () => resolve({ browserId, webContentsId: webview.getWebContentsId() }),
             { once: true },
           );
@@ -129,8 +130,28 @@
 
       const profilePartition = params.get("profilePartition");
       const profileBrowserIds = (params.get("profileBrowserIds") || "").split(",").filter(Boolean);
+      const enterpriseProfileSpecs = params.has("enterpriseProfileSpecs")
+        ? JSON.parse(params.get("enterpriseProfileSpecs"))
+        : [];
       let profileAttachSequence = Promise.resolve();
-      if (profilePartition && profileBrowserIds.length > 0) {
+      if (enterpriseProfileSpecs.length > 0) {
+        profileAttachSequence = (async () => {
+          if (
+            typeof window.paseoDesktop?.browser?.hydrateBrowserProfileAuthorizations !== "function"
+          ) {
+            throw new Error("production browser authorization bridge is unavailable");
+          }
+          const authorizations = JSON.parse(params.get("enterpriseAuthorizations") || "[]");
+          const lifecycleGeneration = params.get("enterpriseLifecycleGeneration") || "";
+          await window.paseoDesktop.browser.hydrateBrowserProfileAuthorizations({
+            authorizations,
+            lifecycleGeneration,
+          });
+          for (const spec of enterpriseProfileSpecs) {
+            await appendProfileHarnessWebview(spec);
+          }
+        })();
+      } else if (profilePartition && profileBrowserIds.length > 0) {
         profileAttachSequence = (async () => {
           for (const browserId of profileBrowserIds) {
             await appendProfileHarnessWebview({

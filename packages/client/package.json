@@ -1,6 +1,6 @@
 {
   "name": "@getpaseo/client",
-  "version": "0.8.0-beta.1",
+  "version": "0.8.0",
   "description": "Paseo client SDK package",
   "files": [
     "dist",
@@ -16,6 +16,10 @@
     "./internal/daemon-client": {
       "types": "./dist/daemon-client.d.ts",
       "default": "./dist/daemon-client.js"
+    },
+    "./internal/enterprise-identity-lifecycle": {
+      "types": "./dist/enterprise-identity-lifecycle.d.ts",
+      "default": "./dist/enterprise-identity-lifecycle.js"
     },
     "./internal/daemon-client-transport-types": {
       "types": "./dist/daemon-client-transport-types.d.ts",
@@ -39,8 +43,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@getpaseo/protocol": "0.8.0-beta.1",
-    "@getpaseo/relay": "0.8.0-beta.1",
+    "@getpaseo/protocol": "0.8.0",
+    "@getpaseo/relay": "0.8.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

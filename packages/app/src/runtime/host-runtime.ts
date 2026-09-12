@@ -3,10 +3,23 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import equal from "fast-deep-equal/es6";
 import {
   DaemonClient,
+  type EnterpriseFileRequest,
   type DaemonClientConfig,
   type ConnectionState,
   type FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
+import type {
+  EnterpriseAuthenticationResult,
+  EnterpriseFileRequestTransport,
+  EnterpriseIdentityLifecyclePorts,
+  EnterpriseIdentityLifecycle,
+  EnterpriseIdentitySnapshot,
+  ProcessCredentialVault,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import {
+  createEnterpriseIdentityLifecycle,
+  createProcessCredentialVault,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import {
   connectionFromListen,
   createRemoteSshHostConnection,
@@ -27,6 +40,16 @@ import {
 } from "@/utils/daemon-endpoints";
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@getpaseo/protocol/connection-offer";
+import {
+  BrowserProfileBindingProjectionSchema,
+  BrowserProfileIdSchema,
+  BrowserProfileSummarySchema,
+  CurrentIdentityProjectionSchema,
+  NodeIdSchema,
+  OrganizationIdSchema,
+  type BrowserProfileBindingProjection,
+  type BrowserProfileSummary,
+} from "@getpaseo/protocol/messages";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
 import { connectToDaemon } from "@/utils/test-daemon-connection";
@@ -55,17 +78,32 @@ import type { TurnLivenessTransition } from "@/timeline/turn-liveness";
 import { useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
 import { invalidateCheckoutGitQueriesForServer } from "@/git/query-keys";
 import { queryClient } from "@/data/query-client";
+import type { EnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
+import { createEnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
+import type { EnterpriseResidueResetTargets } from "@/stores/enterprise/enterprise-residue-reset";
+import {
+  createProductionEnterpriseResidueResetAdapter,
+  type ProductionEnterpriseResidueResetAdapter,
+} from "@/stores/enterprise/enterprise-production-residue";
 import {
   invalidateServerDataQueriesAfterReconnect,
   mountServerDataPushRouter,
 } from "@/data/push-router";
 import { mountBrowserAutomationDaemonClientHandler } from "@/desktop/browser/automation/handler";
+import {
+  mountBrowserPageIdentityDaemonClientHandler,
+  type BrowserPageIdentityDaemonClientHandler,
+} from "@/desktop/browser/page-identity-transport";
 import { schedulesQueryBaseKey } from "@/schedules/aggregated-schedules";
 import { dispatchComposerAgentMessage, sendQueuedComposerMessageNow } from "@/composer/actions";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { resolveComposerAttachmentSubmitFormat } from "@/composer/attachments/submit";
 import { encodeImages } from "@/utils/encode-images";
-import { DirectorySync, type RefreshAgentDirectoryResult } from "@/runtime/directory-sync";
+import {
+  DirectorySync,
+  type DirectoryEnterpriseIdentity,
+  type RefreshAgentDirectoryResult,
+} from "@/runtime/directory-sync";
 import { ReplicaCache } from "@/runtime/replica-cache";
 import type { ReplicaRowStore } from "@/runtime/replica-cache/row-store";
 import { createReplicaRowStore } from "@/runtime/replica-cache/row-store-factory";
@@ -83,6 +121,16 @@ import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
 export type HostRegistryStatus = "loading" | "ready";
+
+const EnterpriseManagementBootstrapSchema = z
+  .object({
+    mode: z.literal("managed"),
+    managementBaseUrl: z.string().url(),
+    nodeId: NodeIdSchema,
+    paseoServerId: z.string().min(1),
+  })
+  .strict();
+export type EnterpriseManagementBootstrap = z.infer<typeof EnterpriseManagementBootstrapSchema>;
 
 export type ActiveConnection =
   | { type: "directTcp"; endpoint: string; display: string }
@@ -163,7 +211,34 @@ export interface HostRuntimeControllerDeps {
     connection: HostConnection;
     clientId: string;
     runtimeGeneration: number;
+    enterpriseFileRequest?: EnterpriseFileRequest;
   }) => DaemonClient;
+  /** Injected host-owned closure; credentials and scope state remain private to its owner. */
+  createEnterpriseFileRequest?: (input: {
+    host: HostProfile;
+    connection: HostConnection;
+    clientId: string;
+    runtimeGeneration: number;
+  }) => EnterpriseFileRequest | undefined;
+  createEnterpriseIdentityLifecycle?: (input: {
+    serverId: string;
+    vault: ProcessCredentialVault;
+    ports: EnterpriseIdentityLifecyclePorts;
+  }) => EnterpriseIdentityLifecycle;
+  /**
+   * Host-owned authentication/teardown ports.  The default app wiring is
+   * fail-closed until the daemon advertises a typed enterprise auth RPC.
+   */
+  createEnterpriseIdentityLifecyclePorts?: (input: {
+    serverId: string;
+    productionPorts: EnterpriseIdentityLifecyclePorts;
+  }) => EnterpriseIdentityLifecyclePorts;
+  /** W3-owned bridge to the W4 browser runtime authorization registry. */
+  browserProfileRuntimeBridge?: BrowserProfileRuntimeBridge;
+  /** Root/W6 adapter for clearing enterprise-scoped app residue. */
+  enterpriseResidueResetAdapter?: EnterpriseResidueResetAdapter;
+  /** Convenience root seam; HostRuntime owns adapter construction when supplied. */
+  enterpriseResidueResetTargets?: EnterpriseResidueResetTargets;
   connectToDaemon: (input: {
     host: HostProfile;
     connection: HostConnection;
@@ -180,6 +255,135 @@ export interface HostRuntimeControllerDeps {
     host: HostProfile;
     connection: HostConnection;
   }) => () => void;
+}
+
+export interface BrowserProfileRuntimeAuthorization {
+  readonly organizationId: string;
+  readonly homeNodeId: string;
+  readonly workspaceId: string;
+  readonly browserProfileId: string;
+  readonly bindingRevision: string;
+  readonly lifecycleGeneration: string;
+}
+
+export interface BrowserProfileRuntimeBridge {
+  hydrateBrowserProfileAuthorizations(input: {
+    readonly homeNodeId: string;
+    readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
+    readonly lifecycleGeneration: string;
+  }): Promise<void>;
+  revokeBrowserProfileGeneration(input: {
+    readonly homeNodeId: string;
+    readonly lifecycleGeneration: string;
+  }): Promise<void>;
+}
+
+export interface BrowserProfileRuntimeProjectionInput {
+  readonly profiles: readonly BrowserProfileSummary[];
+  readonly bindings: readonly BrowserProfileBindingProjection[];
+  readonly lifecycleGeneration: string;
+}
+
+const BrowserProfileRuntimeAuthorizationSchema = z
+  .object({
+    organizationId: OrganizationIdSchema,
+    homeNodeId: NodeIdSchema,
+    workspaceId: z.string().min(1),
+    browserProfileId: BrowserProfileIdSchema,
+    bindingRevision: z.string().min(1),
+    lifecycleGeneration: z.string().min(1),
+  })
+  .strict();
+
+const BrowserProfileLifecycleGenerationSchema = z.string().min(1);
+const StrictBrowserProfileSummarySchema = BrowserProfileSummarySchema.strict();
+const StrictBrowserProfileBindingProjectionSchema = BrowserProfileBindingProjectionSchema.strict();
+const PROJECTION_INPUT_KEYS = ["profiles", "bindings", "lifecycleGeneration"] as const;
+const PROFILE_KEYS = [
+  "browserProfileId",
+  "organizationId",
+  "homeNodeId",
+  "ownerPrincipalId",
+  "platform",
+  "label",
+  "status",
+] as const;
+const BINDING_KEYS = [
+  "organizationId",
+  "nodeId",
+  "workspaceId",
+  "browserProfileId",
+  "boundAt",
+] as const;
+
+function strictOwnDataSnapshot(
+  input: unknown,
+  expectedKeys: readonly string[],
+): Record<string, unknown> | null {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  try {
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== expectedKeys.length ||
+      ownKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+    )
+      return null;
+    const snapshot: Record<string, unknown> = {};
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch {
+    return null;
+  }
+}
+
+function createBrowserProfileBindingRevision(): string {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (typeof randomUUID !== "function") {
+    throw new Error("Browser profile binding revision unavailable");
+  }
+  return randomUUID.call(globalThis.crypto);
+}
+
+/**
+ * Binds the lifecycle-owned credential vault to a host transport without
+ * exposing a credential handle or bearer to app callers.
+ */
+export function createEnterpriseFileRequestFactory(input: {
+  lifecycle: Pick<EnterpriseIdentityLifecycle, "createEnterpriseFileRequest">;
+  fetch?: typeof fetch;
+}): NonNullable<HostRuntimeControllerDeps["createEnterpriseFileRequest"]> {
+  const request = input.fetch ?? globalThis.fetch;
+  return ({ host, connection }) => {
+    if (connection.type !== "directTcp") return undefined;
+    const websocketUrl = buildDaemonWebSocketUrl(connection.endpoint, {
+      useTls: connection.useTls ?? false,
+    });
+    const baseUrl = new URL(websocketUrl);
+    baseUrl.protocol = baseUrl.protocol === "wss:" ? "https:" : "http:";
+    baseUrl.username = "";
+    baseUrl.password = "";
+    baseUrl.pathname = baseUrl.pathname.replace(/\/ws\/?$/, "/");
+    const transport: EnterpriseFileRequestTransport = {
+      request: ({ serverId, workspaceId, relativePath, authorization, signal }) => {
+        if (serverId !== host.serverId) return Promise.reject(new Error("Server scope mismatch"));
+        const url = new URL("/api/files/download", baseUrl);
+        url.searchParams.set("workspaceId", workspaceId);
+        url.searchParams.set("relativePath", relativePath);
+        return request(url, {
+          headers: { Authorization: authorization },
+          signal,
+        });
+      },
+    };
+    return input.lifecycle.createEnterpriseFileRequest({
+      serverId: host.serverId,
+      transport,
+    });
+  };
 }
 
 export interface HostRuntimeStorage {
@@ -490,8 +694,23 @@ function probeIntervalForConnection(
 }
 
 function createDefaultDeps(): HostRuntimeControllerDeps {
-  const browserHostAvailable =
-    typeof getDesktopHost()?.browser?.executeAutomationCommand === "function";
+  const desktopBrowser = getDesktopHost()?.browser;
+  const browserHostAvailable = typeof desktopBrowser?.executeAutomationCommand === "function";
+  const browserProfileRuntimeBridge =
+    typeof desktopBrowser?.hydrateBrowserProfileAuthorizations === "function" &&
+    typeof desktopBrowser.revokeBrowserProfileGeneration === "function"
+      ? {
+          hydrateBrowserProfileAuthorizations: (input: {
+            readonly homeNodeId: string;
+            readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
+            readonly lifecycleGeneration: string;
+          }) => desktopBrowser.hydrateBrowserProfileAuthorizations!(input),
+          revokeBrowserProfileGeneration: (input: {
+            readonly homeNodeId: string;
+            readonly lifecycleGeneration: string;
+          }) => desktopBrowser.revokeBrowserProfileGeneration!(input),
+        }
+      : undefined;
   const browserAutomationCapabilities = browserHostAvailable
     ? {
         [CLIENT_CAPS.browserHost]: {
@@ -505,6 +724,10 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
   };
 
   return {
+    ...(browserProfileRuntimeBridge ? { browserProfileRuntimeBridge } : {}),
+    createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+    createEnterpriseIdentityLifecycle: ({ vault, ports }) =>
+      createEnterpriseIdentityLifecycle({ vault, ports }),
     createClient: ({ host, connection, clientId, runtimeGeneration }) => {
       const desktopTransportFactory = createDesktopDaemonTransportFactory();
       const webSocketConfig = { webSocketFactory: createAppWebSocketFactory() };
@@ -595,6 +818,25 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
   };
 }
 
+function createUnavailableEnterpriseIdentityLifecyclePorts(
+  serverId: string,
+): EnterpriseIdentityLifecyclePorts {
+  const unavailable = async (): Promise<never> => {
+    throw new Error(`Enterprise identity transport unavailable for ${serverId}`);
+  };
+  return {
+    authenticate: unavailable,
+    teardown: {
+      stopNetworkAndSubscriptions: unavailable,
+      disposeRuntimeAndCachePartition: unavailable,
+      destroyDaemonClient: unavailable,
+      startNewClient: unavailable,
+      hydrateScope: unavailable,
+    },
+    remoteLogout: { logoutAll: unavailable },
+  };
+}
+
 export class HostRuntimeController {
   private host: HostProfile;
   private deps: HostRuntimeControllerDeps;
@@ -617,14 +859,148 @@ export class HostRuntimeController {
   private switchRequestVersion = 0;
   private probeRequestVersion = 0;
   private probeCycleInFlight: Promise<void> | null = null;
+  private readonly enterpriseCredentialVault: ProcessCredentialVault | null;
+  private readonly enterpriseIdentityLifecycle: EnterpriseIdentityLifecycle | null;
+  private readonly productionEnterpriseIdentityPortsEnabled: boolean;
+  private pendingEnterpriseAuthentication: {
+    readonly client: DaemonClient;
+    readonly connectionId: string;
+  } | null = null;
+  private enterpriseAuthenticationActivationInProgress = false;
+  private readonly browserProfileRuntimeBridge: BrowserProfileRuntimeBridge | null;
+  private readonly enterpriseResidueResetAdapter:
+    | EnterpriseResidueResetAdapter
+    | ProductionEnterpriseResidueResetAdapter
+    | null;
+  private browserProfileLifecycleGeneration: string | null = null;
+  private browserProfileHomeNodeId: string | null = null;
+  private lastRevokedBrowserProfileGeneration: string | null = null;
+  private browserProfileRevocationInFlight: {
+    generation: string;
+    promise: Promise<void>;
+  } | null = null;
+  private browserProfileBridgeSealed = false;
+  private browserPageIdentityHandler: BrowserPageIdentityDaemonClientHandler | null = null;
+  private browserPageIdentityClient: DaemonClient | null = null;
+  private browserPageIdentityGeneration: string | null = null;
+  private browserPageIdentityMountPromise: Promise<void> | null = null;
+  private browserPageIdentityBarrier: Promise<void> = Promise.resolve();
+  private browserPageIdentityEpoch = 0;
+  private readonly browserProfileBindingRevisions = new Map<
+    string,
+    { fingerprint: string; revision: string }
+  >();
+  private lastHydratedBrowserProfileProjection: {
+    generation: string;
+    fingerprint: string;
+  } | null = null;
 
   constructor(input: {
     host: HostProfile;
     deps?: HostRuntimeControllerDeps;
     onReconcileServerId?: (oldId: string, newId: string) => void;
+    onEnterpriseIdentityChange?: (serverId: string) => void;
   }) {
     this.host = input.host;
     this.deps = input.deps ?? createDefaultDeps();
+    this.browserProfileRuntimeBridge = this.deps.browserProfileRuntimeBridge ?? null;
+    if (this.deps.enterpriseResidueResetAdapter) {
+      this.enterpriseResidueResetAdapter = this.deps.enterpriseResidueResetAdapter;
+    } else if (this.deps.enterpriseResidueResetTargets) {
+      this.enterpriseResidueResetAdapter = createEnterpriseResidueResetAdapter(
+        this.deps.enterpriseResidueResetTargets,
+      );
+    } else if (this.deps.createEnterpriseIdentityLifecycle) {
+      this.enterpriseResidueResetAdapter = createProductionEnterpriseResidueResetAdapter();
+    } else {
+      this.enterpriseResidueResetAdapter = null;
+    }
+    this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
+      ? createProcessCredentialVault()
+      : null;
+    const productionIdentityPorts = this.createProductionEnterpriseIdentityLifecyclePorts();
+    const identityPorts = this.deps.createEnterpriseIdentityLifecycle
+      ? (this.deps.createEnterpriseIdentityLifecyclePorts?.({
+          serverId: this.host.serverId,
+          productionPorts: productionIdentityPorts,
+        }) ?? createUnavailableEnterpriseIdentityLifecyclePorts(this.host.serverId))
+      : null;
+    this.productionEnterpriseIdentityPortsEnabled = identityPorts === productionIdentityPorts;
+    const lifecyclePorts =
+      identityPorts && (this.browserProfileRuntimeBridge || this.enterpriseResidueResetAdapter)
+        ? {
+            ...identityPorts,
+            teardown: {
+              ...identityPorts.teardown,
+              stopNetworkAndSubscriptions: async () => {
+                const errors: unknown[] = [];
+                this.browserPageIdentityEpoch += 1;
+                const generation = this.browserProfileLifecycleGeneration;
+                if (generation && this.enterpriseResidueResetAdapter) {
+                  const active = this.enterpriseResidueResetAdapter.getActiveScope();
+                  if (
+                    active?.serverId === this.host.serverId &&
+                    active.lifecycleGeneration === generation
+                  ) {
+                    try {
+                      this.enterpriseResidueResetAdapter.reset({
+                        serverId: this.host.serverId,
+                        lifecycleGeneration: generation,
+                      });
+                    } catch (error) {
+                      errors.push(error);
+                    }
+                  }
+                }
+                if (generation) {
+                  try {
+                    await this.revokeBrowserProfileGeneration(generation);
+                  } catch (error) {
+                    errors.push(error);
+                  }
+                }
+                try {
+                  await this.disposeBrowserPageIdentityHandler();
+                } catch (error) {
+                  errors.push(error);
+                }
+                try {
+                  await identityPorts.teardown.stopNetworkAndSubscriptions();
+                } catch (error) {
+                  errors.push(error);
+                }
+                if (errors.length === 1) throw errors[0];
+                if (errors.length > 1) {
+                  throw new AggregateError(errors, "Enterprise lifecycle teardown failed", {
+                    cause: errors[0],
+                  });
+                }
+              },
+            },
+          }
+        : identityPorts;
+    this.enterpriseIdentityLifecycle =
+      this.deps.createEnterpriseIdentityLifecycle && this.enterpriseCredentialVault
+        ? this.deps.createEnterpriseIdentityLifecycle({
+            serverId: this.host.serverId,
+            vault: this.enterpriseCredentialVault,
+            ports: lifecyclePorts!,
+          })
+        : null;
+    if (this.enterpriseIdentityLifecycle) {
+      this.enterpriseIdentityLifecycle.subscribe((snapshot) => {
+        if (snapshot.state === "signed_in" && snapshot.generation && snapshot.projection) {
+          this.browserProfileLifecycleGeneration = snapshot.generation;
+          this.browserProfileHomeNodeId = snapshot.projection.nodeId;
+          this.enterpriseResidueResetAdapter?.activate({
+            serverId: this.host.serverId,
+            lifecycleGeneration: snapshot.generation,
+          });
+        }
+        input.onEnterpriseIdentityChange?.(this.host.serverId);
+        void this.mountBrowserPageIdentityHandlerIfReady().catch(() => undefined);
+      });
+    }
     this.onReconcileServerId = input.onReconcileServerId ?? null;
     this.connectionMachineState = {
       tag: "booting",
@@ -647,6 +1023,419 @@ export class HostRuntimeController {
 
   getClient(): DaemonClient | null {
     return this.snapshot.client;
+  }
+
+  getEnterpriseIdentitySnapshot(): ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]> | null {
+    return this.enterpriseIdentityLifecycle?.readSnapshot() ?? null;
+  }
+
+  getEnterpriseIdentityLifecycle(): EnterpriseIdentityLifecycle | null {
+    return this.enterpriseIdentityLifecycle;
+  }
+
+  subscribeEnterpriseIdentity(
+    listener: Parameters<EnterpriseIdentityLifecycle["subscribe"]>[0],
+  ): () => void {
+    return this.enterpriseIdentityLifecycle?.subscribe(listener) ?? (() => {});
+  }
+
+  getEnterpriseScopeGeneration(): string | null {
+    return this.enterpriseIdentityLifecycle?.readSnapshot().generation ?? null;
+  }
+
+  async hydrateBrowserProfileAuthorizations(input: {
+    readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
+    readonly lifecycleGeneration: string;
+  }): Promise<void> {
+    const bridge = this.browserProfileRuntimeBridge;
+    const lifecycle = this.enterpriseIdentityLifecycle;
+    if (!bridge || !lifecycle || this.browserProfileBridgeSealed) {
+      throw new Error("Browser profile runtime unavailable");
+    }
+    const snapshot = lifecycle.readSnapshot();
+    const generation = snapshot.generation;
+    if (snapshot.state !== "signed_in" || !generation || !snapshot.projection) {
+      throw new Error("Browser profile identity is not signed in");
+    }
+    const homeNodeId = snapshot.projection.nodeId;
+    const parsedGeneration = BrowserProfileLifecycleGenerationSchema.safeParse(
+      input.lifecycleGeneration,
+    );
+    if (
+      !parsedGeneration.success ||
+      parsedGeneration.data !== generation ||
+      !Array.isArray(input.authorizations)
+    ) {
+      throw new Error("Invalid browser profile authorization generation");
+    }
+    const detached = input.authorizations.map((authorization) => {
+      const parsed = BrowserProfileRuntimeAuthorizationSchema.safeParse(authorization);
+      if (
+        !parsed.success ||
+        parsed.data.lifecycleGeneration !== parsedGeneration.data ||
+        parsed.data.homeNodeId !== homeNodeId
+      ) {
+        throw new Error("Invalid browser profile authorization generation");
+      }
+      return Object.freeze(structuredClone(parsed.data));
+    });
+    try {
+      await bridge.hydrateBrowserProfileAuthorizations({
+        homeNodeId,
+        authorizations: Object.freeze(detached),
+        lifecycleGeneration: parsedGeneration.data,
+      });
+    } catch (error) {
+      this.browserProfileBridgeSealed = true;
+      throw error;
+    }
+  }
+
+  // oxlint-disable-next-line complexity -- projection validation and staged revision fencing.
+  async hydrateBrowserProfileAuthorizationsFromProjections(
+    input: BrowserProfileRuntimeProjectionInput,
+  ): Promise<void> {
+    const currentSnapshot = this.enterpriseIdentityLifecycle?.readSnapshot();
+    const outerSnapshot = strictOwnDataSnapshot(input, PROJECTION_INPUT_KEYS);
+    const requestedGeneration = BrowserProfileLifecycleGenerationSchema.safeParse(
+      outerSnapshot?.lifecycleGeneration,
+    );
+    if (
+      currentSnapshot?.state !== "signed_in" ||
+      !currentSnapshot.generation ||
+      !requestedGeneration.success ||
+      requestedGeneration.data !== currentSnapshot.generation
+    ) {
+      throw new Error("Browser profile projection generation is not current");
+    }
+    const rawProfiles = outerSnapshot?.profiles;
+    const rawBindings = outerSnapshot?.bindings;
+    if (!Array.isArray(rawProfiles) || !Array.isArray(rawBindings)) {
+      throw new Error("Invalid browser profile projections");
+    }
+    const profiles = rawProfiles.map((profile) => {
+      const snapshot = strictOwnDataSnapshot(profile, PROFILE_KEYS);
+      const parsed = StrictBrowserProfileSummarySchema.safeParse(snapshot);
+      if (!parsed.success) throw new Error("Invalid browser profile projection");
+      return structuredClone(parsed.data);
+    });
+    const bindings = rawBindings.map((binding) => {
+      const snapshot = strictOwnDataSnapshot(binding, BINDING_KEYS);
+      const parsed = StrictBrowserProfileBindingProjectionSchema.safeParse(snapshot);
+      if (!parsed.success) throw new Error("Invalid browser profile binding projection");
+      return structuredClone(parsed.data);
+    });
+    const profileIds = new Set<string>();
+    for (const profile of profiles) {
+      if (profileIds.has(profile.browserProfileId)) {
+        throw new Error("Duplicate browser profile projection");
+      }
+      profileIds.add(profile.browserProfileId);
+    }
+    const profilesById = new Map(profiles.map((profile) => [profile.browserProfileId, profile]));
+    const bindingKeys = new Set<string>();
+    const stagedRevisions = new Map(this.browserProfileBindingRevisions);
+    const authorizations: BrowserProfileRuntimeAuthorization[] = [];
+    for (const binding of bindings) {
+      const profile = profilesById.get(binding.browserProfileId);
+      if (
+        !profile ||
+        profile.organizationId !== binding.organizationId ||
+        profile.homeNodeId !== binding.nodeId
+      ) {
+        throw new Error("Browser profile binding does not match profile projection");
+      }
+      const key = JSON.stringify([binding.workspaceId, binding.browserProfileId]);
+      if (bindingKeys.has(key)) throw new Error("Duplicate browser profile binding projection");
+      bindingKeys.add(key);
+      const fingerprint = JSON.stringify({
+        organizationId: binding.organizationId,
+        homeNodeId: binding.nodeId,
+        workspaceId: binding.workspaceId,
+        browserProfileId: binding.browserProfileId,
+        boundAt: binding.boundAt,
+      });
+      const previous = stagedRevisions.get(key);
+      const revision =
+        previous?.fingerprint === fingerprint
+          ? previous.revision
+          : createBrowserProfileBindingRevision();
+      stagedRevisions.set(key, { fingerprint, revision });
+      authorizations.push({
+        organizationId: binding.organizationId,
+        homeNodeId: binding.nodeId,
+        workspaceId: binding.workspaceId,
+        browserProfileId: binding.browserProfileId,
+        bindingRevision: revision,
+        lifecycleGeneration: requestedGeneration.data,
+      });
+    }
+    authorizations.sort((left, right) =>
+      `${left.workspaceId}\u0000${left.browserProfileId}`.localeCompare(
+        `${right.workspaceId}\u0000${right.browserProfileId}`,
+      ),
+    );
+    const fingerprint = JSON.stringify(authorizations);
+    if (
+      this.lastHydratedBrowserProfileProjection?.generation === requestedGeneration.data &&
+      this.lastHydratedBrowserProfileProjection.fingerprint === fingerprint
+    ) {
+      return;
+    }
+    await this.hydrateBrowserProfileAuthorizations({
+      authorizations,
+      lifecycleGeneration: requestedGeneration.data,
+    });
+    this.browserProfileBindingRevisions.clear();
+    for (const [key, revision] of stagedRevisions) {
+      if (bindingKeys.has(key)) this.browserProfileBindingRevisions.set(key, revision);
+    }
+    this.lastHydratedBrowserProfileProjection = {
+      generation: requestedGeneration.data,
+      fingerprint,
+    };
+  }
+
+  private async revokeBrowserProfileGeneration(generation: string): Promise<void> {
+    if (this.lastRevokedBrowserProfileGeneration === generation) return;
+    if (this.browserProfileRevocationInFlight?.generation === generation) {
+      return this.browserProfileRevocationInFlight.promise;
+    }
+    const bridge = this.browserProfileRuntimeBridge;
+    if (!bridge) return;
+    const homeNodeId = this.browserProfileHomeNodeId;
+    if (!homeNodeId) throw new Error("Browser profile home node is unavailable");
+    const promise = (async () => {
+      try {
+        await bridge.revokeBrowserProfileGeneration({
+          homeNodeId,
+          lifecycleGeneration: generation,
+        });
+        this.lastRevokedBrowserProfileGeneration = generation;
+        if (this.browserProfileLifecycleGeneration === generation) {
+          this.browserProfileLifecycleGeneration = null;
+          this.browserProfileHomeNodeId = null;
+        }
+      } catch (error) {
+        this.browserProfileBridgeSealed = true;
+        throw error;
+      } finally {
+        if (this.browserProfileRevocationInFlight?.generation === generation) {
+          this.browserProfileRevocationInFlight = null;
+        }
+      }
+    })();
+    this.browserProfileRevocationInFlight = { generation, promise };
+    return promise;
+  }
+
+  private createProductionEnterpriseIdentityLifecyclePorts(): EnterpriseIdentityLifecyclePorts {
+    const closePendingAuthentication = async (): Promise<void> => {
+      const pending = this.pendingEnterpriseAuthentication;
+      this.pendingEnterpriseAuthentication = null;
+      if (pending) await pending.client.close().catch(() => undefined);
+    };
+    return {
+      authenticate: async ({
+        serverId,
+        token,
+        signal,
+        clientId: requestedClientId,
+      }): Promise<EnterpriseAuthenticationResult> => {
+        if (serverId !== this.host.serverId || signal.aborted) {
+          throw new DOMException("Aborted", "AbortError");
+        }
+        const connectionId = this.snapshot.activeConnectionId ?? this.host.preferredConnectionId;
+        const connection = findConnectionById(this.host, connectionId);
+        if (!connection || !connectionId || connection.type !== "directTcp") {
+          throw new Error("Enterprise authentication requires a direct node connection");
+        }
+        await closePendingAuthentication();
+        const clientId = requestedClientId ?? (await this.resolveClientId());
+        const runtimeGeneration = this.snapshot.clientGeneration + 1;
+        const authenticatedConnection = { ...connection, password: token };
+        const candidate = this.deps.createClient({
+          host: this.host,
+          connection: authenticatedConnection,
+          clientId,
+          runtimeGeneration,
+          enterpriseFileRequest: this.enterpriseIdentityLifecycle
+            ? createEnterpriseFileRequestFactory({ lifecycle: this.enterpriseIdentityLifecycle })({
+                host: this.host,
+                connection: authenticatedConnection,
+                clientId,
+                runtimeGeneration,
+              })
+            : undefined,
+        });
+        candidate.setReconnectEnabled(false);
+        const teardownAttempt = async () => {
+          if (this.pendingEnterpriseAuthentication?.client === candidate) {
+            this.pendingEnterpriseAuthentication = null;
+          }
+          await candidate.close().catch(() => undefined);
+        };
+        try {
+          await candidate.connect();
+          if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+          const info = candidate.getLastServerInfoMessage();
+          if (info?.serverId !== serverId || info.features?.enterpriseIdentityV1 !== true) {
+            throw new Error("Enterprise identity is unavailable on this host");
+          }
+          const requestId = `identity-login-${crypto.randomUUID()}`;
+          const response = z
+            .object({ requestId: z.string().min(1), identity: CurrentIdentityProjectionSchema })
+            .strict()
+            .parse(
+              await candidate.requestEnterprise(
+                "enterprise.identity.get_current.request",
+                {},
+                requestId,
+              ),
+            );
+          if (response.requestId !== requestId || response.identity.paseoServerId !== serverId) {
+            throw new Error("Enterprise identity response did not match the host");
+          }
+          this.pendingEnterpriseAuthentication = { client: candidate, connectionId };
+          return Object.freeze({
+            projection: response.identity,
+            sessionBindingKey: crypto.randomUUID(),
+            teardownAttempt,
+          });
+        } catch (error) {
+          await teardownAttempt();
+          throw error;
+        }
+      },
+      teardown: {
+        stopNetworkAndSubscriptions: async () => undefined,
+        disposeRuntimeAndCachePartition: async () => undefined,
+        destroyDaemonClient: async () => {
+          await this.disposePreviousActiveClient();
+          await closePendingAuthentication();
+        },
+        startNewClient: async ({ serverId }) => {
+          if (serverId !== this.host.serverId) throw new Error("Enterprise host changed");
+          const pending = this.pendingEnterpriseAuthentication;
+          if (!pending) throw new Error("Enterprise authenticated client unavailable");
+          this.pendingEnterpriseAuthentication = null;
+          this.enterpriseAuthenticationActivationInProgress = true;
+          try {
+            await this.switchToConnection({
+              connectionId: pending.connectionId,
+              existingClient: pending.client,
+            });
+          } finally {
+            this.enterpriseAuthenticationActivationInProgress = false;
+          }
+          if (this.activeClient !== pending.client) {
+            await pending.client.close().catch(() => undefined);
+            throw new Error("Enterprise authenticated client was not activated");
+          }
+        },
+        hydrateScope: async () => undefined,
+      },
+      remoteLogout: {
+        logoutAll: async (serverId) => {
+          if (serverId !== this.host.serverId || !this.activeClient) return;
+          const requestId = `identity-logout-${crypto.randomUUID()}`;
+          const response = await this.activeClient.requestEnterprise(
+            "enterprise.identity.logout_all.request",
+            {},
+            requestId,
+          );
+          if (response.requestId !== requestId || response.loggedOut !== true) {
+            throw new Error("Enterprise logout failed");
+          }
+        },
+      },
+    };
+  }
+
+  authenticateEnterpriseHost(
+    input: Parameters<EnterpriseIdentityLifecycle["authenticateEnterpriseHost"]>[0],
+  ): Promise<ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]>> {
+    if (!this.enterpriseIdentityLifecycle)
+      return Promise.reject(new Error("Enterprise identity unavailable"));
+    return this.enterpriseIdentityLifecycle.authenticateEnterpriseHost(input);
+  }
+
+  async discoverEnterpriseManagement(input?: {
+    readonly signal?: AbortSignal;
+  }): Promise<EnterpriseManagementBootstrap | null> {
+    const connection = findConnectionById(
+      this.host,
+      this.snapshot.activeConnectionId ?? this.host.preferredConnectionId,
+    );
+    if (!connection || connection.type !== "directTcp") return null;
+    const bootstrapResponse = await fetch(
+      new URL(
+        "/api/enterprise/bootstrap",
+        `${connection.useTls ? "https" : "http"}://${connection.endpoint}`,
+      ),
+      {
+        method: "GET",
+        signal: input?.signal,
+        headers: { accept: "application/json" },
+      },
+    );
+    if (bootstrapResponse.status === 404) return null;
+    if (!bootstrapResponse.ok) throw new Error("Enterprise management discovery failed");
+    const bootstrap = EnterpriseManagementBootstrapSchema.parse(await bootstrapResponse.json());
+    if (bootstrap.paseoServerId !== this.host.serverId) {
+      throw new Error("Enterprise management discovery returned a different host");
+    }
+    return bootstrap;
+  }
+
+  async authenticateEnterpriseHostWithPassword(input: {
+    readonly serverId: string;
+    readonly username: string;
+    readonly password: string;
+    readonly signal?: AbortSignal;
+  }): Promise<ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]>> {
+    if (input.serverId !== this.host.serverId || !this.enterpriseIdentityLifecycle) {
+      throw new Error("Enterprise identity unavailable");
+    }
+    if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const clientId = `${await this.resolveClientId()}:enterprise:${crypto.randomUUID()}`;
+    const bootstrap = await this.discoverEnterpriseManagement({ signal: input.signal });
+    if (!bootstrap) throw new Error("Enterprise password login requires a managed node connection");
+    const ticketResponse = await fetch(
+      new URL("/v1/auth/password/session", bootstrap.managementBaseUrl),
+      {
+        method: "POST",
+        signal: input.signal,
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          username: input.username,
+          password: input.password,
+          nodeId: bootstrap.nodeId,
+          clientId,
+          ttlMs: 5 * 60_000,
+        }),
+      },
+    );
+    const ticketBody = await ticketResponse.json();
+    if (!ticketResponse.ok) {
+      throw new Error(
+        ticketResponse.status === 401 ? "identity.invalid_password" : "identity.unavailable",
+      );
+    }
+    const ticket = z
+      .object({
+        ticket: z.string().startsWith("pmt_v1."),
+        endpoint: z.string().url(),
+        expiresAt: z.string().datetime({ offset: true }),
+      })
+      .strict()
+      .parse(ticketBody);
+    return this.enterpriseIdentityLifecycle.authenticateEnterpriseHost({
+      serverId: input.serverId,
+      token: ticket.ticket,
+      signal: input.signal,
+      clientId,
+    });
   }
 
   subscribe(listener: () => void): () => void {
@@ -680,6 +1469,7 @@ export class HostRuntimeController {
     this.switchRequestVersion += 1;
     this.probeRequestVersion += 1;
     this.started = false;
+    this.browserPageIdentityEpoch += 1;
     if (this.probeIntervalHandle) {
       clearInterval(this.probeIntervalHandle);
       this.probeIntervalHandle = null;
@@ -692,6 +1482,15 @@ export class HostRuntimeController {
       this.unsubscribeClientHandlers();
       this.unsubscribeClientHandlers = null;
     }
+    let browserRevokeError: unknown;
+    if (this.browserProfileLifecycleGeneration) {
+      try {
+        await this.revokeBrowserProfileGeneration(this.browserProfileLifecycleGeneration);
+      } catch (error) {
+        browserRevokeError = error;
+      }
+    }
+    await this.disposeBrowserPageIdentityHandler();
     if (this.activeClient) {
       const prev = this.activeClient;
       this.activeClient = null;
@@ -702,6 +1501,7 @@ export class HostRuntimeController {
       ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
       client: null,
     });
+    if (browserRevokeError) throw browserRevokeError;
   }
 
   async updateHost(host: HostProfile): Promise<void> {
@@ -1173,6 +1973,8 @@ export class HostRuntimeController {
       this.unsubscribeClientHandlers();
       this.unsubscribeClientHandlers = null;
     }
+    this.browserPageIdentityEpoch += 1;
+    await this.disposeBrowserPageIdentityHandler();
     if (this.activeClient) {
       const previousClient = this.activeClient;
       this.activeClient = null;
@@ -1235,6 +2037,17 @@ export class HostRuntimeController {
         connection,
         clientId,
         runtimeGeneration: nextGeneration,
+        enterpriseFileRequest: (
+          this.deps.createEnterpriseFileRequest ??
+          (this.enterpriseIdentityLifecycle
+            ? createEnterpriseFileRequestFactory({ lifecycle: this.enterpriseIdentityLifecycle })
+            : undefined)
+        )?.({
+          host: this.host,
+          connection,
+          clientId,
+          runtimeGeneration: nextGeneration,
+        }),
       });
     client.setReconnectEnabled(true);
 
@@ -1282,6 +2095,8 @@ export class HostRuntimeController {
       if (!existingClient) {
         await client.connect();
       }
+      await this.bootstrapEnterpriseIdentityForConnectedClient({ client, connection });
+      await this.mountBrowserPageIdentityHandlerIfReady({ client, requestVersion });
     } catch (error) {
       if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) {
         return;
@@ -1295,6 +2110,182 @@ export class HostRuntimeController {
         ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
       });
     }
+  }
+
+  private async bootstrapEnterpriseIdentityForConnectedClient(input: {
+    readonly client: DaemonClient;
+    readonly connection: HostConnection;
+  }): Promise<void> {
+    const lifecycle = this.enterpriseIdentityLifecycle;
+    if (
+      !lifecycle ||
+      !this.productionEnterpriseIdentityPortsEnabled ||
+      this.enterpriseAuthenticationActivationInProgress
+    )
+      return;
+    const enterpriseIdentityV1 =
+      input.client.getLastServerInfoMessage()?.features?.enterpriseIdentityV1 === true;
+    await lifecycle.bootstrap({
+      target: enterpriseIdentityV1 ? "enterprise_host" : "legacy_passthrough",
+      enterpriseIdentityV1,
+    });
+    if (
+      enterpriseIdentityV1 &&
+      lifecycle.readSnapshot().state !== "signed_in" &&
+      input.connection.type === "directTcp" &&
+      input.connection.password?.startsWith("pmt_v1.")
+    ) {
+      await lifecycle.authenticateEnterpriseHost({
+        serverId: this.host.serverId,
+        token: input.connection.password,
+      });
+    }
+  }
+
+  private enqueueBrowserPageIdentityOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.browserPageIdentityBarrier.then(operation, operation);
+    this.browserPageIdentityBarrier = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private mountBrowserPageIdentityHandlerIfReady(input?: {
+    client?: DaemonClient;
+    requestVersion?: number;
+  }): Promise<void> {
+    return this.enqueueBrowserPageIdentityOperation(() =>
+      this.mountBrowserPageIdentityHandlerIfReadyNow(input),
+    );
+  }
+
+  private isCurrentBrowserPageIdentityMount(input: {
+    client: DaemonClient;
+    generation: string;
+    clientGeneration: number;
+    epoch: number;
+    requestVersion?: number;
+  }): boolean {
+    const lifecycleSnapshot = this.enterpriseIdentityLifecycle?.readSnapshot();
+    const features = input.client.getLastServerInfoMessage()?.features;
+    return (
+      this.activeClient === input.client &&
+      this.snapshot.client === input.client &&
+      input.client.getConnectionState().status === "connected" &&
+      this.snapshot.clientGeneration === input.clientGeneration &&
+      this.browserPageIdentityEpoch === input.epoch &&
+      lifecycleSnapshot?.state === "signed_in" &&
+      lifecycleSnapshot.generation === input.generation &&
+      features?.enterpriseBrowserPageIdentityObservationV1 === true &&
+      features.enterpriseBrowserPageIdentityInvalidationV1 === true &&
+      (input.requestVersion === undefined || this.isCurrentSwitchRequest(input.requestVersion))
+    );
+  }
+
+  // oxlint-disable-next-line complexity -- lifecycle and client tuple fences are intentionally explicit.
+  private async mountBrowserPageIdentityHandlerIfReadyNow(input?: {
+    client?: DaemonClient;
+    requestVersion?: number;
+  }): Promise<void> {
+    const client = input?.client ?? this.activeClient;
+    if (!client || this.activeClient !== client) return;
+    if (input?.requestVersion !== undefined && !this.isCurrentSwitchRequest(input.requestVersion)) {
+      return;
+    }
+    const lifecycleSnapshot = this.enterpriseIdentityLifecycle?.readSnapshot();
+    const generation = lifecycleSnapshot?.generation;
+    const clientGeneration = this.snapshot.clientGeneration;
+    const lifecycleEpoch = this.browserPageIdentityEpoch;
+    const features = client.getLastServerInfoMessage()?.features;
+    if (
+      lifecycleSnapshot?.state !== "signed_in" ||
+      !generation ||
+      client.getConnectionState().status !== "connected" ||
+      features?.enterpriseBrowserPageIdentityObservationV1 !== true ||
+      features.enterpriseBrowserPageIdentityInvalidationV1 !== true
+    ) {
+      return;
+    }
+    if (
+      this.browserPageIdentityHandler &&
+      this.browserPageIdentityMountPromise &&
+      this.browserPageIdentityClient === client &&
+      this.browserPageIdentityGeneration === generation
+    ) {
+      return this.browserPageIdentityMountPromise;
+    }
+    await this.disposeBrowserPageIdentityHandlerNow();
+    if (
+      !this.isCurrentBrowserPageIdentityMount({
+        client,
+        generation,
+        clientGeneration,
+        epoch: lifecycleEpoch,
+        requestVersion: input?.requestVersion,
+      })
+    ) {
+      return;
+    }
+    const handler = mountBrowserPageIdentityDaemonClientHandler({
+      client,
+    });
+    this.browserPageIdentityHandler = handler;
+    this.browserPageIdentityClient = client;
+    this.browserPageIdentityGeneration = generation;
+    const mountPromise = (async () => {
+      await handler.ready();
+      if (
+        !this.isCurrentBrowserPageIdentityMount({
+          client,
+          generation,
+          clientGeneration,
+          epoch: lifecycleEpoch,
+          requestVersion: input?.requestVersion,
+        })
+      ) {
+        if (this.browserPageIdentityHandler === handler) {
+          handler.seal();
+          await handler.dispose().catch(() => undefined);
+          this.browserPageIdentityHandler = null;
+          this.browserPageIdentityClient = null;
+          this.browserPageIdentityGeneration = null;
+          this.browserPageIdentityMountPromise = null;
+        }
+      }
+    })();
+    this.browserPageIdentityMountPromise = mountPromise;
+    try {
+      await mountPromise;
+    } catch (error) {
+      if (this.browserPageIdentityHandler === handler) {
+        handler.seal();
+        await handler.dispose().catch(() => undefined);
+        this.browserPageIdentityHandler = null;
+        this.browserPageIdentityClient = null;
+        this.browserPageIdentityGeneration = null;
+        this.browserPageIdentityMountPromise = null;
+      }
+      throw error;
+    }
+  }
+
+  private disposeBrowserPageIdentityHandler(): Promise<void> {
+    return this.enqueueBrowserPageIdentityOperation(() =>
+      this.disposeBrowserPageIdentityHandlerNow(),
+    );
+  }
+
+  private async disposeBrowserPageIdentityHandlerNow(): Promise<void> {
+    const handler = this.browserPageIdentityHandler;
+    this.browserPageIdentityHandler = null;
+    this.browserPageIdentityClient = null;
+    this.browserPageIdentityGeneration = null;
+    this.browserPageIdentityMountPromise = null;
+    if (!handler) return;
+    handler.seal();
+    await handler.drain().catch(() => undefined);
+    await handler.dispose().catch(() => undefined);
   }
 
   adoptReconciledServerId(newServerId: string): void {
@@ -1369,6 +2360,30 @@ function rekeyMap<V>(map: Map<string, V>, oldKey: string, newKey: string): void 
   }
   map.delete(oldKey);
   map.set(newKey, value);
+}
+
+function directoryEnterpriseIdentityFromSnapshot(
+  serverId: string,
+  snapshot: EnterpriseIdentitySnapshot | null,
+): DirectoryEnterpriseIdentity | null {
+  const scope = snapshot?.scope;
+  const lifecycleGeneration = snapshot?.generation;
+  if (
+    snapshot?.state !== "signed_in" ||
+    snapshot.target !== "enterprise_host" ||
+    !scope ||
+    !lifecycleGeneration ||
+    scope.paseoServerId !== serverId
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    organizationId: scope.organizationId,
+    nodeId: scope.nodeId,
+    paseoServerId: scope.paseoServerId,
+    principalId: scope.principalId,
+    lifecycleGeneration,
+  });
 }
 
 interface AgentDirectoryRefreshInput {
@@ -1662,6 +2677,10 @@ export class HostRuntimeStore {
         markAgentLoading: () => controller.markAgentDirectorySyncLoading(),
         markAgentReady: () => controller.markAgentDirectorySyncReady(),
         markAgentError: (error) => controller.markAgentDirectorySyncError(error),
+        evictAgentTimelines: (agentIds) =>
+          this.timelineReplicaByServer.get(newServerId)?.evictAgents(agentIds),
+        resetAgentTimelineEvictions: () =>
+          this.timelineReplicaByServer.get(newServerId)?.resetEvictions(),
       },
       this.replicaCache,
     );
@@ -1676,6 +2695,7 @@ export class HostRuntimeStore {
     );
     controller.adoptReconciledServerId(newServerId);
     const snapshot = controller.getSnapshot();
+    const identitySnapshot = controller.getEnterpriseIdentitySnapshot();
     this.clearHostReplica(oldServerId);
     this.syncSessionReplica(newServerId, snapshot);
     directory.connectionChanged({
@@ -1685,6 +2705,8 @@ export class HostRuntimeStore {
         clientGeneration: snapshot.clientGeneration,
         connectionEpoch: snapshot.connectionEpoch,
       },
+      enterpriseTarget: identitySnapshot?.target,
+      enterpriseIdentity: directoryEnterpriseIdentityFromSnapshot(newServerId, identitySnapshot),
     });
 
     const listeners = this.serverListeners.get(oldServerId);
@@ -2070,6 +3092,10 @@ export class HostRuntimeStore {
         host,
         deps: this.deps,
         onReconcileServerId: (oldId, newId) => this.reconcileServerId(oldId, newId),
+        onEnterpriseIdentityChange: (serverId) => {
+          this.syncDirectoryConnection(serverId);
+          this.emit(serverId);
+        },
       });
       this.controllers.set(host.serverId, controller);
       useSessionStore.getState().initializeSession(host.serverId, null);
@@ -2080,6 +3106,10 @@ export class HostRuntimeStore {
           markAgentLoading: () => controller.markAgentDirectorySyncLoading(),
           markAgentReady: () => controller.markAgentDirectorySyncReady(),
           markAgentError: (error) => controller.markAgentDirectorySyncError(error),
+          evictAgentTimelines: (agentIds) =>
+            this.timelineReplicaByServer.get(host.serverId)?.evictAgents(agentIds),
+          resetAgentTimelineEvictions: () =>
+            this.timelineReplicaByServer.get(host.serverId)?.resetEvictions(),
         },
         this.replicaCache,
       );
@@ -2139,6 +3169,7 @@ export class HostRuntimeStore {
       return;
     }
     const snapshot = controller.getSnapshot();
+    const identitySnapshot = controller.getEnterpriseIdentitySnapshot();
     const directory = this.directorySyncByServer.get(serverId);
     directory?.connectionChanged({
       client: snapshot.client,
@@ -2147,6 +3178,8 @@ export class HostRuntimeStore {
         clientGeneration: snapshot.clientGeneration,
         connectionEpoch: snapshot.connectionEpoch,
       },
+      enterpriseTarget: identitySnapshot?.target,
+      enterpriseIdentity: directoryEnterpriseIdentityFromSnapshot(serverId, identitySnapshot),
     });
     const previousStatus = this.lastConnectionStatusByServer.get(serverId);
     const statusChanged = previousStatus !== snapshot.connectionStatus;
@@ -2230,6 +3263,10 @@ export class HostRuntimeStore {
     this.directorySyncByServer.get(serverId)?.applyAgentTurnLiveness(agentId, transition);
   }
 
+  isAgentPublicationBlocked(serverId: string, agentId: string): boolean {
+    return this.directorySyncByServer.get(serverId)?.isAgentPublicationBlocked(agentId) ?? false;
+  }
+
   beginAgentCancellation(serverId: string, agentId: string): number {
     const requestId = ++this.nextCancellationRequestId;
     this.applyAgentTurnLiveness(serverId, agentId, { type: "cancellation_started", requestId });
@@ -2286,6 +3323,61 @@ export class HostRuntimeStore {
 
   getClient(serverId: string): DaemonClient | null {
     return this.controllers.get(serverId)?.getClient() ?? null;
+  }
+
+  getEnterpriseIdentitySnapshot(serverId: string): EnterpriseIdentitySnapshot | null {
+    return this.controllers.get(serverId)?.getEnterpriseIdentitySnapshot() ?? null;
+  }
+
+  getEnterpriseIdentityLifecycle(serverId: string): EnterpriseIdentityLifecycle | null {
+    return this.controllers.get(serverId)?.getEnterpriseIdentityLifecycle() ?? null;
+  }
+
+  authenticateEnterpriseHostWithPassword(
+    serverId: string,
+    input: { readonly username: string; readonly password: string; readonly signal?: AbortSignal },
+  ): Promise<EnterpriseIdentitySnapshot> {
+    const controller = this.controllers.get(serverId);
+    if (!controller) return Promise.reject(new Error("Enterprise identity unavailable"));
+    return controller.authenticateEnterpriseHostWithPassword({ serverId, ...input });
+  }
+
+  discoverEnterpriseManagement(
+    serverId: string,
+    input?: { readonly signal?: AbortSignal },
+  ): Promise<EnterpriseManagementBootstrap | null> {
+    const controller = this.controllers.get(serverId);
+    if (!controller) return Promise.resolve(null);
+    return controller.discoverEnterpriseManagement(input);
+  }
+
+  subscribeEnterpriseIdentity(
+    serverId: string,
+    listener: (snapshot: EnterpriseIdentitySnapshot) => void,
+  ): () => void {
+    const unsubscribeServer = this.subscribe(serverId, () => {
+      const snapshot = this.getEnterpriseIdentitySnapshot(serverId);
+      if (snapshot) listener(snapshot);
+    });
+    const unsubscribeIdentity =
+      this.controllers.get(serverId)?.subscribeEnterpriseIdentity(listener) ?? (() => {});
+    return () => {
+      unsubscribeIdentity();
+      unsubscribeServer();
+    };
+  }
+
+  getEnterpriseScopeGeneration(serverId: string): string | null {
+    return this.controllers.get(serverId)?.getEnterpriseScopeGeneration() ?? null;
+  }
+
+  hydrateBrowserProfileAuthorizationsFromProjections(
+    serverId: string,
+    input: BrowserProfileRuntimeProjectionInput,
+  ): Promise<void> {
+    const controller = this.controllers.get(serverId);
+    if (!controller) return Promise.reject(new Error(`Unknown host runtime for ${serverId}`));
+    return controller.hydrateBrowserProfileAuthorizationsFromProjections(input);
   }
 
   subscribe(serverId: string, listener: () => void): () => void {
@@ -2557,6 +3649,28 @@ export function useHosts(): HostProfile[] {
     (onStoreChange) => store.subscribeHostList(onStoreChange),
     () => store.getHosts(),
     () => store.getHosts(),
+  );
+}
+
+export function useHostEnterpriseIdentitySnapshot(
+  serverId: string,
+): EnterpriseIdentitySnapshot | null {
+  const store = getHostRuntimeStore();
+  return useSyncExternalStore(
+    (onStoreChange) => store.subscribeEnterpriseIdentity(serverId, () => onStoreChange()),
+    () => store.getEnterpriseIdentitySnapshot(serverId),
+    () => store.getEnterpriseIdentitySnapshot(serverId),
+  );
+}
+
+export function useHostEnterpriseIdentityLifecycle(
+  serverId: string,
+): EnterpriseIdentityLifecycle | null {
+  const store = getHostRuntimeStore();
+  return useSyncExternalStore(
+    (onStoreChange) => store.subscribeEnterpriseIdentity(serverId, () => onStoreChange()),
+    () => store.getEnterpriseIdentityLifecycle(serverId),
+    () => store.getEnterpriseIdentityLifecycle(serverId),
   );
 }
 

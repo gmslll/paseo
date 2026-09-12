@@ -7,6 +7,8 @@ import {
   loadPersistedConfig,
   PersistedConfigSchema,
   savePersistedConfig,
+  EnterpriseMultiUserSchema,
+  normalizeEnterpriseMultiUser,
 } from "./persisted-config.js";
 import { PRIVATE_FILE_MODE } from "./private-files.js";
 
@@ -22,6 +24,181 @@ function modeOf(filePath: string): number {
 }
 
 describe("PersistedConfigSchema daemon auth config", () => {
+  const enabledConfig = {
+    enabled: true as const,
+    organizationId: "org_0123456789abcdef",
+    nodeId: "nod_0123456789abcdef",
+    managementMode: "standalone" as const,
+    legacyRecords: "owner_only" as const,
+  };
+  test("enabled exact parses through PersistedConfigSchema", () => {
+    expect(
+      PersistedConfigSchema.parse({
+        features: {
+          enterpriseMultiUser: {
+            enabled: true,
+            organizationId: "org_0123456789abcdef",
+            nodeId: "nod_0123456789abcdef",
+            managementMode: "standalone",
+            legacyRecords: "owner_only",
+          },
+        },
+      }).features?.enterpriseMultiUser,
+    ).toEqual(enabledConfig);
+  });
+  test.each([
+    ["organizationId", { ...enabledConfig, organizationId: "bad" }],
+    ["nodeId", { ...enabledConfig, nodeId: "bad" }],
+    ["managementMode", { ...enabledConfig, managementMode: "federated" }],
+    ["legacyRecords", { ...enabledConfig, legacyRecords: "all" }],
+  ])("rejects invalid enabled field %s", (_field, value) => {
+    expect(EnterpriseMultiUserSchema.safeParse(value).success).toBe(false);
+  });
+
+  test("accepts strict managed enterprise configuration", () => {
+    const managed = {
+      ...enabledConfig,
+      managementMode: "managed" as const,
+      management: {
+        baseUrl: "https://management.example.test:17443",
+        caCertificatePath: "/etc/paseo/management-ca.pem",
+        relationshipPath: "/var/lib/paseo/managed-node.json",
+        heartbeatIntervalMs: 15_000,
+      },
+    };
+    expect(EnterpriseMultiUserSchema.parse(managed)).toEqual(managed);
+    const normalized = normalizeEnterpriseMultiUser(managed);
+    expect(Object.isFrozen(normalized)).toBe(true);
+    expect(
+      normalized?.enabled && normalized.managementMode === "managed"
+        ? Object.isFrozen(normalized.management)
+        : false,
+    ).toBe(true);
+    managed.management.heartbeatIntervalMs = 30_000;
+    expect(
+      normalized?.enabled && normalized.managementMode === "managed"
+        ? normalized.management.heartbeatIntervalMs
+        : undefined,
+    ).toBe(15_000);
+  });
+
+  test("rejects managed control-plane URLs without TLS", () => {
+    expect(
+      EnterpriseMultiUserSchema.safeParse({
+        ...enabledConfig,
+        managementMode: "managed",
+        management: {
+          baseUrl: "http://management.example.test:17443",
+          caCertificatePath: "/etc/paseo/management-ca.pem",
+          relationshipPath: "/var/lib/paseo/managed-node.json",
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("enterprise config is under features and rejects daemon path", () => {
+    expect(
+      PersistedConfigSchema.parse({ features: { enterpriseMultiUser: { enabled: false } } })
+        .features?.enterpriseMultiUser,
+    ).toEqual({ enabled: false });
+    expect(() =>
+      PersistedConfigSchema.parse({ daemon: { enterpriseMultiUser: { enabled: false } } }),
+    ).toThrow();
+  });
+
+  test("normalization clones and freezes", () => {
+    const input: Record<string, unknown> = {
+      enabled: true as const,
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      managementMode: "standalone" as const,
+      legacyRecords: "owner_only" as const,
+    };
+    const normalized = normalizeEnterpriseMultiUser(input);
+    expect(Object.isFrozen(normalized)).toBe(true);
+    expect(normalized).not.toBe(input);
+    input.organizationId = "org_aaaaaaaaaaaaaaaa";
+    input.nodeId = "nod_aaaaaaaaaaaaaaaa";
+    input.managementMode = "managed";
+    input.legacyRecords = "all";
+    expect(normalized).toMatchObject({
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      managementMode: "standalone",
+      legacyRecords: "owner_only",
+    });
+  });
+  test("normalize undefined and getter snapshot", () => {
+    expect(normalizeEnterpriseMultiUser(undefined)).toBeUndefined();
+    let reads = 0;
+    const value = {
+      get enabled() {
+        reads++;
+        return false;
+      },
+    };
+    const result = normalizeEnterpriseMultiUser(value);
+    expect(result).toEqual({ enabled: false });
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(reads).toBe(1);
+    expect(() =>
+      normalizeEnterpriseMultiUser({
+        get enabled() {
+          throw new Error("getter");
+        },
+      }),
+    ).toThrow("getter");
+  });
+
+  test.each([
+    ["organizationId", { enabled: true }],
+    ["nodeId", { enabled: true, organizationId: "org_0123456789abcdef" }],
+    [
+      "managementMode",
+      { enabled: true, organizationId: "org_0123456789abcdef", nodeId: "nod_0123456789abcdef" },
+    ],
+    [
+      "legacyRecords",
+      {
+        enabled: true,
+        organizationId: "org_0123456789abcdef",
+        nodeId: "nod_0123456789abcdef",
+        managementMode: "standalone",
+      },
+    ],
+  ])("rejects enabled half-config missing %s", (_field, value) => {
+    expect(() => EnterpriseMultiUserSchema.parse(value)).toThrow();
+  });
+  test.each([
+    { enabled: false, organizationId: "org_0123456789abcdef" },
+    {
+      enabled: true,
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      managementMode: "standalone",
+      legacyRecords: "owner_only",
+      extra: true,
+    },
+  ])("rejects invalid enterprise config %j", (value) => {
+    expect(() => EnterpriseMultiUserSchema.parse(value)).toThrow();
+  });
+  test("loadPersistedConfig reads accepted feature and rejects malformed file", () => {
+    const home = createTempHome();
+    try {
+      writeFileSync(
+        path.join(home, "config.json"),
+        JSON.stringify({ features: { enterpriseMultiUser: { enabled: false } } }),
+      );
+      expect(loadPersistedConfig(home).features?.enterpriseMultiUser).toEqual({ enabled: false });
+      writeFileSync(
+        path.join(home, "config.json"),
+        JSON.stringify({ features: { enterpriseMultiUser: { enabled: true } } }),
+      );
+      expect(() => loadPersistedConfig(home)).toThrow();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
   test("accepts optional daemon password hash", () => {
     const hash = "$2b$12$OLxyuuP9uLK30Uzc4wQX0O6liuU/Q1t5P2b0Ebf36mULvpVK3DRZW";
     const parsed = PersistedConfigSchema.parse({

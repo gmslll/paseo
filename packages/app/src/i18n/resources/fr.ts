@@ -2008,6 +2008,7 @@ export const fr: TranslationResources = {
       usage: "Utilisation",
       terminals: "Terminals",
       plugins: "Plugins",
+      enterprise: "Entreprise",
       host: "Aperçu",
     },
     plugins: pluginSettings.fr,

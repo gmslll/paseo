@@ -1,0 +1,38 @@
+services:
+  management:
+    image: ghcr.io/gmslll/paseo-enterprise-management:${PASEO_MANAGEMENT_VERSION:-latest}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "17443:17443"
+    environment:
+      PASEO_MANAGEMENT_DATA_DIR: /var/lib/paseo-management
+      PASEO_MANAGEMENT_LISTEN: 0.0.0.0:17443
+      PASEO_MANAGEMENT_TLS_CERT: /run/secrets/tls.crt
+      PASEO_MANAGEMENT_TLS_KEY: /run/secrets/tls.key
+      NODE_EXTRA_CA_CERTS: /run/secrets/tls.crt
+      PASEO_MANAGEMENT_ORGANIZATION_ID: ${PASEO_MANAGEMENT_ORGANIZATION_ID}
+      PASEO_MANAGEMENT_ORGANIZATION_NAME: ${PASEO_MANAGEMENT_ORGANIZATION_NAME}
+      PASEO_MANAGEMENT_ISSUER: ${PASEO_MANAGEMENT_ISSUER}
+      PASEO_MANAGEMENT_BOOTSTRAP_SECRET: ${PASEO_MANAGEMENT_BOOTSTRAP_SECRET}
+    volumes:
+      - ./data:/var/lib/paseo-management
+      - ./tls.crt:/run/secrets/tls.crt:ro
+      - ./tls.key:/run/secrets/tls.key:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const fs=require('node:fs'),https=require('node:https'),net=require('node:net'),tls=require('node:tls');const url=new URL(process.env.PASEO_MANAGEMENT_ISSUER),host=url.hostname;const request=https.get({hostname:'127.0.0.1',port:url.port||443,path:'/v1/health',ca:fs.readFileSync(process.env.PASEO_MANAGEMENT_TLS_CERT),servername:net.isIP(host)?undefined:host,checkServerIdentity:(_hostname,certificate)=>tls.checkServerIdentity(host,certificate)},response=>{response.resume();response.on('end',()=>process.exit(response.statusCode===200?0:1))});request.on('error',()=>process.exit(1));request.setTimeout(4000,()=>{request.destroy();process.exit(1)})",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777

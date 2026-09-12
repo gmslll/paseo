@@ -49,6 +49,28 @@ describe("MockLoadTestAgentClient", () => {
     });
   });
 
+  test("can stream without retaining provider history for daemon-core load tests", async () => {
+    vi.useFakeTimers();
+    const client = new MockLoadTestAgentClient(undefined, { retainHistory: false });
+    const session = await client.createSession({
+      provider: "mock",
+      cwd: process.cwd(),
+      model: "ten-second-stream",
+      featureValues: { mockAssistantResponse: "Case20 live event" },
+    });
+    const liveEvents: AgentStreamEvent[] = [];
+    session.subscribe((event) => liveEvents.push(event));
+
+    const result = session.run("Exercise the live stream without provider history.");
+    await vi.runAllTimersAsync();
+
+    await expect(result).resolves.toMatchObject({ canceled: false });
+    expect(liveEvents.length).toBeGreaterThan(0);
+    const history: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) history.push(event);
+    expect(history).toEqual([]);
+  });
+
   test("rejects the configured number of prompts before starting a retry", async () => {
     const client = new MockLoadTestAgentClient();
     const session = await client.createSession({

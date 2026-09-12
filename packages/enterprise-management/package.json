@@ -1,0 +1,38 @@
+{
+  "name": "@getpaseo/enterprise-management",
+  "version": "0.8.0",
+  "private": true,
+  "description": "Paseo distributed enterprise management plane",
+  "bin": {
+    "paseo-enterprise-management": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "clean": "node ../../scripts/clean-package-dist.mjs",
+    "build": "tsc -p tsconfig.json --incremental false",
+    "bundle": "npm run build && esbuild src/cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/standalone.js --packages=bundle",
+    "typecheck": "tsgo -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@getpaseo/protocol": "0.8.0",
+    "bcryptjs": "^3.0.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6"
+  }
+}

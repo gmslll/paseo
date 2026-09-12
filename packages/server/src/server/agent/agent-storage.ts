@@ -2,6 +2,11 @@ import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { Logger } from "pino";
+import {
+  EnterpriseResourceOwnerWireSchema,
+  normalizeEnterpriseResourceOwner,
+  type AgentOwnershipEnvelope,
+} from "@getpaseo/protocol/messages";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
@@ -47,6 +52,7 @@ const STORED_AGENT_SCHEMA = z.object({
   provider: z.string(),
   cwd: z.string(),
   workspaceId: z.string().optional(),
+  ...EnterpriseResourceOwnerWireSchema.shape,
   createdAt: z.string(),
   updatedAt: z.string(),
   lastActivityAt: z.string().optional(),
@@ -92,6 +98,15 @@ export type SerializableAgentConfig = Pick<
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
+}
+
+export function storedAgentOwnership(
+  record: StoredAgentRecord,
+): AgentOwnershipEnvelope | undefined {
+  const owner = normalizeEnterpriseResourceOwner(record);
+  if (!owner) return undefined;
+  if (!record.workspaceId) throw new Error("Enterprise Agent ownership requires workspaceId");
+  return { workspaceId: record.workspaceId, ...owner };
 }
 
 export class AgentStorage {
@@ -185,6 +200,7 @@ export class AgentStorage {
   }
 
   private async writeRecord(record: StoredAgentRecord): Promise<void> {
+    storedAgentOwnership(record);
     const agentId = record.id;
     const nextPath = this.buildRecordPath(record);
     const previousPath = this.pathById.get(agentId);
@@ -247,11 +263,23 @@ export class AgentStorage {
     const hasInternalOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
     await this.queueRecordMutation(agent.id, (existing) => {
-      const record = toStoredAgentRecord(agent, {
+      let record = toStoredAgentRecord(agent, {
         title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
         createdAt: existing?.createdAt,
         internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
       });
+      if (existing && !agent.enterpriseOwnership) {
+        const ownership = storedAgentOwnership(existing);
+        if (ownership) {
+          record = {
+            ...record,
+            organizationId: ownership.organizationId,
+            nodeId: ownership.nodeId,
+            ownerPrincipalId: ownership.ownerPrincipalId,
+            createdByPrincipalId: ownership.createdByPrincipalId,
+          };
+        }
+      }
 
       // Preserve soft-delete/archive status across snapshot flushes. The
       // projection runs inside the per-agent write queue so it cannot commit a

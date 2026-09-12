@@ -1957,6 +1957,7 @@ export const ar: TranslationResources = {
       usage: "الاستخدام",
       terminals: "Terminals",
       plugins: "Plugins",
+      enterprise: "المؤسسة",
       host: "نظرة عامة",
     },
     plugins: pluginSettings.ar,

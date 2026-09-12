@@ -1,5 +1,6 @@
 import { AgentRequests } from "./agent/requests/index.js";
 import { WebSocket, WebSocketServer } from "ws";
+import { z } from "zod";
 import type { IncomingMessage, Server as HTTPServer } from "http";
 import { join } from "path";
 import { hostname as getHostname } from "node:os";
@@ -35,8 +36,42 @@ import {
   Session,
   type SessionLifecycleIntent,
   type SessionOptions,
+  type SessionRpcDiagnosticObservation,
   type SessionRuntimeMetrics,
 } from "./session.js";
+
+type WebSocketDiagnosticRequestType = "fetch_agents_request" | "fetch_agent_request";
+type WebSocketDiagnosticResponseType =
+  | "fetch_agents_response"
+  | "fetch_agent_response"
+  | "rpc_error";
+export type WebSocketRpcDiagnosticObservation =
+  | Readonly<{
+      phase: "frame.received" | "session.call";
+      requestId: string;
+      requestType: WebSocketDiagnosticRequestType;
+      atUnixMs: number;
+    }>
+  | Readonly<{
+      phase:
+        | "response.stringify.begin"
+        | "response.stringify.return"
+        | "response.send.begin"
+        | "response.send.return";
+      requestId: string;
+      responseType: WebSocketDiagnosticResponseType;
+      atUnixMs: number;
+    }>
+  | SessionRpcDiagnosticObservation;
+export type WebSocketRpcDiagnosticObserver = (
+  observation: WebSocketRpcDiagnosticObservation,
+) => void;
+import type {
+  EnterpriseSessionDispatcher,
+  EnterpriseSessionDispatcherFactory,
+  EnterpriseSessionDispatcherFactoryRegistration,
+} from "./session/enterprise-dispatcher.js";
+import type { EnterpriseFeatureAdvertisement } from "./enterprise/dispatcher-registry.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
@@ -100,7 +135,12 @@ import {
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
-import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
+import {
+  OWNER_PERMISSIONS,
+  deriveEnterpriseSessionPermissions,
+  SessionAuthorization,
+  type DaemonPermission,
+} from "./authorization/index.js";
 import type { WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
   APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS,
@@ -111,8 +151,218 @@ import {
   sendBoundedPhysicalFrame,
   sendBoundedPhysicalFrameAndWait,
 } from "./websocket/physical-socket.js";
+import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
+import type { EnterpriseWorkspaceFilesRuntime } from "./enterprise/runtime/workspace-files-runtime.js";
+import { createProductionAuthorizationRuntimeForSession } from "./enterprise/access/production-authorization-runtime-provider.js";
+import type { ProductionAuthorizationRuntime } from "./enterprise/access/production-authorization-runtime.js";
+import type { EnterpriseWorkspaceFilesProductionProvider } from "./enterprise/runtime/production-workspace-files-runtime-provider.js";
+import {
+  isCurrentEnterpriseAdmissionAuthorization,
+  bindOrReplaceEnterpriseAdmissionSession,
+  getEnterpriseAdmissionEvidenceLockPartition,
+  resolveCurrentEnterpriseAdmissionAuthorization,
+  type EnterpriseAdmissionAuthenticationEvidence,
+  type EnterpriseAdmissionAuthorizationHandle,
+} from "./enterprise/identity/admission-authorization.js";
+import { createAuthenticatedBrowserHostSession } from "./browser-tools/page-identity-registry.js";
+import {
+  DaemonPermissionSchema,
+  NodeContextSchema,
+  PrincipalContextSchema,
+  type NodeContext,
+  type PrincipalContext,
+} from "@getpaseo/protocol/messages";
 
 const WS_CLOSE_DAEMON_AUTH_FAILED = 4401;
+const AdmissionSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("legacy"),
+      principalId: z.string(),
+      permissions: z.array(DaemonPermissionSchema),
+      hubExecutionAgents: z.unknown().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("enterprise"),
+      principalId: z.string(),
+      permissions: z.array(DaemonPermissionSchema),
+      enterprise: z
+        .object({
+          principal: z.unknown(),
+          node: z.unknown(),
+          runtime: z.unknown(),
+          grantVersionGuard: z.unknown(),
+        })
+        .strict(),
+    })
+    .strict(),
+]);
+function freezeAdmission(value: SessionAdmission): SessionAdmission {
+  const top = captureRecord(value);
+  if (top.kind === "enterprise") {
+    if (Object.hasOwn(top, "authorizationEvidence")) {
+      exact(top, ["kind", "authorizationEvidence"]);
+      if (
+        !top.authorizationEvidence ||
+        (typeof top.authorizationEvidence !== "object" &&
+          typeof top.authorizationEvidence !== "function")
+      )
+        throw new Error("invalid enterprise evidence");
+      return Object.freeze({
+        kind: "enterprise" as const,
+        authorizationEvidence:
+          top.authorizationEvidence as EnterpriseAdmissionAuthenticationEvidence,
+      });
+    }
+    exact(top, ["kind", "principalId", "permissions", "enterprise"]);
+    const e = captureRecord(top.enterprise);
+    exact(e, ["principal", "node", "runtime", "grantVersionGuard"]);
+    const principal = PrincipalContextSchema.parse(capturePrincipal(e.principal));
+    const node = NodeContextSchema.parse(captureNode(e.node));
+    const permissions = captureDenseArray(top.permissions, (x) => DaemonPermissionSchema.parse(x));
+    if (typeof top.principalId !== "string" || top.principalId !== principal.principalId)
+      throw new Error("principal mismatch");
+    const input = {
+      kind: "enterprise" as const,
+      principalId: top.principalId,
+      permissions: [...new Set(permissions)],
+      enterprise: {
+        principal,
+        node,
+        runtime: e.runtime as EnterpriseAdmissionRuntime,
+        grantVersionGuard: e.grantVersionGuard as EnterpriseAdmissionRuntime["grantVersionGuard"],
+      },
+    };
+    const parsed = AdmissionSchema.parse(input) as SessionAdmission;
+    Object.freeze(parsed.permissions);
+    Object.freeze(principal.grants);
+    for (const g of principal.grants) {
+      Object.freeze(g.selector);
+      if ("workspaceIds" in g.selector) Object.freeze(g.selector.workspaceIds);
+      Object.freeze(g);
+    }
+    Object.freeze(principal);
+    Object.freeze(node);
+    Object.freeze(parsed.enterprise);
+    return Object.freeze(parsed);
+  }
+  if (top.kind !== undefined && top.kind !== "legacy") throw new Error("invalid admission kind");
+  const legacyKeys =
+    top.kind === undefined
+      ? ["principalId", "permissions"]
+      : ["kind", "principalId", "permissions"];
+  const hasHub = Object.hasOwn(top, "hubExecutionAgents");
+  if (hasHub) {
+    if (!top.hubExecutionAgents || typeof top.hubExecutionAgents !== "object")
+      throw new Error("hubExecutionAgents");
+    legacyKeys.push("hubExecutionAgents");
+  }
+  exact(top, legacyKeys);
+  if (typeof top.principalId !== "string") throw new Error("principalId");
+  const hubExecutionAgents = hasHub ? (top.hubExecutionAgents as HubExecutionAgents) : undefined;
+  const legacy: SessionAdmission = {
+    kind: "legacy",
+    principalId: top.principalId,
+    permissions: Object.freeze([
+      ...new Set(captureDenseArray(top.permissions, (x) => DaemonPermissionSchema.parse(x))),
+    ]),
+    ...(hubExecutionAgents ? { hubExecutionAgents } : {}),
+  };
+  return Object.freeze(legacy);
+}
+
+function captureRecord(raw: unknown): Record<string, unknown> {
+  if (
+    !raw ||
+    typeof raw !== "object" ||
+    Array.isArray(raw) ||
+    Object.getPrototypeOf(raw) !== Object.prototype
+  )
+    throw new Error("invalid record");
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(raw)) {
+    if (typeof key !== "string") throw new Error("symbol");
+    const d = Object.getOwnPropertyDescriptor(raw, key);
+    if (!d || !d.enumerable || !("value" in d)) throw new Error("descriptor");
+    out[key] = d.value;
+  }
+  return out;
+}
+function exact(record: Record<string, unknown>, keys: readonly string[]): void {
+  if (Object.keys(record).sort().join("\0") !== [...keys].sort().join("\0"))
+    throw new Error("keys");
+}
+function captureDenseArray<T>(raw: unknown, map: (value: unknown) => T): T[] {
+  if (!Array.isArray(raw)) throw new Error("array");
+  const ld = Object.getOwnPropertyDescriptor(raw, "length");
+  if (!ld || !("value" in ld) || !Number.isSafeInteger(ld.value) || ld.value < 0)
+    throw new Error("length");
+  const n = ld.value;
+  const keys = Reflect.ownKeys(raw);
+  if (keys.length !== n + 1) throw new Error("dense");
+  const out: T[] = [];
+  for (let i = 0; i < n; i++) {
+    const d = Object.getOwnPropertyDescriptor(raw, String(i));
+    if (!d || !d.enumerable || !("value" in d)) throw new Error("index");
+    out.push(map(d.value));
+  }
+  return out;
+}
+function captureSelector(raw: unknown) {
+  const r = captureRecord(raw);
+  const kind = r.kind;
+  if (kind === "self") {
+    exact(r, ["kind"]);
+    return { kind: "self" as const };
+  }
+  if (kind === "organization") {
+    exact(r, ["kind", "organizationId"]);
+    return { kind: "organization" as const, organizationId: r.organizationId as string };
+  }
+  if (kind === "workspace") {
+    exact(r, ["kind", "workspaceIds"]);
+    return {
+      kind: "workspace" as const,
+      workspaceIds: captureDenseArray(r.workspaceIds, (x) => x as string),
+    };
+  }
+  throw new Error("selector");
+}
+function captureGrant(raw: unknown) {
+  const r = captureRecord(raw);
+  exact(r, ["action", "selector"]);
+  return { action: r.action as string, selector: captureSelector(r.selector) };
+}
+function capturePrincipal(raw: unknown) {
+  const r = captureRecord(raw);
+  exact(r, [
+    "principalType",
+    "principalId",
+    "organizationId",
+    "credentialId",
+    "grantVersion",
+    "grants",
+  ]);
+  return {
+    principalType: r.principalType as string,
+    principalId: r.principalId as string,
+    organizationId: r.organizationId as string,
+    credentialId: r.credentialId as string,
+    grantVersion: r.grantVersion as string,
+    grants: captureDenseArray(r.grants, captureGrant),
+  };
+}
+function captureNode(raw: unknown) {
+  const r = captureRecord(raw);
+  exact(r, ["nodeId", "paseoServerId", "mode"]);
+  return {
+    nodeId: r.nodeId as string,
+    paseoServerId: r.paseoServerId as string,
+    mode: r.mode as string,
+  };
+}
 
 export interface ExternalSocketMetadata {
   transport: "relay" | "hub";
@@ -121,17 +371,45 @@ export interface ExternalSocketMetadata {
   hubDaemonId?: string;
 }
 
-export interface SessionAdmission {
-  principalId: string;
-  permissions: readonly DaemonPermission[];
-  hubExecutionAgents?: HubExecutionAgents;
-}
+export type SessionAdmission =
+  | {
+      kind?: "legacy";
+      principalId: string;
+      permissions: readonly DaemonPermission[];
+      hubExecutionAgents?: HubExecutionAgents;
+      enterprise?: never;
+    }
+  | {
+      kind: "enterprise";
+      authorizationEvidence: EnterpriseAdmissionAuthenticationEvidence;
+      principalId?: never;
+      permissions?: never;
+      enterprise?: never;
+    }
+  | {
+      kind: "enterprise";
+      principalId: string;
+      permissions: readonly DaemonPermission[];
+      enterprise: {
+        principal: PrincipalContext;
+        node: NodeContext;
+        runtime: EnterpriseAdmissionRuntime;
+        grantVersionGuard: EnterpriseAdmissionRuntime["grantVersionGuard"];
+      };
+      hubExecutionAgents?: never;
+    };
 
 interface PendingConnection {
   connectionLogger: pino.Logger;
   helloTimeout: ReturnType<typeof setTimeout> | null;
   identity: WebSocketConnectionIdentity;
   admission: SessionAdmission;
+  authorizationEvidence?: EnterpriseAdmissionAuthenticationEvidence;
+}
+interface PendingMessageItem {
+  readonly message: WSInboundMessage;
+  readonly pendingConnection: PendingConnection;
+  readonly capturedAtUnixMs?: number;
 }
 
 interface WebSocketConnectionIdentity {
@@ -148,6 +426,24 @@ interface WebSocketConnectionIdentity {
   clientId?: string;
   sessionId?: string;
   appVersion?: string;
+}
+
+export function getWebSocketRpcDiagnosticResponseIdentity(
+  message: WSOutboundMessage,
+): { requestId: string; responseType: WebSocketDiagnosticResponseType } | null {
+  if (message.type !== "session") return null;
+  const nested = message.message;
+  if (nested.type === "fetch_agents_response" || nested.type === "fetch_agent_response") {
+    return { requestId: nested.payload.requestId, responseType: nested.type };
+  }
+  if (
+    nested.type === "rpc_error" &&
+    (nested.payload.requestType === "fetch_agents_request" ||
+      nested.payload.requestType === "fetch_agent_request")
+  ) {
+    return { requestId: nested.payload.requestId, responseType: "rpc_error" };
+  }
+  return null;
 }
 
 interface WebSocketServerConfig {
@@ -337,6 +633,7 @@ function createNoopWorkspaceRegistry(): WorkspaceRegistry {
     get: async () => null,
     update: async () => null,
     upsert: async () => {},
+    transferOwnership: async () => null,
     archive: async () => {},
     remove: async () => {},
   };
@@ -449,6 +746,7 @@ interface SessionConnectionBase {
   clientCapabilities: Record<string, unknown> | null;
   connectionLogger: pino.Logger;
   sockets: Set<WebSocketLike>;
+  enterpriseAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
 }
 
 interface ReconnectableSessionConnection extends SessionConnectionBase {
@@ -464,6 +762,7 @@ interface PluginSessionConnection extends SessionConnectionBase {
 type SessionConnection = ReconnectableSessionConnection | PluginSessionConnection;
 
 interface BrowserToolsRegistration {
+  routeId: string;
   capabilitySignature: string;
   unregister: () => void;
 }
@@ -482,6 +781,17 @@ interface SocketSessionOptions {
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
+  enterprise?: SessionAdmission["enterprise"];
+  grantVersionGuard?: EnterpriseAdmissionRuntime["grantVersionGuard"];
+  sessionId?: string;
+  sessionAuthorization?: SessionAuthorization;
+  enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+  enterpriseSessionBindingGeneration?: string;
+  enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
+  rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
+  admissionInvalidationSink?: SessionOptions["admissionInvalidationSink"];
+  admissionAuthorizationIssuer?: EnterpriseAdmissionRuntime["admission"]["authorizationIssuer"];
+  admissionAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
 }
 
 interface ClosePhysicalSocketParams {
@@ -537,9 +847,24 @@ export class VoiceAssistantWebSocketServer {
   private readonly logger: pino.Logger;
   private readonly wss: WebSocketServer;
   private readonly pendingConnections: Map<WebSocketLike, PendingConnection> = new Map();
+  /** Handshakes remain owned while async hello admission/server_info work runs. */
+  private readonly handshakeConnections: Map<WebSocketLike, PendingConnection> = new Map();
+  /** Authentication promises are owned by shutdown until they settle. */
+  private readonly authenticationTasks: Map<WebSocketLike, Promise<void>> = new Map();
   private readonly sessions: Map<WebSocketLike, SessionConnection> = new Map();
   private readonly socketIdentities: Map<WebSocketLike, WebSocketConnectionIdentity> = new Map();
   private readonly externalSessionsByKey: Map<string, ReconnectableSessionConnection> = new Map();
+  private readonly externalSessionsByBaseKey: Map<string, ReconnectableSessionConnection> =
+    new Map();
+  private readonly pendingMessageQueues = new Map<WebSocketLike, PendingMessageItem[]>();
+  private readonly pendingMessageDraining = new Set<WebSocketLike>();
+  private readonly pendingMessageReplaying = new Set<WebSocketLike>();
+  private readonly pendingMessageOwners = new Map<WebSocketLike, PendingConnection>();
+  private readonly pendingMessageTasks = new Map<WebSocketLike, Promise<void>>();
+  private readonly pendingMessageErrors = new Map<WebSocketLike, unknown>();
+  private readonly connectionCleanupPromises = new WeakMap<SessionConnection, Promise<void>>();
+  private readonly handshakeInFlight = new Set<WebSocketLike>();
+  private readonly handshakeLocks = new Map<string, Promise<void>>();
   private readonly pluginSocketIds = new WeakMap<WebSocketLike, string>();
   private readonly pluginSocketCleanup = new WeakMap<WebSocketLike, () => void>();
   private readonly serverId: string;
@@ -598,11 +923,20 @@ export class VoiceAssistantWebSocketServer {
   private readonly hubRelationships: HubRelationshipManagement | null;
   private readonly browserToolsRegistrations = new Map<string, BrowserToolsRegistration>();
   private connectionLifecycle: "starting" | "accepting" | "stopping" = "accepting";
+  private closePromise: Promise<void> | null = null;
   private readonly advertiseDaemonStatusRpc: boolean;
   private readonly advertiseRelayConfig: boolean;
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
+  private readonly enterpriseRuntime?: EnterpriseAdmissionRuntime;
+  private readonly enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider;
+  private readonly enterpriseDispatcher?: EnterpriseSessionDispatcher;
+  private readonly enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory;
+  private readonly enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration;
+  private readonly enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement;
+  private readonly rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
+  private readonly enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
 
   constructor(
     server: HTTPServer,
@@ -650,9 +984,25 @@ export class VoiceAssistantWebSocketServer {
     pluginRuntime?: SessionOptions["pluginRuntime"],
     orchestrationSkills?: SessionOptions["orchestrationSkills"],
     workspaceLabelService?: WorkspaceLabelService,
+    enterpriseRuntime?: EnterpriseAdmissionRuntime,
+    enterpriseWorkspaceFilesProvider?: EnterpriseWorkspaceFilesProductionProvider,
+    enterpriseDispatcher?: EnterpriseSessionDispatcher,
+    enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"],
+    enterpriseFeatureFlags?: EnterpriseFeatureAdvertisement,
+    enterpriseDispatcherFactory?: EnterpriseSessionDispatcherFactory,
+    enterpriseDispatcherRegistration?: EnterpriseSessionDispatcherFactoryRegistration,
+    rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
+    this.enterpriseRuntime = enterpriseRuntime;
+    this.rpcDiagnosticObserver = rpcDiagnosticObserver;
+    this.enterpriseWorkspaceFilesProvider = enterpriseWorkspaceFilesProvider;
+    this.enterpriseDispatcher = enterpriseDispatcher;
+    this.enterpriseIdentitySelfAuthorization = enterpriseIdentitySelfAuthorization;
+    this.enterpriseFeatureFlags = enterpriseFeatureFlags;
+    this.enterpriseDispatcherFactory = enterpriseDispatcherFactory;
+    this.enterpriseDispatcherRegistration = enterpriseDispatcherRegistration;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
@@ -819,7 +1169,37 @@ export class VoiceAssistantWebSocketServer {
       },
     });
     wss.on("connection", (ws, request) => {
-      void this.attachAuthenticatedSocket(ws, request, password);
+      const socket = request.socket;
+      let paused = false;
+      if (socket && typeof socket.pause === "function") {
+        try {
+          socket.pause();
+          paused = true;
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to pause websocket during authentication");
+        }
+      } else {
+        paused = true;
+      }
+      if (!paused) {
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "WebSocket authentication unavailable");
+        return;
+      }
+      const task = this.attachAuthenticatedSocket(ws, request, password).finally(() => {
+        if (socket && typeof socket.resume === "function") {
+          try {
+            socket.resume();
+          } catch (error) {
+            this.logger.warn({ err: error }, "Failed to resume websocket after authentication");
+            safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "WebSocket authentication failed");
+          }
+        }
+      });
+      this.authenticationTasks.set(ws, task);
+      void task.then(
+        () => this.authenticationTasks.delete(ws),
+        () => this.authenticationTasks.delete(ws),
+      );
     });
     return wss;
   }
@@ -903,6 +1283,56 @@ export class VoiceAssistantWebSocketServer {
     request: IncomingMessage,
     password: string | undefined,
   ): Promise<void> {
+    try {
+      await this.attachAuthenticatedSocketImpl(ws, request, password);
+    } catch (error) {
+      this.logger.warn({ err: error }, "WebSocket authentication failed unexpectedly");
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication failed");
+    }
+  }
+
+  private async attachAuthenticatedSocketImpl(
+    ws: WebSocket,
+    request: IncomingMessage,
+    password: string | undefined,
+  ): Promise<void> {
+    if (this.enterpriseRuntime) {
+      const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
+      const token = extractWsBearerToken(protocol);
+      const metadata = extractSocketRequestMetadata(request);
+      if (!token) {
+        ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication required");
+        return;
+      }
+      const authorizationEvidence = await this.enterpriseRuntime.admission.authenticateEvidence(
+        token,
+        {
+          node: this.enterpriseRuntime.node,
+          transport: "direct",
+          peer: resolveConnectionPeer(extractSocketRequestMetadata(request), undefined),
+          ...(metadata.origin ? { origin: metadata.origin } : {}),
+          ...(metadata.remoteAddress ? { remoteAddress: metadata.remoteAddress } : {}),
+          ...(metadata.userAgent ? { userAgent: metadata.userAgent } : {}),
+        },
+      );
+      if (ws.readyState !== 1 || this.connectionLifecycle === "stopping") {
+        return;
+      }
+      if (!authorizationEvidence) {
+        ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authentication failed");
+        return;
+      }
+      await this.attachSocket(
+        ws,
+        request,
+        undefined,
+        false,
+        { kind: "enterprise", authorizationEvidence },
+        undefined,
+        authorizationEvidence,
+      );
+      return;
+    }
     if (password) {
       const requestMetadata = extractSocketRequestMetadata(request);
       const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
@@ -969,10 +1399,50 @@ export class VoiceAssistantWebSocketServer {
     admission: SessionAdmission = OWNER_SESSION_ADMISSION,
     initialHello?: WSHelloMessage,
   ): Promise<void> {
+    // Enterprise external admission is established by the authenticated
+    // WebSocket path.  This public bridge must never inspect caller supplied
+    // admission objects: relay/hub callers are untrusted and may provide a
+    // throwing Proxy or structural authority substitute.
+    if (this.enterpriseRuntime) {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission required");
+      return;
+    }
+    const authorizationEvidence =
+      admission.kind === "enterprise" && "authorizationEvidence" in admission
+        ? admission.authorizationEvidence
+        : undefined;
     if (metadata?.transport === "relay") {
       this.incrementRuntimeCounter("relayExternalSocketAttached");
     }
-    await this.attachSocket(ws, undefined, metadata, false, admission, initialHello);
+    await this.attachSocket(
+      ws,
+      undefined,
+      metadata,
+      false,
+      admission,
+      initialHello,
+      authorizationEvidence,
+    );
+  }
+
+  public async attachRelayAuthenticatedSocket(
+    ws: WebSocketLike,
+    metadata: ExternalSocketMetadata | undefined,
+    authorizationEvidence: EnterpriseAdmissionAuthenticationEvidence,
+  ): Promise<void> {
+    if (!this.enterpriseRuntime || metadata?.transport !== "relay") {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise relay admission required");
+      return;
+    }
+    await this.attachSocket(
+      ws,
+      undefined,
+      metadata,
+      false,
+      { kind: "enterprise", authorizationEvidence },
+      undefined,
+      authorizationEvidence,
+    );
   }
 
   public async attachPluginSocket(
@@ -1025,13 +1495,48 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
-  public async close(): Promise<void> {
-    this.prepareForShutdown();
-    this.unsubscribeSpeechReadiness?.();
+  public close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    let resolveClose!: () => void;
+    let rejectClose!: (reason: unknown) => void;
+    this.closePromise = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    const initialErrors: unknown[] = [];
+    if (this.connectionLifecycle !== "stopping") {
+      try {
+        this.prepareForShutdown();
+      } catch (error) {
+        initialErrors.push(error);
+      }
+    }
+    void this.closeImpl(initialErrors).then(resolveClose, rejectClose);
+    return this.closePromise;
+  }
+
+  private async closeImpl(initialErrors: readonly unknown[]): Promise<void> {
+    const errors: unknown[] = [];
+    const appendError = (error: unknown): void => {
+      if (error instanceof AggregateError) {
+        for (const nested of error.errors) appendError(nested);
+        return;
+      }
+      if (!errors.includes(error)) errors.push(error);
+    };
+    for (const error of initialErrors) appendError(error);
+    const captureSync = (fn: () => void) => {
+      try {
+        fn();
+      } catch (error) {
+        appendError(error);
+      }
+    };
+    captureSync(() => this.unsubscribeSpeechReadiness?.());
     this.unsubscribeSpeechReadiness = null;
-    this.unsubscribeDaemonConfigChange?.();
+    captureSync(() => this.unsubscribeDaemonConfigChange?.());
     this.unsubscribeDaemonConfigChange = null;
-    this.unsubscribeTerminalActivity?.();
+    captureSync(() => this.unsubscribeTerminalActivity?.());
     this.unsubscribeTerminalActivity = null;
     if (this.runtimeMetricsInterval) {
       clearInterval(this.runtimeMetricsInterval);
@@ -1041,9 +1546,9 @@ export class VoiceAssistantWebSocketServer {
       clearInterval(this.applicationSocketLeaseInterval);
       this.applicationSocketLeaseInterval = null;
     }
-    this.applicationSocketLease.clear();
-    this.flushRuntimeMetrics({ final: true });
-    this.eventLoopDelayMonitor?.disable();
+    captureSync(() => this.applicationSocketLease.clear());
+    captureSync(() => this.flushRuntimeMetrics({ final: true }));
+    captureSync(() => this.eventLoopDelayMonitor?.disable());
     this.eventLoopDelayMonitor = null;
 
     const uniqueConnections = new Set<SessionConnection>([
@@ -1051,7 +1556,12 @@ export class VoiceAssistantWebSocketServer {
       ...this.externalSessionsByKey.values(),
     ]);
 
-    const pendingSockets = new Set<WebSocketLike>(this.pendingConnections.keys());
+    const pendingSockets = new Set<WebSocketLike>([
+      ...this.pendingConnections.keys(),
+      ...this.handshakeConnections.keys(),
+      ...this.authenticationTasks.keys(),
+      ...this.pendingMessageTasks.keys(),
+    ]);
     for (const pending of this.pendingConnections.values()) {
       if (pending.helloTimeout) {
         clearTimeout(pending.helloTimeout);
@@ -1060,13 +1570,22 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const cleanupPromises: Promise<void>[] = [];
+    const connectionCleanupErrors: unknown[] = [];
     for (const connection of uniqueConnections) {
       if (connection.lifecycle === "reconnectable" && connection.externalDisconnectCleanupTimeout) {
         clearTimeout(connection.externalDisconnectCleanupTimeout);
         connection.externalDisconnectCleanupTimeout = null;
       }
 
-      cleanupPromises.push(Promise.resolve(connection.session.cleanup()));
+      this.releaseEnterpriseAuthorization(connection);
+
+      cleanupPromises.push(
+        Promise.resolve()
+          .then(() => this.cleanupConnection(connection, "Server closing session"))
+          .catch((error) => {
+            if (!connectionCleanupErrors.includes(error)) connectionCleanupErrors.push(error);
+          }),
+      );
       for (const ws of connection.sockets) {
         cleanupPromises.push(
           new Promise<void>((resolve) => {
@@ -1076,7 +1595,12 @@ export class VoiceAssistantWebSocketServer {
               return;
             }
             ws.once("close", () => resolve());
-            ws.close();
+            try {
+              ws.close();
+            } catch (error) {
+              appendError(error);
+              resolve();
+            }
           }),
         );
       }
@@ -1090,23 +1614,53 @@ export class VoiceAssistantWebSocketServer {
             return;
           }
           ws.once("close", () => resolve());
-          ws.close();
+          try {
+            ws.close();
+          } catch (error) {
+            appendError(error);
+            resolve();
+          }
         }),
       );
     }
 
     await Promise.all(cleanupPromises);
-    this.providerSnapshotManager.destroy();
-    this.checkoutDiffManager.dispose();
-    await this.workspaceGitService.dispose();
+    await Promise.all(this.authenticationTasks.values());
+    await Promise.all(this.pendingMessageTasks.values());
+    for (const error of this.pendingMessageErrors.values()) appendError(error);
+    for (const error of connectionCleanupErrors) appendError(error);
+    await Promise.resolve()
+      .then(() => this.providerSnapshotManager.destroy())
+      .catch((e) => appendError(e));
+    await Promise.resolve()
+      .then(() => this.checkoutDiffManager.dispose())
+      .catch((e) => appendError(e));
+    await Promise.resolve()
+      .then(() => this.workspaceGitService.dispose())
+      .catch((e) => appendError(e));
     this.pendingConnections.clear();
+    this.handshakeConnections.clear();
+    this.authenticationTasks.clear();
+    this.pendingMessageTasks.clear();
+    this.pendingMessageErrors.clear();
+    this.handshakeLocks.clear();
     this.sessions.clear();
     this.socketIdentities.clear();
     this.externalSessionsByKey.clear();
+    this.externalSessionsByBaseKey.clear();
     for (const clientId of this.browserToolsRegistrations.keys()) {
-      this.unregisterBrowserToolsClient(clientId);
+      try {
+        this.unregisterBrowserToolsClient(clientId);
+      } catch (error) {
+        appendError(error);
+      }
     }
-    this.wss.close();
+    await Promise.resolve()
+      .then(() => this.wss.close())
+      .catch((e) => appendError(e));
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1)
+      throw new AggregateError(errors, "websocket close failed", { cause: errors[0] });
   }
 
   private sendToClient(ws: WebSocketLike, message: WSOutboundMessage): void {
@@ -1119,6 +1673,13 @@ export class VoiceAssistantWebSocketServer {
       return;
     }
 
+    const response = getWebSocketRpcDiagnosticResponseIdentity(message);
+    if (response)
+      this.emitRpcDiagnostic({
+        phase: "response.stringify.begin",
+        ...response,
+        atUnixMs: performance.timeOrigin + performance.now(),
+      });
     let payload: string;
     try {
       payload = JSON.stringify(message);
@@ -1126,12 +1687,30 @@ export class VoiceAssistantWebSocketServer {
       this.logger.warn({ err }, "ws_serialize_failed");
       return;
     }
+    if (response)
+      this.emitRpcDiagnostic({
+        phase: "response.stringify.return",
+        ...response,
+        atUnixMs: performance.timeOrigin + performance.now(),
+      });
 
     const payloadBytes = outboundFrameByteLength(payload);
     for (const ws of writableSockets) {
+      if (response)
+        this.emitRpcDiagnostic({
+          phase: "response.send.begin",
+          ...response,
+          atUnixMs: performance.timeOrigin + performance.now(),
+        });
       this.sendFrameToClient(ws, payload, payloadBytes, () => {
         this.runtimeMetrics.recordOutboundMessage(message, ws.bufferedAmount);
       });
+      if (response)
+        this.emitRpcDiagnostic({
+          phase: "response.send.return",
+          ...response,
+          atUnixMs: performance.timeOrigin + performance.now(),
+        });
     }
   }
 
@@ -1236,6 +1815,7 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  // oxlint-disable-next-line complexity -- admission canonicalization and lifecycle setup.
   private async attachSocket(
     ws: WebSocketLike,
     request?: unknown,
@@ -1243,7 +1823,44 @@ export class VoiceAssistantWebSocketServer {
     allowDuringStartup = false,
     admission: SessionAdmission = OWNER_SESSION_ADMISSION,
     initialHello?: WSHelloMessage,
+    authorizationEvidence?: EnterpriseAdmissionAuthenticationEvidence,
   ): Promise<void> {
+    if (
+      ws.readyState !== 1 ||
+      (this.enterpriseRuntime && (!authorizationEvidence || admission.kind !== "enterprise")) ||
+      (!this.enterpriseRuntime && authorizationEvidence)
+    ) {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Invalid enterprise admission");
+      return;
+    }
+    try {
+      admission = freezeAdmission(admission);
+      if (admission.enterprise && admission.enterprise.runtime !== this.enterpriseRuntime)
+        throw new Error("enterprise runtime mismatch");
+      if (
+        admission.enterprise &&
+        admission.enterprise.grantVersionGuard !== admission.enterprise.runtime.grantVersionGuard
+      )
+        throw new Error("enterprise grant guard mismatch");
+      if (admission.enterprise && this.enterpriseRuntime) {
+        const n = admission.enterprise.node;
+        const r = this.enterpriseRuntime.node;
+        if (n.nodeId !== r.nodeId || n.paseoServerId !== r.paseoServerId || n.mode !== r.mode)
+          throw new Error("enterprise node mismatch");
+        admission = freezeAdmission({
+          ...admission,
+          enterprise: { ...admission.enterprise, node: r },
+        });
+      }
+      if (
+        admission.enterprise &&
+        admission.principalId !== admission.enterprise.principal.principalId
+      )
+        throw new Error("enterprise principal mismatch");
+    } catch {
+      ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Invalid admission");
+      return;
+    }
     if (
       this.connectionLifecycle === "stopping" ||
       (this.connectionLifecycle === "starting" && !allowDuringStartup)
@@ -1266,6 +1883,7 @@ export class VoiceAssistantWebSocketServer {
       helloTimeout: null,
       identity,
       admission,
+      ...(authorizationEvidence ? { authorizationEvidence } : {}),
     };
     const timeout = setTimeout(() => {
       if (this.pendingConnections.get(ws) !== pending) {
@@ -1298,10 +1916,15 @@ export class VoiceAssistantWebSocketServer {
       "Client connected; awaiting hello",
     );
     if (initialHello) {
-      this.handleHello({ ws, message: initialHello, pending });
+      this.handlePendingConnectionMessage({
+        ws,
+        message: initialHello,
+        pendingConnection: pending,
+      });
     }
   }
 
+  // oxlint-disable-next-line complexity -- Session ownership wiring is explicit.
   private createSessionConnection(params: {
     ws: WebSocketLike;
     clientId: string;
@@ -1309,74 +1932,132 @@ export class VoiceAssistantWebSocketServer {
     clientCapabilities: Record<string, unknown> | null;
     connectionLogger: pino.Logger;
     lifecycle: { kind: "reconnectable" } | { kind: "ephemeral-plugin"; pluginId: string };
-    admission: SessionAdmission;
+    admission: Exclude<SessionAdmission, { authorizationEvidence: unknown }>;
+    enterpriseAuthorizationHandle?: EnterpriseAdmissionAuthorizationHandle;
+    sessionId?: string;
+    sessionAuthorization?: SessionAuthorization;
+    enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
+    enterpriseSessionBindingGeneration?: string;
+    onEnterpriseWorkspaceRuntimeConstructionFailure?: (
+      runtime: EnterpriseWorkspaceFilesRuntime,
+    ) => void;
   }): SessionConnection {
-    const { ws, clientId, appVersion, clientCapabilities, connectionLogger, lifecycle, admission } =
-      params;
-    let connection: SessionConnection | null = null;
-
-    const session = this.createSocketSession({
+    const {
+      ws,
       clientId,
       appVersion,
       clientCapabilities,
-      permissions: admission.permissions,
       connectionLogger,
-      onMessage: (msg) => {
-        if (!connection) {
-          return;
-        }
-        this.sendToConnection(connection, wrapSessionMessage(msg));
-      },
-      onMessageToSource: (source, msg) => {
-        if (!connection || !connection.sockets.has(source as WebSocketLike)) {
-          return;
-        }
-        this.sendToClient(source as WebSocketLike, wrapSessionMessage(msg));
-      },
-      onBinaryMessage: (frame) => {
-        if (!connection) {
-          return;
-        }
-        this.sendBinaryToConnection(connection, frame);
-      },
-      onBinaryMessageToSource: async (source, frame) => {
-        if (!connection || !connection.sockets.has(source as WebSocketLike)) {
-          throw new Error("File transfer source socket is no longer attached");
-        }
-        await this.sendBinaryToClientAndWait(source as WebSocketLike, frame);
-      },
-      getTransportBufferedAmount: () => {
-        if (!connection) {
-          return null;
-        }
-        // Relay-attached sockets are a WebSocketLike that doesn't expose
-        // bufferedAmount. Return null when no socket gives a signal so the
-        // terminal fallback can't mistake "no signal" for "client keeping up";
-        // a direct ws reports its real buffered bytes (0 when drained).
-        let maxBuffered: number | null = null;
-        for (const socket of connection.sockets) {
-          if (typeof socket.bufferedAmount === "number") {
-            maxBuffered = Math.max(maxBuffered ?? 0, socket.bufferedAmount);
+      lifecycle,
+      admission,
+      sessionId,
+      sessionAuthorization,
+      enterpriseAuthorizationRuntime,
+      enterpriseSessionBindingGeneration,
+      onEnterpriseWorkspaceRuntimeConstructionFailure,
+    } = params;
+    let connection: SessionConnection | null = null;
+    const enterpriseWorkspaceFilesRuntime =
+      enterpriseAuthorizationRuntime && this.enterpriseWorkspaceFilesProvider
+        ? this.enterpriseWorkspaceFilesProvider.createSessionRuntime(enterpriseAuthorizationRuntime)
+        : undefined;
+    if (
+      enterpriseAuthorizationRuntime &&
+      this.enterpriseWorkspaceFilesProvider &&
+      !enterpriseWorkspaceFilesRuntime
+    ) {
+      throw new Error("Enterprise workspace files runtime unavailable");
+    }
+
+    let session: Session;
+    try {
+      session = this.createSocketSession({
+        clientId,
+        appVersion,
+        clientCapabilities,
+        permissions: Object.freeze([...admission.permissions]),
+        connectionLogger,
+        onMessage: (msg) => {
+          if (!connection) {
+            return;
           }
-        }
-        return maxBuffered;
-      },
-      onLifecycleIntent: (intent) => {
-        this.onLifecycleIntent?.(intent);
-      },
-      hubExecutionAgents: admission.hubExecutionAgents,
-      hubRelationships: this.hubRelationships ?? undefined,
-    });
+          this.sendToConnection(connection, wrapSessionMessage(msg));
+        },
+        onMessageToSource: (source, msg) => {
+          if (!connection || !connection.sockets.has(source as WebSocketLike)) {
+            return;
+          }
+          this.sendToClient(source as WebSocketLike, wrapSessionMessage(msg));
+        },
+        onBinaryMessage: (frame) => {
+          if (!connection) {
+            return;
+          }
+          this.sendBinaryToConnection(connection, frame);
+        },
+        onBinaryMessageToSource: async (source, frame) => {
+          if (!connection || !connection.sockets.has(source as WebSocketLike)) {
+            throw new Error("File transfer source socket is no longer attached");
+          }
+          await this.sendBinaryToClientAndWait(source as WebSocketLike, frame);
+        },
+        getTransportBufferedAmount: () => {
+          if (!connection) {
+            return null;
+          }
+          // Relay-attached sockets are a WebSocketLike that doesn't expose
+          // bufferedAmount. Return null when no socket gives a signal so the
+          // terminal fallback can't mistake "no signal" for "client keeping up";
+          // a direct ws reports its real buffered bytes (0 when drained).
+          let maxBuffered: number | null = null;
+          for (const socket of connection.sockets) {
+            if (typeof socket.bufferedAmount === "number") {
+              maxBuffered = Math.max(maxBuffered ?? 0, socket.bufferedAmount);
+            }
+          }
+          return maxBuffered;
+        },
+        onLifecycleIntent: (intent) => {
+          this.onLifecycleIntent?.(intent);
+        },
+        hubExecutionAgents: admission.hubExecutionAgents,
+        hubRelationships: this.hubRelationships ?? undefined,
+        enterprise: admission.enterprise,
+        ...(enterpriseWorkspaceFilesRuntime ? { enterpriseWorkspaceFilesRuntime } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(sessionAuthorization ? { sessionAuthorization } : {}),
+        ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+        ...(enterpriseSessionBindingGeneration ? { enterpriseSessionBindingGeneration } : {}),
+        ...(this.enterpriseRuntime && params.enterpriseAuthorizationHandle
+          ? { admissionAuthorizationIssuer: this.enterpriseRuntime.admission.authorizationIssuer }
+          : {}),
+        ...(params.enterpriseAuthorizationHandle
+          ? { admissionAuthorizationHandle: params.enterpriseAuthorizationHandle }
+          : {}),
+      });
+    } catch (error) {
+      if (enterpriseWorkspaceFilesRuntime) {
+        onEnterpriseWorkspaceRuntimeConstructionFailure?.(enterpriseWorkspaceFilesRuntime);
+      }
+      throw error;
+    }
 
     const base: SessionConnectionBase = {
       session,
       principalId: admission.principalId,
-      sessionKey: sessionConnectionKey(admission.principalId, clientId),
+      sessionKey: sessionConnectionKey(
+        admission.principalId,
+        clientId,
+        admission.enterprise?.principal,
+      ),
       clientId,
       appVersion,
       clientCapabilities,
       connectionLogger,
       sockets: new Set([ws]),
+      ...(params.enterpriseAuthorizationHandle
+        ? { enterpriseAuthorizationHandle: params.enterpriseAuthorizationHandle }
+        : {}),
     };
     connection =
       lifecycle.kind === "ephemeral-plugin"
@@ -1386,9 +2067,58 @@ export class VoiceAssistantWebSocketServer {
     return connection;
   }
 
+  // oxlint-disable-next-line complexity -- Session constructor wiring is intentionally explicit.
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
       clientId: options.clientId,
+      ...(options.enterprise
+        ? {
+            enterpriseContext: {
+              principal: options.enterprise.principal,
+              node: options.enterprise.node,
+              sessionBindingGeneration:
+                options.enterpriseSessionBindingGeneration ??
+                options.enterprise.runtime.nextSessionBindingGeneration(),
+            },
+            enterpriseAgentContextRegistry: options.enterprise.runtime.agentContextRegistry,
+            authorityReceiptState: options.enterprise.runtime.authorityReceiptState,
+            principalGrantVersionGuard: options.enterprise.runtime.grantVersionGuard,
+            resourceAuthorization: options.enterprise.runtime.resourceAuthorization,
+            admissionInvalidationSink: options.enterprise.runtime.admissionInvalidationSink,
+          }
+        : {}),
+      ...(options.enterpriseWorkspaceFilesRuntime
+        ? { enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime }
+        : {}),
+      ...(options.enterpriseAuthorizationRuntime
+        ? { enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime }
+        : {}),
+      ...(options.admissionAuthorizationIssuer
+        ? { admissionAuthorizationIssuer: options.admissionAuthorizationIssuer }
+        : {}),
+      ...(options.admissionAuthorizationHandle
+        ? { admissionAuthorizationHandle: options.admissionAuthorizationHandle }
+        : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.sessionAuthorization
+        ? { sessionAuthorization: options.sessionAuthorization }
+        : {}),
+      ...(this.rpcDiagnosticObserver
+        ? {
+            rpcDiagnosticObserver: (observation: SessionRpcDiagnosticObservation) =>
+              this.rpcDiagnosticObserver?.(observation),
+          }
+        : {}),
+      ...(this.enterpriseDispatcher ? { enterpriseDispatcher: this.enterpriseDispatcher } : {}),
+      ...(this.enterpriseIdentitySelfAuthorization
+        ? { enterpriseIdentitySelfAuthorization: this.enterpriseIdentitySelfAuthorization }
+        : {}),
+      ...(this.enterpriseDispatcherFactory
+        ? { enterpriseDispatcherFactory: this.enterpriseDispatcherFactory }
+        : {}),
+      ...(this.enterpriseDispatcherRegistration
+        ? { enterpriseDispatcherRegistration: this.enterpriseDispatcherRegistration }
+        : {}),
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
       permissions: options.permissions,
@@ -1489,12 +2219,70 @@ export class VoiceAssistantWebSocketServer {
     return pending;
   }
 
+  private isHandshakeCurrent(ws: WebSocketLike, pending: PendingConnection): boolean {
+    return (
+      this.connectionLifecycle !== "stopping" &&
+      ws.readyState === 1 &&
+      this.socketIdentities.get(ws) === pending.identity
+    );
+  }
+
+  // oxlint-disable-next-line complexity -- protocol validation and enterprise reconnect fence.
   private handleHello(params: {
     ws: WebSocketLike;
     message: WSHelloMessage;
     pending: PendingConnection;
-  }): void {
+  }): Promise<void> {
+    if (
+      this.pendingConnections.get(params.ws) !== params.pending ||
+      params.ws.readyState !== 1 ||
+      this.connectionLifecycle === "stopping"
+    ) {
+      return Promise.resolve();
+    }
+    const enterprisePrincipal = params.pending.admission.enterprise?.principal;
+    const admissionPrincipalId =
+      "principalId" in params.pending.admission ? params.pending.admission.principalId : "opaque";
+    const fallbackLockKey = `${
+      enterprisePrincipal?.organizationId ?? "legacy"
+    }:${enterprisePrincipal?.principalId ?? admissionPrincipalId}:${params.message.clientId.trim()}`;
+    const lockKey =
+      params.pending.authorizationEvidence && this.enterpriseRuntime
+        ? (getEnterpriseAdmissionEvidenceLockPartition(
+            this.enterpriseRuntime.admission.authorizationIssuer,
+            params.pending.authorizationEvidence,
+            params.message.clientId.trim(),
+          ) ?? fallbackLockKey)
+        : fallbackLockKey;
+    if (lockKey.length === 0) {
+      return this.handleHelloUnlocked(params);
+    }
+    const prior = this.handshakeLocks.get(lockKey);
+    const run = () => this.handleHelloUnlocked(params);
+    const task = prior ? prior.then(run, run) : run();
+    this.handshakeLocks.set(lockKey, task);
+    void task.then(
+      () => this.handshakeLocks.get(lockKey) === task && this.handshakeLocks.delete(lockKey),
+      () => this.handshakeLocks.get(lockKey) === task && this.handshakeLocks.delete(lockKey),
+    );
+    return task;
+  }
+
+  // oxlint-disable-next-line complexity -- protocol validation and enterprise reconnect fence.
+  private async handleHelloUnlocked(params: {
+    ws: WebSocketLike;
+    message: WSHelloMessage;
+    pending: PendingConnection;
+  }): Promise<void> {
     const { ws, message, pending } = params;
+
+    if (
+      (this.pendingConnections.get(ws) !== pending &&
+        this.handshakeConnections.get(ws) !== pending) ||
+      !this.isHandshakeCurrent(ws, pending)
+    ) {
+      return;
+    }
 
     if (message.protocolVersion !== WS_PROTOCOL_VERSION) {
       this.clearPendingConnection(ws);
@@ -1538,66 +2326,326 @@ export class VoiceAssistantWebSocketServer {
     }
 
     this.clearPendingConnection(ws);
+    this.handshakeConnections.set(ws, pending);
     pending.identity.clientId = clientId;
     if (message.appVersion) {
       pending.identity.appVersion = message.appVersion;
     }
-    const sessionKey = sessionConnectionKey(pending.admission.principalId, clientId);
-    const existing = pluginId ? undefined : this.externalSessionsByKey.get(sessionKey);
+    let admission = pending.admission;
+    let enterpriseAuthorizationHandle: EnterpriseAdmissionAuthorizationHandle | undefined;
+    let enterpriseAuthorizationRuntime: ProductionAuthorizationRuntime | undefined;
+    let enterpriseSessionBindingGeneration: string | undefined;
+    let sessionAuthorization: SessionAuthorization | undefined;
+    let sessionId: string | undefined;
+    let sessionKey: string;
+    let existing: ReconnectableSessionConnection | undefined;
+    if (pending.authorizationEvidence) {
+      const runtime = this.enterpriseRuntime;
+      if (!runtime) {
+        this.handshakeConnections.delete(ws);
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise runtime unavailable");
+        return;
+      }
+      const handle = pluginId
+        ? runtime.admission.bindSession(pending.authorizationEvidence, clientId)
+        : bindOrReplaceEnterpriseAdmissionSession(
+            runtime.admission.authorizationIssuer,
+            pending.authorizationEvidence,
+            clientId,
+          );
+      const resolved = handle
+        ? resolveCurrentEnterpriseAdmissionAuthorization(
+            runtime.admission.authorizationIssuer,
+            handle,
+          )
+        : null;
+      if (!handle || !resolved) {
+        if (handle) {
+          runtime.admission.releaseSession(handle);
+        }
+        this.handshakeConnections.delete(ws);
+        safeCloseSocket(
+          ws,
+          WS_CLOSE_DAEMON_AUTH_FAILED,
+          "Enterprise admission is no longer current",
+        );
+        return;
+      }
+      enterpriseSessionBindingGeneration = resolved.sessionBindingGeneration;
+      const enterprisePermissions = deriveEnterpriseSessionPermissions(resolved.principal);
+      enterpriseAuthorizationHandle = handle;
+      if (runtime.authorizationRuntimeProvider) {
+        sessionAuthorization = new SessionAuthorization(enterprisePermissions);
+        sessionId = randomUUID();
+        const createdAuthorizationRuntime = await createProductionAuthorizationRuntimeForSession(
+          runtime.authorizationRuntimeProvider,
+          {
+            admissionAuthorizationIssuer: runtime.admission.authorizationIssuer,
+            admissionAuthorizationHandle: handle,
+            sessionAuthorization,
+            sessionId,
+            authorityState: runtime.authorityReceiptState,
+          },
+        );
+        if (!createdAuthorizationRuntime || !this.isHandshakeCurrent(ws, pending)) {
+          runtime.admission.releaseSession(handle);
+          this.handshakeConnections.delete(ws);
+          safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authorization unavailable");
+          return;
+        }
+        enterpriseAuthorizationRuntime = createdAuthorizationRuntime;
+      }
+      sessionKey = sessionConnectionKey(
+        resolved.principal.principalId,
+        clientId,
+        resolved.principal,
+      );
+      existing = pluginId ? undefined : this.externalSessionsByKey.get(sessionKey);
+      admission = Object.freeze({
+        kind: "enterprise",
+        principalId: resolved.principal.principalId,
+        permissions: enterprisePermissions,
+        enterprise: Object.freeze({
+          principal: resolved.principal as PrincipalContext,
+          node: resolved.node as NodeContext,
+          runtime,
+          grantVersionGuard: runtime.grantVersionGuard,
+        }),
+      });
+      if (existing) {
+        if (enterpriseAuthorizationRuntime) {
+          // ADR-0021: a replacement gets a new Session/runtime generation.
+          // Retire the old connection before publishing the replacement.
+          try {
+            await this.cleanupConnection(existing, "Enterprise session replaced");
+          } catch (error) {
+            runtime.admission.releaseSession(handle);
+            await enterpriseAuthorizationRuntime.release().catch(() => undefined);
+            this.handshakeConnections.delete(ws);
+            safeCloseSocket(
+              ws,
+              WS_CLOSE_DAEMON_AUTH_FAILED,
+              "Enterprise session replacement failed",
+            );
+            throw error;
+          }
+          existing = undefined;
+        } else {
+          existing.enterpriseAuthorizationHandle = handle;
+        }
+      }
+      if (existing) {
+        try {
+          await this.resumeSession({ ws, message, pending, existing });
+        } catch (error) {
+          this.releaseEnterpriseAuthorization(existing);
+          const oldSockets = [...existing.sockets];
+          try {
+            await this.cleanupConnection(existing, "Enterprise session resume failed");
+          } catch (cleanupError) {
+            // oxlint-disable-next-line max-depth -- cleanup error aggregation.
+            for (const oldSocket of oldSockets) {
+              safeCloseSocket(
+                oldSocket,
+                WS_CLOSE_DAEMON_AUTH_FAILED,
+                "Enterprise session replaced",
+              );
+            }
+            // oxlint-disable-next-line preserve-caught-error
+            throw new AggregateError([error, cleanupError], "enterprise resume failed", {
+              cause: error,
+            });
+          }
+          for (const oldSocket of oldSockets) {
+            safeCloseSocket(oldSocket, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise session replaced");
+          }
+          throw error;
+        }
+        return;
+      }
+    } else {
+      if ("authorizationEvidence" in admission) {
+        this.handshakeConnections.delete(ws);
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission is incomplete");
+        return;
+      }
+      sessionKey = sessionConnectionKey(
+        admission.principalId,
+        clientId,
+        admission.enterprise?.principal,
+      );
+      existing = pluginId
+        ? undefined
+        : (this.externalSessionsByKey.get(sessionKey) ??
+          this.externalSessionsByBaseKey.get(
+            sessionConnectionBaseKey(admission.principalId, clientId),
+          ));
+    }
     if (existing) {
-      this.resumeSession({ ws, message, pending, existing });
+      await this.resumeSession({ ws, message, pending, existing });
       return;
     }
 
+    if ("authorizationEvidence" in admission) {
+      this.handshakeConnections.delete(ws);
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission is incomplete");
+      return;
+    }
+    const activeAdmission = admission;
     const connectionLogger = pending.connectionLogger.child({ clientId });
     this.incrementRuntimeCounter("helloNew");
-    const connection = this.createSessionConnection({
-      ws,
-      clientId,
-      appVersion: message.appVersion ?? null,
-      clientCapabilities: message.capabilities ?? null,
-      connectionLogger,
-      lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
-      admission: pending.admission,
-    });
-    this.sessions.set(ws, connection);
-    if (connection.lifecycle === "reconnectable") {
-      this.externalSessionsByKey.set(sessionKey, connection);
+    let connection: SessionConnection | undefined;
+    let cleanupStarted = false;
+    let workspaceCleanupPromise: Promise<void> | null = null;
+    try {
+      connection = this.createSessionConnection({
+        ws,
+        clientId,
+        appVersion: message.appVersion ?? null,
+        clientCapabilities: message.capabilities ?? null,
+        connectionLogger,
+        lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
+        admission: activeAdmission,
+        ...(enterpriseAuthorizationHandle ? { enterpriseAuthorizationHandle } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(sessionAuthorization ? { sessionAuthorization } : {}),
+        ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
+        ...(enterpriseSessionBindingGeneration ? { enterpriseSessionBindingGeneration } : {}),
+        onEnterpriseWorkspaceRuntimeConstructionFailure: (runtime) => {
+          workspaceCleanupPromise ??= runtime.cleanup("session-closed");
+        },
+      });
+      const initialInfo = this.sendServerInfoToClient(
+        ws,
+        connection.session,
+        connection.enterpriseAuthorizationHandle,
+      );
+      const initialAllowed: boolean =
+        initialInfo instanceof Promise ? await initialInfo : initialInfo;
+      if (!this.isHandshakeCurrent(ws, pending)) {
+        throw new Error("WebSocket closed during enterprise handshake");
+      }
+      if (enterpriseAuthorizationHandle && this.enterpriseRuntime) {
+        const current = isCurrentEnterpriseAdmissionAuthorization(
+          this.enterpriseRuntime.admission.authorizationIssuer,
+          enterpriseAuthorizationHandle,
+        );
+        if (!current) throw new Error("Enterprise admission is no longer current");
+      }
+      if (!initialAllowed) {
+        this.releaseEnterpriseAuthorization(connection);
+        cleanupStarted = true;
+        await connection.session.cleanup();
+        this.handshakeConnections.delete(ws);
+        return;
+      }
+      this.sessions.set(ws, connection);
+      if (connection.lifecycle === "reconnectable") {
+        this.externalSessionsByKey.set(sessionKey, connection);
+        this.externalSessionsByBaseKey.set(
+          sessionConnectionBaseKey(activeAdmission.principalId, clientId),
+          connection,
+        );
+      }
+      pending.identity.sessionId = connection.session.getSessionId();
+      this.syncBrowserToolsClientRegistration(connection);
+      connection.connectionLogger.info(
+        {
+          ...toConnectionLogFields(pending.identity),
+          resumed: false,
+          totalSessions: this.sessions.size,
+        },
+        "Client connected via hello",
+      );
+      this.handshakeConnections.delete(ws);
+    } catch (primary) {
+      const cleanupErrors: unknown[] = [];
+      if (workspaceCleanupPromise) {
+        try {
+          await workspaceCleanupPromise;
+        } catch (workspaceCleanup) {
+          cleanupErrors.push(workspaceCleanup);
+        }
+      }
+      this.handshakeConnections.delete(ws);
+      if (connection) {
+        this.releaseEnterpriseAuthorization(connection);
+        if (!cleanupStarted) {
+          try {
+            cleanupStarted = true;
+            await connection.session.cleanup();
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+      } else if (enterpriseAuthorizationHandle && this.enterpriseRuntime) {
+        this.enterpriseRuntime.admission.releaseSession(enterpriseAuthorizationHandle);
+        if (enterpriseAuthorizationRuntime) {
+          try {
+            await enterpriseAuthorizationRuntime.release();
+          } catch (runtimeCleanup) {
+            cleanupErrors.push(runtimeCleanup);
+          }
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        // oxlint-disable-next-line preserve-caught-error
+        throw new AggregateError([primary, ...cleanupErrors], "enterprise hello failed", {
+          cause: primary,
+        });
+      }
+      throw primary;
     }
-    pending.identity.sessionId = connection.session.getSessionId();
-    this.syncBrowserToolsClientRegistration(connection);
-    this.sendToClient(ws, this.createServerInfoMessage(connection.session));
-    connection.connectionLogger.info(
-      {
-        ...toConnectionLogFields(pending.identity),
-        resumed: false,
-        totalSessions: this.sessions.size,
-      },
-      "Client connected via hello",
-    );
   }
 
-  private resumeSession(params: {
+  private async resumeSession(params: {
     ws: WebSocketLike;
     message: WSHelloMessage;
     pending: PendingConnection;
     existing: ReconnectableSessionConnection;
-  }): void {
+  }): Promise<void> {
     const { ws, message, pending, existing } = params;
+    const expectedHandle = existing.enterpriseAuthorizationHandle;
     this.incrementRuntimeCounter("helloResumed");
+    const newAppVersion = message.appVersion ?? null;
+    const newClientCapabilities = message.capabilities ?? null;
+    const resumedInfo = this.sendServerInfoToClient(
+      ws,
+      existing.session,
+      existing.enterpriseAuthorizationHandle,
+    );
+    const resumedAllowed = resumedInfo instanceof Promise ? await resumedInfo : resumedInfo;
+    if (!this.isHandshakeCurrent(ws, pending)) {
+      throw new Error("WebSocket closed during session resume");
+    }
+    if (existing.enterpriseAuthorizationHandle !== expectedHandle) {
+      throw new Error("Enterprise session handle changed during resume");
+    }
+    if (expectedHandle && this.enterpriseRuntime) {
+      if (
+        !isCurrentEnterpriseAdmissionAuthorization(
+          this.enterpriseRuntime.admission.authorizationIssuer,
+          expectedHandle,
+        )
+      ) {
+        throw new Error("Enterprise admission is no longer current");
+      }
+    }
+    if (!resumedAllowed) {
+      if (expectedHandle) {
+        throw new Error("Enterprise server_info denied");
+      }
+      this.handshakeConnections.delete(ws);
+      return;
+    }
     if (existing.externalDisconnectCleanupTimeout) {
       clearTimeout(existing.externalDisconnectCleanupTimeout);
       existing.externalDisconnectCleanupTimeout = null;
     }
-    const newAppVersion = message.appVersion ?? null;
     if (newAppVersion && newAppVersion !== existing.appVersion) {
       existing.appVersion = newAppVersion;
       existing.session.updateAppVersion(newAppVersion);
     }
-    const newClientCapabilities = message.capabilities ?? null;
-    // COMPAT(selectiveAgentTimeline): added in v0.1.106. Every capable resumed
-    // hello resets membership before server_info so stale retained-session
-    // state cannot leak. Remove after 2027-01-12.
     existing.session.updateClientCapabilities(newClientCapabilities, ws);
     if (
       JSON.stringify(existing.clientCapabilities ?? null) !==
@@ -1608,9 +2656,9 @@ export class VoiceAssistantWebSocketServer {
     }
     existing.sockets.add(ws);
     this.sessions.set(ws, existing);
+    this.handshakeConnections.delete(ws);
     pending.identity.sessionId = existing.session.getSessionId();
     this.syncBrowserToolsClientRegistration(existing);
-    this.sendToClient(ws, this.createServerInfoMessage(existing.session));
     pending.connectionLogger.info(
       {
         ...toConnectionLogFields(pending.identity),
@@ -1644,6 +2692,7 @@ export class VoiceAssistantWebSocketServer {
         providersSnapshot: true,
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: true,
+        ...this.enterpriseFeatureFlags,
         // COMPAT(checkoutForgeSetAutoMerge): added in v0.2.0-beta.1. Remove the
         // feature gate and legacy fallback after 2027-01-17 once the supported
         // daemon floor is >= v0.2.0.
@@ -1790,6 +2839,51 @@ export class VoiceAssistantWebSocketServer {
     };
   }
 
+  private sendServerInfoToClient(
+    ws: WebSocketLike,
+    session: Session,
+    authorizationHandle?: EnterpriseAdmissionAuthorizationHandle,
+  ): boolean | Promise<boolean> {
+    const message = this.createServerInfoMessage(session);
+    if (this.enterpriseRuntime) {
+      return this.sendEnterpriseServerInfo(ws, session, message, authorizationHandle);
+    }
+    this.sendToClient(ws, message);
+    return true;
+  }
+
+  private async sendEnterpriseServerInfo(
+    ws: WebSocketLike,
+    session: Session,
+    message: WSOutboundMessage,
+    authorizationHandle?: EnterpriseAdmissionAuthorizationHandle,
+  ): Promise<boolean> {
+    const context = session.getEnterpriseSessionContext();
+    if (!context || message.type !== "session") return false;
+    const allowed = await this.enterpriseRuntime!.resourceAuthorization.canEmit(
+      context.principal,
+      message.message,
+      { kind: "transport_control", control: "server_info" },
+    );
+    if (!allowed) {
+      ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise authorization failed");
+      return false;
+    }
+    if (
+      ws.readyState !== 1 ||
+      this.connectionLifecycle === "stopping" ||
+      (authorizationHandle &&
+        !isCurrentEnterpriseAdmissionAuthorization(
+          this.enterpriseRuntime!.admission.authorizationIssuer,
+          authorizationHandle,
+        ))
+    ) {
+      return false;
+    }
+    this.sendToClient(ws, message);
+    return true;
+  }
+
   private createDaemonConfigChangedMessage(config: MutableDaemonConfig): WSOutboundMessage {
     return wrapSessionMessage({
       type: "status",
@@ -1802,7 +2896,22 @@ export class VoiceAssistantWebSocketServer {
 
   private broadcastCapabilitiesUpdate(): void {
     for (const connection of new Set(this.sessions.values())) {
-      this.sendToConnection(connection, this.createServerInfoMessage(connection.session));
+      for (const socket of connection.sockets) {
+        void Promise.resolve(
+          this.sendServerInfoToClient(
+            socket,
+            connection.session,
+            connection.enterpriseAuthorizationHandle,
+          ),
+        )
+          .then((sent) =>
+            sent ? undefined : this.cleanupConnection(connection, "server_info denied"),
+          )
+          .catch((error) => {
+            this.logger.warn({ err: error }, "server_info broadcast send failed");
+            return this.cleanupConnection(connection, "server_info failed");
+          });
+      }
     }
   }
 
@@ -1856,6 +2965,7 @@ export class VoiceAssistantWebSocketServer {
     const identity = this.socketIdentities.get(ws);
     const identityFields = identity ? toConnectionLogFields(identity) : {};
     const pending = this.clearPendingConnection(ws);
+    this.handshakeConnections.delete(ws);
     if (pending) {
       this.incrementRuntimeCounter("pendingDisconnected");
       pending.connectionLogger.info(
@@ -1951,7 +3061,15 @@ export class VoiceAssistantWebSocketServer {
     resolve();
   }
 
-  private async cleanupConnection(
+  private cleanupConnection(connection: SessionConnection, logMessage: string): Promise<void> {
+    const existing = this.connectionCleanupPromises.get(connection);
+    if (existing) return existing;
+    const cleanup = this.cleanupConnectionImpl(connection, logMessage);
+    this.connectionCleanupPromises.set(connection, cleanup);
+    return cleanup;
+  }
+
+  private async cleanupConnectionImpl(
     connection: SessionConnection,
     logMessage: string,
   ): Promise<void> {
@@ -1971,14 +3089,25 @@ export class VoiceAssistantWebSocketServer {
       if (existing === connection) {
         this.externalSessionsByKey.delete(connection.sessionKey);
       }
+      const baseKey = sessionConnectionBaseKey(connection.principalId, connection.clientId);
+      if (this.externalSessionsByBaseKey.get(baseKey) === connection)
+        this.externalSessionsByBaseKey.delete(baseKey);
     }
     this.unregisterBrowserToolsClient(connection);
+    this.releaseEnterpriseAuthorization(connection);
 
     connection.connectionLogger.trace(
       { clientId: connection.clientId, totalSessions: this.sessions.size },
       logMessage,
     );
     await connection.session.cleanup();
+  }
+
+  private releaseEnterpriseAuthorization(connection: SessionConnection): void {
+    const handle = connection.enterpriseAuthorizationHandle;
+    if (!handle) return;
+    connection.enterpriseAuthorizationHandle = undefined;
+    this.enterpriseRuntime?.admission.releaseSession(handle);
   }
 
   private syncBrowserToolsClientRegistration(connection: SessionConnection): void {
@@ -1995,7 +3124,30 @@ export class VoiceAssistantWebSocketServer {
       this.unregisterBrowserToolsClient(registrationKey);
       return;
     }
-    const capabilitySignature = JSON.stringify(browserHostCapability);
+    const authenticatedSession =
+      connection.enterpriseAuthorizationHandle && this.enterpriseRuntime
+        ? (() => {
+            const resolved = resolveCurrentEnterpriseAdmissionAuthorization(
+              this.enterpriseRuntime.admission.authorizationIssuer,
+              connection.enterpriseAuthorizationHandle,
+            );
+            return resolved
+              ? createAuthenticatedBrowserHostSession({
+                  clientId: resolved.clientId,
+                  homeNodeId: resolved.node.nodeId,
+                  sessionBindingGeneration: resolved.sessionBindingGeneration,
+                })
+              : undefined;
+          })()
+        : undefined;
+    if (connection.enterpriseAuthorizationHandle && !authenticatedSession) {
+      this.unregisterBrowserToolsClient(registrationKey);
+      return;
+    }
+    const capabilitySignature = JSON.stringify({
+      capability: browserHostCapability,
+      generation: authenticatedSession?.sessionBindingGeneration ?? null,
+    });
     const existing = this.browserToolsRegistrations.get(registrationKey);
     if (existing?.capabilitySignature === capabilitySignature) {
       return;
@@ -2005,15 +3157,31 @@ export class VoiceAssistantWebSocketServer {
       existing.unregister();
     }
 
+    let routeId: string;
+    if (authenticatedSession) {
+      routeId = `browser-host:${randomUUID()}`;
+    } else if (connection.principalId === "owner") {
+      routeId = connection.clientId;
+    } else {
+      routeId = registrationKey;
+    }
     const unregister = this.browserToolsBroker.registerClient({
-      id: connection.principalId === "owner" ? connection.clientId : registrationKey,
+      id: routeId,
       hostKind: browserHostCapability.hostKind,
       supportedCommands: browserHostCapability.supportedCommands,
+      ...(authenticatedSession
+        ? {
+            authenticatedSession,
+            enterpriseProfiles: { version: 1 as const },
+            homeNodeId: authenticatedSession.homeNodeId,
+          }
+        : {}),
       sendBrowserAutomationRequest: (request) => {
         this.sendToConnection(connection, wrapSessionMessage(request));
       },
     });
     this.browserToolsRegistrations.set(registrationKey, {
+      routeId,
       capabilitySignature,
       unregister,
     });
@@ -2145,35 +3313,91 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike;
     message: WSInboundMessage;
     pendingConnection: PendingConnection;
+    capturedAtUnixMs?: number;
   }): void {
-    const { ws, message, pendingConnection } = params;
-    if (message.type === "hello") {
-      this.handleHello({
-        ws,
-        message,
-        pending: pendingConnection,
-      });
-      return;
-    }
-
-    pendingConnection.connectionLogger.warn(
-      {
-        messageType: message.type,
+    const { ws, message, pendingConnection, capturedAtUnixMs } = params;
+    if (message.type === "hello") this.handshakeInFlight.add(ws);
+    const queue = this.pendingMessageQueues.get(ws) ?? [];
+    this.pendingMessageOwners.set(ws, pendingConnection);
+    queue.push({ message, pendingConnection, capturedAtUnixMs });
+    this.pendingMessageQueues.set(ws, queue);
+    if (this.pendingMessageDraining.has(ws)) return;
+    this.pendingMessageDraining.add(ws);
+    const task = this.drainPendingMessages(ws).catch((error) => {
+      this.pendingMessageErrors.set(ws, error);
+      this.logger.warn({ err: error }, "pending websocket message failed");
+      this.pendingMessageQueues.delete(ws);
+      this.pendingMessageOwners.delete(ws);
+      this.pendingMessageDraining.delete(ws);
+      try {
+        ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, "Authentication failed");
+      } catch {
+        /* ignore */
+      }
+    });
+    this.pendingMessageTasks.set(ws, task);
+    void task.then(
+      () => {
+        if (this.pendingMessageTasks.get(ws) === task) this.pendingMessageTasks.delete(ws);
+        if (this.connectionLifecycle !== "stopping") this.pendingMessageErrors.delete(ws);
+        return undefined;
       },
-      "Rejected pending message before hello",
+      () => {
+        if (this.pendingMessageTasks.get(ws) === task) this.pendingMessageTasks.delete(ws);
+        if (this.connectionLifecycle !== "stopping") this.pendingMessageErrors.delete(ws);
+        return undefined;
+      },
     );
-    this.incrementRuntimeCounter("pendingMessageRejectedBeforeHello");
-    this.clearPendingConnection(ws);
+  }
+
+  // oxlint-disable max-depth -- serialized pending dispatch.
+  private async drainPendingMessages(ws: WebSocketLike): Promise<void> {
     try {
-      ws.close(WS_CLOSE_INVALID_HELLO, "Session message before hello");
+      for (;;) {
+        const item = this.pendingMessageQueues.get(ws)?.shift();
+        if (!item) return;
+        if (item.message.type === "hello") {
+          await this.handleHello({ ws, message: item.message, pending: item.pendingConnection });
+        } else {
+          this.pendingMessageReplaying.add(ws);
+          try {
+            const active = this.sessions.get(ws);
+            if (active && item.message.type === "session") {
+              await this.dispatchSessionMessage(ws, active, item.message, item.capturedAtUnixMs);
+            } else {
+              this.handleRawMessage(
+                ws,
+                Buffer.from(JSON.stringify(item.message)),
+                item.capturedAtUnixMs,
+              );
+            }
+          } finally {
+            this.pendingMessageReplaying.delete(ws);
+          }
+        }
+      }
+    } finally {
+      this.pendingMessageQueues.delete(ws);
+      this.pendingMessageDraining.delete(ws);
+      this.pendingMessageOwners.delete(ws);
+      this.handshakeInFlight.delete(ws);
+    }
+  }
+  // oxlint-enable max-depth
+
+  private emitRpcDiagnostic(observation: WebSocketRpcDiagnosticObservation): void {
+    try {
+      this.rpcDiagnosticObserver?.(observation);
     } catch {
-      // ignore close errors
+      // Diagnostics must never affect protocol handling.
     }
   }
 
+  // oxlint-disable-next-line complexity -- pending queue gate plus protocol dispatch.
   private handleRawMessage(
     ws: WebSocketLike,
     data: Buffer | ArrayBuffer | Buffer[] | string,
+    capturedAtUnixMs = performance.timeOrigin + performance.now(),
   ): void {
     if (
       this.connectionLifecycle === "stopping" ||
@@ -2216,6 +3440,23 @@ export class VoiceAssistantWebSocketServer {
       }
 
       const message = parsedMessage.data;
+      if (
+        !pendingConnection &&
+        this.handshakeInFlight.has(ws) &&
+        !this.pendingMessageReplaying.has(ws)
+      ) {
+        const owner = this.pendingMessageOwners.get(ws);
+        if (owner) {
+          const queue = this.pendingMessageQueues.get(ws) ?? [];
+          queue.push({
+            message,
+            pendingConnection: owner,
+            capturedAtUnixMs,
+          });
+          this.pendingMessageQueues.set(ws, queue);
+          return;
+        }
+      }
       this.recordInboundMessageType(message.type);
 
       if (message.type === "ping") {
@@ -2233,6 +3474,7 @@ export class VoiceAssistantWebSocketServer {
           ws,
           message,
           pendingConnection,
+          capturedAtUnixMs,
         });
         return;
       }
@@ -2255,9 +3497,11 @@ export class VoiceAssistantWebSocketServer {
       }
 
       if (message.type === "session") {
-        void this.dispatchSessionMessage(ws, activeConnection, message).catch((error: unknown) => {
-          this.handleRawMessageError({ ws, data, error, log: activeConnection.connectionLogger });
-        });
+        void this.dispatchSessionMessage(ws, activeConnection, message, capturedAtUnixMs).catch(
+          (error: unknown) => {
+            this.handleRawMessageError({ ws, data, error, log: activeConnection.connectionLogger });
+          },
+        );
       }
     } catch (error) {
       this.handleRawMessageError({ ws, data, error, log });
@@ -2268,6 +3512,7 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike,
     activeConnection: SessionConnection,
     message: Extract<WSInboundMessage, { type: "session" }>,
+    capturedAtUnixMs = performance.timeOrigin + performance.now(),
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
     const controlRpc = getControlRpcLogInfo(message.message);
@@ -2292,10 +3537,39 @@ export class VoiceAssistantWebSocketServer {
         await activeConnection.session.handleMessage(message.message, ws);
         return;
       }
-      this.browserToolsBroker?.receiveResponse(message.message as BrowserAutomationExecuteResponse);
+      const registration = this.browserToolsRegistrations.get(activeConnection.sessionKey);
+      if (!registration) {
+        return;
+      }
+      this.browserToolsBroker?.receiveResponse(
+        registration.routeId,
+        message.message as BrowserAutomationExecuteResponse,
+      );
       return;
     }
 
+    if (
+      message.message.type === "fetch_agents_request" ||
+      message.message.type === "fetch_agent_request"
+    ) {
+      this.emitRpcDiagnostic({
+        phase: "frame.received",
+        requestId: message.message.requestId,
+        requestType: message.message.type,
+        atUnixMs: capturedAtUnixMs,
+      });
+    }
+    if (
+      message.message.type === "fetch_agents_request" ||
+      message.message.type === "fetch_agent_request"
+    ) {
+      this.emitRpcDiagnostic({
+        phase: "session.call",
+        requestId: message.message.requestId,
+        requestType: message.message.type,
+        atUnixMs: performance.timeOrigin + performance.now(),
+      });
+    }
     const startMs = performance.now();
     await activeConnection.session.handleMessage(message.message, ws);
     const durationMs = performance.now() - startMs;
@@ -2708,8 +3982,30 @@ function createWebSocketConnectionIdentity(
   };
 }
 
-function sessionConnectionKey(principalId: string, clientId: string): string {
+function sessionConnectionKey(
+  principalId: string,
+  clientId: string,
+  principal?: PrincipalContext,
+): string {
+  return JSON.stringify([
+    principalId,
+    clientId,
+    principal?.principalType ?? null,
+    principal?.organizationId ?? null,
+    principal?.credentialId ?? null,
+    principal?.grantVersion ?? null,
+  ]);
+}
+function sessionConnectionBaseKey(principalId: string, clientId: string): string {
   return JSON.stringify([principalId, clientId]);
+}
+
+function safeCloseSocket(ws: WebSocketLike, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch {
+    // ignore close errors
+  }
 }
 
 function toConnectionLogFields(identity: WebSocketConnectionIdentity): Record<string, string> {

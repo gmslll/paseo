@@ -335,6 +335,7 @@ describe("workspace git watch targets", () => {
       subscriptionId: "sub-1",
       filter: undefined,
       isBootstrapping: false,
+      excludedWorkspaceIds: new Set(),
       pendingUpdatesByWorkspaceId: new Map(),
       lastEmittedByWorkspaceId: new Map(),
     };
@@ -407,6 +408,7 @@ describe("workspace git watch targets", () => {
       subscriptionId: "sub-1",
       filter: undefined,
       isBootstrapping: false,
+      excludedWorkspaceIds: new Set(),
       pendingUpdatesByWorkspaceId: new Map(),
       lastEmittedByWorkspaceId: new Map(),
     };
@@ -588,6 +590,7 @@ describe("workspace git watch targets", () => {
       subscriptionId: "sub-1",
       filter: undefined,
       isBootstrapping: false,
+      excludedWorkspaceIds: new Set(),
       pendingUpdatesByWorkspaceId: new Map(),
       lastEmittedByWorkspaceId: new Map(),
     };

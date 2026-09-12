@@ -37,6 +37,11 @@ server:
   - "packages/server/**"
   - "packages/app/e2e/support/fixtures/recording.*"
 
+enterprise:
+  - "packages/enterprise-management/**"
+  - "packages/server/src/server/enterprise/managed-node/**"
+  - "packages/protocol/src/enterprise-management*"
+
 desktop:
   - "packages/desktop/**"
   - "packages/app/src/desktop/**"

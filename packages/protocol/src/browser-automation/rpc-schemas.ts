@@ -19,6 +19,9 @@ const BROWSER_AUTOMATION_BROWSER_ID_MESSAGE =
   "browserId must be a real id returned by browser_new_tab or browser_list_tabs";
 const BROWSER_AUTOMATION_WAIT_CONDITION_MESSAGE =
   "browser_wait requires exactly one of text or url";
+const BROWSER_PROFILE_ID_PATTERN = /^brp_[0-9a-f]{16}$/;
+const NODE_ID_PATTERN = /^nod_[0-9a-f]{16}$/;
+const LEASE_ID_PATTERN = /^lea_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const BROWSER_AUTOMATION_COMMAND_NAMES = [
   "list_tabs",
@@ -51,6 +54,14 @@ export const BrowserAutomationBrowserIdSchema = z
   .string({ error: () => BROWSER_AUTOMATION_BROWSER_ID_MESSAGE })
   .min(1, BROWSER_AUTOMATION_BROWSER_ID_MESSAGE)
   .regex(BROWSER_AUTOMATION_BROWSER_ID_PATTERN, BROWSER_AUTOMATION_BROWSER_ID_MESSAGE);
+
+export const BrowserAutomationEnterpriseContextSchema = z.object({
+  browserProfileId: z.string().regex(BROWSER_PROFILE_ID_PATTERN),
+  nodeId: z.string().regex(NODE_ID_PATTERN),
+  leaseId: z.string().regex(LEASE_ID_PATTERN),
+  fencingToken: z.number().int().nonnegative(),
+  leaseRevision: z.string().min(1),
+});
 
 const BrowserAutomationTabTargetSchema = z
   .object({
@@ -259,6 +270,8 @@ export const BrowserAutomationCommandSchema = z.discriminatedUnion("command", [
 export const BrowserAutomationTabInfoSchema = z.object({
   browserId: BrowserAutomationBrowserIdSchema,
   workspaceId: z.string().min(1).optional(),
+  // COMPAT(enterpriseBrowserProfilesV1): added in v0.9.0, remove after 2027-03-09 once host floors support enterprise Profiles.
+  enterpriseContext: BrowserAutomationEnterpriseContextSchema.optional(),
   url: z.string(),
   title: z.string(),
   isActive: z.boolean().default(false),
@@ -502,6 +515,8 @@ export const BrowserAutomationExecuteRequestSchema = z
     agentId: z.string().min(1).optional(),
     cwd: z.string().min(1).optional(),
     workspaceId: z.string().min(1).optional(),
+    // COMPAT(enterpriseBrowserProfilesV1): added in v0.9.0, remove after 2027-03-09 once host floors support enterprise Profiles.
+    enterpriseContext: BrowserAutomationEnterpriseContextSchema.optional(),
     command: BrowserAutomationCommandSchema,
   })
   .strict();
@@ -513,12 +528,16 @@ export const BrowserAutomationExecuteResponseSchema = z.object({
       requestId: z.string().min(1),
       ok: z.literal(true),
       result: BrowserAutomationResultSchema,
+      // COMPAT(enterpriseBrowserProfilesV1): added in v0.9.0, remove after 2027-03-09 once host floors support enterprise Profiles.
+      enterpriseContext: BrowserAutomationEnterpriseContextSchema.optional(),
       dialogs: z.array(BrowserAutomationDialogEventSchema).optional(),
     }),
     z.object({
       requestId: z.string().min(1),
       ok: z.literal(false),
       error: BrowserAutomationErrorSchema,
+      // COMPAT(enterpriseBrowserProfilesV1): added in v0.9.0, remove after 2027-03-09 once host floors support enterprise Profiles.
+      enterpriseContext: BrowserAutomationEnterpriseContextSchema.optional(),
       dialogs: z.array(BrowserAutomationDialogEventSchema).optional(),
     }),
   ]),
@@ -535,6 +554,9 @@ export type BrowserAutomationNetworkLogEntry = z.infer<
   typeof BrowserAutomationNetworkLogEntrySchema
 >;
 export type BrowserAutomationDialogEvent = z.infer<typeof BrowserAutomationDialogEventSchema>;
+export type BrowserAutomationEnterpriseContext = z.infer<
+  typeof BrowserAutomationEnterpriseContextSchema
+>;
 export type BrowserAutomationExecuteRequest = z.infer<typeof BrowserAutomationExecuteRequestSchema>;
 export type BrowserAutomationExecuteResponse = z.infer<
   typeof BrowserAutomationExecuteResponseSchema

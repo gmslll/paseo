@@ -1,18 +1,49 @@
 import { randomUUID } from "node:crypto";
 import {
+  BROWSER_AUTOMATION_COMMAND_NAMES,
+  BrowserAutomationCommandSchema,
   BrowserAutomationExecuteRequestSchema,
   BrowserAutomationExecuteResponseSchema,
   type BrowserAutomationCommand,
   type BrowserAutomationCommandName,
+  type BrowserAutomationEnterpriseContext,
   type BrowserAutomationExecuteRequest,
   type BrowserAutomationExecuteResponse,
+  type BrowserAutomationResult,
 } from "@getpaseo/protocol/browser-automation/rpc-schemas";
+import {
+  BrowserProfileRecordSchema,
+  EnterpriseResourceOwnerSchema,
+  type AuthorizedWorkspace,
+  type FencedLease,
+} from "@getpaseo/protocol/messages";
+import { z } from "zod";
+import type { EnterpriseAgentContextHandle } from "../session/enterprise-agent-session-context-registry.js";
+import type {
+  BrowserProfileLeaseAccessInput,
+  BrowserProfileLeaseAcquireInput,
+  BrowserProfileLeaseAttachHostInput,
+  BrowserProfileLeaseAuthorization,
+} from "../enterprise/browser/lease-manager.js";
 import { browserToolsFailure, type BrowserToolsResponsePayload } from "./errors.js";
+import {
+  isAuthenticatedBrowserHostSession,
+  isBrowserPageIdentityRegistry,
+  type AuthenticatedBrowserHostSession,
+  type BrowserPageIdentityRegistry,
+  type BrowserPageIdentityVerification,
+} from "./page-identity-registry.js";
 
 export interface BrowserHostClient {
+  /** Opaque server-assigned transport route/registration identity. Not an authenticated client ID. */
   id: string;
   hostKind: string;
   supportedCommands: readonly BrowserAutomationCommandName[];
+  enterpriseProfiles?: { version: 1 };
+  /** Trusted execution node from the authenticated Session context. */
+  homeNodeId?: string;
+  /** Nominal W1 Session identity required by the page-observation capability. */
+  authenticatedSession?: AuthenticatedBrowserHostSession;
   sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void | Promise<void>;
 }
 
@@ -25,68 +56,248 @@ export interface BrowserToolsExecuteInput {
   timeoutMs?: number;
 }
 
+export interface EnterpriseBrowserToolsExecuteInput {
+  handle: EnterpriseAgentContextHandle;
+  command: BrowserAutomationCommand;
+}
+
+export interface EnterpriseBrowserProfileHostBindingInput {
+  handle: EnterpriseAgentContextHandle;
+  /** Browser transport route/registration identity, not the authenticated client ID. */
+  hostClientId: string;
+}
+
+export interface EnterpriseBrowserProfileLeasePort {
+  acquire(input: BrowserProfileLeaseAcquireInput): Promise<FencedLease>;
+  attachHost(input: BrowserProfileLeaseAttachHostInput): Promise<void>;
+  validateLease(input: BrowserProfileLeaseAccessInput): Promise<FencedLease>;
+  releaseLease(input: BrowserProfileLeaseAccessInput): Promise<void>;
+  invalidateHost(hostClientId: string): Promise<void>;
+}
+
+export interface EnterpriseBrowserToolsRuntime {
+  isCurrentHandle(handle: EnterpriseAgentContextHandle): boolean;
+  resolveAuthorization(
+    handle: EnterpriseAgentContextHandle,
+  ): BrowserProfileLeaseAuthorization | Promise<BrowserProfileLeaseAuthorization>;
+  leases: EnterpriseBrowserProfileLeasePort;
+  leaseTtlMs: number;
+}
+
 interface PendingBrowserToolsRequest {
-  clientId: string;
+  routeId: string;
+  request: BrowserAutomationExecuteRequest;
+  enterpriseAuthorization?: BrowserProfileLeaseAuthorization;
   rememberAffinity: boolean;
   timeout: ReturnType<typeof setTimeout>;
   resolve: (payload: BrowserToolsResponsePayload) => void;
 }
 
 interface RegisteredBrowserHost {
-  client: BrowserHostClient;
+  routeId: string;
+  hostKind: string;
+  sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void | Promise<void>;
+  enterpriseProfiles?: Readonly<{ version: 1 }>;
+  homeNodeId?: string;
+  authenticatedSession?: AuthenticatedBrowserHostSession;
   registeredAt: number;
   supportedCommands: ReadonlySet<BrowserAutomationCommandName>;
+  ready: Promise<boolean>;
 }
 
 export interface BrowserToolsBrokerOptions {
   defaultTimeoutMs?: number;
   createRequestId?: () => string;
+  enterprise?: EnterpriseBrowserToolsRuntime;
+  pageIdentity?: BrowserPageIdentityRegistry;
+  onHostTeardownError?: (error: Error, routeId: string) => void;
+}
+
+interface EnterpriseRuntimeSnapshot {
+  readonly isCurrentHandle: EnterpriseBrowserToolsRuntime["isCurrentHandle"];
+  readonly resolveAuthorization: EnterpriseBrowserToolsRuntime["resolveAuthorization"];
+  readonly acquire: EnterpriseBrowserProfileLeasePort["acquire"];
+  readonly attachHost: EnterpriseBrowserProfileLeasePort["attachHost"];
+  readonly validateLease: EnterpriseBrowserProfileLeasePort["validateLease"];
+  readonly releaseLease: EnterpriseBrowserProfileLeasePort["releaseLease"];
+  readonly invalidateHost: EnterpriseBrowserProfileLeasePort["invalidateHost"];
+  readonly leaseTtlMs: number;
+}
+
+interface EnterpriseHandleAuthoritySnapshot {
+  readonly agentId: string;
+  readonly organizationId: string;
+  readonly nodeId: string;
+  readonly principalId: string;
+  readonly sessionBindingGeneration: string;
+}
+
+interface EnterprisePageIdentityExecution {
+  readonly verification: BrowserPageIdentityVerification;
+  readonly browserId: string;
 }
 
 const DEFAULT_BROWSER_TOOLS_TIMEOUT_MS = 15_000;
+const MAX_REQUEST_ID_ALLOCATION_ATTEMPTS = 16;
+const BROWSER_HOST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const NODE_ID_PATTERN = /^nod_[0-9a-f]{16}$/;
+const SUPPORTED_BROWSER_COMMANDS = new Set<BrowserAutomationCommandName>(
+  BROWSER_AUTOMATION_COMMAND_NAMES,
+);
+const AuthorizedWorkspaceSchema = EnterpriseResourceOwnerSchema.extend({
+  workspaceId: z.string().min(1),
+}).strict();
+const BrowserProfileLeaseAuthorizationSchema = z
+  .object({
+    workspace: AuthorizedWorkspaceSchema,
+    agent: EnterpriseResourceOwnerSchema.extend({
+      agentId: z.string().min(1),
+      workspaceId: z.string().min(1),
+    }).strict(),
+    profile: BrowserProfileRecordSchema.strict(),
+    bindingRevision: z.string().min(1),
+  })
+  .strict();
 
 export class BrowserToolsBroker {
   private readonly defaultTimeoutMs: number;
   private readonly createRequestId: () => string;
+  private readonly enterpriseRuntime: EnterpriseRuntimeSnapshot | null;
+  private readonly pageIdentity: BrowserPageIdentityRegistry | null;
+  private readonly onHostTeardownError: (error: Error, routeId: string) => void;
   private readonly clients = new Map<string, RegisteredBrowserHost>();
   private readonly pending = new Map<string, PendingBrowserToolsRequest>();
   private readonly browserHostByBrowserId = new Map<string, string>();
   private readonly strandedBrowserHostByBrowserId = new Map<string, string>();
+  private readonly enterpriseBrowserHostByAffinity = new Map<string, string>();
+  private readonly enterpriseBrowserHostByProfile = new Map<string, string>();
+  private readonly liveRequestIds = new Set<string>();
+  private readonly hostTeardownBarriers = new Map<string, Promise<void>>();
+  private readonly readyHosts = new WeakSet<RegisteredBrowserHost>();
+  private readonly failedPageIdentitySessions = new WeakSet<AuthenticatedBrowserHostSession>();
   private registrationSequence = 0;
 
   public constructor(options: BrowserToolsBrokerOptions) {
-    this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_BROWSER_TOOLS_TIMEOUT_MS;
-    this.createRequestId = options.createRequestId ?? (() => `browser_${randomUUID()}`);
+    const defaultTimeoutMs = options.defaultTimeoutMs;
+    const createRequestId = options.createRequestId ?? (() => `browser_${randomUUID()}`);
+    const enterprise = options.enterprise;
+    const pageIdentity = options.pageIdentity;
+    const onHostTeardownError = options.onHostTeardownError;
+    this.defaultTimeoutMs = defaultTimeoutMs ?? DEFAULT_BROWSER_TOOLS_TIMEOUT_MS;
+    this.createRequestId = () => createRequestId();
+    this.onHostTeardownError = onHostTeardownError ?? (() => {});
+    if (pageIdentity !== undefined && !isBrowserPageIdentityRegistry(pageIdentity)) {
+      throw new Error("Enterprise Browser page identity registry is invalid.");
+    }
+    this.pageIdentity = pageIdentity ?? null;
+    const enterpriseLeaseTtlMs = enterprise?.leaseTtlMs;
+    if (enterprise && (!Number.isSafeInteger(enterpriseLeaseTtlMs) || enterpriseLeaseTtlMs! <= 0)) {
+      throw new Error("Enterprise Browser Profile lease TTL must be a positive safe integer.");
+    }
+    if (enterprise) {
+      const isCurrentHandle = enterprise.isCurrentHandle.bind(enterprise);
+      const resolveAuthorization = enterprise.resolveAuthorization.bind(enterprise);
+      const leases = enterprise.leases;
+      const acquire = leases.acquire.bind(leases);
+      const attachHost = leases.attachHost.bind(leases);
+      const validateLease = leases.validateLease.bind(leases);
+      const releaseLease = leases.releaseLease.bind(leases);
+      const invalidateHost = leases.invalidateHost.bind(leases);
+      this.enterpriseRuntime = Object.freeze({
+        isCurrentHandle: (handle: EnterpriseAgentContextHandle) => isCurrentHandle(handle),
+        resolveAuthorization: (handle: EnterpriseAgentContextHandle) =>
+          resolveAuthorization(handle),
+        acquire,
+        attachHost,
+        validateLease,
+        releaseLease,
+        invalidateHost,
+        leaseTtlMs: enterpriseLeaseTtlMs!,
+      });
+    } else {
+      this.enterpriseRuntime = null;
+    }
   }
 
   public registerClient(client: BrowserHostClient): () => void {
-    this.unregisterClient(client.id);
+    const snapshot = snapshotBrowserHostClient(client);
+    const existing = this.clients.get(snapshot.routeId);
+    if (existing) {
+      this.detachRegisteredClient(existing);
+      this.beginHostTeardown(snapshot.routeId);
+    }
+    const teardownBarrier = this.hostTeardownBarriers.get(snapshot.routeId);
     const registeredAt = ++this.registrationSequence;
-    this.clients.set(client.id, {
-      client,
+    let host!: RegisteredBrowserHost;
+    const ready = teardownBarrier
+      ? teardownBarrier.then(
+          () => {
+            if (this.clients.get(snapshot.routeId) !== host) {
+              return false;
+            }
+            this.readyHosts.add(host);
+            return true;
+          },
+          () => {
+            if (this.clients.get(snapshot.routeId) === host) {
+              this.clients.delete(snapshot.routeId);
+            }
+            return false;
+          },
+        )
+      : Promise.resolve(true);
+    host = Object.freeze({
+      ...snapshot,
       registeredAt,
-      supportedCommands: new Set(client.supportedCommands),
+      ready,
     });
-    return () => this.unregisterClient(client.id, registeredAt);
+    this.clients.set(snapshot.routeId, host);
+    if (!teardownBarrier) {
+      this.readyHosts.add(host);
+    }
+    return () => this.unregisterClient(snapshot.routeId, registeredAt);
   }
 
-  public unregisterClient(clientId: string, registeredAt?: number): void {
-    const current = this.clients.get(clientId);
+  public unregisterClient(routeId: string, registeredAt?: number): void {
+    const current = this.clients.get(routeId);
     if (!current || (registeredAt !== undefined && current.registeredAt !== registeredAt)) {
       return;
     }
-    this.clients.delete(clientId);
+    this.detachRegisteredClient(current);
+    this.beginHostTeardown(routeId);
+  }
 
-    for (const [browserId, ownerClientId] of this.browserHostByBrowserId) {
-      if (ownerClientId !== clientId) {
+  private detachRegisteredClient(current: RegisteredBrowserHost): void {
+    const routeId = current.routeId;
+    if (this.clients.get(routeId) === current) {
+      this.clients.delete(routeId);
+    }
+    this.readyHosts.delete(current);
+    if (current.authenticatedSession) {
+      this.pageIdentity?.invalidateHostSession(current.authenticatedSession);
+    }
+
+    for (const [browserId, ownerRouteId] of this.browserHostByBrowserId) {
+      if (ownerRouteId !== routeId) {
         continue;
       }
       this.browserHostByBrowserId.delete(browserId);
-      this.strandedBrowserHostByBrowserId.set(browserId, clientId);
+      this.strandedBrowserHostByBrowserId.set(browserId, routeId);
+    }
+
+    for (const [affinityKey, ownerRouteId] of this.enterpriseBrowserHostByAffinity) {
+      if (ownerRouteId === routeId) {
+        this.enterpriseBrowserHostByAffinity.delete(affinityKey);
+      }
+    }
+    for (const [profileKey, ownerRouteId] of this.enterpriseBrowserHostByProfile) {
+      if (ownerRouteId === routeId) {
+        this.enterpriseBrowserHostByProfile.delete(profileKey);
+      }
     }
 
     for (const [requestId, pending] of this.pending) {
-      if (pending.clientId !== clientId) {
+      if (pending.routeId !== routeId) {
         continue;
       }
       this.pending.delete(requestId);
@@ -102,6 +313,28 @@ export class BrowserToolsBroker {
     }
   }
 
+  private beginHostTeardown(routeId: string): Promise<void> {
+    if (!this.enterpriseRuntime) {
+      return Promise.resolve();
+    }
+    const prior = this.hostTeardownBarriers.get(routeId) ?? Promise.resolve();
+    const barrier = prior.then(() => this.enterpriseRuntime!.invalidateHost(routeId));
+    this.hostTeardownBarriers.set(routeId, barrier);
+    void barrier.then(
+      () => {
+        if (this.hostTeardownBarriers.get(routeId) === barrier) {
+          this.hostTeardownBarriers.delete(routeId);
+        }
+        return undefined;
+      },
+      (error: unknown) => {
+        this.onHostTeardownError(toError(error), routeId);
+        return undefined;
+      },
+    );
+    return barrier;
+  }
+
   public getPendingRequestCount(): number {
     return this.pending.size;
   }
@@ -111,54 +344,503 @@ export class BrowserToolsBroker {
   }
 
   public async execute(input: BrowserToolsExecuteInput): Promise<BrowserToolsResponsePayload> {
-    const requestId = input.requestId ?? this.createRequestId();
+    let requestId = "unknown";
+    let claimedRequestId = false;
+    try {
+      const snapshot = snapshotBrowserToolsExecuteInput(input);
+      if (snapshot.hasCallerOwnedAuthority) {
+        return browserToolsFailure({
+          requestId,
+          code: "browser_denied",
+          message: "Caller-owned Browser Profile authority is not accepted.",
+        });
+      }
+      if (snapshot.requestId) {
+        requestId = snapshot.requestId;
+        this.claimRequestId(requestId);
+      } else {
+        requestId = this.allocateRequestId();
+      }
+      claimedRequestId = true;
+      const request = BrowserAutomationExecuteRequestSchema.safeParse({
+        type: "browser.automation.execute.request",
+        requestId,
+        ...(snapshot.agentId ? { agentId: snapshot.agentId } : {}),
+        ...(snapshot.cwd ? { cwd: snapshot.cwd } : {}),
+        ...(snapshot.workspaceId ? { workspaceId: snapshot.workspaceId } : {}),
+        command: snapshot.command,
+      });
 
-    const request = BrowserAutomationExecuteRequestSchema.safeParse({
-      type: "browser.automation.execute.request",
-      requestId,
-      ...(input.agentId ? { agentId: input.agentId } : {}),
-      ...(input.cwd ? { cwd: input.cwd } : {}),
-      ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
-      command: input.command,
-    });
+      if (!request.success) {
+        return browserToolsFailure({
+          requestId,
+          code: "browser_unknown_error",
+          message: formatBrowserAutomationValidationError(request.error.issues[0]?.message),
+        });
+      }
+      const frozenRequest = deepFreezeClone(request.data);
+      const hostReadiness = this.getHostReadinessBarrier();
+      if (hostReadiness) {
+        await hostReadiness;
+      }
+      if (frozenRequest.command.command === "list_tabs") {
+        return this.executeListTabs({
+          request: frozenRequest,
+          timeoutMs: snapshot.timeoutMs ?? this.defaultTimeoutMs,
+        });
+      }
 
-    if (!request.success) {
+      const host = this.selectHostForRequest(frozenRequest);
+      if (!host.ok) {
+        return host.payload;
+      }
+
+      const unsupported = this.unsupportedCommandFailure({
+        host: host.value,
+        commandName: frozenRequest.command.command,
+        requestId,
+      });
+      if (unsupported) {
+        return unsupported;
+      }
+
+      return this.sendRequest({
+        host: host.value,
+        request: frozenRequest,
+        timeoutMs: snapshot.timeoutMs ?? this.defaultTimeoutMs,
+      });
+    } catch (error) {
       return browserToolsFailure({
         requestId,
         code: "browser_unknown_error",
-        message: formatBrowserAutomationValidationError(request.error.issues[0]?.message),
+        message: `Browser automation request failed closed: ${toError(error).message}`,
       });
+    } finally {
+      if (claimedRequestId) {
+        this.liveRequestIds.delete(requestId);
+      }
     }
+  }
 
-    if (request.data.command.command === "list_tabs") {
-      return this.executeListTabs({
-        request: request.data,
-        timeoutMs: input.timeoutMs ?? this.defaultTimeoutMs,
-      });
-    }
-
-    const host = this.selectHostForCommand(request.data.command, requestId);
-    if (!host.ok) {
-      return host.payload;
-    }
-
-    const unsupported = this.unsupportedCommandFailure({
-      host: host.value,
-      commandName: request.data.command.command,
+  public async executeEnterprise(
+    input: EnterpriseBrowserToolsExecuteInput,
+  ): Promise<BrowserToolsResponsePayload> {
+    let requestId = "unknown";
+    let claimedRequestId = false;
+    let lease: FencedLease | null = null;
+    let cleanupHandle: EnterpriseAgentContextHandle | null = null;
+    let result: BrowserToolsResponsePayload = browserToolsFailure({
       requestId,
+      code: "browser_denied",
+      message: "Enterprise browser authorization failed closed.",
     });
-    if (unsupported) {
-      return unsupported;
-    }
+    try {
+      const runtime = this.enterpriseRuntime;
+      const snapshot = snapshotEnterpriseExecuteInput(input);
+      cleanupHandle = snapshot.handle;
+      requestId = this.allocateRequestId();
+      claimedRequestId = true;
+      if (!runtime) {
+        return browserToolsFailure({
+          requestId,
+          code: "browser_disabled",
+          message: "Enterprise Browser Profiles are disabled on this daemon.",
+        });
+      }
+      const handleAuthority = this.snapshotCurrentHandle(runtime, snapshot.handle);
+      const pageIdentity = await this.preparePageIdentityExecution(runtime, snapshot);
+      const authorization = await this.resolveCurrentAuthorization(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+      );
 
-    return this.sendRequest({
-      host: host.value,
-      request: request.data,
-      timeoutMs: input.timeoutMs ?? this.defaultTimeoutMs,
+      await this.recheckPageIdentityExecution(pageIdentity, authorization);
+      const selected = this.selectEnterpriseHostForCommand(
+        {
+          command: snapshot.command,
+          requestId,
+          bootstrapAuthority: handleAuthority,
+        },
+        authorization,
+      );
+      if (!selected.ok) {
+        result = selected.payload;
+      } else {
+        await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value);
+        const unsupported = this.unsupportedCommandFailure({
+          host: selected.value,
+          commandName: snapshot.command.command,
+          requestId,
+        });
+        if (unsupported) {
+          result = unsupported;
+        } else {
+          lease = await runtime.acquire({
+            handle: snapshot.handle,
+            resourceId: authorization.profile.browserProfileId,
+            mode: leaseModeForCommand(snapshot.command),
+            ttlMs: runtime.leaseTtlMs,
+          });
+          await this.assertAuthorizationStillCurrent(
+            runtime,
+            snapshot.handle,
+            handleAuthority,
+            authorization,
+          );
+          const enterpriseContext = enterpriseContextFromLease(lease);
+          const request = deepFreezeClone(
+            BrowserAutomationExecuteRequestSchema.parse({
+              type: "browser.automation.execute.request",
+              requestId,
+              agentId: authorization.agent.agentId,
+              workspaceId: authorization.workspace.workspaceId,
+              enterpriseContext,
+              command: snapshot.command,
+            }),
+          );
+          await runtime.attachHost({
+            handle: snapshot.handle,
+            lease,
+            hostClientId: selected.value.routeId,
+          });
+          await this.assertAuthorizationStillCurrent(
+            runtime,
+            snapshot.handle,
+            handleAuthority,
+            authorization,
+          );
+          await this.recheckPageIdentityExecution(pageIdentity, authorization, selected.value);
+          result = await this.sendRequest({
+            host: selected.value,
+            request,
+            enterpriseAuthorization: authorization,
+            rememberAffinity: false,
+            timeoutMs: this.defaultTimeoutMs,
+          });
+          await runtime.validateLease({ handle: snapshot.handle, lease });
+          await this.assertAuthorizationStillCurrent(
+            runtime,
+            snapshot.handle,
+            handleAuthority,
+            authorization,
+          );
+          if (
+            result.ok &&
+            this.clients.get(selected.value.routeId) === selected.value &&
+            this.readyHosts.has(selected.value)
+          ) {
+            this.rememberBrowserHostForPayload(
+              selected.value.routeId,
+              result,
+              request,
+              authorization,
+            );
+          } else if (result.ok) {
+            result = this.noBrowserHostFailure(requestId);
+          }
+        }
+      }
+    } catch {
+      result = browserToolsFailure({
+        requestId,
+        code: "browser_denied",
+        message: "Enterprise browser authorization is no longer current.",
+      });
+    } finally {
+      if (lease && cleanupHandle && this.enterpriseRuntime) {
+        try {
+          await this.enterpriseRuntime.releaseLease({ handle: cleanupHandle, lease });
+        } catch {
+          if (result.ok) {
+            result = browserToolsFailure({
+              requestId,
+              code: "browser_denied",
+              message: "Enterprise browser lease cleanup failed closed.",
+            });
+          }
+        }
+      }
+      if (claimedRequestId) {
+        this.liveRequestIds.delete(requestId);
+      }
+    }
+    return result;
+  }
+
+  public async bindEnterpriseProfileHost(
+    input: EnterpriseBrowserProfileHostBindingInput,
+  ): Promise<boolean> {
+    const runtime = this.enterpriseRuntime;
+    let lease: FencedLease | null = null;
+    let cleanupHandle: EnterpriseAgentContextHandle | null = null;
+    let releaseAttempted = false;
+    try {
+      if (!runtime) {
+        return false;
+      }
+      const snapshot = snapshotEnterpriseHostBindingInput(input);
+      cleanupHandle = snapshot.handle;
+      const handleAuthority = this.snapshotCurrentHandle(runtime, snapshot.handle);
+      const authorization = await this.resolveCurrentAuthorization(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+      );
+      const host = await this.getReadyHost(snapshot.hostClientId);
+      if (!host || !this.isEnterpriseHostForNode(host, authorization.profile.homeNodeId)) {
+        return false;
+      }
+      await this.assertAuthorizationStillCurrent(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+        authorization,
+      );
+      lease = await runtime.acquire({
+        handle: snapshot.handle,
+        resourceId: authorization.profile.browserProfileId,
+        mode: "read",
+        ttlMs: runtime.leaseTtlMs,
+      });
+      await this.assertAuthorizationStillCurrent(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+        authorization,
+      );
+      await runtime.attachHost({
+        handle: snapshot.handle,
+        lease,
+        hostClientId: host.routeId,
+      });
+      await this.assertAuthorizationStillCurrent(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+        authorization,
+      );
+      await runtime.validateLease({ handle: snapshot.handle, lease });
+      await this.assertAuthorizationStillCurrent(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+        authorization,
+      );
+      releaseAttempted = true;
+      await runtime.releaseLease({ handle: snapshot.handle, lease });
+      lease = null;
+      await this.assertAuthorizationStillCurrent(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+        authorization,
+      );
+      if ((await this.getReadyHost(host.routeId)) !== host) {
+        return false;
+      }
+      await this.assertAuthorizationStillCurrent(
+        runtime,
+        snapshot.handle,
+        handleAuthority,
+        authorization,
+      );
+      this.enterpriseBrowserHostByProfile.set(
+        getEnterpriseBrowserProfileKey({
+          authorization,
+        }),
+        host.routeId,
+      );
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (lease && cleanupHandle && runtime && !releaseAttempted) {
+        releaseAttempted = true;
+        try {
+          await runtime.releaseLease({ handle: cleanupHandle, lease });
+        } catch {
+          // The binding is never published when proof-lease cleanup fails.
+        }
+      }
+    }
+  }
+
+  private async preparePageIdentityExecution(
+    runtime: EnterpriseRuntimeSnapshot,
+    input: ReturnType<typeof snapshotEnterpriseExecuteInput>,
+  ): Promise<EnterprisePageIdentityExecution | null> {
+    if (!this.pageIdentity) {
+      throw new Error("Enterprise Browser page identity is unavailable.");
+    }
+    // These Profile-filtered bootstrap operations create the server-owned Browser registration
+    // that atomically combines with authenticated provisional page evidence. Neither operation
+    // grants page proof by itself.
+    if (input.command.command === "list_tabs" || input.command.command === "new_tab") {
+      return null;
+    }
+    const browserId = getBrowserIdForCommand(input.command);
+    if (!browserId) throw new Error("Enterprise browser command has no canonical Browser ID.");
+    // The command ID is only a selector; Profile, binding, host, and observation authority all
+    // come from the unique server-owned Browser registration resolved by the registry.
+    const verification = await this.pageIdentity.verify({ browserId });
+    this.assertCurrentHandle(runtime, input.handle);
+    await this.pageIdentity.recheck(verification, { browserId });
+    this.assertCurrentHandle(runtime, input.handle);
+    return Object.freeze({
+      verification,
+      browserId,
     });
   }
 
-  public receiveResponse(response: BrowserAutomationExecuteResponse): boolean {
+  private async recheckPageIdentityExecution(
+    input: EnterprisePageIdentityExecution | null,
+    authorization: BrowserProfileLeaseAuthorization,
+    host?: RegisteredBrowserHost,
+  ): Promise<void> {
+    if (!input || !this.pageIdentity) return;
+    const authenticatedSession = host?.authenticatedSession;
+    if (
+      host &&
+      (!authenticatedSession || this.failedPageIdentitySessions.has(authenticatedSession))
+    ) {
+      throw new Error("Authenticated Browser host Session is unavailable.");
+    }
+    await this.pageIdentity.recheck(
+      input.verification,
+      authenticatedSession
+        ? {
+            browserId: input.browserId,
+            browserProfileId: authorization.profile.browserProfileId,
+            bindingRevision: authorization.bindingRevision,
+            hostClientId: authenticatedSession.clientId,
+            hostSessionBindingGeneration: authenticatedSession.sessionBindingGeneration,
+          }
+        : {
+            browserId: input.browserId,
+            browserProfileId: authorization.profile.browserProfileId,
+            bindingRevision: authorization.bindingRevision,
+          },
+    );
+  }
+
+  private assertCurrentHandle(
+    runtime: EnterpriseRuntimeSnapshot,
+    handle: EnterpriseAgentContextHandle,
+  ): void {
+    if (!runtime.isCurrentHandle(handle)) {
+      throw new Error("Enterprise Agent context is stale.");
+    }
+  }
+
+  private snapshotCurrentHandle(
+    runtime: EnterpriseRuntimeSnapshot,
+    handle: EnterpriseAgentContextHandle,
+  ): EnterpriseHandleAuthoritySnapshot {
+    this.assertCurrentHandle(runtime, handle);
+    return snapshotEnterpriseHandleAuthority(handle);
+  }
+
+  private async resolveCurrentAuthorization(
+    runtime: EnterpriseRuntimeSnapshot,
+    handle: EnterpriseAgentContextHandle,
+    handleAuthority: EnterpriseHandleAuthoritySnapshot,
+  ): Promise<BrowserProfileLeaseAuthorization> {
+    this.assertCurrentHandle(runtime, handle);
+    const unresolved = await runtime.resolveAuthorization(handle);
+    this.assertCurrentHandle(runtime, handle);
+    const authorization = snapshotBrowserProfileLeaseAuthorization(unresolved);
+    assertBrowserAuthorizationMatchesHandle(handleAuthority, authorization);
+    return authorization;
+  }
+
+  private async assertAuthorizationStillCurrent(
+    runtime: EnterpriseRuntimeSnapshot,
+    handle: EnterpriseAgentContextHandle,
+    handleAuthority: EnterpriseHandleAuthoritySnapshot,
+    expected: BrowserProfileLeaseAuthorization,
+  ): Promise<void> {
+    const current = await this.resolveCurrentAuthorization(runtime, handle, handleAuthority);
+    if (!browserProfileLeaseAuthorizationsEqual(expected, current)) {
+      throw new Error("Enterprise Browser Profile authorization changed during execution.");
+    }
+  }
+
+  private getHostReadinessBarrier(): Promise<unknown> | null {
+    const pendingHosts = Array.from(this.clients.values()).filter(
+      (host) => !this.readyHosts.has(host),
+    );
+    return pendingHosts.length > 0 ? Promise.all(pendingHosts.map((host) => host.ready)) : null;
+  }
+
+  private async getReadyHost(routeId: string): Promise<RegisteredBrowserHost | null> {
+    const host = this.clients.get(routeId);
+    if (
+      !host ||
+      !(await host.ready) ||
+      this.clients.get(routeId) !== host ||
+      !this.readyHosts.has(host)
+    ) {
+      return null;
+    }
+    return host;
+  }
+
+  private claimRequestId(requestId: string): void {
+    if (
+      typeof requestId !== "string" ||
+      !BROWSER_HOST_ID_PATTERN.test(requestId) ||
+      this.liveRequestIds.has(requestId) ||
+      this.pending.has(requestId)
+    ) {
+      throw new Error("Browser automation request ID is invalid or already active.");
+    }
+    this.liveRequestIds.add(requestId);
+  }
+
+  private allocateRequestId(): string {
+    for (let attempt = 0; attempt < MAX_REQUEST_ID_ALLOCATION_ATTEMPTS; attempt += 1) {
+      const requestId = this.createRequestId();
+      try {
+        this.claimRequestId(requestId);
+        return requestId;
+      } catch {
+        // Retry boundedly; malformed or colliding factories fail closed below.
+      }
+    }
+    throw new Error("Unable to allocate a unique Browser automation request ID.");
+  }
+
+  private allocateDerivedRequestId(baseRequestId: string, routeId: string): string {
+    for (let attempt = 0; attempt < MAX_REQUEST_ID_ALLOCATION_ATTEMPTS; attempt += 1) {
+      const suffix = attempt === 0 ? "" : `:${attempt}`;
+      const requestId = `${baseRequestId}:${routeId}${suffix}`;
+      try {
+        this.claimRequestId(requestId);
+        return requestId;
+      } catch {
+        // Try the next deterministic suffix without ever overwriting live state.
+      }
+    }
+    throw new Error("Unable to allocate a unique Browser automation child request ID.");
+  }
+
+  public receiveResponse(senderId: string, response: BrowserAutomationExecuteResponse): boolean;
+  /**
+   * COMPAT(browserResponseSender): added in v0.9.0; remove after websocket hosts always pass
+   * their server-side registration identity (after 2027-03-09). Enterprise responses never
+   * use this overload.
+   */
+  public receiveResponse(response: BrowserAutomationExecuteResponse): boolean;
+  public receiveResponse(
+    senderOrResponse: string | BrowserAutomationExecuteResponse,
+    responseFromSender?: BrowserAutomationExecuteResponse,
+  ): boolean {
+    const senderId = typeof senderOrResponse === "string" ? senderOrResponse : null;
+    const response = typeof senderOrResponse === "string" ? responseFromSender : senderOrResponse;
+    if (!response) {
+      return false;
+    }
     const parsed = BrowserAutomationExecuteResponseSchema.safeParse(response);
     if (!parsed.success) {
       const requestId = getBrowserAutomationResponseRequestId(response);
@@ -168,6 +850,9 @@ export class BrowserToolsBroker {
 
       const pending = this.pending.get(requestId);
       if (!pending) {
+        return false;
+      }
+      if (!this.responseSenderMatches(pending, senderId)) {
         return false;
       }
 
@@ -187,11 +872,19 @@ export class BrowserToolsBroker {
     if (!pending) {
       return false;
     }
+    if (!this.responseMatchesPendingRequest(pending, senderId, parsed.data)) {
+      return false;
+    }
 
     this.pending.delete(parsed.data.payload.requestId);
     clearTimeout(pending.timeout);
     if (pending.rememberAffinity) {
-      this.rememberBrowserHostForPayload(pending.clientId, parsed.data.payload);
+      this.rememberBrowserHostForPayload(
+        pending.routeId,
+        parsed.data.payload,
+        pending.request,
+        pending.enterpriseAuthorization,
+      );
     }
     pending.resolve(parsed.data.payload);
     return true;
@@ -201,7 +894,9 @@ export class BrowserToolsBroker {
     request: BrowserAutomationExecuteRequest;
     timeoutMs: number;
   }): Promise<BrowserToolsResponsePayload> {
-    const hosts = Array.from(this.clients.values());
+    const hosts = params.request.enterpriseContext
+      ? this.listEnterpriseHostsForNode(params.request.enterpriseContext.nodeId)
+      : Array.from(this.clients.values()).filter((host) => this.readyHosts.has(host));
     if (hosts.length === 0) {
       return this.noBrowserHostFailure(params.request.requestId);
     }
@@ -225,20 +920,32 @@ export class BrowserToolsBroker {
       });
     }
 
-    const hostResponses = await Promise.all(
-      hosts.map(async (host) => ({
-        host,
-        payload: await this.sendRequest({
-          host,
-          request: {
-            ...params.request,
-            requestId: `${params.request.requestId}:${host.client.id}`,
-          },
-          rememberAffinity: false,
-          timeoutMs: params.timeoutMs,
+    const childRequestIds: string[] = [];
+    let hostResponses: Array<{ host: RegisteredBrowserHost; payload: BrowserToolsResponsePayload }>;
+    try {
+      hostResponses = await Promise.all(
+        hosts.map(async (host) => {
+          const childRequestId = this.allocateDerivedRequestId(
+            params.request.requestId,
+            host.routeId,
+          );
+          childRequestIds.push(childRequestId);
+          return {
+            host,
+            payload: await this.sendRequest({
+              host,
+              request: deepFreezeClone({ ...params.request, requestId: childRequestId }),
+              rememberAffinity: false,
+              timeoutMs: params.timeoutMs,
+            }),
+          };
         }),
-      })),
-    );
+      );
+    } finally {
+      for (const childRequestId of childRequestIds) {
+        this.liveRequestIds.delete(childRequestId);
+      }
+    }
 
     const failed = hostResponses.find(({ payload }) => !payload.ok);
     if (failed) {
@@ -246,7 +953,7 @@ export class BrowserToolsBroker {
     }
 
     for (const { host, payload } of hostResponses) {
-      this.rememberBrowserHostForPayload(host.client.id, payload);
+      this.rememberBrowserHostForPayload(host.routeId, payload, params.request);
     }
 
     return {
@@ -261,12 +968,26 @@ export class BrowserToolsBroker {
     };
   }
 
-  private selectHostForCommand(
-    command: BrowserAutomationCommand,
-    requestId: string,
+  private selectHostForRequest(
+    request: BrowserAutomationExecuteRequest,
+    enterpriseAuthorization?: BrowserProfileLeaseAuthorization,
   ):
     | { ok: true; value: RegisteredBrowserHost }
     | { ok: false; payload: BrowserToolsResponsePayload } {
+    const { command, requestId } = request;
+    if (request.enterpriseContext) {
+      return enterpriseAuthorization
+        ? this.selectEnterpriseHostForRequest(request, enterpriseAuthorization)
+        : {
+            ok: false,
+            payload: browserToolsFailure({
+              requestId,
+              code: "browser_denied",
+              message: "Enterprise browser routing authority is unavailable.",
+            }),
+          };
+    }
+
     if (command.command === "new_tab") {
       const host = this.selectMostRecentlyRegisteredHost();
       return host
@@ -282,10 +1003,10 @@ export class BrowserToolsBroker {
         : { ok: false, payload: this.noBrowserHostFailure(requestId) };
     }
 
-    const ownerClientId = this.browserHostByBrowserId.get(browserId);
-    if (ownerClientId) {
-      const host = this.clients.get(ownerClientId);
-      if (host) {
+    const ownerRouteId = this.browserHostByBrowserId.get(browserId);
+    if (ownerRouteId) {
+      const host = this.clients.get(ownerRouteId);
+      if (host && this.readyHosts.has(host)) {
         return { ok: true, value: host };
       }
       return {
@@ -294,12 +1015,12 @@ export class BrowserToolsBroker {
       };
     }
 
-    const strandedOwnerClientId = this.strandedBrowserHostByBrowserId.get(browserId);
-    if (strandedOwnerClientId) {
-      const reconnectedHost = this.clients.get(strandedOwnerClientId);
-      if (reconnectedHost) {
+    const strandedOwnerRouteId = this.strandedBrowserHostByBrowserId.get(browserId);
+    if (strandedOwnerRouteId) {
+      const reconnectedHost = this.clients.get(strandedOwnerRouteId);
+      if (reconnectedHost && this.readyHosts.has(reconnectedHost)) {
         this.strandedBrowserHostByBrowserId.delete(browserId);
-        this.browserHostByBrowserId.set(browserId, strandedOwnerClientId);
+        this.browserHostByBrowserId.set(browserId, strandedOwnerRouteId);
         return { ok: true, value: reconnectedHost };
       }
       return {
@@ -308,14 +1029,12 @@ export class BrowserToolsBroker {
       };
     }
 
-    if (this.clients.size === 1) {
-      const host = this.selectMostRecentlyRegisteredHost();
-      if (host) {
-        return { ok: true, value: host };
-      }
+    const readyHosts = this.listReadyHosts();
+    if (readyHosts.length === 1) {
+      return { ok: true, value: readyHosts[0] };
     }
 
-    if (this.clients.size === 0) {
+    if (readyHosts.length === 0) {
       return { ok: false, payload: this.noBrowserHostFailure(requestId) };
     }
 
@@ -329,12 +1048,147 @@ export class BrowserToolsBroker {
     };
   }
 
+  private selectEnterpriseHostForRequest(
+    request: BrowserAutomationExecuteRequest,
+    authorization: BrowserProfileLeaseAuthorization,
+  ):
+    | { ok: true; value: RegisteredBrowserHost }
+    | { ok: false; payload: BrowserToolsResponsePayload } {
+    const { command, enterpriseContext, requestId, workspaceId } = request;
+    if (!enterpriseContext || !workspaceId) {
+      return {
+        ok: false,
+        payload: browserToolsFailure({
+          requestId,
+          code: "browser_denied",
+          message: "Enterprise browser automation requires an authorized workspace.",
+        }),
+      };
+    }
+    return this.selectEnterpriseHostForCommand({ command, requestId }, authorization);
+  }
+
+  private selectEnterpriseHostForCommand(
+    input: {
+      readonly command: BrowserAutomationCommand;
+      readonly requestId: string;
+      readonly bootstrapAuthority?: EnterpriseHandleAuthoritySnapshot;
+    },
+    authorization: BrowserProfileLeaseAuthorization,
+  ):
+    | { ok: true; value: RegisteredBrowserHost }
+    | { ok: false; payload: BrowserToolsResponsePayload } {
+    const { command, requestId } = input;
+
+    const homeNodeId = authorization.profile.homeNodeId;
+    const eligibleHosts = this.listEnterpriseHostsForNode(homeNodeId);
+    const profileKey = getEnterpriseBrowserProfileKey({ authorization });
+    const profileOwnerRouteId = this.enterpriseBrowserHostByProfile.get(profileKey);
+    const routedHost = profileOwnerRouteId ? this.clients.get(profileOwnerRouteId) : undefined;
+    if (routedHost && !this.isEnterpriseHostForNode(routedHost, homeNodeId)) {
+      this.enterpriseBrowserHostByProfile.delete(profileKey);
+    }
+    if (command.command === "new_tab" || command.command === "list_tabs") {
+      const host =
+        routedHost && this.isEnterpriseHostForNode(routedHost, homeNodeId) ? routedHost : null;
+      if (host) {
+        return { ok: true, value: host };
+      }
+      const bootstrapHosts = input.bootstrapAuthority
+        ? this.listEnterpriseBootstrapHosts(input.bootstrapAuthority, homeNodeId)
+        : [];
+      if (bootstrapHosts.length === 1) {
+        return { ok: true, value: bootstrapHosts[0] };
+      }
+      return {
+        ok: false,
+        payload: browserToolsFailure({
+          requestId,
+          code: "browser_denied",
+          message:
+            "This Browser Profile does not have a unique authorized Desktop host for the current Agent Session.",
+        }),
+      };
+    }
+
+    const browserId = getBrowserIdForCommand(command);
+    if (!browserId) {
+      return {
+        ok: false,
+        payload: browserToolsFailure({
+          requestId,
+          code: "browser_unknown_error",
+          message: "Enterprise browser automation request has no browser target.",
+        }),
+      };
+    }
+    const affinityKey = getEnterpriseBrowserAffinityKey({ authorization, browserId });
+    const ownerRouteId = this.enterpriseBrowserHostByAffinity.get(affinityKey);
+    const host = ownerRouteId ? this.clients.get(ownerRouteId) : undefined;
+    if (host && this.isEnterpriseHostForNode(host, homeNodeId)) {
+      return { ok: true, value: host };
+    }
+    this.enterpriseBrowserHostByAffinity.delete(affinityKey);
+
+    if (eligibleHosts.length === 0) {
+      return { ok: false, payload: this.noBrowserHostFailure(requestId) };
+    }
+    return {
+      ok: false,
+      payload: browserToolsFailure({
+        requestId,
+        code: "browser_tab_not_found",
+        message: `Browser tab ${browserId} is not registered for this Browser Profile. Call browser_list_tabs and use one of the returned browserId values.`,
+      }),
+    };
+  }
+
   private selectMostRecentlyRegisteredHost(): RegisteredBrowserHost | null {
     let selected: RegisteredBrowserHost | null = null;
     for (const host of this.clients.values()) {
-      selected = host;
+      if (this.readyHosts.has(host)) {
+        selected = host;
+      }
     }
     return selected;
+  }
+
+  private listReadyHosts(): RegisteredBrowserHost[] {
+    return Array.from(this.clients.values()).filter((host) => this.readyHosts.has(host));
+  }
+
+  private listEnterpriseHostsForNode(nodeId: string): RegisteredBrowserHost[] {
+    return Array.from(this.clients.values()).filter(
+      (host) => this.readyHosts.has(host) && this.isEnterpriseHostForNode(host, nodeId),
+    );
+  }
+
+  private listEnterpriseBootstrapHosts(
+    authority: EnterpriseHandleAuthoritySnapshot,
+    profileHomeNodeId: string,
+  ): RegisteredBrowserHost[] {
+    if (authority.nodeId !== profileHomeNodeId) return [];
+    return Array.from(this.clients.values()).filter((host) => {
+      const session = host.authenticatedSession;
+      return (
+        session !== undefined &&
+        this.isEnterpriseHostForNode(host, authority.nodeId) &&
+        session.homeNodeId === authority.nodeId &&
+        session.sessionBindingGeneration === authority.sessionBindingGeneration &&
+        !this.failedPageIdentitySessions.has(session)
+      );
+    });
+  }
+
+  private isEnterpriseHostForNode(host: RegisteredBrowserHost, nodeId: string): boolean {
+    return (
+      this.readyHosts.has(host) &&
+      host.enterpriseProfiles?.version === 1 &&
+      host.homeNodeId === nodeId &&
+      (!this.pageIdentity ||
+        (host.authenticatedSession !== undefined &&
+          !this.failedPageIdentitySessions.has(host.authenticatedSession)))
+    );
   }
 
   private unsupportedCommandFailure(params: {
@@ -374,16 +1228,26 @@ export class BrowserToolsBroker {
   }
 
   private rememberBrowserHostForPayload(
-    clientId: string,
+    routeId: string,
     payload: BrowserToolsResponsePayload,
+    request: BrowserAutomationExecuteRequest,
+    enterpriseAuthorization?: BrowserProfileLeaseAuthorization,
   ): void {
     if (!payload.ok) {
       return;
     }
 
+    if (request.enterpriseContext) {
+      if (!request.workspaceId || !enterpriseAuthorization) {
+        return;
+      }
+      this.rememberEnterpriseBrowserHostForPayload(routeId, payload, enterpriseAuthorization);
+      return;
+    }
+
     if (payload.result.command === "list_tabs") {
       for (const tab of payload.result.tabs) {
-        this.browserHostByBrowserId.set(tab.browserId, clientId);
+        this.browserHostByBrowserId.set(tab.browserId, routeId);
         this.strandedBrowserHostByBrowserId.delete(tab.browserId);
       }
       return;
@@ -396,20 +1260,124 @@ export class BrowserToolsBroker {
     }
 
     if ("browserId" in payload.result) {
-      this.browserHostByBrowserId.set(payload.result.browserId, clientId);
+      this.browserHostByBrowserId.set(payload.result.browserId, routeId);
       this.strandedBrowserHostByBrowserId.delete(payload.result.browserId);
     }
+  }
+
+  private rememberEnterpriseBrowserHostForPayload(
+    routeId: string,
+    payload: Extract<BrowserToolsResponsePayload, { ok: true }>,
+    authorization: BrowserProfileLeaseAuthorization,
+  ): void {
+    const affinityKey = (browserId: string): string =>
+      getEnterpriseBrowserAffinityKey({ authorization, browserId });
+
+    const host = this.clients.get(routeId);
+    const pageIdentity = this.pageIdentity;
+    const authenticatedSession = host?.authenticatedSession;
+    if (
+      !host ||
+      !pageIdentity ||
+      !authenticatedSession ||
+      this.failedPageIdentitySessions.has(authenticatedSession)
+    ) {
+      if (host) this.failPageIdentityHost(host);
+      throw new Error("Enterprise Browser host Session is unavailable.");
+    }
+
+    let browserIds: readonly string[] = [];
+    if (payload.result.command === "list_tabs") {
+      browserIds = payload.result.tabs.map((tab) => tab.browserId);
+    } else if ("browserId" in payload.result) {
+      browserIds = [payload.result.browserId];
+    }
+    try {
+      for (const browserId of browserIds) {
+        pageIdentity.registerBrowser({
+          host: authenticatedSession,
+          browserId,
+          browserProfileId: authorization.profile.browserProfileId,
+          bindingRevision: authorization.bindingRevision,
+        });
+      }
+    } catch (error) {
+      this.failPageIdentityHost(host);
+      throw error;
+    }
+
+    this.enterpriseBrowserHostByProfile.set(
+      getEnterpriseBrowserProfileKey({ authorization }),
+      routeId,
+    );
+
+    if (payload.result.command === "list_tabs") {
+      for (const tab of payload.result.tabs) {
+        this.enterpriseBrowserHostByAffinity.set(affinityKey(tab.browserId), routeId);
+      }
+      return;
+    }
+    if (payload.result.command === "close_tab") {
+      this.enterpriseBrowserHostByAffinity.delete(affinityKey(payload.result.browserId));
+      pageIdentity.invalidateBrowser(authenticatedSession, payload.result.browserId);
+      return;
+    }
+    if ("browserId" in payload.result) {
+      this.enterpriseBrowserHostByAffinity.set(affinityKey(payload.result.browserId), routeId);
+    }
+  }
+
+  private failPageIdentityHost(host: RegisteredBrowserHost): void {
+    if (host.authenticatedSession) {
+      this.failedPageIdentitySessions.add(host.authenticatedSession);
+    }
+    this.detachRegisteredClient(host);
+    this.beginHostTeardown(host.routeId);
+  }
+
+  private responseSenderMatches(
+    pending: PendingBrowserToolsRequest,
+    senderId: string | null,
+  ): boolean {
+    if (senderId !== null) {
+      return senderId === pending.routeId;
+    }
+    return pending.request.enterpriseContext === undefined;
+  }
+
+  private responseMatchesPendingRequest(
+    pending: PendingBrowserToolsRequest,
+    senderId: string | null,
+    response: BrowserAutomationExecuteResponse,
+  ): boolean {
+    if (!this.responseSenderMatches(pending, senderId)) {
+      return false;
+    }
+    const expectedContext = pending.request.enterpriseContext;
+    const actualContext = response.payload.enterpriseContext;
+    if (!expectedContext) {
+      return actualContext === undefined;
+    }
+    if (!actualContext || !browserEnterpriseContextsEqual(expectedContext, actualContext)) {
+      return false;
+    }
+    if (!response.payload.ok) {
+      return true;
+    }
+    return browserResultMatchesEnterpriseRequest(pending.request, response.payload.result);
   }
 
   private sendRequest(params: {
     host: RegisteredBrowserHost;
     request: BrowserAutomationExecuteRequest;
+    enterpriseAuthorization?: BrowserProfileLeaseAuthorization;
     rememberAffinity?: boolean;
     timeoutMs: number;
   }): Promise<BrowserToolsResponsePayload> {
     const { host, request, timeoutMs } = params;
-    const client = host.client;
-
+    if (this.clients.get(host.routeId) !== host || !this.readyHosts.has(host)) {
+      return Promise.resolve(this.noBrowserHostFailure(request.requestId));
+    }
     return new Promise<BrowserToolsResponsePayload>((resolve) => {
       const timeout = setTimeout(() => {
         if (!this.pending.delete(request.requestId)) {
@@ -426,14 +1394,18 @@ export class BrowserToolsBroker {
       }, timeoutMs);
 
       this.pending.set(request.requestId, {
-        clientId: client.id,
+        routeId: host.routeId,
+        request,
+        ...(params.enterpriseAuthorization
+          ? { enterpriseAuthorization: params.enterpriseAuthorization }
+          : {}),
         rememberAffinity: params.rememberAffinity ?? true,
         timeout,
         resolve,
       });
 
       try {
-        Promise.resolve(client.sendBrowserAutomationRequest(request)).catch((error: unknown) => {
+        Promise.resolve(host.sendBrowserAutomationRequest(request)).catch((error: unknown) => {
           resolveSendFailure({
             requestId: request.requestId,
             pending: this.pending,
@@ -462,8 +1434,263 @@ function getBrowserIdForCommand(command: BrowserAutomationCommand): string | nul
   return command.args.browserId;
 }
 
+function getEnterpriseBrowserAffinityKey(input: {
+  authorization: BrowserProfileLeaseAuthorization;
+  browserId: string;
+}): string {
+  const { authorization } = input;
+  return JSON.stringify([
+    authorization.workspace.organizationId,
+    authorization.profile.homeNodeId,
+    authorization.workspace.workspaceId,
+    authorization.profile.browserProfileId,
+    authorization.bindingRevision,
+    authorization.workspace.ownerPrincipalId,
+    input.browserId,
+  ]);
+}
+
+function getEnterpriseBrowserProfileKey(input: {
+  authorization: BrowserProfileLeaseAuthorization;
+}): string {
+  const { authorization } = input;
+  return JSON.stringify([
+    authorization.workspace.organizationId,
+    authorization.profile.homeNodeId,
+    authorization.workspace.workspaceId,
+    authorization.profile.browserProfileId,
+    authorization.bindingRevision,
+    authorization.workspace.ownerPrincipalId,
+  ]);
+}
+
+function snapshotBrowserToolsExecuteInput(input: BrowserToolsExecuteInput): {
+  command: BrowserAutomationCommand;
+  agentId?: string;
+  cwd?: string;
+  workspaceId?: string;
+  requestId?: string;
+  timeoutMs?: number;
+  hasCallerOwnedAuthority: boolean;
+} {
+  const values = readOwnDataRecord(input, "Browser automation execution input");
+  const authorityKeys = new Set([
+    "browserProfileId",
+    "enterpriseContext",
+    "fencingToken",
+    "lease",
+    "leaseId",
+    "partition",
+    "partitionKey",
+    "pid",
+    "processId",
+  ]);
+  const allowedKeys = new Set([
+    "agentId",
+    "command",
+    "cwd",
+    "requestId",
+    "timeoutMs",
+    "workspaceId",
+  ]);
+  const keys = Object.keys(values);
+  const hasCallerOwnedAuthority = keys.some((key) => authorityKeys.has(key));
+  if (keys.some((key) => !allowedKeys.has(key) && !authorityKeys.has(key))) {
+    throw new Error("Browser automation execution input has unknown fields.");
+  }
+  return {
+    command: deepFreezeClone(values.command) as BrowserAutomationCommand,
+    ...(values.agentId !== undefined ? { agentId: values.agentId as string } : {}),
+    ...(values.cwd !== undefined ? { cwd: values.cwd as string } : {}),
+    ...(values.workspaceId !== undefined ? { workspaceId: values.workspaceId as string } : {}),
+    ...(values.requestId !== undefined ? { requestId: values.requestId as string } : {}),
+    ...(values.timeoutMs !== undefined ? { timeoutMs: values.timeoutMs as number } : {}),
+    hasCallerOwnedAuthority,
+  };
+}
+
+function snapshotEnterpriseExecuteInput(input: EnterpriseBrowserToolsExecuteInput): {
+  handle: EnterpriseAgentContextHandle;
+  command: BrowserAutomationCommand;
+} {
+  const values = readSelectedOwnDataProperties(
+    input,
+    ["command", "handle"],
+    ["command", "handle"],
+    "Enterprise Browser execution input",
+  );
+  if (Reflect.ownKeys(input).some((key) => key !== "command" && key !== "handle")) {
+    throw new Error("Enterprise Browser execution input has invalid fields.");
+  }
+  return {
+    handle: values.handle as EnterpriseAgentContextHandle,
+    command: snapshotBrowserAutomationCommand(values.command),
+  };
+}
+
+function snapshotEnterpriseHostBindingInput(input: EnterpriseBrowserProfileHostBindingInput): {
+  handle: EnterpriseAgentContextHandle;
+  hostClientId: string;
+} {
+  const values = readExactOwnDataRecord(
+    input,
+    ["handle", "hostClientId"],
+    "Enterprise Browser host binding input",
+  );
+  if (
+    typeof values.hostClientId !== "string" ||
+    !BROWSER_HOST_ID_PATTERN.test(values.hostClientId)
+  ) {
+    throw new Error("Invalid Enterprise Browser host registration ID.");
+  }
+  return {
+    handle: values.handle as EnterpriseAgentContextHandle,
+    hostClientId: values.hostClientId,
+  };
+}
+
+function snapshotBrowserAutomationCommand(input: unknown): BrowserAutomationCommand {
+  return deepFreezeClone(BrowserAutomationCommandSchema.parse(clonePlainData(input)));
+}
+
+function snapshotEnterpriseHandleAuthority(
+  handle: EnterpriseAgentContextHandle,
+): EnterpriseHandleAuthoritySnapshot {
+  const handleValues = readOwnDataRecord(handle, "Enterprise Agent context handle", {
+    allowSymbols: true,
+  });
+  const context = readExactOwnDataRecord(
+    handleValues.context,
+    ["node", "principal", "sessionBindingGeneration"],
+    "Enterprise Agent context",
+  );
+  const principal = readOwnDataRecord(context.principal, "Enterprise Principal context");
+  const node = readOwnDataRecord(context.node, "Enterprise Node context");
+  const values = {
+    agentId: handleValues.agentId,
+    organizationId: principal.organizationId,
+    nodeId: node.nodeId,
+    principalId: principal.principalId,
+    sessionBindingGeneration: context.sessionBindingGeneration,
+  };
+  if (Object.values(values).some((value) => typeof value !== "string" || value.length === 0)) {
+    throw new Error("Invalid Enterprise Agent context authority.");
+  }
+  return Object.freeze(values) as EnterpriseHandleAuthoritySnapshot;
+}
+
+function snapshotBrowserProfileLeaseAuthorization(
+  input: unknown,
+): BrowserProfileLeaseAuthorization {
+  return deepFreezeClone(BrowserProfileLeaseAuthorizationSchema.parse(clonePlainData(input)));
+}
+
+function assertBrowserAuthorizationMatchesHandle(
+  handle: EnterpriseHandleAuthoritySnapshot,
+  authorization: BrowserProfileLeaseAuthorization,
+): void {
+  const { workspace } = authorization;
+  if (
+    workspace.organizationId !== handle.organizationId ||
+    workspace.nodeId !== handle.nodeId ||
+    workspace.ownerPrincipalId !== handle.principalId ||
+    authorization.agent.agentId !== handle.agentId ||
+    authorization.agent.workspaceId !== workspace.workspaceId ||
+    !authorizedResourceOwnersEqual(authorization.agent, workspace) ||
+    authorization.profile.organizationId !== workspace.organizationId ||
+    authorization.profile.homeNodeId !== workspace.nodeId ||
+    authorization.profile.ownerPrincipalId !== workspace.ownerPrincipalId
+  ) {
+    throw new Error("Resolved Browser Profile authorization does not match its canonical tuple.");
+  }
+}
+
+function authorizedResourceOwnersEqual(
+  left: AuthorizedWorkspace,
+  right: AuthorizedWorkspace,
+): boolean {
+  return (
+    left.organizationId === right.organizationId &&
+    left.nodeId === right.nodeId &&
+    left.workspaceId === right.workspaceId &&
+    left.ownerPrincipalId === right.ownerPrincipalId &&
+    left.createdByPrincipalId === right.createdByPrincipalId
+  );
+}
+
+function browserProfileLeaseAuthorizationsEqual(
+  left: BrowserProfileLeaseAuthorization,
+  right: BrowserProfileLeaseAuthorization,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function enterpriseContextFromLease(lease: FencedLease): BrowserAutomationEnterpriseContext {
+  if (lease.resourceKind !== "browser_profile") {
+    throw new Error("Browser automation received a non-Browser Profile lease.");
+  }
+  return {
+    browserProfileId: lease.resourceId,
+    nodeId: lease.nodeId,
+    leaseId: lease.leaseId,
+    fencingToken: lease.fencingToken,
+    leaseRevision: lease.leaseRevision,
+  };
+}
+
+function leaseModeForCommand(command: BrowserAutomationCommand): "read" | "write" {
+  switch (command.command) {
+    case "list_tabs":
+    case "snapshot":
+    case "screenshot":
+    case "logs":
+    case "wait":
+      return "read";
+    default:
+      return "write";
+  }
+}
+
+function browserEnterpriseContextsEqual(
+  expected: BrowserAutomationEnterpriseContext,
+  actual: BrowserAutomationEnterpriseContext,
+): boolean {
+  return (
+    actual.browserProfileId === expected.browserProfileId &&
+    actual.nodeId === expected.nodeId &&
+    actual.leaseId === expected.leaseId &&
+    actual.fencingToken === expected.fencingToken &&
+    actual.leaseRevision === expected.leaseRevision
+  );
+}
+
+function browserResultMatchesEnterpriseRequest(
+  request: BrowserAutomationExecuteRequest,
+  result: BrowserAutomationResult,
+): boolean {
+  if (result.command !== request.command.command || !request.enterpriseContext) {
+    return false;
+  }
+  const expectedBrowserId = getBrowserIdForCommand(request.command);
+  if (expectedBrowserId && (!("browserId" in result) || result.browserId !== expectedBrowserId)) {
+    return false;
+  }
+  if (result.command === "list_tabs") {
+    return result.tabs.every(
+      (tab) =>
+        tab.workspaceId === request.workspaceId &&
+        tab.enterpriseContext !== undefined &&
+        browserEnterpriseContextsEqual(request.enterpriseContext!, tab.enterpriseContext),
+    );
+  }
+  if ("workspaceId" in result && result.workspaceId !== undefined) {
+    return result.workspaceId === request.workspaceId;
+  }
+  return true;
+}
+
 function describeBrowserHost(host: RegisteredBrowserHost): string {
-  const hostKind = host.client.hostKind.trim();
+  const hostKind = host.hostKind;
   return hostKind || "browser host";
 }
 
@@ -524,6 +1751,289 @@ function getBrowserAutomationResponseRequestId(response: unknown): string | null
     return null;
   }
   return payload.requestId;
+}
+
+function snapshotBrowserHostClient(
+  input: BrowserHostClient,
+): Omit<RegisteredBrowserHost, "ready" | "registeredAt"> {
+  const values = readSelectedOwnDataProperties(
+    input,
+    [
+      "authenticatedSession",
+      "enterpriseProfiles",
+      "homeNodeId",
+      "hostKind",
+      "id",
+      "sendBrowserAutomationRequest",
+      "supportedCommands",
+    ],
+    ["hostKind", "id", "sendBrowserAutomationRequest", "supportedCommands"],
+    "Browser host registration",
+  );
+  const {
+    id,
+    hostKind,
+    supportedCommands,
+    authenticatedSession,
+    enterpriseProfiles,
+    homeNodeId,
+    sendBrowserAutomationRequest,
+  } = values;
+  if (typeof id !== "string" || !BROWSER_HOST_ID_PATTERN.test(id)) {
+    throw new Error("Invalid Browser host registration ID.");
+  }
+  if (typeof hostKind !== "string" || hostKind.trim().length === 0) {
+    throw new Error("Invalid Browser host kind.");
+  }
+  const commandValues = clonePlainData(supportedCommands);
+  if (!Array.isArray(commandValues)) {
+    throw new Error("Invalid Browser host command capability.");
+  }
+  const commands = commandValues.map((command) => {
+    if (
+      typeof command !== "string" ||
+      !SUPPORTED_BROWSER_COMMANDS.has(command as BrowserAutomationCommandName)
+    ) {
+      throw new Error("Invalid Browser host command capability.");
+    }
+    return command as BrowserAutomationCommandName;
+  });
+  if (new Set(commands).size !== commands.length) {
+    throw new Error("Duplicate Browser host command capability.");
+  }
+  if (typeof sendBrowserAutomationRequest !== "function") {
+    throw new Error("Invalid Browser host send method.");
+  }
+
+  const { enterpriseCapability, trustedHomeNodeId, trustedSession } =
+    snapshotEnterpriseBrowserHostIdentity({
+      enterpriseProfiles,
+      homeNodeId,
+      authenticatedSession,
+    });
+  const send = sendBrowserAutomationRequest as (
+    request: BrowserAutomationExecuteRequest,
+  ) => void | Promise<void>;
+  const receiver = Object.freeze({
+    id,
+    hostKind: hostKind.trim(),
+    supportedCommands: Object.freeze([...commands]),
+    sendBrowserAutomationRequest: send,
+    ...(enterpriseCapability
+      ? { enterpriseProfiles: enterpriseCapability, homeNodeId: trustedHomeNodeId }
+      : {}),
+    ...(trustedSession ? { authenticatedSession: trustedSession } : {}),
+  });
+  return Object.freeze({
+    routeId: id,
+    hostKind: hostKind.trim(),
+    supportedCommands: new Set(commands),
+    sendBrowserAutomationRequest: (request: BrowserAutomationExecuteRequest) =>
+      Reflect.apply(send, receiver, [request]),
+    ...(enterpriseCapability
+      ? { enterpriseProfiles: enterpriseCapability, homeNodeId: trustedHomeNodeId }
+      : {}),
+    ...(trustedSession ? { authenticatedSession: trustedSession } : {}),
+  });
+}
+
+function snapshotEnterpriseBrowserHostIdentity(input: {
+  enterpriseProfiles: unknown;
+  homeNodeId: unknown;
+  authenticatedSession: unknown;
+}): {
+  enterpriseCapability?: Readonly<{ version: 1 }>;
+  trustedHomeNodeId?: string;
+  trustedSession?: AuthenticatedBrowserHostSession;
+} {
+  const { enterpriseProfiles, homeNodeId, authenticatedSession } = input;
+  if (enterpriseProfiles === undefined) {
+    if (homeNodeId !== undefined || authenticatedSession !== undefined) {
+      throw new Error("A legacy Browser host cannot claim Enterprise authority.");
+    }
+    return {};
+  }
+  const capability = readExactOwnDataRecord(
+    enterpriseProfiles,
+    ["version"],
+    "Enterprise Browser host capability",
+  );
+  if (capability.version !== 1) {
+    throw new Error("Invalid Enterprise Browser host capability version.");
+  }
+  if (typeof homeNodeId !== "string" || !NODE_ID_PATTERN.test(homeNodeId)) {
+    throw new Error("Enterprise Browser host requires a valid trusted home node ID.");
+  }
+  const enterpriseCapability = Object.freeze({ version: 1 as const });
+  const trustedHomeNodeId = homeNodeId;
+  if (authenticatedSession === undefined) return { enterpriseCapability, trustedHomeNodeId };
+  if (
+    !isAuthenticatedBrowserHostSession(authenticatedSession) ||
+    authenticatedSession.homeNodeId !== homeNodeId
+  ) {
+    throw new Error("Enterprise Browser host Session does not match its registration.");
+  }
+  return { enterpriseCapability, trustedHomeNodeId, trustedSession: authenticatedSession };
+}
+
+function readSelectedOwnDataProperties(
+  input: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(input);
+  } catch (error) {
+    throw new Error(`${label} cannot be inspected: ${toError(error).message}`, {
+      cause: error,
+    });
+  }
+  for (const key of requiredKeys) {
+    if (!(key in descriptors)) {
+      throw new Error(`${label}.${key} is required.`);
+    }
+  }
+  const output: Record<string, unknown> = {};
+  for (const key of allowedKeys) {
+    const descriptor = descriptors[key];
+    if (!descriptor) {
+      continue;
+    }
+    if (descriptor.get || descriptor.set || !("value" in descriptor)) {
+      throw new Error(`${label}.${key} must be a stable data property.`);
+    }
+    output[key] = descriptor.value;
+  }
+  return output;
+}
+
+function readExactOwnDataRecord(
+  input: unknown,
+  expectedKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  const record = readOwnDataRecord(input, label);
+  const keys = Object.keys(record).sort();
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error(`${label} has invalid fields.`);
+  }
+  return record;
+}
+
+function readOwnDataRecord(
+  input: unknown,
+  label: string,
+  options: { allowSymbols?: boolean } = {},
+): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  let descriptors: PropertyDescriptorMap;
+  let symbols: symbol[];
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(input);
+    symbols = Object.getOwnPropertySymbols(input);
+  } catch (error) {
+    throw new Error(`${label} cannot be inspected: ${toError(error).message}`, {
+      cause: error,
+    });
+  }
+  if (!options.allowSymbols && symbols.length > 0) {
+    throw new Error(`${label} has invalid symbol fields.`);
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (descriptor.get || descriptor.set || !("value" in descriptor)) {
+      throw new Error(`${label}.${key} must be a stable data property.`);
+    }
+    output[key] = descriptor.value;
+  }
+  return output;
+}
+
+function clonePlainData(input: unknown, depth = 0): unknown {
+  if (depth > 32) {
+    throw new Error("Browser data nesting is too deep.");
+  }
+  if (
+    input === null ||
+    typeof input === "string" ||
+    typeof input === "number" ||
+    typeof input === "boolean" ||
+    input === undefined
+  ) {
+    return input;
+  }
+  if (Array.isArray(input)) {
+    let descriptors: PropertyDescriptorMap;
+    try {
+      descriptors = Object.getOwnPropertyDescriptors(input) as unknown as PropertyDescriptorMap;
+    } catch (error) {
+      throw new Error(`Browser array cannot be inspected: ${toError(error).message}`, {
+        cause: error,
+      });
+    }
+    const lengthDescriptor = descriptors.length;
+    const length = lengthDescriptor?.value;
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new Error("Invalid Browser array length.");
+    }
+    const keys = Object.keys(descriptors).filter((key) => key !== "length");
+    if (keys.length !== length) {
+      throw new Error("Sparse or decorated Browser arrays are not accepted.");
+    }
+    return Array.from({ length }, (_, index) => {
+      const descriptor = descriptors[String(index)];
+      if (!descriptor || descriptor.get || descriptor.set || !("value" in descriptor)) {
+        throw new Error("Browser array entries must be stable data properties.");
+      }
+      return clonePlainData(descriptor.value, depth + 1);
+    });
+  }
+  if (typeof input !== "object") {
+    throw new Error("Browser data contains a non-data value.");
+  }
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(input);
+  } catch (error) {
+    throw new Error(`Browser object prototype cannot be inspected: ${toError(error).message}`, {
+      cause: error,
+    });
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("Browser data must use plain objects.");
+  }
+  const values = readOwnDataRecord(input, "Browser data");
+  return Object.fromEntries(
+    Object.entries(values).map(([key, value]) => [key, clonePlainData(value, depth + 1)]),
+  );
+}
+
+function deepFreezeClone<T>(input: T): T {
+  return deepFreeze(clonePlainData(input)) as T;
+}
+
+function deepFreeze<T>(input: T): T {
+  if (input && typeof input === "object" && !Object.isFrozen(input)) {
+    for (const value of Object.values(input as Record<string, unknown>)) {
+      deepFreeze(value);
+    }
+    Object.freeze(input);
+  }
+  return input;
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

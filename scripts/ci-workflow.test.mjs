@@ -7,6 +7,7 @@ const repoRoot = new URL("../", import.meta.url);
 const ciWorkflowPath = new URL(".github/workflows/ci.yml", repoRoot);
 const dockerWorkflowPath = new URL(".github/workflows/docker.yml", repoRoot);
 const nixWorkflowPath = new URL(".github/workflows/nix.yml", repoRoot);
+const desktopReleaseWorkflowPath = new URL(".github/workflows/desktop-release.yml", repoRoot);
 const filtersPath = new URL(".github/ci-paths.yml", repoRoot);
 const serverTsconfigPath = new URL("packages/server/tsconfig.server.json", repoRoot);
 const desktopPackagePath = new URL("packages/desktop/package.json", repoRoot);
@@ -17,6 +18,7 @@ const gatedCiJobs = new Map([
   ["typecheck", { name: "typecheck", contract: "quality" }],
   ["server-tests-ubuntu", { name: "server-tests (ubuntu-latest)", contracts: ["server", "hub"] }],
   ["server-tests-windows", { name: "server-tests (windows-latest)", contracts: ["server", "hub"] }],
+  ["enterprise-management-tests", { name: "enterprise management tests", contract: "enterprise" }],
   ["desktop-tests-ubuntu", { name: "desktop-tests (ubuntu-latest)", contract: "desktop" }],
   ["desktop-tests-windows", { name: "desktop-tests (windows-latest)", contract: "desktop" }],
   ["app-tests", { name: "app-tests", contract: "app" }],
@@ -109,6 +111,22 @@ test("change gating allows superseded workflow runs to cancel", () => {
   }
 });
 
+test("non-publishing macOS desktop builds do not require release credentials", () => {
+  const workflowSource = readFileSync(desktopReleaseWorkflowPath, "utf8");
+  const jobs = jobBlocks(workflowSource);
+  const publishMacos = jobs.get("publish-macos")?.join("\n") ?? "";
+
+  assert.match(publishMacos, /if \[\[ "\$SHOULD_PUBLISH" != "true" \]\]; then/);
+  assert.match(
+    publishMacos,
+    /unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID/,
+  );
+  assert.match(publishMacos, /export CSC_IDENTITY_AUTO_DISCOVERY=false/);
+  assert.match(publishMacos, /build_args\+=\("-c\.mac\.notarize=false"\)/);
+  assert.match(publishMacos, /if: env\.SHOULD_PUBLISH != 'true'/);
+  assert.match(publishMacos, /name: desktop-macos-\$\{\{ matrix\.electron_arch \}\}/);
+});
+
 test("focused contracts stay inside existing required checks", () => {
   const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
   const changes = jobs.get("changes")?.join("\n") ?? "";
@@ -160,6 +178,11 @@ test("PR routing declares stable behavior ownership", () => {
     quality: ["**/*.{cjs,js,json,jsx,mjs,ts,tsx}", "packages/expo-two-way-audio/**"],
     hub: ["packages/cli/src/commands/hub/**", "packages/server/src/server/hub/**"],
     server: ["packages/server/**", "packages/app/e2e/support/fixtures/recording.*"],
+    enterprise: [
+      "packages/enterprise-management/**",
+      "packages/server/src/server/enterprise/managed-node/**",
+      "packages/protocol/src/enterprise-management*",
+    ],
     desktop: [
       "packages/desktop/**",
       "packages/app/src/desktop/**",

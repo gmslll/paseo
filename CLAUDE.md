@@ -4,6 +4,14 @@ Paseo is a mobile app for monitoring and controlling your local AI coding agents
 
 **Supported agents:** Claude Code, Codex, GitHub Copilot, OpenCode, and Pi.
 
+## Enterprise multi-user project
+
+Before making any change for the enterprise multi-user project, read
+`ENTERPRISE_IMPLEMENTATION_MASTER.md` completely. Work only inside the assigned W0–W8
+workstream and obey its exclusive file ownership. If a requested change crosses a workstream
+boundary or conflicts with the master spec, stop that part, create a `DECISION_REQUIRED` ADR
+draft, and hand it to the integration owner. No test evidence means the work is not complete.
+
 ## Repository map
 
 This is an npm workspace monorepo:
@@ -47,6 +55,7 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [docs/protocol-compatibility.md](docs/protocol-compatibility.md)     | Why app/daemon versions drift, protocol vs feature contract, capability gating, COMPAT tagging                                 |
 | [docs/protocol-validation.md](docs/protocol-validation.md)           | zod-aot generated inbound WebSocket validation, patched compiler regressions, schema-purity rules                              |
 | [docs/permissions.md](docs/permissions.md)                           | Semantic daemon permissions, principals, credentials, pairing invitations, and Hub authority                                   |
+| [docs/enterprise/contracts.md](docs/enterprise/contracts.md)         | Enterprise V1 protocol contracts, trusted inputs, authorization ports, projections, and compatibility boundaries               |
 | [docs/terminal-performance.md](docs/terminal-performance.md)         | Terminal latency pipeline, coalescing/backpressure invariants, benchmark + perf spec usage                                     |
 | [docs/agent-stream-performance.md](docs/agent-stream-performance.md) | Assistant text pipeline — coalescing window, paced reveal, why arrival lumps are smoothed at render                            |
 | [docs/file-observation.md](docs/file-observation.md)                 | Recursive watcher ownership, Linux constraints, teardown invariants, and Parcel comparison                                     |
@@ -106,9 +115,14 @@ Repo dev commands use checkout-local state by default. In this checkout, `PASEO_
 
 See [docs/development.md](docs/development.md) for full setup, build sync requirements, and debugging.
 
-## Critical rules
+## Release branches
 
-- **Before changing the plugin SDK, compiler, host module maps, scaffold, or examples, read [SDK import boundaries](docs/plugins.md#sdk-import-boundaries).** Classify the export by runtime first and preserve the enforced boundaries.
+When the user says "this goes to next", create or
+retarget the PR to `next` and preserve that destination through delivery. Follow
+[release branch discipline](docs/release.md#release-branch-discipline) for creating
+and updating `next`, integrating it after a release, and releasing a hotfix from a tag.
+
+## Critical rules
 
 - **NEVER restart the main Paseo daemon on port 6767 without permission** — it manages all running agents. If you're an agent, restarting it kills your own process.
 - **NEVER assume a timeout means the service needs restarting** — timeouts can be transient.

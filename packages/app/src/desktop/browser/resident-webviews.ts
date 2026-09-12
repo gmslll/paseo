@@ -9,12 +9,22 @@ import { WEB_SURFACE_PLANE } from "@/lib/overlay-root";
 const RESIDENT_BROWSER_HOST_ID = "paseo-browser-resident-webviews";
 const BROWSER_ID_ATTRIBUTE = "data-paseo-browser-id";
 const BROWSER_SURFACE_ATTRIBUTE = "data-paseo-browser-surface";
+const PROFILE_WORKSPACE_ATTRIBUTE = "data-paseo-workspace-id";
+const PROFILE_ORGANIZATION_ATTRIBUTE = "data-paseo-organization-id";
+const PROFILE_HOME_NODE_ATTRIBUTE = "data-paseo-home-node-id";
+const PROFILE_ID_ATTRIBUTE = "data-paseo-browser-profile-id";
+const PROFILE_BINDING_ATTRIBUTE = "data-paseo-binding-revision";
+const PROFILE_LIFECYCLE_ATTRIBUTE = "data-paseo-lifecycle-generation";
+const ENTERPRISE_BROWSER_PROFILE_ID_PATTERN = /^brp_[0-9a-f]{16}$/;
+const ENTERPRISE_ORGANIZATION_ID_PATTERN = /^org_[0-9a-f]{16}$/;
+const ENTERPRISE_NODE_ID_PATTERN = /^nod_[0-9a-f]{16}$/;
 const RESIDENT_VIEWPORT_WIDTH = 1280;
 const RESIDENT_VIEWPORT_HEIGHT = 800;
 
 const residentWebviewsByBrowserId = new Map<string, HTMLElement>();
 const residentSurfacesByBrowserId = new Map<string, HTMLElement>();
 const residentWebviewSizesByBrowserId = new Map<string, { width: number; height: number }>();
+const browserProfilesByBrowserId = new Map<string, BrowserProfileAuthorizationResult>();
 
 interface BrowserWebviewElement extends HTMLElement {
   src: string;
@@ -24,16 +34,41 @@ interface BrowserWebviewElement extends HTMLElement {
 interface BrowserWebviewIdentity {
   browserId: string;
   workspaceId: string;
+  profile?: BrowserProfileRuntimeSelector;
+}
+
+export interface BrowserProfileRuntimeAuthorization {
+  organizationId: string;
+  homeNodeId: string;
+  workspaceId: string;
+  browserProfileId: string;
+  bindingRevision: string;
+  lifecycleGeneration: string;
+}
+
+export type BrowserProfileRuntimeSelector = Pick<
+  BrowserProfileRuntimeAuthorization,
+  | "organizationId"
+  | "homeNodeId"
+  | "workspaceId"
+  | "browserProfileId"
+  | "bindingRevision"
+  | "lifecycleGeneration"
+>;
+
+export interface BrowserProfileAuthorizationResult {
+  authorization: BrowserProfileRuntimeAuthorization;
+  partition: string;
 }
 
 export interface BrowserWebviewProfileHost {
   profilePartition: string;
-  registerAttachedBrowser(input: DesktopAttachedBrowserRegistration): Promise<void>;
+  registerAttachedBrowser(
+    input: DesktopAttachedBrowserRegistration & { profile?: BrowserProfileRuntimeSelector },
+  ): Promise<void>;
 }
 
-function isAttachedBrowserBridge(
-  browser: DesktopBrowserBridge | undefined,
-): browser is BrowserWebviewProfileHost {
+function isAttachedBrowserBridge(browser: DesktopBrowserBridge | undefined): boolean {
   return (
     browser !== undefined &&
     typeof browser.profilePartition === "string" &&
@@ -50,7 +85,7 @@ function getBrowserBridge(override?: BrowserWebviewProfileHost): BrowserWebviewP
   if (!isAttachedBrowserBridge(browser)) {
     throw new Error("Electron browser profile bridge is unavailable");
   }
-  return browser;
+  return browser as BrowserWebviewProfileHost;
 }
 
 function registerBrowserWhenAttached(
@@ -67,11 +102,53 @@ function registerBrowserWhenAttached(
         browserId: identity.browserId,
         workspaceId: identity.workspaceId,
         webContentsId,
+        ...(identity.profile ? { profile: identity.profile } : {}),
       })
       .catch((error) => {
         console.error("[browser-webview] attached registration failed", error);
       });
   });
+}
+
+function browserProfileResultsEqual(
+  left: BrowserProfileAuthorizationResult,
+  right: BrowserProfileAuthorizationResult,
+): boolean {
+  return (
+    left.partition === right.partition &&
+    left.authorization.organizationId === right.authorization.organizationId &&
+    left.authorization.homeNodeId === right.authorization.homeNodeId &&
+    left.authorization.workspaceId === right.authorization.workspaceId &&
+    left.authorization.browserProfileId === right.authorization.browserProfileId &&
+    left.authorization.bindingRevision === right.authorization.bindingRevision &&
+    left.authorization.lifecycleGeneration === right.authorization.lifecycleGeneration
+  );
+}
+
+function rememberBrowserProfile(
+  browserId: string,
+  profile: BrowserProfileAuthorizationResult,
+): void {
+  const snapshot = parseBrowserProfileAuthorizationResult(profile);
+  const existing = browserProfilesByBrowserId.get(browserId);
+  if (existing && !browserProfileResultsEqual(existing, snapshot)) {
+    throw new Error("An existing Browser ID cannot change its Workspace or Profile binding.");
+  }
+  browserProfilesByBrowserId.set(browserId, snapshot);
+}
+
+export function getBrowserWebviewProfile(
+  browserId: string,
+): BrowserProfileAuthorizationResult | null {
+  const profile = browserProfilesByBrowserId.get(browserId);
+  return profile ? parseBrowserProfileAuthorizationResult(profile) : null;
+}
+
+export function inheritBrowserWebviewProfile(sourceBrowserId: string, browserId: string): void {
+  const profile = browserProfilesByBrowserId.get(sourceBrowserId);
+  if (profile) {
+    rememberBrowserProfile(browserId, profile);
+  }
 }
 
 function trimNonEmpty(value: string | null | undefined): string | null {
@@ -299,30 +376,71 @@ export function prepareBrowserWebview(
     browserId: string;
     workspaceId: string;
     initialUrl?: string | null;
+    profile?: BrowserProfileAuthorizationResult;
     profileHost?: BrowserWebviewProfileHost;
   },
 ): void {
   const browser = getBrowserBridge(input.profileHost);
+  const profileInput = input.profile;
+  if (profileInput) {
+    rememberBrowserProfile(input.browserId, profileInput);
+  }
+  const profile = browserProfilesByBrowserId.get(input.browserId);
+  if (profile && profile.authorization.workspaceId !== input.workspaceId) {
+    throw new Error("Browser Profile authorization does not match the Browser Workspace.");
+  }
   webview.setAttribute(BROWSER_ID_ATTRIBUTE, input.browserId);
-  webview.setAttribute("partition", browser.profilePartition);
+  webview.setAttribute("partition", profile?.partition ?? browser.profilePartition);
+  if (profile) {
+    webview.setAttribute(PROFILE_ORGANIZATION_ATTRIBUTE, profile.authorization.organizationId);
+    webview.setAttribute(PROFILE_HOME_NODE_ATTRIBUTE, profile.authorization.homeNodeId);
+    webview.setAttribute(PROFILE_WORKSPACE_ATTRIBUTE, profile.authorization.workspaceId);
+    webview.setAttribute(PROFILE_ID_ATTRIBUTE, profile.authorization.browserProfileId);
+    webview.setAttribute(PROFILE_BINDING_ATTRIBUTE, profile.authorization.bindingRevision);
+    webview.setAttribute(PROFILE_LIFECYCLE_ATTRIBUTE, profile.authorization.lifecycleGeneration);
+  }
   webview.setAttribute("allowpopups", "true");
   webview.setAttribute("spellcheck", "false");
   webview.setAttribute("autosize", "on");
   if (input.initialUrl) {
     (webview as BrowserWebviewElement).src = input.initialUrl;
   }
-  registerBrowserWhenAttached(webview as BrowserWebviewElement, input, browser);
+  registerBrowserWhenAttached(
+    webview as BrowserWebviewElement,
+    {
+      browserId: input.browserId,
+      workspaceId: input.workspaceId,
+      ...(profile
+        ? {
+            profile: {
+              organizationId: profile.authorization.organizationId,
+              homeNodeId: profile.authorization.homeNodeId,
+              workspaceId: profile.authorization.workspaceId,
+              browserProfileId: profile.authorization.browserProfileId,
+              bindingRevision: profile.authorization.bindingRevision,
+              lifecycleGeneration: profile.authorization.lifecycleGeneration,
+            },
+          }
+        : {}),
+    },
+    browser,
+  );
 }
 
 export function ensureResidentBrowserWebview(input: {
   browserId: string;
   workspaceId: string;
   url: string;
+  profile?: BrowserProfileAuthorizationResult;
   profileHost?: BrowserWebviewProfileHost;
 }): HTMLElement | null {
   const browserId = trimNonEmpty(input.browserId);
   if (!browserId) {
     return null;
+  }
+  const profileInput = input.profile;
+  if (profileInput) {
+    rememberBrowserProfile(browserId, profileInput);
   }
   const ownerDocument = readDocument();
   if (!ownerDocument) {
@@ -348,10 +466,110 @@ export function ensureResidentBrowserWebview(input: {
     browserId,
     workspaceId: input.workspaceId,
     initialUrl: input.url,
+    ...(profileInput ? { profile: browserProfilesByBrowserId.get(browserId)! } : {}),
     profileHost: input.profileHost,
   });
   releaseResidentBrowserWebview(browserId, webview);
   return webview;
+}
+
+export function parseBrowserProfileAuthorizationResult(
+  input: unknown,
+): BrowserProfileAuthorizationResult {
+  const result = readExactStableRecord(
+    input,
+    ["authorization", "partition"],
+    "Browser Profile authorization result",
+  );
+  const authorizationInput = readExactStableRecord(
+    result.authorization,
+    [
+      "bindingRevision",
+      "browserProfileId",
+      "homeNodeId",
+      "lifecycleGeneration",
+      "organizationId",
+      "workspaceId",
+    ],
+    "Browser Profile runtime authorization",
+  );
+  const authorization = Object.freeze({
+    organizationId: parsePattern(
+      authorizationInput.organizationId,
+      ENTERPRISE_ORGANIZATION_ID_PATTERN,
+      "organization ID",
+    ),
+    homeNodeId: parsePattern(
+      authorizationInput.homeNodeId,
+      ENTERPRISE_NODE_ID_PATTERN,
+      "home node ID",
+    ),
+    workspaceId: parseNonEmpty(authorizationInput.workspaceId, "Workspace ID"),
+    browserProfileId: parsePattern(
+      authorizationInput.browserProfileId,
+      ENTERPRISE_BROWSER_PROFILE_ID_PATTERN,
+      "Browser Profile ID",
+    ),
+    bindingRevision: parseNonEmpty(authorizationInput.bindingRevision, "binding revision"),
+    lifecycleGeneration: parseNonEmpty(
+      authorizationInput.lifecycleGeneration,
+      "lifecycle generation",
+    ),
+  });
+  const partition = parseNonEmpty(result.partition, "Browser Profile partition");
+  if (partition !== `persist:paseo-enterprise-${authorization.browserProfileId}`) {
+    throw new Error("Browser Profile partition does not match its authorized Profile.");
+  }
+  return Object.freeze({ authorization, partition });
+}
+
+function readExactStableRecord(
+  input: unknown,
+  expectedKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  let descriptors: PropertyDescriptorMap;
+  let symbols: symbol[];
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(input);
+    symbols = Object.getOwnPropertySymbols(input);
+  } catch {
+    throw new Error(`Invalid ${label}.`);
+  }
+  const keys = Object.keys(descriptors).sort();
+  if (
+    symbols.length > 0 ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error(`Invalid ${label} fields.`);
+  }
+  const record: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || descriptor.get || descriptor.set || !("value" in descriptor)) {
+      throw new Error(`Invalid ${label} field ${key}.`);
+    }
+    record[key] = descriptor.value;
+  }
+  return record;
+}
+
+function parsePattern(input: unknown, pattern: RegExp, label: string): string {
+  if (typeof input !== "string" || !pattern.test(input)) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return input;
+}
+
+function parseNonEmpty(input: unknown, label: string): string {
+  if (typeof input !== "string" || input.length === 0 || input.trim() !== input) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return input;
 }
 
 export function getResidentBrowserWebview(browserId: string): HTMLElement | null {
@@ -435,6 +653,7 @@ export function removeResidentBrowserWebview(browserId: string): void {
   residentWebviewsByBrowserId.delete(normalizedBrowserId);
   residentSurfacesByBrowserId.delete(normalizedBrowserId);
   residentWebviewSizesByBrowserId.delete(normalizedBrowserId);
+  browserProfilesByBrowserId.delete(normalizedBrowserId);
   resident?.remove();
   surface?.remove();
 }
@@ -446,5 +665,6 @@ export function clearResidentBrowserWebviewsForTests(): void {
   residentWebviewsByBrowserId.clear();
   residentSurfacesByBrowserId.clear();
   residentWebviewSizesByBrowserId.clear();
+  browserProfilesByBrowserId.clear();
   readDocument()?.getElementById(RESIDENT_BROWSER_HOST_ID)?.remove();
 }

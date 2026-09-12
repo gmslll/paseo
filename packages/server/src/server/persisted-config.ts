@@ -15,10 +15,62 @@ import {
   PluginIdSchema,
   PluginSourceSchema,
   TerminalProfileSchema,
+  OrganizationIdSchema,
+  NodeIdSchema,
 } from "@getpaseo/protocol/messages";
 import { PaseoServicePortAllocationSchema } from "@getpaseo/protocol/paseo-config-schema";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
+const EnterpriseManagementConnectionSchema = z
+  .object({
+    baseUrl: z
+      .string()
+      .url()
+      .refine((value) => {
+        const url = new URL(value);
+        return url.protocol === "https:" && url.username === "" && url.password === "";
+      }, "Enterprise management base URL must use HTTPS without embedded credentials"),
+    caCertificatePath: z.string().min(1),
+    relationshipPath: z.string().min(1),
+    heartbeatIntervalMs: z.number().int().min(5_000).max(300_000).optional(),
+    policyRefreshIntervalMs: z.number().int().min(1_000).max(300_000).optional(),
+    auditUploadIntervalMs: z.number().int().min(1_000).max(300_000).optional(),
+  })
+  .strict();
+export const EnterpriseMultiUserSchema = z.union([
+  z.object({ enabled: z.literal(false) }).strict(),
+  z
+    .object({
+      enabled: z.literal(true),
+      organizationId: OrganizationIdSchema,
+      nodeId: NodeIdSchema,
+      managementMode: z.literal("standalone"),
+      legacyRecords: z.literal("owner_only"),
+    })
+    .strict(),
+  z
+    .object({
+      enabled: z.literal(true),
+      organizationId: OrganizationIdSchema,
+      nodeId: NodeIdSchema,
+      managementMode: z.literal("managed"),
+      legacyRecords: z.literal("owner_only"),
+      management: EnterpriseManagementConnectionSchema,
+    })
+    .strict(),
+]);
+export type EnterpriseMultiUserConfig = Readonly<z.infer<typeof EnterpriseMultiUserSchema>>;
+export function normalizeEnterpriseMultiUser(
+  value: unknown,
+): Readonly<z.infer<typeof EnterpriseMultiUserSchema> | undefined> {
+  const parsed =
+    value === undefined ? undefined : EnterpriseMultiUserSchema.parse(structuredClone(value));
+  if (!parsed) return undefined;
+  if (parsed.enabled && parsed.managementMode === "managed") {
+    return Object.freeze({ ...parsed, management: Object.freeze({ ...parsed.management }) });
+  }
+  return Object.freeze({ ...parsed });
+}
 export const LogFormatSchema = z.enum(["pretty", "json"]);
 
 const LogConfigSchema = z
@@ -324,6 +376,7 @@ export const PersistedConfigSchema = z
       .optional(),
     features: z
       .object({
+        enterpriseMultiUser: EnterpriseMultiUserSchema.optional(),
         dictation: FeatureDictationSchema.optional(),
         voiceMode: FeatureVoiceModeSchema.optional(),
         webUi: FeatureWebUiSchema.optional(),

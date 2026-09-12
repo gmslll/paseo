@@ -1,10 +1,11 @@
 import { createAgentRequestsStub } from "./test-utils/session-stubs.js";
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve as resolvePath } from "path";
+import { fileURLToPath } from "url";
 import pino from "pino";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import {
   assertPullRequestAutoMergeDisableReady,
@@ -12,25 +13,116 @@ import {
 } from "../services/github-service.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
-import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
+import type {
+  OutboundAuthorizationContext,
+  ResourceAuthorization,
+  WorkspaceDescriptorPayload,
+} from "@getpaseo/protocol/messages";
+import {
+  EnterpriseAgentContentReadRequestSchema,
+  EnterpriseAgentContentReadResponseSchema,
+  EnterpriseAppSlotContentReadRequestSchema,
+  EnterpriseAppSlotContentReadResponseSchema,
+  EnterpriseBrowserBindProfileRequestSchema,
+  EnterpriseBrowserListProfilesRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationRequestSchema,
+  EnterpriseBrowserPageIdentityInvalidationResponseSchema,
+  EnterpriseBrowserPageIdentityObservationRequestSchema,
+  EnterpriseBrowserPageIdentityObservationResponseSchema,
+  EnterpriseBrowserProfileContentReadRequestSchema,
+  EnterpriseBrowserProfileContentReadResponseSchema,
+  EnterpriseResourceAcquireLeaseRequestSchema,
+  EnterpriseWorkspaceContentReadRequestSchema,
+  EnterpriseWorkspaceContentReadResponseSchema,
+} from "@getpaseo/protocol/messages";
 import {
   decodeFileTransferFrame,
   encodeFileTransferFrame,
   FileTransferOpcode,
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
-import { Session } from "./session.js";
-import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
+import {
+  createEnterpriseFetchAgentsStartScheduler,
+  Session,
+  type EnterpriseFetchAgentsStartScheduler,
+  type SessionRpcDiagnosticObservation,
+  type SessionRpcDiagnosticObserver,
+} from "./session.js";
+import { VoiceSession } from "./session/voice/voice-session.js";
+import {
+  createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseAgentContextHandle,
+  type EnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "./session/enterprise-agent-session-context-registry.js";
+import { MemoryAuthorityReceiptState } from "./session/enterprise-authority-receipt-state.js";
+import {
+  createAdmissionInvalidationSink,
+  type AdmissionInvalidationSink,
+} from "./session/enterprise-admission-invalidation.js";
+import { StrictOutboundAuthorityVerifier } from "./enterprise/access/authority-receipt-verifier.js";
+import {
+  createEnterpriseAuthorizationRuntime,
+  isCurrentProductionAuthorizationRuntime,
+} from "./enterprise/access/production-authorization-runtime.js";
+import { ResourceAuthorizationService } from "./enterprise/access/resource-authorization.js";
+import {
+  createProductionAuthorizationRuntimeForSession,
+  createProductionAuthorizationRuntimeProvider,
+} from "./enterprise/access/production-authorization-runtime-provider.js";
+import { createProductionResourceBundle } from "./enterprise/access/production-resource-bundle.js";
+import {
+  createProductionBrowserLeaseBundle,
+  isProductionBrowserLeaseWaitingContextForSession,
+  type ProductionBrowserLeaseBundle,
+  type ProductionBrowserLeaseWaitingContext,
+} from "./enterprise/browser/production-bundle.js";
+import type { BrowserProfileLeaseAuthorization } from "./enterprise/browser/lease-manager.js";
+import { createProductionAuditRuntime } from "./enterprise/audit/production-audit-runtime.js";
+import {
+  bindEnterpriseAdmissionSession,
+  createEnterpriseAdmissionAuthorizationIssuer,
+  issueEnterpriseAdmissionEvidence,
+  resolveCurrentEnterpriseAdmissionAuthorization,
+} from "./enterprise/identity/admission-authorization.js";
+import {
+  createProductionPrincipalGrantSource,
+  createProductionPrincipalProvisioning,
+} from "./enterprise/identity/principal-source.js";
+import {
+  FileBackedGrantStorage,
+  GrantStore,
+  type GrantVersionSource,
+} from "./enterprise/access/grant-store.js";
+import { OwnerRegistry } from "./enterprise/access/owner-registry.js";
+import {
+  OWNER_PERMISSIONS,
+  SessionAuthorization,
+  type DaemonPermission,
+} from "./authorization/index.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
-import type { AgentManagerEvent } from "./agent/agent-manager.js";
+import type { AgentManagerEvent, ManagedAgent } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
-import { createPersistedProjectRecord } from "./workspace-registry.js";
+import {
+  createPersistedProjectRecord,
+  createPersistedWorkspaceRecord,
+  FileBackedWorkspaceRegistry,
+} from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
+import {
+  type EnterpriseDispatchContext,
+  type EnterpriseDispatchResponse,
+  type EnterpriseSessionDispatcher,
+  resolveEnterpriseContentReadPolicy,
+  type EnterpriseSessionDispatcherFactoryRegistration,
+  type EnterpriseContentReadRequestType,
+} from "./session/enterprise-dispatcher.js";
+import { createEnterpriseIdentityDispatcher } from "./enterprise/identity/handlers.js";
 import {
   asSessionInternals as asSessionInternalsHelper,
   asAgentManager,
@@ -57,6 +149,38 @@ import type { CheckDetails, ForgeService } from "../services/forge-service.js";
 import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 
 interface SessionHandlerInternals {
+  authorization: SessionAuthorization;
+  sessionLogger: pino.Logger;
+  agentUpdates: {
+    beginSubscription(...args: unknown[]): void;
+    flushBootstrapped(subscriptionId: string): Promise<void>;
+    hasSubscription(): boolean;
+    invalidateWorkspace(workspaceId: string): void;
+  };
+  viewedTimelineAgentIds: Set<string>;
+  workspaceUpdatesSubscription: {
+    excludedWorkspaceIds: Set<string>;
+    pendingUpdatesByWorkspaceId: Map<string, unknown>;
+    lastEmittedByWorkspaceId: Map<string, unknown>;
+  } | null;
+  workspaceUpdateTails: Map<string, Promise<void>>;
+  enterpriseWorkspaceOwnershipTransferDispatcher: EnterpriseSessionDispatcher;
+  productionAuthorizationSession?: unknown;
+  enqueueAuthorizedEmit(
+    message: SessionOutboundMessage,
+    context?: OutboundAuthorizationContext,
+  ): Promise<boolean>;
+  emitEnterpriseDispatcherResponse(
+    request: SessionInboundMessage,
+    contextual: EnterpriseDispatchResponse,
+  ): Promise<void>;
+  listFetchAgentsEntries(params: SessionInboundMessage): Promise<unknown>;
+  readAgentDirectorySync(params: SessionInboundMessage): Promise<unknown>;
+  listFetchWorkspacesEntries(params: SessionInboundMessage): Promise<unknown>;
+  readWorkspaceDirectorySync(params: SessionInboundMessage): Promise<unknown>;
+  terminalController: {
+    dispatch(message: SessionInboundMessage): Promise<void> | undefined;
+  };
   interruptAgentIfRunning(agentId: string): Promise<void>;
   handleSendAgentMessage(
     agentId: string,
@@ -87,6 +211,18 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
+  emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void>;
+  filterEnterpriseAgentProjectionSources(
+    liveAgents: readonly ManagedAgent[],
+    persistedRecords: readonly StoredAgentRecord[],
+  ): Promise<{ liveAgents: ManagedAgent[]; persistedRecords: StoredAgentRecord[] }>;
+  emitEnterpriseBrowserLeaseWaiting(
+    notice: {
+      requestId: string;
+      context: ProductionBrowserLeaseWaitingContext;
+    },
+    expectedContext: ProductionBrowserLeaseWaitingContext,
+  ): Promise<void>;
 }
 
 function asSessionInternals(session: Session): SessionHandlerInternals {
@@ -285,6 +421,7 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 });
 
 interface SessionForTestOptions {
+  logger?: pino.Logger;
   clientId?: string;
   permissions?: readonly DaemonPermission[];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
@@ -306,7 +443,7 @@ interface SessionForTestOptions {
     getWorkspaceGitMetadata?: ReturnType<typeof vi.fn>;
     getProjectSlug?: ReturnType<typeof vi.fn>;
   };
-  workspaceRegistry?: { get: ReturnType<typeof vi.fn> };
+  workspaceRegistry?: Partial<SessionOptions["workspaceRegistry"]>;
   projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
   terminalManager?: SessionOptions["terminalManager"];
   serviceProxy?: SessionOptions["serviceProxy"];
@@ -324,15 +461,39 @@ interface SessionForTestOptions {
   downloadTokenStore?: SessionOptions["downloadTokenStore"];
   pushNotifications?: SessionOptions["pushNotifications"];
   messages?: unknown[];
+  onMessage?: SessionOptions["onMessage"];
   targetedMessages?: Array<{ source: object; message: SessionOutboundMessage }>;
   binaryMessages?: Uint8Array[];
+  targetedBinaryMessages?: Array<{ source: object; frame: Uint8Array }>;
+  onBinaryMessageToSource?: SessionOptions["onBinaryMessageToSource"];
   pluginRuntime?: SessionOptions["pluginRuntime"];
   orchestrationSkills?: SessionOptions["orchestrationSkills"];
   workspaceLabelService?: WorkspaceLabelService;
+  enterpriseContext?: EnterpriseSessionContext;
+  enterpriseAgentContextRegistry?: EnterpriseAgentSessionContextRegistry;
+  authorityReceiptState?: SessionOptions["authorityReceiptState"];
+  autoAuthorityReceiptState?: boolean;
+  principalGrantVersionGuard?: SessionOptions["principalGrantVersionGuard"];
+  autoPrincipalGrantVersionGuard?: boolean;
+  resourceAuthorization?: SessionOptions["resourceAuthorization"];
+  enterpriseWorkspaceFilesRuntime?: SessionOptions["enterpriseWorkspaceFilesRuntime"];
+  admissionInvalidationSink?: AdmissionInvalidationSink;
+  sessionId?: SessionOptions["sessionId"];
+  sessionAuthorization?: SessionOptions["sessionAuthorization"];
+  admissionAuthorizationIssuer?: SessionOptions["admissionAuthorizationIssuer"];
+  admissionAuthorizationHandle?: SessionOptions["admissionAuthorizationHandle"];
+  enterpriseAuthorizationRuntime?: SessionOptions["enterpriseAuthorizationRuntime"];
+  enterpriseDispatcher?: SessionOptions["enterpriseDispatcher"];
+  enterpriseDispatcherRegistration?: SessionOptions["enterpriseDispatcherRegistration"];
+  enterpriseIdentitySelfAuthorization?: SessionOptions["enterpriseIdentitySelfAuthorization"];
+  enterpriseFetchAgentsStartScheduler?: EnterpriseFetchAgentsStartScheduler;
+  rpcDiagnosticObserver?: SessionOptions["rpcDiagnosticObserver"];
+  now?: SessionOptions["now"];
 }
 
+// oxlint-disable-next-line complexity -- fixture wiring mirrors full SessionOptions.
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
-  const logger = pino({ level: "silent" });
+  const logger = options.logger ?? pino({ level: "silent" });
   const github = options.github ?? {
     invalidate: vi.fn(),
     searchIssuesAndPrs: vi.fn(),
@@ -362,11 +523,17 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     ...options.workspaceGitService,
   };
   const messages = options.messages ?? [];
+  const onBinaryMessageToSource =
+    options.onBinaryMessageToSource ??
+    (options.targetedBinaryMessages
+      ? async (source: object, frame: Uint8Array) =>
+          options.targetedBinaryMessages?.push({ source, frame })
+      : undefined);
 
   const sessionOptions: SessionOptions = {
     agentRequests: createAgentRequestsStub(),
     clientId: options.clientId ?? "test-client",
-    onMessage: (message) => messages.push(message),
+    onMessage: options.onMessage ?? ((message) => messages.push(message)),
     ...(options.targetedMessages
       ? {
           onMessageToSource: (source: object, message: SessionOutboundMessage) =>
@@ -374,6 +541,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
         }
       : {}),
     onBinaryMessage: createBinaryMessageHandler(options.binaryMessages),
+    ...(onBinaryMessageToSource ? { onBinaryMessageToSource } : {}),
     logger,
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
@@ -433,9 +601,3966 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
     permissions: options.permissions ?? OWNER_PERMISSIONS,
+    enterpriseContext: options.enterpriseContext,
+    enterpriseAgentContextRegistry: options.enterpriseAgentContextRegistry,
+    authorityReceiptState:
+      options.authorityReceiptState ??
+      (options.autoAuthorityReceiptState !== false &&
+      options.enterpriseContext &&
+      options.enterpriseAgentContextRegistry
+        ? new MemoryAuthorityReceiptState()
+        : undefined),
+    principalGrantVersionGuard:
+      options.principalGrantVersionGuard ??
+      (options.autoPrincipalGrantVersionGuard !== false && options.enterpriseContext
+        ? { isCurrent: () => true }
+        : undefined),
+    resourceAuthorization:
+      options.resourceAuthorization ??
+      (options.enterpriseContext ? ({ canEmit: vi.fn(async () => true) } as never) : undefined),
+    enterpriseWorkspaceFilesRuntime: options.enterpriseWorkspaceFilesRuntime,
+    admissionInvalidationSink: options.admissionInvalidationSink,
+    sessionId: options.sessionId,
+    sessionAuthorization: options.sessionAuthorization,
+    admissionAuthorizationIssuer: options.admissionAuthorizationIssuer,
+    admissionAuthorizationHandle: options.admissionAuthorizationHandle,
+    enterpriseAuthorizationRuntime: options.enterpriseAuthorizationRuntime,
+    enterpriseDispatcher: options.enterpriseDispatcher,
+    enterpriseDispatcherRegistration: options.enterpriseDispatcherRegistration,
+    enterpriseIdentitySelfAuthorization: options.enterpriseIdentitySelfAuthorization,
+    enterpriseFetchAgentsStartScheduler: options.enterpriseFetchAgentsStartScheduler,
+    rpcDiagnosticObserver: options.rpcDiagnosticObserver,
+    now: options.now,
   };
   return new Session(sessionOptions);
 }
+
+describe("Session RPC diagnostic observer", () => {
+  test("observes a correlated response around its synchronous delivery", async () => {
+    const observations: SessionRpcDiagnosticObservation[] = [];
+    const order: string[] = [];
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      onMessage: (message) => {
+        order.push(`sink:${message.type}`);
+        messages.push(message);
+      },
+      rpcDiagnosticObserver: (observation) => {
+        observations.push(observation);
+        order.push(observation.phase);
+      },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "rpc-diagnostic-normal",
+    });
+    order.push("handled");
+
+    expect(order).toEqual([
+      "session.enter",
+      "response.deliver.begin",
+      "sink:fetch_agents_response",
+      "response.deliver.return",
+      "handled",
+    ]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: "fetch_agents_response",
+      payload: { requestId: "rpc-diagnostic-normal" },
+    });
+    expect(observations.map(({ atUnixMs: _atUnixMs, ...observation }) => observation)).toEqual([
+      {
+        phase: "session.enter",
+        requestId: "rpc-diagnostic-normal",
+        requestType: "fetch_agents_request",
+      },
+      {
+        phase: "response.deliver.begin",
+        requestId: "rpc-diagnostic-normal",
+        responseType: "fetch_agents_response",
+      },
+      {
+        phase: "response.deliver.return",
+        requestId: "rpc-diagnostic-normal",
+        responseType: "fetch_agents_response",
+      },
+    ]);
+    expect(observations.every((observation) => Object.isFrozen(observation))).toBe(true);
+    for (const [index, observation] of observations.entries()) {
+      expect(Number.isFinite(observation.atUnixMs)).toBe(true);
+      expect(observation.atUnixMs).toBeGreaterThan(1_000_000_000_000);
+      if (index > 0)
+        expect(observation.atUnixMs).toBeGreaterThanOrEqual(observations[index - 1]!.atUnixMs);
+    }
+
+    await session.cleanup();
+  });
+
+  test("observes a correlated denial only when its rpc_error reaches the sink", async () => {
+    const observations: SessionRpcDiagnosticObservation[] = [];
+    const order: string[] = [];
+    const session = createSessionForTest({
+      permissions: [],
+      onMessage: (message) => order.push(`sink:${message.type}`),
+      rpcDiagnosticObserver: (observation) => {
+        observations.push(observation);
+        order.push(observation.phase);
+      },
+    });
+
+    const handling = session.handleMessage({
+      type: "fetch_agent_request",
+      agentId: "11111111-1111-4111-8111-111111111111",
+      requestId: "rpc-diagnostic-denied",
+    });
+    order.push("handle-returned");
+
+    expect(order).toEqual([
+      "session.enter",
+      "response.deliver.begin",
+      "sink:rpc_error",
+      "response.deliver.return",
+      "handle-returned",
+    ]);
+    expect(observations.map(({ atUnixMs: _atUnixMs, ...observation }) => observation)).toEqual([
+      {
+        phase: "session.enter",
+        requestId: "rpc-diagnostic-denied",
+        requestType: "fetch_agent_request",
+      },
+      {
+        phase: "response.deliver.begin",
+        requestId: "rpc-diagnostic-denied",
+        responseType: "rpc_error",
+      },
+      {
+        phase: "response.deliver.return",
+        requestId: "rpc-diagnostic-denied",
+        responseType: "rpc_error",
+      },
+    ]);
+
+    await handling;
+    await session.cleanup();
+  });
+
+  test("does not report delivery phases when outbound authorization rejects the response", async () => {
+    const observations: SessionRpcDiagnosticObservation[] = [];
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    vi.spyOn(asSessionInternals(session).authorization, "allowsOutbound").mockReturnValue(false);
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "rpc-diagnostic-outbound-denied",
+    });
+
+    expect(messages).toEqual([]);
+    expect(observations.map(({ atUnixMs: _atUnixMs, ...observation }) => observation)).toEqual([
+      {
+        phase: "session.enter",
+        requestId: "rpc-diagnostic-outbound-denied",
+        requestType: "fetch_agents_request",
+      },
+    ]);
+    await session.cleanup();
+  });
+
+  test("does not observe non-target requests, responses, or rpc errors", async () => {
+    const observer = vi.fn<SessionRpcDiagnosticObserver>();
+    const allowed = createSessionForTest({ rpcDiagnosticObserver: observer });
+    const denied = createSessionForTest({
+      permissions: [],
+      rpcDiagnosticObserver: observer,
+    });
+
+    await allowed.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "rpc-diagnostic-non-target-response",
+    });
+    await denied.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "rpc-diagnostic-non-target-error",
+    });
+
+    expect(observer).not.toHaveBeenCalled();
+    await Promise.all([allowed.cleanup(), denied.cleanup()]);
+  });
+
+  test("isolates observer failures from response delivery", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const observer = vi.fn<SessionRpcDiagnosticObserver>(() => {
+      throw new Error("diagnostic observer failed");
+    });
+    const session = createSessionForTest({ messages, rpcDiagnosticObserver: observer });
+
+    await expect(
+      session.handleMessage({
+        type: "fetch_agents_request",
+        requestId: "rpc-diagnostic-observer-throws",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(observer).toHaveBeenCalledTimes(3);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: "fetch_agents_response",
+      payload: { requestId: "rpc-diagnostic-observer-throws" },
+    });
+    await session.cleanup();
+  });
+
+  test("keeps synchronous rejection delivery unchanged when no observer is configured", async () => {
+    const order: string[] = [];
+    const session = createSessionForTest({
+      permissions: [],
+      onMessage: (message) => order.push(`sink:${message.type}`),
+    });
+
+    const handling = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "rpc-diagnostic-disabled",
+    });
+    order.push("handle-returned");
+
+    expect(order).toEqual(["sink:rpc_error", "handle-returned"]);
+    await handling;
+    order.push("handled");
+    expect(order).toEqual(["sink:rpc_error", "handle-returned", "handled"]);
+    await session.cleanup();
+  });
+});
+
+function enterpriseContext(
+  generation = "generation-a",
+  overrides: Partial<EnterpriseSessionContext["principal"]> = {},
+  nodeOverrides: Partial<EnterpriseSessionContext["node"]> = {},
+): EnterpriseSessionContext {
+  return {
+    principal: {
+      principalType: "human",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      grants: [
+        {
+          action: "workspace.content.read",
+          selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+        },
+      ],
+      credentialId: "cred_a",
+      grantVersion: "grant-v1",
+      ...overrides,
+    },
+    node: {
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: "server-a",
+      mode: "standalone",
+      ...nodeOverrides,
+    },
+    sessionBindingGeneration: generation,
+  };
+}
+
+const WAITING_WORKSPACE_ID = "wks_aaaaaaaaaaaaaaaa";
+const WAITING_PROFILE_ID = "brp_bbbbbbbbbbbbbbbb";
+
+function browserWaitingAuthorization(
+  handle: EnterpriseAgentContextHandle,
+): BrowserProfileLeaseAuthorization {
+  const { principal, node } = handle.context;
+  return {
+    workspace: {
+      organizationId: principal.organizationId,
+      nodeId: node.nodeId,
+      ownerPrincipalId: principal.principalId,
+      createdByPrincipalId: principal.principalId,
+      workspaceId: WAITING_WORKSPACE_ID,
+    },
+    agent: {
+      organizationId: principal.organizationId,
+      nodeId: node.nodeId,
+      ownerPrincipalId: principal.principalId,
+      createdByPrincipalId: principal.principalId,
+      agentId: handle.agentId,
+      workspaceId: WAITING_WORKSPACE_ID,
+    },
+    profile: {
+      browserProfileId: WAITING_PROFILE_ID,
+      organizationId: principal.organizationId,
+      homeNodeId: node.nodeId,
+      businessIdentityId: "bid_bbbbbbbbbbbbbbbb",
+      ownerPrincipalId: principal.principalId,
+      platform: "generic",
+      businessAccountKey: "case-10-waiting",
+      label: "Case 10 waiting profile",
+      partitionKey: `persist:paseo-enterprise-${WAITING_PROFILE_ID}`,
+      downloadRoot: `/profiles/${WAITING_PROFILE_ID}/downloads`,
+      status: "ready",
+      createdAt: "2026-09-11T00:00:00.000Z",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+    },
+    bindingRevision: "binding-revision-case-10",
+  };
+}
+
+function createBrowserWaitingBundle(
+  paseoHome: string,
+  createRequestId: () => string,
+): ProductionBrowserLeaseBundle {
+  let leaseNumber = 0;
+  return createProductionBrowserLeaseBundle({
+    paseoHome,
+    nodeId: "nod_aaaaaaaaaaaaaaaa",
+    downloadBaseRoot: join(paseoHome, "downloads"),
+    auditSink: { append: vi.fn(async (event) => event as never) },
+    clock: {
+      now: () => 1_000,
+      setTimeout: vi.fn(() => Object.freeze({})),
+      clearTimeout: vi.fn(),
+    },
+    createLeaseId: () => `lea_00000000-0000-4000-8000-${String(++leaseNumber).padStart(12, "0")}`,
+    createRequestId,
+    maxLeaseTtlMs: 60_000,
+  });
+}
+
+function createBrowserWaitingRegistration(input: {
+  bundle: ProductionBrowserLeaseBundle;
+  registry: EnterpriseAgentSessionContextRegistry;
+  openedContexts?: ProductionBrowserLeaseWaitingContext[];
+}): EnterpriseSessionDispatcherFactoryRegistration {
+  return {
+    manifest: { operations: [] },
+    open(openInput) {
+      const waitingContext = openInput.requestLifecycle;
+      if (
+        !isProductionBrowserLeaseWaitingContextForSession(waitingContext, {
+          sessionId: openInput.sessionId,
+          clientId: openInput.clientId,
+          sessionBindingGeneration: openInput.context.sessionBindingGeneration,
+        })
+      ) {
+        throw new Error("Expected exact Browser lease waiting lifecycle.");
+      }
+      input.openedContexts?.push(waitingContext);
+      const unbind = input.bundle.bindSessionAuthority({
+        generation: openInput.context.sessionBindingGeneration,
+        isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
+        resolveAuthorization: (handle, profileId) => {
+          if (!input.registry.isCurrentHandle(handle) || profileId !== WAITING_PROFILE_ID)
+            throw new Error("Browser waiting authorization is unavailable.");
+          return browserWaitingAuthorization(handle);
+        },
+        waitingContext,
+      });
+      let closed = false;
+      return Object.freeze({
+        dispatcher: { handle: vi.fn(() => false) },
+        close: async () => {
+          if (closed) return;
+          closed = true;
+          unbind();
+          await input.bundle.invalidateSession(openInput.context.sessionBindingGeneration);
+        },
+      });
+    },
+  };
+}
+
+function bindBrowserWaitingAuthority(input: {
+  bundle: ProductionBrowserLeaseBundle;
+  registry: EnterpriseAgentSessionContextRegistry;
+  generation: string;
+  waitingContext?: ProductionBrowserLeaseWaitingContext;
+}): () => void {
+  return input.bundle.bindSessionAuthority({
+    generation: input.generation,
+    isCurrentHandle: (handle) => input.registry.isCurrentHandle(handle),
+    resolveAuthorization: (handle, profileId) => {
+      if (!input.registry.isCurrentHandle(handle) || profileId !== WAITING_PROFILE_ID)
+        throw new Error("Browser waiting authorization is unavailable.");
+      return browserWaitingAuthorization(handle);
+    },
+    waitingContext: input.waitingContext,
+  });
+}
+
+async function flushBrowserWaitingDelivery(): Promise<void> {
+  for (let index = 0; index < 12; index++) await Promise.resolve();
+}
+
+function parseContentRequest(value: unknown, type: string): SessionInboundMessage {
+  switch (type) {
+    case "enterprise.workspace.content.read.request":
+      return EnterpriseWorkspaceContentReadRequestSchema.parse(value);
+    case "enterprise.agent.content.read.request":
+      return EnterpriseAgentContentReadRequestSchema.parse(value);
+    case "enterprise.browser_profile.content.read.request":
+      return EnterpriseBrowserProfileContentReadRequestSchema.parse(value);
+    case "enterprise.app_slot.content.read.request":
+      return EnterpriseAppSlotContentReadRequestSchema.parse(value);
+    default:
+      throw new Error(`unknown content request type: ${type}`);
+  }
+}
+
+function parseContentResponse(value: unknown, type: string): SessionOutboundMessage {
+  switch (type) {
+    case "enterprise.workspace.content.read.response":
+      return EnterpriseWorkspaceContentReadResponseSchema.parse(value);
+    case "enterprise.agent.content.read.response":
+      return EnterpriseAgentContentReadResponseSchema.parse(value);
+    case "enterprise.browser_profile.content.read.response":
+      return EnterpriseBrowserProfileContentReadResponseSchema.parse(value);
+    case "enterprise.app_slot.content.read.response":
+      return EnterpriseAppSlotContentReadResponseSchema.parse(value);
+    default:
+      throw new Error(`unknown content response type: ${type}`);
+  }
+}
+
+type BrowserPageIdentityRequest = Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "enterprise.browser.page_identity.observe.request"
+      | "enterprise.browser.page_identity.invalidate.request";
+  }
+>;
+
+function browserPageIdentityRequests(): BrowserPageIdentityRequest[] {
+  return [
+    EnterpriseBrowserPageIdentityObservationRequestSchema.parse({
+      type: "enterprise.browser.page_identity.observe.request",
+      requestId: "page-identity-observe",
+      browser: {
+        browserId: "11111111-1111-4111-8111-111111111111",
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+      },
+      hostname: "account.example.com",
+      accountLabelHash: "a".repeat(64),
+      observationRevision: "observation-revision-1",
+      bindingRevision: "binding-revision-1",
+      lifecycleGeneration: "lifecycle-generation-1",
+    }),
+    EnterpriseBrowserPageIdentityInvalidationRequestSchema.parse({
+      type: "enterprise.browser.page_identity.invalidate.request",
+      requestId: "page-identity-invalidate",
+      browser: {
+        browserId: "1712345678901-abcdef012345",
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+      },
+      bindingRevision: "binding-revision-1",
+      lifecycleGeneration: "lifecycle-generation-1",
+      observationRevision: "observation-revision-1",
+    }),
+  ];
+}
+
+function browserPageIdentityResponse(request: BrowserPageIdentityRequest): SessionOutboundMessage {
+  const value = {
+    type: request.type.replace(/\.request$/, ".response"),
+    payload: {
+      requestId: request.requestId,
+      acceptedRevision: request.observationRevision,
+    },
+  };
+  return request.type === "enterprise.browser.page_identity.observe.request"
+    ? EnterpriseBrowserPageIdentityObservationResponseSchema.parse(value)
+    : EnterpriseBrowserPageIdentityInvalidationResponseSchema.parse(value);
+}
+
+function browserPageIdentityRegistration(
+  handle: EnterpriseSessionDispatcher["handle"],
+  options: {
+    consumeResponse?: ReturnType<typeof vi.fn>;
+    close?: ReturnType<typeof vi.fn>;
+    open?: ReturnType<typeof vi.fn>;
+  } = {},
+): EnterpriseSessionDispatcherFactoryRegistration {
+  const operations = browserPageIdentityRequests().map((request) => request.type);
+  const open = options.open ?? vi.fn();
+  const registration: EnterpriseSessionDispatcherFactoryRegistration = {
+    manifest: { operations },
+    open: (input) => {
+      open(input);
+      return {
+        dispatcher: {
+          requestPolicyForType: (type) =>
+            operations.includes(type as BrowserPageIdentityRequest["type"])
+              ? "transport_control"
+              : null,
+          handle,
+          ...(options.consumeResponse ? { consumeResponse: options.consumeResponse } : {}),
+        },
+        close: options.close ?? vi.fn(),
+      };
+    },
+  };
+  return registration;
+}
+
+test.each([
+  [
+    "workspace",
+    "enterprise.workspace.content.read.request",
+    "enterprise.workspace.content.read.response",
+    { resourceKind: "workspace", localResourceId: "wks_aaaaaaaaaaaaaaaa" },
+    { kind: "workspace", view: "timeline" },
+  ],
+  [
+    "agent",
+    "enterprise.agent.content.read.request",
+    "enterprise.agent.content.read.response",
+    { resourceKind: "agent", localResourceId: "agent-a" },
+    { kind: "agent", view: "transcript" },
+  ],
+  [
+    "browser profile",
+    "enterprise.browser_profile.content.read.request",
+    "enterprise.browser_profile.content.read.response",
+    {
+      resourceKind: "browser_profile",
+      localResourceId: "brp_aaaaaaaaaaaaaaaa",
+    },
+    { kind: "browser_profile", view: "state" },
+  ],
+  [
+    "app slot",
+    "enterprise.app_slot.content.read.request",
+    "enterprise.app_slot.content.read.response",
+    { resourceKind: "app_slot", localResourceId: "aps_aaaaaaaaaaaaaaaa" },
+    { kind: "app_slot", view: "state" },
+  ],
+])(
+  "delivers %s content through the resources authorization context",
+  async (_name, requestType, responseType, resource, selector) => {
+    const messages: SessionOutboundMessage[] = [];
+    const requestId = `content-${String(_name)}`;
+    const request = parseContentRequest(
+      {
+        type: requestType as EnterpriseContentReadRequestType,
+        requestId,
+        resource: {
+          organizationId: "org_aaaaaaaaaaaaaaaa",
+          nodeId: "nod_aaaaaaaaaaaaaaaa",
+          ...resource,
+        },
+        selector,
+        page: { limit: 20 },
+      },
+      requestType,
+    );
+    const response = parseContentResponse(
+      {
+        type: responseType,
+        payload: {
+          requestId,
+          resource: request.resource,
+          selector,
+          page: { items: [], nextCursor: null },
+        },
+      },
+      responseType,
+    );
+    let dispatchContext: EnterpriseDispatchContext | undefined;
+    const handle = vi.fn(async (input: { sessionContext: EnterpriseDispatchContext }) => {
+      dispatchContext = input.sessionContext;
+      return response;
+    });
+    const consumeResponse = vi.fn((input: { sessionContext: EnterpriseDispatchContext }) => {
+      expect(input.sessionContext).toBe(dispatchContext);
+      return {
+        response,
+        authorizationContext: {
+          kind: "resources" as const,
+          resources: [request.resource],
+        },
+        receiptClassification: "resources" as const,
+      };
+    });
+    const dispatcher = {
+      requestPolicyForType: (type: string) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle,
+      consumeResponse,
+    };
+    const resourceAuthorization: ResourceAuthorization = {
+      filterWorkspaces: (_ctx, rows) => [...rows],
+      assertWorkspace: vi.fn(),
+      assertAgent: vi.fn(),
+      assertBrowserProfile: vi.fn(),
+      assertAppSlot: vi.fn(),
+      resolveWorkspacePath: vi.fn(),
+      canEmit: vi.fn(async () => true),
+    };
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      resourceAuthorization,
+      enterpriseDispatcher: dispatcher,
+    });
+
+    await session.handleMessage(request);
+
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(consumeResponse).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual(response);
+    expect(resourceAuthorization.canEmit).toHaveBeenCalledWith(
+      expect.anything(),
+      response,
+      expect.objectContaining({ kind: "resources", resources: [request.resource] }),
+    );
+  },
+);
+
+test("fails closed for an unregistered content handler", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = {
+    type: "enterprise.workspace.content.read.request",
+    requestId: "content-missing-handler",
+    resource: {
+      resourceKind: "workspace",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      localResourceId: "wks_aaaaaaaaaaaaaaaa",
+    },
+    selector: { kind: "workspace", view: "timeline" },
+    page: { limit: 20 },
+  } as SessionInboundMessage;
+  const handle = vi.fn(() => false);
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle,
+    },
+  });
+
+  await session.handleMessage(request);
+
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(messages).toContainEqual({
+    type: "rpc_error",
+    payload: {
+      requestId: request.requestId,
+      requestType: request.type,
+      error: "Enterprise operation unavailable",
+      code: "unavailable",
+    },
+  });
+});
+
+test("routes dynamically registered browser resource policies through the resource branch", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const requests = [
+    EnterpriseBrowserListProfilesRequestSchema.parse({
+      type: "enterprise.browser.list_profiles.request",
+      requestId: "browser-list-dynamic",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+    }),
+    EnterpriseBrowserBindProfileRequestSchema.parse({
+      type: "enterprise.browser.bind_profile.request",
+      requestId: "browser-bind-dynamic",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+    }),
+    EnterpriseResourceAcquireLeaseRequestSchema.parse({
+      type: "enterprise.resource.acquire_lease.request",
+      requestId: "browser-lease-dynamic",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      resourceKind: "browser_profile",
+      mode: "read",
+    }),
+  ];
+  const handle = vi.fn(async () => false);
+  const dispatcher = {
+    requestPolicyForType: vi.fn(() => "resources" as const),
+    handle,
+  };
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-dynamic-browser-resource"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: dispatcher,
+  });
+
+  for (const request of requests) {
+    await session.handleMessage(request);
+  }
+
+  expect(handle).toHaveBeenCalledTimes(requests.length);
+  expect(messages).toEqual(
+    requests.map((request) => ({
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        requestType: request.type,
+        error: "Enterprise operation unavailable",
+        code: "unavailable",
+      },
+    })),
+  );
+  await session.cleanup();
+});
+
+test.each(browserPageIdentityRequests())(
+  "routes registered $type through the current Session inherited context",
+  async (request) => {
+    const messages: SessionOutboundMessage[] = [];
+    const response = browserPageIdentityResponse(request);
+    const context = enterpriseContext("generation-page-identity-current");
+    const consumeResponse = vi.fn(() => {
+      throw new Error("transport control must not consume a resource or authority receipt");
+    });
+    const canEmit = vi.fn(async () => {
+      throw new Error("transport control must not require resource authorization");
+    });
+    const open = vi.fn();
+    const handle = vi.fn(({ sessionContext, message }) => {
+      expect(Object.isFrozen(sessionContext)).toBe(true);
+      expect(sessionContext).toEqual({
+        sessionId: open.mock.calls[0]?.[0].sessionId,
+        clientId: "client-page-identity-current",
+        credentialId: context.principal.credentialId,
+        sessionBindingGeneration: context.sessionBindingGeneration,
+        enterpriseContext: session.getEnterpriseSessionContext(),
+      });
+      expect(message).toBe(request);
+      return response;
+    });
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-page-identity-current",
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      resourceAuthorization: { canEmit } as unknown as ResourceAuthorization,
+      enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle, {
+        consumeResponse,
+        open,
+      }),
+    });
+    const allowsOutbound = vi.spyOn(asSessionInternals(session).authorization, "allowsOutbound");
+
+    await session.handleMessage(request);
+
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(consumeResponse).not.toHaveBeenCalled();
+    expect(canEmit).not.toHaveBeenCalled();
+    expect(allowsOutbound).toHaveBeenCalledTimes(1);
+    expect(allowsOutbound).toHaveBeenCalledWith(response);
+    expect(messages).toEqual([response]);
+    await session.cleanup();
+  },
+);
+
+test.each([
+  ["false", () => false],
+  [
+    "response type mismatch",
+    (request: BrowserPageIdentityRequest) =>
+      request.type === "enterprise.browser.page_identity.observe.request"
+        ? EnterpriseBrowserPageIdentityInvalidationResponseSchema.parse({
+            type: "enterprise.browser.page_identity.invalidate.response",
+            payload: {
+              requestId: request.requestId,
+              acceptedRevision: request.observationRevision,
+            },
+          })
+        : EnterpriseBrowserPageIdentityObservationResponseSchema.parse({
+            type: "enterprise.browser.page_identity.observe.response",
+            payload: {
+              requestId: request.requestId,
+              acceptedRevision: request.observationRevision,
+            },
+          }),
+  ],
+  [
+    "request id mismatch",
+    (request: BrowserPageIdentityRequest) => ({
+      ...browserPageIdentityResponse(request),
+      payload: {
+        ...browserPageIdentityResponse(request).payload,
+        requestId: `${request.requestId}-wrong`,
+      },
+    }),
+  ],
+  [
+    "accepted revision mismatch",
+    (request: BrowserPageIdentityRequest) => ({
+      ...browserPageIdentityResponse(request),
+      payload: {
+        ...browserPageIdentityResponse(request).payload,
+        acceptedRevision: `${request.observationRevision}-wrong`,
+      },
+    }),
+  ],
+  [
+    "malformed response",
+    (request: BrowserPageIdentityRequest) => ({
+      type: request.type.replace(/\.request$/, ".response"),
+      payload: { requestId: request.requestId },
+    }),
+  ],
+  ["throw", () => Promise.reject(new Error("registered transport handler failed"))],
+] as const)(
+  "returns correlated unavailable when a registered transport handler yields %s",
+  async (_case, result) => {
+    const request = browserPageIdentityRequests()[0];
+    const messages: SessionOutboundMessage[] = [];
+    const handle = vi.fn(() => result(request) as never);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-page-identity-failure"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle),
+    });
+
+    await expect(session.handleMessage(request)).resolves.toBeUndefined();
+
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: request.requestId,
+          requestType: request.type,
+          error: "Enterprise operation unavailable",
+          code: "unavailable",
+        },
+      },
+    ]);
+    await session.cleanup();
+  },
+);
+
+test("reserves a registered transport request id until its inherited outbound tail settles", async () => {
+  const request = browserPageIdentityRequests()[0];
+  const response = browserPageIdentityResponse(request);
+  const messages: SessionOutboundMessage[] = [];
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const handle = vi.fn(async () => {
+    await blocked;
+    return response;
+  });
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-page-identity-duplicate"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle),
+  });
+
+  const first = session.handleMessage(request);
+  await Promise.resolve();
+  const duplicate = session.handleMessage(request);
+  await Promise.resolve();
+  expect(handle).toHaveBeenCalledTimes(1);
+  release();
+  await Promise.all([first, duplicate]);
+
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(messages).toEqual([response]);
+  await session.cleanup();
+});
+
+test("drops registered transport responses after revocation or Session cleanup", async () => {
+  for (const terminal of ["revoke", "cleanup"] as const) {
+    const request = browserPageIdentityRequests()[0];
+    const response = browserPageIdentityResponse(request);
+    const messages: SessionOutboundMessage[] = [];
+    let current = true;
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handle = vi.fn(async () => {
+      await blocked;
+      return response;
+    });
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext(`generation-page-identity-${terminal}`),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      principalGrantVersionGuard: { isCurrent: () => current },
+      enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle),
+    });
+
+    const pending = session.handleMessage(request);
+    await Promise.resolve();
+    if (terminal === "revoke") current = false;
+    else await session.cleanup();
+    release();
+    await pending;
+    await session.handleMessage(request);
+
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([]);
+    if (terminal === "revoke") await session.cleanup();
+  }
+});
+
+test("keeps page identity registration inactive for legacy and absent registrations", async () => {
+  const request = browserPageIdentityRequests()[0];
+  const legacyMessages: SessionOutboundMessage[] = [];
+  const open = vi.fn();
+  const handle = vi.fn(() => browserPageIdentityResponse(request));
+  const legacy = createSessionForTest({
+    messages: legacyMessages,
+    enterpriseDispatcherRegistration: browserPageIdentityRegistration(handle, { open }),
+  });
+  await legacy.handleMessage(request);
+  expect(open).not.toHaveBeenCalled();
+  expect(handle).not.toHaveBeenCalled();
+  expect(legacyMessages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        requestType: request.type,
+        error: "Enterprise operation unavailable",
+        code: "unavailable",
+      },
+    },
+  ]);
+
+  const enterpriseMessages: SessionOutboundMessage[] = [];
+  const enterprise = createSessionForTest({
+    messages: enterpriseMessages,
+    enterpriseContext: enterpriseContext("generation-page-identity-unregistered"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+  });
+  await enterprise.handleMessage(request);
+  expect(enterpriseMessages).toEqual(legacyMessages);
+  await Promise.all([legacy.cleanup(), enterprise.cleanup()]);
+});
+
+test("passes the per-session workspace files runtime through dispatcher registration", async () => {
+  const filesRuntime = makeEnterpriseRuntime(async () => {});
+  const close = vi.fn(async () => {});
+  const open = vi.fn(() => ({
+    dispatcher: { handle: vi.fn(() => false) },
+    close,
+  }));
+  const registration: EnterpriseSessionDispatcherFactoryRegistration = {
+    manifest: { operations: ["workspace.content.read"] },
+    open,
+  };
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseWorkspaceFilesRuntime: filesRuntime,
+    enterpriseDispatcherRegistration: registration,
+  });
+
+  expect(open).toHaveBeenCalledWith(expect.objectContaining({ filesRuntime }));
+  await session.cleanup();
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("passes an exact nominal waiting lifecycle through dispatcher registration", async () => {
+  const context = enterpriseContext("generation-browser-waiting-lifecycle");
+  const open = vi.fn(() => ({
+    dispatcher: { handle: vi.fn(() => false) },
+    close: vi.fn(),
+  }));
+  const session = createSessionForTest({
+    clientId: "client-browser-waiting-lifecycle",
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcherRegistration: {
+      manifest: { operations: [] },
+      open,
+    },
+  });
+
+  const openInput = open.mock.calls[0]?.[0];
+  if (!openInput) throw new Error("Expected dispatcher registration input.");
+  expect(
+    isProductionBrowserLeaseWaitingContextForSession(openInput.requestLifecycle, {
+      sessionId: openInput.sessionId,
+      clientId: "client-browser-waiting-lifecycle",
+      sessionBindingGeneration: context.sessionBindingGeneration,
+    }),
+  ).toBe(true);
+  await session.cleanup();
+});
+
+test("delivers same-Profile waiting once only to the exact waiter Session", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-waiting-"));
+  const createRequestId = vi.fn(() => "case10-internal-request-b");
+  const bundle = createBrowserWaitingBundle(paseoHome, createRequestId);
+  const contexts = [
+    enterpriseContext("generation-browser-holder"),
+    enterpriseContext("generation-browser-waiter"),
+    enterpriseContext("generation-browser-third"),
+  ];
+  const registries = contexts.map(() => createEnterpriseAgentSessionContextRegistry());
+  const messages: SessionOutboundMessage[][] = [[], [], []];
+  const canEmit = contexts.map(() => vi.fn<ResourceAuthorization["canEmit"]>(async () => true));
+  const openedContexts: ProductionBrowserLeaseWaitingContext[][] = [[], [], []];
+  const sessions = contexts.map((context, index) => {
+    const registry = registries[index]!;
+    return createSessionForTest({
+      clientId: `client-browser-${index}`,
+      messages: messages[index]!,
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: registry,
+      resourceAuthorization: { canEmit: canEmit[index]! } as never,
+      enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+        bundle,
+        registry,
+        openedContexts: openedContexts[index]!,
+      }),
+      now: () => 2_999,
+    });
+  });
+  const handles = sessions.map((session, index) => {
+    const handle = session.bindAgentPrincipalContext(`agent-browser-${index}`);
+    if (!handle) throw new Error("Expected enterprise Agent context handle.");
+    return handle;
+  });
+  const waiterCallback = vi.spyOn(
+    asSessionInternals(sessions[1]!),
+    "emitEnterpriseBrowserLeaseWaiting",
+  );
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: handles[0]!,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    const waitingLeasePromise = bundle.leases.acquire({
+      handle: handles[1]!,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await flushBrowserWaitingDelivery();
+
+    const expectedWaiting = {
+      type: "enterprise.resource.waiting",
+      payload: {
+        status: "resource_waiting",
+        workspaceId: WAITING_WORKSPACE_ID,
+        agentId: "agent-browser-1",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        resourceKind: "browser_profile",
+        resourceId: WAITING_PROFILE_ID,
+        mode: "write",
+        queuedAt: "1970-01-01T00:00:02.999Z",
+        position: 1,
+      },
+    } as const;
+    expect(createRequestId).toHaveBeenCalledTimes(1);
+    expect(createRequestId).toHaveReturnedWith("case10-internal-request-b");
+    expect(waiterCallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: "case10-internal-request-b",
+        context: openedContexts[1]![0],
+      }),
+      openedContexts[1]![0],
+    );
+    expect(messages).toEqual([[], [expectedWaiting], []]);
+    expect(Object.hasOwn(messages[1]?.[0]?.payload ?? {}, "requestId")).toBe(false);
+    expect(JSON.stringify(messages[1]?.[0])).not.toContain("case10-internal-request-b");
+    expect(Date.parse(expectedWaiting.payload.queuedAt) - 1_000).toBeLessThan(2_000);
+    expect(canEmit[0]!).not.toHaveBeenCalled();
+    expect(canEmit[2]!).not.toHaveBeenCalled();
+    expect(canEmit[1]!).toHaveBeenCalledWith(contexts[1]!.principal, expectedWaiting, {
+      kind: "resources",
+      resources: [
+        {
+          resourceKind: "browser_profile",
+          organizationId: contexts[1]!.principal.organizationId,
+          nodeId: contexts[1]!.node.nodeId,
+          localResourceId: WAITING_PROFILE_ID,
+        },
+      ],
+    });
+    const authorizationContext = canEmit[1]!.mock.calls[0]?.[2];
+    if (authorizationContext?.kind !== "resources")
+      throw new Error("Expected Browser Profile resource context.");
+    expect(Object.isFrozen(authorizationContext)).toBe(true);
+    expect(Object.isFrozen(authorizationContext?.resources)).toBe(true);
+    expect(Object.isFrozen(authorizationContext?.resources[0])).toBe(true);
+    expect(openedContexts.map((entries) => entries.length)).toEqual([1, 1, 1]);
+
+    await bundle.leases.releaseLease({ handle: handles[0]!, lease: holderLease });
+    const waitingLease = await waitingLeasePromise;
+    await bundle.leases.releaseLease({ handle: handles[1]!, lease: waitingLease });
+  } finally {
+    await Promise.allSettled(sessions.map((session) => session.cleanup()));
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("rejects Browser waiting when Session outbound authorization denies delivery", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-waiting-denied-"));
+  const bundle = createBrowserWaitingBundle(paseoHome, () => "case10-denied-request");
+  const holderContext = enterpriseContext("generation-browser-denied-holder");
+  const holderRegistry = createEnterpriseAgentSessionContextRegistry();
+  const holderHandle = holderRegistry.bind({
+    agentId: "agent-denied-holder",
+    context: holderContext,
+  });
+  const unbindHolder = bindBrowserWaitingAuthority({
+    bundle,
+    registry: holderRegistry,
+    generation: holderContext.sessionBindingGeneration,
+  });
+  const waiterContext = enterpriseContext("generation-browser-denied-waiter");
+  const waiterRegistry = createEnterpriseAgentSessionContextRegistry();
+  const messages: SessionOutboundMessage[] = [];
+  const canEmit = vi.fn<ResourceAuthorization["canEmit"]>(async () => true);
+  const session = createSessionForTest({
+    clientId: "client-browser-waiting-denied",
+    permissions: [],
+    messages,
+    enterpriseContext: waiterContext,
+    enterpriseAgentContextRegistry: waiterRegistry,
+    resourceAuthorization: { canEmit } as never,
+    enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+      bundle,
+      registry: waiterRegistry,
+    }),
+  });
+  const allowsOutbound = vi.spyOn(asSessionInternals(session).authorization, "allowsOutbound");
+  const waiterHandle = session.bindAgentPrincipalContext("agent-denied-waiter");
+  if (!waiterHandle) throw new Error("Expected waiter Agent context handle.");
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: holderHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await expect(
+      bundle.leases.acquire({
+        handle: waiterHandle,
+        resourceId: WAITING_PROFILE_ID,
+        mode: "write",
+        ttlMs: 60_000,
+      }),
+    ).rejects.toThrow(/status unavailable/i);
+
+    expect(canEmit).toHaveBeenCalledTimes(1);
+    expect(allowsOutbound).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([]);
+    await bundle.leases.releaseLease({ handle: holderHandle, lease: holderLease });
+  } finally {
+    await session.cleanup();
+    unbindHolder();
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("seals a racing Browser waiting callback before dispatcher close", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-close-race-"));
+  const bundle = createBrowserWaitingBundle(paseoHome, () => "case10-close-race-request");
+  const holderContext = enterpriseContext("generation-browser-close-race-holder");
+  const holderRegistry = createEnterpriseAgentSessionContextRegistry();
+  const holderHandle = holderRegistry.bind({
+    agentId: "agent-close-race-holder",
+    context: holderContext,
+  });
+  const unbindHolder = bindBrowserWaitingAuthority({
+    bundle,
+    registry: holderRegistry,
+    generation: holderContext.sessionBindingGeneration,
+  });
+  const waiterContext = enterpriseContext("generation-browser-close-race-waiter");
+  const waiterRegistry = createEnterpriseAgentSessionContextRegistry();
+  const messages: SessionOutboundMessage[] = [];
+  const canEmitStarted = deferred<void>();
+  const releaseCanEmit = deferred<void>();
+  const canEmit = vi.fn<ResourceAuthorization["canEmit"]>(async () => {
+    canEmitStarted.resolve();
+    await releaseCanEmit.promise;
+    return true;
+  });
+  const session = createSessionForTest({
+    clientId: "client-browser-close-race",
+    messages,
+    enterpriseContext: waiterContext,
+    enterpriseAgentContextRegistry: waiterRegistry,
+    resourceAuthorization: { canEmit } as never,
+    enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+      bundle,
+      registry: waiterRegistry,
+    }),
+    now: () => 3_000,
+  });
+  const waiterHandle = session.bindAgentPrincipalContext("agent-close-race-waiter");
+  if (!waiterHandle) throw new Error("Expected waiter Agent context handle.");
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: holderHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    const waitingLeasePromise = bundle.leases.acquire({
+      handle: waiterHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await canEmitStarted.promise;
+
+    const cleanup = session.cleanup();
+    releaseCanEmit.resolve();
+    await cleanup;
+    await expect(waitingLeasePromise).rejects.toThrow(/status unavailable/i);
+    expect(canEmit).toHaveBeenCalledTimes(1);
+    expect(messages).toEqual([]);
+
+    await bundle.leases.releaseLease({ handle: holderHandle, lease: holderLease });
+  } finally {
+    releaseCanEmit.resolve();
+    unbindHolder();
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("drops a late Browser waiting callback from the closed generation", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "paseo-session-browser-late-waiting-"));
+  const bundle = createBrowserWaitingBundle(paseoHome, () => "case10-late-request");
+  const holderContext = enterpriseContext("generation-browser-late-holder");
+  const holderRegistry = createEnterpriseAgentSessionContextRegistry();
+  const holderHandle = holderRegistry.bind({
+    agentId: "agent-late-holder",
+    context: holderContext,
+  });
+  const unbindHolder = bindBrowserWaitingAuthority({
+    bundle,
+    registry: holderRegistry,
+    generation: holderContext.sessionBindingGeneration,
+  });
+  const closedContext = enterpriseContext("generation-browser-late-closed");
+  const closedRegistry = createEnterpriseAgentSessionContextRegistry();
+  const openedContexts: ProductionBrowserLeaseWaitingContext[] = [];
+  const messages: SessionOutboundMessage[] = [];
+  const canEmit = vi.fn<ResourceAuthorization["canEmit"]>(async () => true);
+  const session = createSessionForTest({
+    clientId: "client-browser-late-closed",
+    messages,
+    enterpriseContext: closedContext,
+    enterpriseAgentContextRegistry: closedRegistry,
+    resourceAuthorization: { canEmit } as never,
+    enterpriseDispatcherRegistration: createBrowserWaitingRegistration({
+      bundle,
+      registry: closedRegistry,
+      openedContexts,
+    }),
+  });
+
+  try {
+    const holderLease = await bundle.leases.acquire({
+      handle: holderHandle,
+      resourceId: WAITING_PROFILE_ID,
+      mode: "write",
+      ttlMs: 60_000,
+    });
+    await session.cleanup();
+    const lateRegistry = createEnterpriseAgentSessionContextRegistry();
+    const lateHandle = lateRegistry.bind({
+      agentId: "agent-late-closed",
+      context: closedContext,
+    });
+    const unbindLate = bindBrowserWaitingAuthority({
+      bundle,
+      registry: lateRegistry,
+      generation: closedContext.sessionBindingGeneration,
+      waitingContext: openedContexts[0],
+    });
+    try {
+      await expect(
+        bundle.leases.acquire({
+          handle: lateHandle,
+          resourceId: WAITING_PROFILE_ID,
+          mode: "write",
+          ttlMs: 60_000,
+        }),
+      ).rejects.toThrow(/status unavailable/i);
+      expect(canEmit).not.toHaveBeenCalled();
+      expect(messages).toEqual([]);
+    } finally {
+      unbindLate();
+    }
+    await bundle.leases.releaseLease({ handle: holderHandle, lease: holderLease });
+  } finally {
+    unbindHolder();
+    await bundle.close();
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});
+
+test("does not open dispatcher registration before fallible Session construction completes", () => {
+  const open = vi.fn(() => ({
+    dispatcher: { handle: vi.fn(() => false) },
+    close: vi.fn(),
+  }));
+  const runtime = {
+    ...makeEnterpriseRuntime(async () => {}),
+    createUploadStore: () => {
+      throw new Error("workspace file runtime construction failed");
+    },
+  };
+
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-browser-late-open"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseWorkspaceFilesRuntime: runtime,
+      enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      name: "AggregateError",
+      cause: expect.objectContaining({ message: "workspace file runtime construction failed" }),
+    }),
+  );
+  expect(open).not.toHaveBeenCalled();
+});
+
+test("fails closed for a registration open exception and a non-nominal context", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const context = enterpriseContext("generation-browser-open-failure");
+  const cleanupWorkspaceFiles = vi.fn(async () => {});
+  const open = vi.fn(
+    (input: Parameters<EnterpriseSessionDispatcherFactoryRegistration["open"]>[0]) => {
+      expect(
+        isProductionBrowserLeaseWaitingContextForSession(input.requestLifecycle, {
+          sessionId: input.sessionId,
+          clientId: input.clientId,
+          sessionBindingGeneration: context.sessionBindingGeneration,
+        }),
+      ).toBe(true);
+      expect(
+        isProductionBrowserLeaseWaitingContextForSession(structuredClone(input.requestLifecycle), {
+          sessionId: input.sessionId,
+          clientId: input.clientId,
+          sessionBindingGeneration: context.sessionBindingGeneration,
+        }),
+      ).toBe(false);
+      expect(
+        isProductionBrowserLeaseWaitingContextForSession(input.requestLifecycle, {
+          sessionId: input.sessionId,
+          clientId: input.clientId,
+          sessionBindingGeneration: "generation-browser-wrong",
+        }),
+      ).toBe(false);
+      throw new Error("registration open failed");
+    },
+  );
+
+  expect(() =>
+    createSessionForTest({
+      clientId: "client-browser-open-failure",
+      messages,
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseWorkspaceFilesRuntime: makeEnterpriseRuntime(cleanupWorkspaceFiles),
+      enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      name: "AggregateError",
+      cause: expect.objectContaining({ message: "registration open failed" }),
+    }),
+  );
+  expect(open).toHaveBeenCalledTimes(1);
+  expect(messages).toEqual([]);
+  await flushBrowserWaitingDelivery();
+  expect(cleanupWorkspaceFiles).toHaveBeenCalledTimes(1);
+});
+
+test("closes an opened dispatcher lease once when final Session assembly fails", async () => {
+  const close = vi.fn(async () => {
+    throw new Error("post-open close failed");
+  });
+  const open = vi.fn(() => ({
+    get dispatcher(): never {
+      throw new Error("post-open dispatcher failed");
+    },
+    close,
+  }));
+
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-browser-post-open-failure"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+    }),
+  ).toThrow(
+    expect.objectContaining({
+      name: "AggregateError",
+      cause: expect.objectContaining({ message: "post-open dispatcher failed" }),
+    }),
+  );
+  await flushBrowserWaitingDelivery();
+  expect(open).toHaveBeenCalledTimes(1);
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("seals waiting and closes a failing dispatcher lease exactly once", async () => {
+  const close = vi.fn(() => {
+    throw new Error("registration close failed");
+  });
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-browser-close-failure"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcherRegistration: {
+      manifest: { operations: [] },
+      open: () => ({ dispatcher: { handle: vi.fn(() => false) }, close }),
+    },
+  });
+
+  await expect(session.cleanup()).rejects.toThrow("registration close failed");
+  await expect(session.cleanup()).rejects.toThrow("registration close failed");
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+test("keeps legacy and enterprise Sessions without registration unchanged", async () => {
+  const legacyMessages: SessionOutboundMessage[] = [];
+  const open = vi.fn(() => ({ dispatcher: { handle: vi.fn(() => false) }, close: vi.fn() }));
+  const legacy = createSessionForTest({
+    messages: legacyMessages,
+    enterpriseDispatcherRegistration: { manifest: { operations: [] }, open },
+  });
+  legacy.publish({
+    type: "pong",
+    payload: { requestId: "legacy-no-registration", serverReceivedAt: 1, serverSentAt: 2 },
+  });
+  expect(open).not.toHaveBeenCalled();
+  expect(legacyMessages).toEqual([
+    {
+      type: "pong",
+      payload: { requestId: "legacy-no-registration", serverReceivedAt: 1, serverSentAt: 2 },
+    },
+  ]);
+
+  const enterpriseMessages: SessionOutboundMessage[] = [];
+  const enterprise = createSessionForTest({
+    messages: enterpriseMessages,
+    enterpriseContext: enterpriseContext("generation-browser-no-registration"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+  });
+  enterprise.publish(
+    {
+      type: "pong",
+      payload: { requestId: "enterprise-no-registration", serverReceivedAt: 3, serverSentAt: 4 },
+    },
+    { kind: "transport_control", control: "pong" },
+  );
+  await flushBrowserWaitingDelivery();
+  expect(enterpriseMessages).toEqual([
+    {
+      type: "pong",
+      payload: { requestId: "enterprise-no-registration", serverReceivedAt: 3, serverSentAt: 4 },
+    },
+  ]);
+  await Promise.all([legacy.cleanup(), enterprise.cleanup()]);
+});
+
+test("routes registered content requests through the per-session lease beside the global registry", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = parseContentRequest(
+    {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "content-production-lease",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { limit: 20 },
+    },
+    "enterprise.workspace.content.read.request",
+  );
+  const response = parseContentResponse(
+    {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: request.requestId,
+        resource: request.resource,
+        selector: request.selector,
+        page: { items: [], nextCursor: null },
+      },
+    },
+    "enterprise.workspace.content.read.response",
+  );
+  const primary = {
+    requestPolicyForType: vi.fn(() => null),
+    handle: vi.fn(() => false),
+  };
+  const registeredHandle = vi.fn(() => response);
+  const registeredConsume = vi.fn(() => ({
+    response,
+    authorizationContext: { kind: "resources" as const, resources: [request.resource] },
+    receiptClassification: "resources" as const,
+  }));
+  const registration: EnterpriseSessionDispatcherFactoryRegistration = {
+    manifest: { operations: [request.type] },
+    open: vi.fn(() => ({
+      dispatcher: {
+        requestPolicyForType: (type: string) =>
+          type === request.type ? ("resources" as const) : null,
+        handle: registeredHandle,
+        consumeResponse: registeredConsume,
+      },
+      close: vi.fn(),
+    })),
+  };
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces: (_ctx, rows) => [...rows],
+    assertWorkspace: vi.fn(),
+    assertAgent: vi.fn(),
+    assertBrowserProfile: vi.fn(),
+    assertAppSlot: vi.fn(),
+    resolveWorkspacePath: vi.fn(),
+    canEmit: vi.fn(async () => true),
+  };
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    resourceAuthorization,
+    enterpriseDispatcher: primary,
+    enterpriseDispatcherRegistration: registration,
+    enterpriseWorkspaceFilesRuntime: makeEnterpriseRuntime(async () => {}),
+  });
+
+  await session.handleMessage(request);
+
+  expect(primary.handle).not.toHaveBeenCalled();
+  expect(registeredHandle).toHaveBeenCalledTimes(1);
+  expect(registeredConsume).toHaveBeenCalledTimes(1);
+  expect(messages).toContainEqual(response);
+});
+
+test("reserves a content request id until the outbound tail settles", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = parseContentRequest(
+    {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "content-duplicate",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { limit: 20 },
+    },
+    "enterprise.workspace.content.read.request",
+  );
+  const response = parseContentResponse(
+    {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: request.requestId,
+        resource: request.resource,
+        selector: request.selector,
+        page: { items: [], nextCursor: null },
+      },
+    },
+    "enterprise.workspace.content.read.response",
+  );
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const handle = vi.fn(async () => {
+    await blocked;
+    return response;
+  });
+  const consumeResponse = vi.fn(() => ({
+    response,
+    authorizationContext: { kind: "resources" as const, resources: [request.resource] },
+    receiptClassification: "resources" as const,
+  }));
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle,
+      consumeResponse,
+    },
+  });
+
+  const first = session.handleMessage(request);
+  await Promise.resolve();
+  const second = session.handleMessage(request);
+  await Promise.resolve();
+  expect(handle).toHaveBeenCalledTimes(1);
+  release();
+  await Promise.all([first, second]);
+  expect(messages).toHaveLength(1);
+});
+
+test("does not deliver content when ResourceAuthorization denies emission", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const request = parseContentRequest(
+    {
+      type: "enterprise.workspace.content.read.request",
+      requestId: "content-denied-emission",
+      resource: {
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "wks_aaaaaaaaaaaaaaaa",
+      },
+      selector: { kind: "workspace", view: "timeline" },
+      page: { limit: 20 },
+    },
+    "enterprise.workspace.content.read.request",
+  );
+  const response = parseContentResponse(
+    {
+      type: "enterprise.workspace.content.read.response",
+      payload: {
+        requestId: request.requestId,
+        resource: request.resource,
+        selector: request.selector,
+        page: { items: [], nextCursor: null },
+      },
+    },
+    "enterprise.workspace.content.read.response",
+  );
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces: (_ctx, rows) => [...rows],
+    assertWorkspace: vi.fn(),
+    assertAgent: vi.fn(),
+    assertBrowserProfile: vi.fn(),
+    assertAppSlot: vi.fn(),
+    resolveWorkspacePath: vi.fn(),
+    canEmit: vi.fn(async () => false),
+  };
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    resourceAuthorization,
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) =>
+        resolveEnterpriseContentReadPolicy(type) ? ("resources" as const) : null,
+      handle: vi.fn(async () => response),
+      consumeResponse: vi.fn(() => ({
+        response,
+        authorizationContext: { kind: "resources" as const, resources: [request.resource] },
+        receiptClassification: "resources" as const,
+      })),
+    },
+  });
+  await session.handleMessage(request);
+  expect(resourceAuthorization.canEmit).toHaveBeenCalledTimes(1);
+  expect(messages).toHaveLength(0);
+});
+
+class SessionTestGrantVersions implements GrantVersionSource {
+  private value = 1;
+  next(): string {
+    this.value += 1;
+    return `grant-v${this.value}`;
+  }
+}
+
+let binaryAuthorizationRoot = "";
+let binaryAuthorizationAddonPath = "";
+
+beforeAll(() => {
+  if (process.platform !== "darwin") return;
+  binaryAuthorizationRoot = mkdtempSync(join(tmpdir(), "paseo-session-binary-auth-"));
+  binaryAuthorizationAddonPath = join(binaryAuthorizationRoot, "darwin-audit-fs.node");
+  execFileSync(process.execPath, [
+    fileURLToPath(new URL("./enterprise/audit/native/build-darwin-audit-fs.mjs", import.meta.url)),
+    "--output",
+    binaryAuthorizationAddonPath,
+  ]);
+});
+
+afterAll(() => {
+  if (binaryAuthorizationRoot) rmSync(binaryAuthorizationRoot, { recursive: true, force: true });
+});
+
+async function createBinaryAuthorizationFixture(
+  name: string,
+  grants = [
+    {
+      action: "workspace.content.read" as const,
+      selector: {
+        kind: "workspace" as const,
+        workspaceIds: ["workspace-1", "wks_aaaaaaaaaaaaaaaa"],
+      },
+    },
+  ],
+  permissions: readonly DaemonPermission[] = ["workspace.read", "hub.execute"],
+) {
+  if (process.platform !== "darwin") throw new Error("Darwin authorization fixture unavailable");
+  const context = enterpriseContext(`generation-${name}`, {
+    grants,
+  });
+  const audit = await createProductionAuditRuntime({
+    node: context.node,
+    auditRoot: join(binaryAuthorizationRoot, `audit-${name}`),
+    nativeAddonPath: binaryAuthorizationAddonPath,
+  });
+  const storage = new FileBackedGrantStorage(join(binaryAuthorizationRoot, `grants-${name}.json`));
+  await storage.put({
+    principalId: context.principal.principalId,
+    organizationId: context.principal.organizationId,
+    grants: context.principal.grants,
+    grantVersion: context.principal.grantVersion,
+  });
+  const grantStore = new GrantStore(storage, new SessionTestGrantVersions(), audit);
+  const mintSecret = Object.freeze({});
+  const issuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret);
+  const evidence = issueEnterpriseAdmissionEvidence(
+    issuer,
+    mintSecret,
+    context.principal,
+    context.node,
+    { node: context.node, transport: "direct", peer: "loopback" },
+  );
+  if (!evidence) throw new Error("Expected admission evidence");
+  const handle = bindEnterpriseAdmissionSession(issuer, evidence, "client-test");
+  if (!handle) throw new Error("Expected admission handle");
+  const resolved = resolveCurrentEnterpriseAdmissionAuthorization(issuer, handle);
+  if (!resolved) throw new Error("Expected resolved admission handle");
+  const enterpriseSessionContext: EnterpriseSessionContext = {
+    principal: resolved.principal,
+    node: resolved.node,
+    sessionBindingGeneration: resolved.sessionBindingGeneration,
+  };
+  const owners = new OwnerRegistry();
+  owners.registerWorkspace({
+    id: "workspace-1",
+    organizationId: resolved.principal.organizationId,
+    nodeId: resolved.node.nodeId,
+    ownerPrincipalId: resolved.principal.principalId,
+    createdByPrincipalId: resolved.principal.principalId,
+  });
+  const sessionAuthorization = new SessionAuthorization(permissions);
+  const sessionId = `session-${name}`;
+  const authorityState = new MemoryAuthorityReceiptState();
+  const runtime = await createEnterpriseAuthorizationRuntime({
+    admissionAuthorizationIssuer: issuer,
+    admissionAuthorizationHandle: handle,
+    grantStore,
+    audit,
+    sessionAuthorization,
+    sessionId,
+    owners,
+    authorityState,
+  });
+  if (!runtime) throw new Error("Expected production authorization runtime");
+  return {
+    audit,
+    grantStore,
+    issuer,
+    handle,
+    runtime,
+    sessionAuthorization,
+    sessionId,
+    authorityState,
+    enterpriseSessionContext,
+    owners,
+  };
+}
+
+function createBinaryAuthorizedSession(
+  fixture: Awaited<ReturnType<typeof createBinaryAuthorizationFixture>>,
+  options: SessionForTestOptions = {},
+): Session {
+  return createSessionForTest({
+    ...options,
+    clientId: "client-test",
+    enterpriseContext: fixture.enterpriseSessionContext,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: fixture.authorityState,
+    principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+    resourceAuthorization: fixture.runtime.resourceAuthorization,
+    sessionId: fixture.sessionId,
+    sessionAuthorization: fixture.sessionAuthorization,
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    enterpriseAuthorizationRuntime: fixture.runtime,
+  });
+}
+
+describe("enterprise fetch-agents start scheduling", () => {
+  test("only the frozen nominal factory result can be injected", async () => {
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const scheduler = createEnterpriseFetchAgentsStartScheduler(waitForStart);
+    expect(Object.isFrozen(scheduler)).toBe(true);
+    await scheduler.waitForStart();
+    expect(waitForStart.mock.calls).toEqual([[]]);
+
+    const structuralScheduler = { waitForStart };
+    // @ts-expect-error The unexported unique-symbol brand rejects structural construction.
+    const nominalScheduler: EnterpriseFetchAgentsStartScheduler = structuralScheduler;
+    expect(() =>
+      createSessionForTest({ enterpriseFetchAgentsStartScheduler: nominalScheduler }),
+    ).toThrow("Enterprise fetch-agents start scheduler must be created by its factory");
+
+    const clonedScheduler = { ...scheduler };
+    expect(() =>
+      createSessionForTest({ enterpriseFetchAgentsStartScheduler: clonedScheduler }),
+    ).toThrow("Enterprise fetch-agents start scheduler must be created by its factory");
+  });
+
+  test("two Sessions reach a shared scheduling ticket before either starts directory work", async () => {
+    if (process.platform !== "darwin") return;
+    const [fixtureA, fixtureB] = await Promise.all([
+      createBinaryAuthorizationFixture("fetch-agents-start-a"),
+      createBinaryAuthorizationFixture("fetch-agents-start-b"),
+    ]);
+    const release = deferred<void>();
+    const waitForStart = vi.fn(() => release.promise);
+    const scheduler = createEnterpriseFetchAgentsStartScheduler(waitForStart);
+    const messagesA: SessionOutboundMessage[] = [];
+    const messagesB: SessionOutboundMessage[] = [];
+    const listAgentsA = vi.fn(() => []);
+    const listAgentsB = vi.fn(() => []);
+    const listStorageA = vi.fn().mockResolvedValue([]);
+    const listStorageB = vi.fn().mockResolvedValue([]);
+    const sessionA = createBinaryAuthorizedSession(fixtureA, {
+      messages: messagesA,
+      enterpriseFetchAgentsStartScheduler: scheduler,
+      agentManager: { listAgents: listAgentsA },
+      agentStorage: { list: listStorageA },
+    });
+    const sessionB = createBinaryAuthorizedSession(fixtureB, {
+      messages: messagesB,
+      enterpriseFetchAgentsStartScheduler: scheduler,
+      agentManager: { listAgents: listAgentsB },
+      agentStorage: { list: listStorageB },
+    });
+
+    const handlingA = sessionA.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-a",
+    });
+    const handlingB = sessionB.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-b",
+    });
+
+    await vi.waitFor(() => expect(waitForStart).toHaveBeenCalledTimes(2));
+    expect(waitForStart.mock.calls).toEqual([[], []]);
+    expect(listAgentsA).not.toHaveBeenCalled();
+    expect(listAgentsB).not.toHaveBeenCalled();
+    expect(listStorageA).not.toHaveBeenCalled();
+    expect(listStorageB).not.toHaveBeenCalled();
+    expect(messagesA).toEqual([]);
+    expect(messagesB).toEqual([]);
+
+    release.resolve();
+    await Promise.all([handlingA, handlingB]);
+
+    expect(listAgentsA).toHaveBeenCalledTimes(1);
+    expect(listAgentsB).toHaveBeenCalledTimes(1);
+    expect(listStorageA).toHaveBeenCalledTimes(1);
+    expect(listStorageB).toHaveBeenCalledTimes(1);
+    expect(messagesA).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-a" }),
+      }),
+    );
+    expect(messagesB).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-b" }),
+      }),
+    );
+    await Promise.all([sessionA.cleanup(), sessionB.cleanup()]);
+  });
+
+  test("subscription and explicit sync modes keep their original synchronous start", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-start-stateful");
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const messages: SessionOutboundMessage[] = [];
+    const session = createBinaryAuthorizedSession(fixture, {
+      messages,
+      enterpriseFetchAgentsStartScheduler: createEnterpriseFetchAgentsStartScheduler(waitForStart),
+    });
+    const internals = asSessionInternals(session);
+    const beginSubscription = vi.spyOn(internals.agentUpdates, "beginSubscription");
+    const listFetchAgentsEntries = vi.spyOn(internals, "listFetchAgentsEntries").mockResolvedValue({
+      entries: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+    const readAgentDirectorySync = vi.spyOn(internals, "readAgentDirectorySync").mockResolvedValue({
+      entries: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+
+    const subscribed = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-subscribe",
+      subscribe: { subscriptionId: "sub-start-stateful" },
+    });
+    expect(beginSubscription).toHaveBeenCalledTimes(1);
+    expect(listFetchAgentsEntries).toHaveBeenCalledTimes(1);
+    expect(waitForStart).not.toHaveBeenCalled();
+    await subscribed;
+
+    const explicitAsync = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-explicit-async",
+      sync: false,
+    });
+    expect(listFetchAgentsEntries).toHaveBeenCalledTimes(2);
+    expect(waitForStart).not.toHaveBeenCalled();
+    await explicitAsync;
+
+    const explicitSync = session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-explicit-sync",
+      sync: true,
+    });
+    expect(readAgentDirectorySync).toHaveBeenCalledTimes(1);
+    expect(waitForStart).not.toHaveBeenCalled();
+    await explicitSync;
+
+    expect(messages.filter((message) => message.type === "fetch_agents_response")).toHaveLength(3);
+    await session.cleanup();
+  });
+
+  test.each(["cleanup", "revoke"] as const)(
+    "%s while waiting prevents every directory, authorization, and delivery side effect",
+    async (terminal) => {
+      if (process.platform !== "darwin") return;
+      const fixture = await createBinaryAuthorizationFixture(`fetch-agents-start-${terminal}`);
+      const release = deferred<void>();
+      const waitForStart = vi.fn(() => release.promise);
+      const listAgents = vi.fn(() => []);
+      const listStorage = vi.fn().mockResolvedValue([]);
+      const prefilterAgentContentRows = vi.spyOn(
+        fixture.runtime.resourceAuthorization,
+        "prefilterAgentContentRows",
+      );
+      const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+      const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+      const messages: SessionOutboundMessage[] = [];
+      const session = createBinaryAuthorizedSession(fixture, {
+        messages,
+        enterpriseFetchAgentsStartScheduler:
+          createEnterpriseFetchAgentsStartScheduler(waitForStart),
+        agentManager: { listAgents },
+        agentStorage: { list: listStorage },
+      });
+      const beginSubscription = vi.spyOn(
+        asSessionInternals(session).agentUpdates,
+        "beginSubscription",
+      );
+
+      const handling = session.handleMessage({
+        type: "fetch_agents_request",
+        requestId: `fetch-agents-start-${terminal}`,
+      });
+      await vi.waitFor(() => expect(waitForStart).toHaveBeenCalledTimes(1));
+      if (terminal === "cleanup") {
+        await session.cleanup();
+      } else {
+        await fixture.grantStore.update({
+          organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+          principalId: fixture.enterpriseSessionContext.principal.principalId,
+          expectedVersion: fixture.runtime.principal.grantVersion,
+          grants: [],
+          actor: fixture.runtime.principal,
+        });
+      }
+      release.resolve();
+      await handling;
+
+      expect(beginSubscription).not.toHaveBeenCalled();
+      expect(listAgents).not.toHaveBeenCalled();
+      expect(listStorage).not.toHaveBeenCalled();
+      expect(prefilterAgentContentRows).not.toHaveBeenCalled();
+      expect(assertAgent).not.toHaveBeenCalled();
+      expect(canEmit).not.toHaveBeenCalled();
+      expect(messages).toEqual([]);
+      if (terminal === "revoke") await session.cleanup();
+    },
+  );
+
+  test.each([
+    ["reject", () => Promise.reject(new Error("scheduler rejected"))],
+    [
+      "throw",
+      () => {
+        throw new Error("scheduler threw");
+      },
+    ],
+  ] as const)(
+    "%s is contained by the correlated request error path",
+    async (name, waitForStart) => {
+      if (process.platform !== "darwin") return;
+      const fixture = await createBinaryAuthorizationFixture(`fetch-agents-start-${name}`);
+      const listAgents = vi.fn(() => []);
+      const listStorage = vi.fn().mockResolvedValue([]);
+      const prefilterAgentContentRows = vi.spyOn(
+        fixture.runtime.resourceAuthorization,
+        "prefilterAgentContentRows",
+      );
+      const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+      const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+      const messages: SessionOutboundMessage[] = [];
+      const session = createBinaryAuthorizedSession(fixture, {
+        messages,
+        enterpriseFetchAgentsStartScheduler:
+          createEnterpriseFetchAgentsStartScheduler(waitForStart),
+        agentManager: { listAgents },
+        agentStorage: { list: listStorage },
+      });
+      const requestError = vi.spyOn(asSessionInternals(session).sessionLogger, "error");
+
+      await expect(
+        session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: `fetch-agents-start-${name}`,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(listAgents).not.toHaveBeenCalled();
+      expect(listStorage).not.toHaveBeenCalled();
+      expect(prefilterAgentContentRows).not.toHaveBeenCalled();
+      expect(assertAgent).not.toHaveBeenCalled();
+      expect(canEmit).not.toHaveBeenCalled();
+      expect(requestError).toHaveBeenCalledWith(
+        {
+          err: expect.objectContaining({
+            message: `scheduler ${name === "reject" ? "rejected" : "threw"}`,
+          }),
+        },
+        "Failed to handle fetch_agents_request",
+      );
+      expect(messages).toEqual([]);
+      await session.cleanup();
+    },
+  );
+
+  test("no-port enterprise and configured-port legacy fetches keep synchronous starts and results", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-start-no-port");
+    const enterpriseMessages: SessionOutboundMessage[] = [];
+    const enterpriseList = vi.fn().mockResolvedValue([]);
+    const enterprise = createBinaryAuthorizedSession(fixture, {
+      messages: enterpriseMessages,
+      agentStorage: { list: enterpriseList },
+    });
+    const enterpriseHandling = enterprise.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-no-port",
+    });
+    expect(enterpriseList).toHaveBeenCalledTimes(1);
+    await enterpriseHandling;
+    expect(enterpriseMessages).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-no-port" }),
+      }),
+    );
+
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const legacyMessages: SessionOutboundMessage[] = [];
+    const legacyLiveList = vi.fn(() => []);
+    const legacyList = vi.fn().mockResolvedValue([]);
+    const legacy = createSessionForTest({
+      messages: legacyMessages,
+      enterpriseFetchAgentsStartScheduler: createEnterpriseFetchAgentsStartScheduler(waitForStart),
+      agentManager: { listAgents: legacyLiveList },
+      agentStorage: { list: legacyList },
+    });
+    const legacyHandling = legacy.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-start-legacy",
+    });
+    expect(legacyLiveList).toHaveBeenCalledTimes(1);
+    await legacyHandling;
+    expect(legacyList).toHaveBeenCalledTimes(1);
+    expect(waitForStart).not.toHaveBeenCalled();
+    expect(legacyMessages).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agents_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-legacy" }),
+      }),
+    );
+    await Promise.all([enterprise.cleanup(), legacy.cleanup()]);
+  });
+
+  test("enterprise history and other RPCs do not request a fetch-agents start ticket", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-start-other");
+    const waitForStart = vi.fn().mockResolvedValue(undefined);
+    const messages: SessionOutboundMessage[] = [];
+    const session = createBinaryAuthorizedSession(fixture, {
+      messages,
+      enterpriseFetchAgentsStartScheduler: createEnterpriseFetchAgentsStartScheduler(waitForStart),
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-agents-start-history",
+    });
+    await session.handleMessage({
+      type: "fetch_agent_request",
+      requestId: "fetch-agents-start-single",
+      agentId: "agt_unknown_exact_id",
+    });
+
+    expect(waitForStart).not.toHaveBeenCalled();
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "fetch_agent_history_response",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-history" }),
+      }),
+    );
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "rpc_error",
+        payload: expect.objectContaining({ requestId: "fetch-agents-start-single" }),
+      }),
+    );
+    await session.cleanup();
+  });
+});
+
+const enterpriseSendAgentId = "agt_aaaaaaaaaaaaaaaa";
+const enterpriseSendWorkspaceId = "workspace-1";
+
+async function* emptyAgentRun() {}
+
+function makeEnterpriseSendManagedAgent(): ManagedAgent {
+  const timestamp = new Date("2026-09-11T00:00:00.000Z");
+  return {
+    id: enterpriseSendAgentId,
+    provider: "codex",
+    cwd: "/tmp/enterprise-send-agent",
+    workspaceId: enterpriseSendWorkspaceId,
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: true,
+      supportsMcpServers: true,
+      supportsReasoningStream: true,
+      supportsToolInvocations: true,
+    },
+    config: { provider: "codex", cwd: "/tmp/enterprise-send-agent" },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    availableModes: [],
+    currentModeId: null,
+    pendingPermissions: new Map(),
+    persistence: null,
+    lastUserMessageAt: null,
+    activeTurnId: null,
+    activeTurnStartedAt: null,
+    attention: { requiresAttention: false },
+    labels: {},
+    lifecycle: "running",
+    activeForegroundTurnId: null,
+  } as unknown as ManagedAgent;
+}
+
+async function createEnterpriseSendAgentHarness(
+  name: string,
+  options: { streamError?: Error } = {},
+) {
+  const fixture = await createBinaryAuthorizationFixture(
+    name,
+    [
+      {
+        action: "workspace.write",
+        selector: { kind: "workspace", workspaceIds: [enterpriseSendWorkspaceId] },
+      },
+    ],
+    ["workspace.write", "hub.execute"],
+  );
+  fixture.owners.registerAgent({
+    id: enterpriseSendAgentId,
+    workspaceId: enterpriseSendWorkspaceId,
+  });
+  const managedAgent = makeEnterpriseSendManagedAgent();
+  const listAgents = vi.fn(() => {
+    throw new Error("enterprise send must not enumerate live agents");
+  });
+  const listStorage = vi.fn(async () => {
+    throw new Error("enterprise send must not enumerate stored agents");
+  });
+  const getAgent = vi.fn(() => managedAgent);
+  const streamAgent = vi.fn(() => {
+    if (options.streamError) throw options.streamError;
+    return emptyAgentRun();
+  });
+  const waitForAgentRunStart = vi.fn(async () => {});
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    clientId: "client-test",
+    enterpriseContext: fixture.enterpriseSessionContext,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: fixture.authorityState,
+    principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+    resourceAuthorization: fixture.runtime.resourceAuthorization,
+    sessionId: fixture.sessionId,
+    sessionAuthorization: fixture.sessionAuthorization,
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    enterpriseAuthorizationRuntime: fixture.runtime,
+    agentManager: {
+      getAgent,
+      listAgents,
+      waitForAgentClose: vi.fn(async () => {}),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => false),
+      streamAgent,
+      waitForAgentRunStart,
+    },
+    agentStorage: {
+      get: vi.fn(async () => undefined),
+      list: listStorage,
+    },
+  });
+  return {
+    fixture,
+    getAgent,
+    listAgents,
+    listStorage,
+    messages,
+    session,
+    streamAgent,
+    waitForAgentRunStart,
+  };
+}
+
+function makeEnterpriseRuntime(
+  cleanup: () => Promise<void>,
+): NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]> {
+  return {
+    stat: vi.fn(),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => ({
+      begin: vi.fn(),
+      beginStaged: vi.fn(),
+      receiveFrame: vi.fn(),
+      cleanup: vi.fn(async () => {}),
+    }),
+    cleanup,
+  };
+}
+
+test("legacy Session has no enterprise context or agent resolution", () => {
+  const session = createSessionForTest();
+  expect(session.getEnterpriseSessionContext()).toBeUndefined();
+  expect(session.getEnterpriseSessionBindingKey()).toBeUndefined();
+  expect(session.bindAgentPrincipalContext("agent-a")).toBeNull();
+  expect(session.resolveAgentPrincipalContext("agent-a")).toBeNull();
+});
+
+test.each([
+  ["context only", { enterpriseContext: enterpriseContext() }],
+  [
+    "registry only",
+    { enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry() },
+  ],
+])("Session rejects %s enterprise half-configuration", (_name, options) => {
+  expect(() => createSessionForTest(options)).toThrow(
+    "Enterprise context, registry, and authority receipt state",
+  );
+});
+
+test("Session rejects every partial enterprise four-piece configuration", () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const context = enterpriseContext();
+  const principalGrantVersionGuard = { isCurrent: () => true };
+  const partials = Array.from({ length: 16 }, (_, mask) => mask)
+    .filter((mask) => mask !== 0 && mask !== 15)
+    .map((mask) => {
+      const partial: SessionForTestOptions = {};
+      if (mask & 1) partial.enterpriseContext = context;
+      if (mask & 2) partial.enterpriseAgentContextRegistry = registry;
+      if (mask & 4) partial.authorityReceiptState = authorityReceiptState;
+      if (mask & 8) partial.principalGrantVersionGuard = principalGrantVersionGuard;
+      return partial;
+    });
+  expect(partials).toHaveLength(14);
+  for (const partial of partials)
+    expect(() =>
+      createSessionForTest({
+        ...partial,
+        autoAuthorityReceiptState: false,
+        autoPrincipalGrantVersionGuard: false,
+      }),
+    ).toThrow();
+});
+
+test("Session registers exact authority binding and releases it exactly once", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const registerSessionBinding = vi.spyOn(authorityReceiptState, "registerSessionBinding");
+  const releaseSession = vi.spyOn(authorityReceiptState, "releaseSession");
+  const context = enterpriseContext("generation-authority");
+  const session = createSessionForTest({
+    clientId: "client-authority",
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState,
+  });
+  const key = session.getEnterpriseSessionBindingKey();
+  expect(key).toBeTruthy();
+  const resolved = await authorityReceiptState.resolveCurrentSessionBinding({
+    sessionBindingKey: key!,
+    sessionBindingGeneration: context.sessionBindingGeneration,
+  });
+  expect(resolved).toEqual(
+    expect.objectContaining({
+      sessionBindingKey: key,
+      sessionBindingGeneration: context.sessionBindingGeneration,
+      organizationId: context.principal.organizationId,
+      principalId: context.principal.principalId,
+      principalType: context.principal.principalType,
+      credentialId: context.principal.credentialId,
+      grantVersion: context.principal.grantVersion,
+      nodeId: context.node.nodeId,
+      clientId: "client-authority",
+    }),
+  );
+  expect(registerSessionBinding).toHaveBeenCalledTimes(1);
+  expect(registerSessionBinding.mock.calls[0]?.[0]).toEqual(resolved);
+  await session.cleanup();
+  await session.cleanup();
+  expect(releaseSession).toHaveBeenCalledTimes(1);
+  expect(
+    await authorityReceiptState.resolveCurrentSessionBinding({
+      sessionBindingKey: key!,
+      sessionBindingGeneration: context.sessionBindingGeneration,
+    }),
+  ).toBeNull();
+});
+
+test("Session registers admission invalidation and unsubscribes exactly once", async () => {
+  const sink = createAdmissionInvalidationSink();
+  const originalRegister = sink.register.bind(sink);
+  const register = vi.spyOn(sink, "register");
+  const unsubscribe = vi.fn();
+  register.mockImplementation((input) => {
+    const release = originalRegister(input);
+    return () => {
+      unsubscribe();
+      release();
+    };
+  });
+  const context = enterpriseContext("generation-admission-sink");
+  const session = createSessionForTest({
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    admissionInvalidationSink: sink,
+    clientId: "client-admission-sink",
+  });
+  const bindingKey = session.getEnterpriseSessionBindingKey();
+  expect(register).toHaveBeenCalledWith(
+    expect.objectContaining({
+      sessionBindingKey: bindingKey,
+      generation: context.sessionBindingGeneration,
+      credentialId: context.principal.credentialId,
+      principalId: context.principal.principalId,
+      organizationId: context.principal.organizationId,
+      grantVersion: context.principal.grantVersion,
+    }),
+  );
+  await session.cleanup();
+  await session.cleanup();
+  expect(unsubscribe).toHaveBeenCalledTimes(1);
+});
+
+test("Session replacement cleanup does not release a newer binding", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const sessionA = createSessionForTest({
+    clientId: "client-authority",
+    enterpriseContext: enterpriseContext("generation-a"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState,
+  });
+  const sessionB = createSessionForTest({
+    clientId: "client-authority",
+    enterpriseContext: enterpriseContext("generation-b"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState,
+  });
+  const key = sessionB.getEnterpriseSessionBindingKey()!;
+  await sessionA.cleanup();
+  expect(
+    await authorityReceiptState.resolveCurrentSessionBinding({
+      sessionBindingKey: key,
+      sessionBindingGeneration: "generation-b",
+    }),
+  ).not.toBeNull();
+  await sessionB.cleanup();
+  expect(
+    await authorityReceiptState.resolveCurrentSessionBinding({
+      sessionBindingKey: key,
+      sessionBindingGeneration: "generation-b",
+    }),
+  ).toBeNull();
+});
+
+test("normal cleanup releases authority before a failing registry release", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const releaseRegistry = vi.fn(() => {
+    throw new Error("registry release failed");
+  });
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const releaseAuthority = vi.spyOn(authorityReceiptState, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-error"),
+    enterpriseAgentContextRegistry: { ...registry, releaseSession: releaseRegistry },
+    authorityReceiptState,
+  });
+  await expect(session.cleanup()).rejects.toThrow("registry release failed");
+  expect(releaseAuthority).toHaveBeenCalledTimes(1);
+  expect(releaseRegistry).toHaveBeenCalledTimes(1);
+});
+
+test("Session construction fails closed when authority binding registration fails", () => {
+  const releaseSession = vi.fn();
+  const unsubscribeAgent = vi.fn();
+  const subscribeAgent = vi.fn(() => unsubscribeAgent);
+  const unsubscribeHub = vi.fn();
+  const authorityReceiptState = {
+    registerSessionBinding: vi.fn(() => {
+      throw new Error("registration failed");
+    }),
+    releaseSession,
+  } as unknown as SessionOptions["authorityReceiptState"];
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-dispatch", {
+        grants: [{ action: "identity.manage", selector: { kind: "self" } }],
+      }),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState,
+      agentManager: { subscribe: subscribeAgent },
+      hubExecutionAgents: {
+        create: vi.fn(),
+        control: vi.fn(),
+        subscribe: vi.fn(() => unsubscribeHub),
+        invalidateAuthority: vi.fn(),
+      },
+    }),
+  ).toThrow();
+  expect(releaseSession).toHaveBeenCalledTimes(1);
+  expect(subscribeAgent).toHaveBeenCalled();
+  expect(unsubscribeAgent).toHaveBeenCalledTimes(1);
+  expect(unsubscribeHub).toHaveBeenCalledTimes(1);
+});
+
+test("enterprise authorized request registers active handle before handler and closes exactly once", async () => {
+  const state = new MemoryAuthorityReceiptState({ clock: { now: () => 1 } });
+  const register = vi.spyOn(state, "register");
+  const end = vi.spyOn(state, "endRequest");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    paseoHome: "/tmp/paseo-authority-test",
+    serverId: "srv-test",
+    daemonVersion: "1.0.0",
+    daemonRuntimeConfig: { listen: "127.0.0.1:6767", getRelayConfig: () => null },
+    enterpriseContext: enterpriseContext("generation-request"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "authority-1" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(register.mock.calls[0]?.[0].binding).toEqual(
+    expect.objectContaining({
+      sessionId: session.getSessionId(),
+      sessionBindingKey: session.getEnterpriseSessionBindingKey(),
+      sessionBindingGeneration: "generation-request",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      clientId: "test-client",
+    }),
+  );
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(register.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]!);
+  expect(end.mock.calls[0]?.[0]).toEqual({
+    sessionId: session.getSessionId(),
+    sessionBindingKey: session.getEnterpriseSessionBindingKey(),
+    sessionBindingGeneration: "generation-request",
+    requestId: "authority-1",
+  });
+  expect(
+    messages.some(
+      (message) => (message as { type?: string }).type === "daemon.get_status.response",
+    ),
+  ).toBe(true);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("stale Grant guard fails closed without registering", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-stale"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    principalGrantVersionGuard: { isCurrent: () => false },
+  });
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "stale" });
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "stale", code: "access_denied" }),
+    }),
+  ]);
+  await session.cleanup();
+});
+
+test("same-value permission generation replacement before registration fails closed", async () => {
+  let grantChecks = 0;
+  let session!: Session;
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const messages: unknown[] = [];
+  session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-permission-replaced"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    principalGrantVersionGuard: {
+      isCurrent: () => {
+        grantChecks += 1;
+        if (grantChecks === 1) session.setPermissions(session.getPermissions());
+        return true;
+      },
+    },
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "stale-permission" });
+  expect(grantChecks).toBe(1);
+  expect(register).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "stale-permission", code: "access_denied" }),
+    }),
+  ]);
+  await session.cleanup();
+});
+
+test("mutable request id changed during Grant check fails closed before registration", async () => {
+  let message: { type: "daemon.get_status.request"; requestId: string } = {
+    type: "daemon.get_status.request",
+    requestId: "request-a",
+  };
+  let firstCheck = true;
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-request-mutation"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    principalGrantVersionGuard: {
+      isCurrent: () => {
+        if (firstCheck) {
+          firstCheck = false;
+          message.requestId = "request-b";
+        }
+        return true;
+      },
+    },
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await session.handleMessage(message);
+  expect(register).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("missing and empty request ids fail closed with current Grant", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-missing-id"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({ type: "daemon.get_status.request" } as never);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "" });
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(0);
+  await session.cleanup();
+});
+
+test("register failure releases reservation so the same request id can retry", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const originalRegister = state.register.bind(state);
+  const register = vi
+    .spyOn(state, "register")
+    .mockImplementationOnce(async () => {
+      throw new Error("register failed");
+    })
+    .mockImplementation((input) => originalRegister(input));
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-retry"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "retry" });
+  expect(messages).toHaveLength(0);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "retry" });
+  expect(register).toHaveBeenCalledTimes(2);
+  expect(
+    messages.some(
+      (message) => (message as { type?: string }).type === "daemon.get_status.response",
+    ),
+  ).toBe(true);
+  await session.cleanup();
+});
+
+test("duplicate request id is reserved while handler is blocked and reusable after completion", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const end = vi.spyOn(state, "endRequest");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-duplicate"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  let finish!: () => void;
+  const dispatch = vi
+    .spyOn(session as never, "dispatchInboundMessage" as never)
+    .mockImplementationOnce(() => new Promise<void>((resolve) => (finish = resolve)));
+  const first = session.handleMessage({
+    type: "daemon.get_status.request",
+    requestId: "duplicate",
+  });
+  await Promise.resolve();
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "duplicate" });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  finish();
+  await first;
+  expect(end).toHaveBeenCalledTimes(1);
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "duplicate" });
+  expect(register).toHaveBeenCalledTimes(2);
+  expect(dispatch).toHaveBeenCalledTimes(2);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("handler failure still ends the exact registered request", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const end = vi.spyOn(state, "endRequest");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-handler-error"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  vi.spyOn(session as never, "dispatchInboundMessage" as never).mockRejectedValueOnce(
+    new Error("handler"),
+  );
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "handler-error" });
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(end.mock.calls[0]?.[0]).toEqual(
+    expect.objectContaining({
+      requestId: "handler-error",
+      sessionBindingGeneration: "generation-handler-error",
+    }),
+  );
+  await session.cleanup();
+});
+
+test("end failure releases once and makes later authority requests fail closed", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const end = vi.spyOn(state, "endRequest").mockImplementation(() => {
+    throw new Error("end failed");
+  });
+  const release = vi.spyOn(state, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-end-error"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await expect(
+    session.handleMessage({ type: "daemon.get_status.request", requestId: "end-error" }),
+  ).rejects.toThrow("end failed");
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "after-end-error" });
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(register).toHaveBeenCalledTimes(1);
+  await session.cleanup();
+});
+
+test("end and release failures preserve AggregateError primary/cause", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  vi.spyOn(state, "endRequest").mockImplementation(() => {
+    throw new Error("end primary");
+  });
+  vi.spyOn(state, "releaseSession").mockImplementation(() => {
+    throw new Error("release cleanup");
+  });
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-end-release"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  await expect(
+    session.handleMessage({ type: "daemon.get_status.request", requestId: "end-release" }),
+  ).rejects.toMatchObject({
+    cause: expect.objectContaining({ message: "end primary" }),
+    errors: [
+      expect.objectContaining({ message: "end primary" }),
+      expect.objectContaining({ message: "release cleanup" }),
+    ],
+  });
+  await session.handleMessage({
+    type: "daemon.get_status.request",
+    requestId: "after-double-error",
+  });
+  expect(register).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  await session.cleanup().catch(() => undefined);
+});
+
+test("resource-scoped request keeps handler behavior without authority receipt registration", async () => {
+  const state = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(state, "register");
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-resource"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+  });
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "resource-1",
+    filter: {},
+  });
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: "resource-1",
+        requestType: "fetch_workspaces_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    },
+  ]);
+  await session.cleanup();
+});
+
+test("enterprise workspace file responses use canonical workspace authorization context", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const canEmit = vi.fn(async () => true);
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces: (_ctx, rows) => [...rows],
+    assertWorkspace: async () => {
+      throw new Error("not used");
+    },
+    assertAgent: async () => {
+      throw new Error("not used");
+    },
+    assertBrowserProfile: async () => {
+      throw new Error("not used");
+    },
+    assertAppSlot: async () => {
+      throw new Error("not used");
+    },
+    resolveWorkspacePath: async () => {
+      throw new Error("not used");
+    },
+    canEmit,
+  };
+  const runtime = {
+    stat: vi.fn(async () => ({ size: 1, mtimeMs: 0, revision: "r1" })),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => ({
+      begin: vi.fn(),
+      beginStaged: vi.fn(),
+      receiveFrame: vi.fn(),
+      cleanup: vi.fn(async () => {}),
+    }),
+    cleanup: vi.fn(async () => {}),
+  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+  const session = createSessionForTest({
+    messages,
+    targetedMessages,
+    enterpriseContext: enterpriseContext("generation-file-context"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    resourceAuthorization,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await session.handleMessage({
+    type: "fs.file.write.request",
+    cwd: "ignored",
+    workspaceId: "workspace-1",
+    path: "notes.txt",
+    content: "hello",
+    expectedModifiedAt: "2026-01-01T00:00:00.000Z",
+    requestId: "file-context-1",
+  });
+  expect(runtime.write).toHaveBeenCalledWith(
+    expect.objectContaining({ workspaceId: "workspace-1" }),
+  );
+  expect(canEmit).toHaveBeenCalled();
+  const context = canEmit.mock.calls.at(-1)?.[2];
+  expect(context).toMatchObject({
+    kind: "resources",
+    resources: [
+      expect.objectContaining({
+        resourceKind: "workspace",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        localResourceId: "workspace-1",
+      }),
+    ],
+  });
+  expect(Object.isFrozen(context)).toBe(true);
+  expect(Object.isFrozen(context.resources)).toBe(true);
+  expect(Object.isFrozen(context.resources[0])).toBe(true);
+  const canEmitCalls = canEmit.mock.calls.length;
+  const messageCount = messages.length;
+  const targetedCount = targetedMessages.length;
+  await session.handleMessage({
+    type: "fs.file.write.request",
+    cwd: "ignored",
+    workspaceId: "",
+    path: "notes.txt",
+    content: "denied",
+    expectedModifiedAt: "2026-01-01T00:00:00.000Z",
+    requestId: "file-context-invalid",
+  });
+  expect(canEmit).toHaveBeenCalledTimes(canEmitCalls);
+  expect(messages).toHaveLength(messageCount);
+  expect(targetedMessages).toHaveLength(targetedCount);
+  await session.cleanup();
+});
+
+test("enterprise runtime construction failure rolls back registered authority binding", () => {
+  const state = new MemoryAuthorityReceiptState();
+  const release = vi.spyOn(state, "releaseSession");
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const runtime = {
+    stat: vi.fn(),
+    list: vi.fn(),
+    openRead: vi.fn(),
+    write: vi.fn(),
+    create: vi.fn(),
+    rename: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+    watch: vi.fn(),
+    issueDownloadToken: vi.fn(),
+    createUploadStore: () => {
+      throw new Error("upload store failed");
+    },
+    cleanup: vi.fn(async () => {}),
+  } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-runtime-failure"),
+      enterpriseAgentContextRegistry: registry,
+      authorityReceiptState: state,
+      enterpriseWorkspaceFilesRuntime: runtime,
+    }),
+  ).toThrow("Session construction rollback failed");
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("enterprise binary channel rejects construction without production authorization runtime", () => {
+  expect(() =>
+    createSessionForTest({
+      targetedBinaryMessages: [],
+      enterpriseContext: enterpriseContext("generation-binary-runtime-required"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: new MemoryAuthorityReceiptState(),
+      enterpriseWorkspaceFilesRuntime: makeEnterpriseRuntime(async () => {}),
+    }),
+  ).toThrow("Enterprise file binary channel requires production authorization runtime");
+});
+
+test("enterprise Session rejects a structural authorization runtime without touching it", () => {
+  let getCalls = 0;
+  let ownKeysCalls = 0;
+  const structuralRuntime = new Proxy(Object.create(null), {
+    get() {
+      getCalls += 1;
+      throw new Error("runtime getter must not run");
+    },
+    ownKeys() {
+      ownKeysCalls += 1;
+      throw new Error("runtime keys must not run");
+    },
+  });
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext("generation-structural-runtime"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: new MemoryAuthorityReceiptState(),
+      sessionId: "session-structural-runtime",
+      sessionAuthorization: new SessionAuthorization(["workspace.read"]),
+      admissionAuthorizationIssuer: Object.freeze(Object.create(null)) as never,
+      admissionAuthorizationHandle: Object.freeze(Object.create(null)) as never,
+      enterpriseAuthorizationRuntime: structuralRuntime as never,
+    }),
+  ).toThrow("Enterprise authorization runtime does not match canonical session authority");
+  expect(getCalls).toBe(0);
+  expect(ownKeysCalls).toBe(0);
+});
+
+describe.runIf(process.platform === "darwin")("enterprise production binary authorization", () => {
+  test("authorizes detached frames, reserves concurrent Begin, and isolates sources", async () => {
+    const fixture = await createBinaryAuthorizationFixture("delivery");
+    const targetedBinaryMessages: Array<{ source: object; frame: Uint8Array }> = [];
+    const close = vi.fn(async () => {});
+    const workspaceRuntime = {
+      stat: vi.fn(),
+      list: vi.fn(),
+      openRead: vi.fn(async () => ({
+        workspaceId: "workspace-1",
+        relativePath: "notes.txt",
+        size: 1,
+        mtimeMs: 0,
+        revision: "r1",
+        read: async () => new Uint8Array([1]),
+        close,
+      })),
+      write: vi.fn(),
+      create: vi.fn(),
+      rename: vi.fn(),
+      copy: vi.fn(),
+      delete: vi.fn(),
+      watch: vi.fn(),
+      issueDownloadToken: vi.fn(),
+      createUploadStore: () => ({
+        begin: vi.fn(),
+        beginStaged: vi.fn(),
+        receiveFrame: vi.fn(),
+        cleanup: vi.fn(async () => {}),
+      }),
+      cleanup: vi.fn(async () => {}),
+    } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+    const session = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      targetedBinaryMessages,
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      enterpriseWorkspaceFilesRuntime: workspaceRuntime,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+    await session.handleMessage(
+      {
+        type: "file_explorer_request",
+        cwd: "ignored",
+        workspaceId: "workspace-1",
+        path: "notes.txt",
+        mode: "file",
+        acceptBinary: true,
+        requestId: "binary-authorized-1",
+      },
+      {},
+    );
+    expect(
+      targetedBinaryMessages.map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([
+      FileTransferOpcode.FileBegin,
+      FileTransferOpcode.FileChunk,
+      FileTransferOpcode.FileEnd,
+    ]);
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const binaryInternals = session as unknown as {
+      emitAuthorizedWorkspaceBinary(
+        frame: Uint8Array,
+        workspaceId: string,
+        source?: object,
+      ): Promise<void>;
+      activeFileBinaryStreams: Map<object | undefined, Map<string, unknown>>;
+    };
+    const sourceA = Object.freeze({ id: "source-a" });
+    const sourceB = Object.freeze({ id: "source-b" });
+    const begin = encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId: "shared-request",
+      metadata: {
+        mime: "text/plain",
+        size: 0,
+        encoding: "binary",
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        revision: "revision-shared",
+      },
+    });
+    const end = encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileEnd,
+      requestId: "shared-request",
+    });
+    await Promise.all([
+      binaryInternals.emitAuthorizedWorkspaceBinary(begin, "workspace-1", sourceA),
+      binaryInternals.emitAuthorizedWorkspaceBinary(begin, "workspace-1", sourceB),
+    ]);
+    expect(targetedBinaryMessages).toHaveLength(5);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceA)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin]);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceB)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin]);
+    await Promise.all([
+      binaryInternals.emitAuthorizedWorkspaceBinary(end, "workspace-1", sourceA),
+      binaryInternals.emitAuthorizedWorkspaceBinary(end, "workspace-1", sourceB),
+    ]);
+    expect(targetedBinaryMessages).toHaveLength(7);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceA)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin, FileTransferOpcode.FileEnd]);
+    expect(
+      targetedBinaryMessages
+        .filter(({ source }) => source === sourceB)
+        .map(({ frame }) => decodeFileTransferFrame(frame)?.opcode),
+    ).toEqual([FileTransferOpcode.FileBegin, FileTransferOpcode.FileEnd]);
+
+    const raceSource = Object.freeze({ id: "race-source" });
+    const raceBegin = encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId: "race-request",
+      metadata: {
+        mime: "text/plain",
+        size: 0,
+        encoding: "binary",
+        modifiedAt: "2026-09-10T00:00:00.000Z",
+        revision: "revision-race",
+      },
+    });
+    const firstRace = binaryInternals.emitAuthorizedWorkspaceBinary(
+      raceBegin,
+      "workspace-1",
+      raceSource,
+    );
+    raceBegin.fill(0);
+    const secondRace = binaryInternals.emitAuthorizedWorkspaceBinary(
+      encodeFileTransferFrame({
+        opcode: FileTransferOpcode.FileBegin,
+        requestId: "race-request",
+        metadata: {
+          mime: "text/plain",
+          size: 0,
+          encoding: "binary",
+          modifiedAt: "2026-09-10T00:00:00.000Z",
+          revision: "revision-race",
+        },
+      }),
+      "workspace-1",
+      raceSource,
+    );
+    await Promise.all([firstRace, secondRace]);
+    expect(targetedBinaryMessages).toHaveLength(8);
+    await binaryInternals.emitAuthorizedWorkspaceBinary(
+      encodeFileTransferFrame({
+        opcode: FileTransferOpcode.FileEnd,
+        requestId: "race-request",
+      }),
+      "workspace-1",
+      raceSource,
+    );
+    expect(targetedBinaryMessages).toHaveLength(9);
+    expect(binaryInternals.activeFileBinaryStreams.size).toBe(0);
+
+    await session.cleanup();
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
+    await fixture.audit.close();
+  });
+
+  test("cleanup clears active and opening streams without reviving an awaited Begin", async () => {
+    const beginFrame = (requestId: string) =>
+      encodeFileTransferFrame({
+        opcode: FileTransferOpcode.FileBegin,
+        requestId,
+        metadata: {
+          mime: "text/plain",
+          size: 0,
+          encoding: "binary",
+          modifiedAt: "2026-09-10T00:00:00.000Z",
+          revision: `revision-${requestId}`,
+        },
+      });
+    const internals = (session: Session) =>
+      session as unknown as {
+        emitAuthorizedWorkspaceBinary(
+          frame: Uint8Array,
+          workspaceId: string,
+          source?: object,
+        ): Promise<void>;
+        activeFileBinaryStreams: Map<object | undefined, Map<string, unknown>>;
+      };
+
+    const activeFixture = await createBinaryAuthorizationFixture("cleanup-active");
+    const activeMessages: Array<{ source: object; frame: Uint8Array }> = [];
+    const activeSession = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      targetedBinaryMessages: activeMessages,
+      enterpriseContext: activeFixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: activeFixture.authorityState,
+      principalGrantVersionGuard: activeFixture.runtime.grantVersionGuard,
+      resourceAuthorization: activeFixture.runtime.resourceAuthorization,
+      sessionId: activeFixture.sessionId,
+      sessionAuthorization: activeFixture.sessionAuthorization,
+      admissionAuthorizationIssuer: activeFixture.issuer,
+      admissionAuthorizationHandle: activeFixture.handle,
+      enterpriseAuthorizationRuntime: activeFixture.runtime,
+    });
+    const activeInternals = internals(activeSession);
+    const activeSource = Object.freeze({ id: "active-source" });
+    await activeInternals.emitAuthorizedWorkspaceBinary(
+      beginFrame("active-cleanup"),
+      "workspace-1",
+      activeSource,
+    );
+    expect(activeInternals.activeFileBinaryStreams.size).toBe(1);
+    expect(activeMessages).toHaveLength(1);
+    await activeSession.cleanup();
+    expect(activeInternals.activeFileBinaryStreams.size).toBe(0);
+    await activeFixture.audit.close();
+
+    const openingFixture = await createBinaryAuthorizationFixture("cleanup-opening");
+    const openingMessages: Array<{ source: object; frame: Uint8Array }> = [];
+    const openingSession = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      targetedBinaryMessages: openingMessages,
+      enterpriseContext: openingFixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: openingFixture.authorityState,
+      principalGrantVersionGuard: openingFixture.runtime.grantVersionGuard,
+      resourceAuthorization: openingFixture.runtime.resourceAuthorization,
+      sessionId: openingFixture.sessionId,
+      sessionAuthorization: openingFixture.sessionAuthorization,
+      admissionAuthorizationIssuer: openingFixture.issuer,
+      admissionAuthorizationHandle: openingFixture.handle,
+      enterpriseAuthorizationRuntime: openingFixture.runtime,
+    });
+    const openingInternals = internals(openingSession);
+    const pendingBegin = openingInternals.emitAuthorizedWorkspaceBinary(
+      beginFrame("opening-cleanup"),
+      "workspace-1",
+      Object.freeze({ id: "opening-source" }),
+    );
+    expect(openingInternals.activeFileBinaryStreams.size).toBe(1);
+    const cleanup = openingSession.cleanup();
+    expect(openingInternals.activeFileBinaryStreams.size).toBe(0);
+    await Promise.all([pendingBegin, cleanup]);
+    await Promise.resolve();
+    expect(openingInternals.activeFileBinaryStreams.size).toBe(0);
+    expect(openingMessages).toHaveLength(0);
+    await openingFixture.audit.close();
+  });
+
+  test("public file explorer cleanup waits for blocked Begin delivery and emits no late frames", async () => {
+    const fixture = await createBinaryAuthorizationFixture("public-cleanup-barrier");
+    const beginDeliveryStarted = deferred<void>();
+    const releaseBeginDelivery = deferred<void>();
+    const delivered: Array<{ source: object; frame: Uint8Array }> = [];
+    const close = vi.fn(async () => {});
+    const workspaceRuntime = {
+      ...makeEnterpriseRuntime(async () => {}),
+      openRead: vi.fn(async () => ({
+        workspaceId: "workspace-1",
+        relativePath: "notes.txt",
+        size: 1,
+        mtimeMs: 0,
+        revision: "public-cleanup-r1",
+        read: async () => new Uint8Array([1]),
+        close,
+      })),
+    } satisfies NonNullable<SessionOptions["enterpriseWorkspaceFilesRuntime"]>;
+    const session = createSessionForTest({
+      clientId: "client-test",
+      permissions: ["workspace.read"],
+      binaryMessages: [],
+      onBinaryMessageToSource: async (source, frame) => {
+        delivered.push({ source, frame });
+        if (decodeFileTransferFrame(frame)?.opcode === FileTransferOpcode.FileBegin) {
+          beginDeliveryStarted.resolve();
+          await releaseBeginDelivery.promise;
+        }
+      },
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      enterpriseWorkspaceFilesRuntime: workspaceRuntime,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+    const source = Object.freeze({ id: "public-cleanup-source" });
+    const request = session.handleMessage(
+      {
+        type: "file_explorer_request",
+        cwd: "ignored",
+        workspaceId: "workspace-1",
+        path: "notes.txt",
+        mode: "file",
+        acceptBinary: true,
+        requestId: "public-cleanup-request",
+      },
+      source,
+    );
+    await beginDeliveryStarted.promise;
+    const internals = session as unknown as {
+      activeFileBinaryStreams: Map<object | undefined, Map<string, unknown>>;
+    };
+    expect(internals.activeFileBinaryStreams.size).toBe(1);
+    let cleanupSettled = false;
+    const cleanup = session.cleanup().then(() => (cleanupSettled = true));
+    expect(internals.activeFileBinaryStreams.size).toBe(0);
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(false);
+    releaseBeginDelivery.resolve();
+    await Promise.all([request, cleanup]);
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(true);
+    expect(internals.activeFileBinaryStreams.size).toBe(0);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.source).toBe(source);
+    expect(decodeFileTransferFrame(delivered[0]!.frame)?.opcode).toBe(FileTransferOpcode.FileBegin);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
+    await fixture.audit.close();
+  });
+
+  test("rejects a wrong Session identity and leaves construction rollback to the caller", async () => {
+    const fixture = await createBinaryAuthorizationFixture("construction-owner");
+    const common = {
+      clientId: "client-test",
+      permissions: ["workspace.read"] as const,
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    };
+    expect(() => createSessionForTest({ ...common, sessionId: "wrong-session" })).toThrow(
+      "Enterprise authorization runtime does not match canonical session authority",
+    );
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(true);
+
+    const createError = new Error("upload store construction failed");
+    const failingWorkspaceRuntime = {
+      ...makeEnterpriseRuntime(async () => {}),
+      createUploadStore: () => {
+        throw createError;
+      },
+    };
+    expect(() =>
+      createSessionForTest({
+        ...common,
+        sessionId: fixture.sessionId,
+        enterpriseWorkspaceFilesRuntime: failingWorkspaceRuntime,
+      }),
+    ).toThrow("Session construction rollback failed");
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(true);
+    await fixture.runtime.release();
+    expect(isCurrentProductionAuthorizationRuntime(fixture.runtime)).toBe(false);
+    expect(() => createSessionForTest({ ...common, sessionId: fixture.sessionId })).toThrow(
+      "Enterprise authorization runtime does not match canonical session authority",
+    );
+    await fixture.audit.close();
+  });
+});
+
+test("cleanup waits for workspace runtime before releasing authority", async () => {
+  let resolveCleanup!: () => void;
+  const cleanupPromise = new Promise<void>((resolve) => {
+    resolveCleanup = resolve;
+  });
+  const runtime = makeEnterpriseRuntime(() => cleanupPromise);
+  const state = new MemoryAuthorityReceiptState();
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const stateRelease = vi.spyOn(state, "releaseSession");
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-blocked"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState: state,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  const cleanup = session.cleanup();
+  await Promise.resolve();
+  expect(stateRelease).not.toHaveBeenCalled();
+  expect(registryRelease).not.toHaveBeenCalled();
+  resolveCleanup();
+  await cleanup;
+  expect(stateRelease).toHaveBeenCalledTimes(1);
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("cleanup continues authority and registry release when workspace runtime rejects", async () => {
+  const disposeError = new Error("workspace dispose failed");
+  const runtime = makeEnterpriseRuntime(async () => {
+    throw disposeError;
+  });
+  const state = new MemoryAuthorityReceiptState();
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const stateRelease = vi.spyOn(state, "releaseSession");
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-reject"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState: state,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await expect(session.cleanup()).rejects.toBe(disposeError);
+  expect(stateRelease).toHaveBeenCalledTimes(1);
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("cleanup aggregates workspace and authority release errors while continuing registry release", async () => {
+  const disposeError = new Error("workspace dispose failed");
+  const authorityError = new Error("authority release failed");
+  const runtime = makeEnterpriseRuntime(async () => {
+    throw disposeError;
+  });
+  const state = new MemoryAuthorityReceiptState();
+  vi.spyOn(state, "releaseSession").mockImplementation(() => {
+    throw authorityError;
+  });
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const registryRelease = vi.spyOn(registry, "releaseSession");
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-cleanup-double-error"),
+    enterpriseAgentContextRegistry: registry,
+    authorityReceiptState: state,
+    enterpriseWorkspaceFilesRuntime: runtime,
+  });
+  await expect(session.cleanup()).rejects.toMatchObject({
+    cause: disposeError,
+    errors: [disposeError, authorityError],
+  });
+  expect(registryRelease).toHaveBeenCalledTimes(1);
+});
+
+test("identity-self request is unavailable until its owning policy is registered", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-identity-self"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+  });
+  await session.handleMessage({
+    type: "enterprise.identity.get_current.request",
+    requestId: "identity-self-1",
+  });
+  expect(messages.at(-1)).toMatchObject({
+    type: "rpc_error",
+    payload: { requestId: "identity-self-1", code: "unavailable" },
+  });
+  await session.cleanup();
+});
+
+test("identity-self requests register and emit through the current session binding", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const logoutAll = vi.fn(async () => true);
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(authorityReceiptState, "register");
+  const context = enterpriseContext("generation-identity-self-current");
+  const dispatcher = createEnterpriseIdentityDispatcher({
+    listPrincipals: vi.fn(async () => []),
+    logoutAll,
+  });
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState,
+    enterpriseDispatcher: dispatcher,
+  });
+
+  await session.handleMessage({
+    type: "enterprise.identity.get_current.request",
+    requestId: "identity-current-1",
+  });
+  await session.handleMessage({
+    type: "enterprise.identity.logout_all.request",
+    requestId: "identity-logout-1",
+  });
+
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "enterprise.identity.get_current.response",
+      payload: expect.objectContaining({ requestId: "identity-current-1" }),
+    }),
+    expect.objectContaining({
+      type: "enterprise.identity.logout_all.response",
+      payload: { requestId: "identity-logout-1", loggedOut: true },
+    }),
+  ]);
+  expect(logoutAll).toHaveBeenCalledTimes(1);
+  expect(register).toHaveBeenCalledTimes(2);
+  expect(register.mock.calls[0]?.[0].binding).toMatchObject({
+    sessionBindingGeneration: context.sessionBindingGeneration,
+    organizationId: context.principal.organizationId,
+    principalId: context.principal.principalId,
+    credentialId: context.principal.credentialId,
+    grantVersion: context.principal.grantVersion,
+    nodeId: context.node.nodeId,
+    clientId: expect.any(String),
+  });
+  await session.cleanup();
+});
+
+test("reuses the exact dispatch context when consuming an enterprise authority response", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const context = enterpriseContext("generation-authority-dispatch-context", {
+    grants: [
+      {
+        action: "identity.manage",
+        selector: { kind: "organization", organizationId: "org_aaaaaaaaaaaaaaaa" },
+      },
+    ],
+  });
+  const request = {
+    type: "enterprise.access.list_grants.request",
+    requestId: "authority-dispatch-context",
+    principalId: context.principal.principalId,
+  } as const satisfies SessionInboundMessage;
+  const response = {
+    type: "enterprise.access.list_grants.response",
+    payload: {
+      requestId: request.requestId,
+      principalId: context.principal.principalId,
+      grants: context.principal.grants,
+      revision: context.principal.grantVersion,
+    },
+  } as const satisfies SessionOutboundMessage;
+  let dispatchContext: EnterpriseDispatchContext | undefined;
+  const handle = vi.fn((input: { sessionContext: EnterpriseDispatchContext }) => {
+    dispatchContext = input.sessionContext;
+    return response;
+  });
+  const consumeResponse = vi.fn((input: { sessionContext: EnterpriseDispatchContext }) =>
+    input.sessionContext === dispatchContext
+      ? { response, receiptClassification: "authority" as const }
+      : null,
+  );
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: {
+      requestPolicyForType: (type) => (type === request.type ? "authority" : null),
+      handle,
+      consumeResponse,
+    },
+  });
+
+  await session.handleMessage(request);
+
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(consumeResponse).toHaveBeenCalledTimes(1);
+  expect(messages).toContainEqual(response);
+  expect(messages).not.toContainEqual(
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: request.requestId }),
+    }),
+  );
+  await session.cleanup();
+});
+
+test("identity-self requests fail closed when the current grant is stale", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const handle = vi.fn(() => false);
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-identity-self-stale"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    principalGrantVersionGuard: { isCurrent: () => false },
+    enterpriseDispatcher: { handle },
+  });
+
+  await session.handleMessage({
+    type: "enterprise.identity.get_current.request",
+    requestId: "identity-stale-1",
+  });
+
+  expect(handle).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "identity-stale-1", code: "access_denied" }),
+    }),
+  ]);
+  await session.cleanup();
+});
+
+test("denied enterprise principal receives an immediate access-denied envelope", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const handle = vi.fn(() => false);
+  const session = createSessionForTest({
+    messages,
+    permissions: ["workspace.read"],
+    enterpriseContext: enterpriseContext("generation-denied-status"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    enterpriseDispatcher: { handle },
+  });
+
+  await session.handleMessage({
+    type: "daemon.get_status.request",
+    requestId: "global-denied",
+  });
+
+  expect(handle).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: "global-denied",
+        requestType: "daemon.get_status.request",
+        error: "Session is not authorized for daemon.get_status.request",
+        code: "access_denied",
+      },
+    },
+  ]);
+  expect(JSON.stringify(messages)).not.toContain("canary");
+  await session.cleanup();
+});
+
+test("coarse workspace access denies missing enterprise actions without receipt or dispatch", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const handle = vi.fn(() => false);
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(authorityReceiptState, "register");
+  const context = enterpriseContext("generation-action-denial");
+  const session = createSessionForTest({
+    messages,
+    permissions: ["workspace.read"],
+    enterpriseContext: context,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState,
+    enterpriseDispatcher: { handle },
+  });
+
+  await session.handleMessage({
+    type: "enterprise.audit.list_events.request",
+    requestId: "audit-denied",
+  });
+  await session.handleMessage({
+    type: "enterprise.access.list_grants.request",
+    requestId: "grants-denied",
+    principalId: context.principal.principalId,
+  });
+
+  expect(handle).not.toHaveBeenCalled();
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toHaveLength(2);
+  expect(messages).toEqual([
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({
+        requestId: "audit-denied",
+        requestType: "enterprise.audit.list_events.request",
+        code: "access_denied",
+      }),
+    }),
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({
+        requestId: "grants-denied",
+        requestType: "enterprise.access.list_grants.request",
+        code: "access_denied",
+      }),
+    }),
+  ]);
+  expect(JSON.stringify(messages)).not.toContain("canary");
+  await session.cleanup();
+});
+
+test("enterprise global list terminals is denied before terminal enumeration", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const register = vi.spyOn(authorityReceiptState, "register");
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-terminal-policy-null"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState,
+  });
+  const dispatch = vi.spyOn(session as never, "dispatchInboundMessage" as never);
+  const terminalDispatch = vi.spyOn(asSessionInternals(session).terminalController, "dispatch");
+
+  await session.handleMessage({
+    type: "list_terminals_request",
+    cwd: "/workspace",
+    requestId: "terminal-policy-null",
+  });
+
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(terminalDispatch).not.toHaveBeenCalled();
+  expect(register).not.toHaveBeenCalled();
+  expect(messages).toEqual([
+    {
+      type: "rpc_error",
+      payload: {
+        requestId: "terminal-policy-null",
+        requestType: "list_terminals_request",
+        error: "Session is not authorized for global terminal listing",
+        code: "access_denied",
+      },
+    },
+  ]);
+  dispatch.mockRestore();
+  await session.cleanup();
+});
+
+test("each authority emission mints fresh state and post-first Grant revoke drops later output", async () => {
+  let current = true;
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-emission-fresh"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    principalGrantVersionGuard: { isCurrent: () => current },
+    resourceAuthorization: {
+      canEmit: vi.fn(async () => {
+        current = false;
+        return true;
+      }),
+    } as never,
+  });
+  vi.spyOn(session as never, "dispatchInboundMessage" as never).mockImplementationOnce(async () => {
+    session.publish({
+      type: "daemon.update.progress",
+      payload: { requestId: "fresh-1", phase: "starting" },
+    });
+    session.publish({
+      type: "daemon.update.progress",
+      payload: { requestId: "fresh-1", phase: "complete" },
+    });
+  });
+  await session.handleMessage({ type: "daemon.update.request", requestId: "fresh-1" });
+  expect(messages).toHaveLength(1);
+  await session.cleanup();
+});
+
+test("strict verifier consumes each fresh progress receipt from the shared authority state", async () => {
+  let id = 0;
+  const state = new MemoryAuthorityReceiptState({
+    clock: { now: () => 1 },
+    receiptIdFactory: () => `receipt-shared-${++id}`,
+  });
+  const verifier = new StrictOutboundAuthorityVerifier("nod_aaaaaaaaaaaaaaaa", state, {
+    now: () => 1,
+  });
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-strict-shared"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: state,
+    resourceAuthorization: {
+      canEmit: async (principal, event, context) =>
+        context.kind === "authority" ? verifier.verify(principal, event, context.authority) : false,
+    } as never,
+  });
+  vi.spyOn(session as never, "dispatchInboundMessage" as never).mockImplementationOnce(async () => {
+    session.publish({
+      type: "daemon.update.progress",
+      payload: { requestId: "strict-shared", phase: "starting" },
+    });
+    session.publish({
+      type: "daemon.update.progress",
+      payload: { requestId: "strict-shared", phase: "complete" },
+    });
+  });
+  await session.handleMessage({ type: "daemon.update.request", requestId: "strict-shared" });
+  expect(
+    messages.filter((message) => (message as { type?: string }).type === "daemon.update.progress"),
+  ).toHaveLength(2);
+  await session.cleanup();
+});
+
+test("handler failure emits correlated rpc_error before request close", async () => {
+  const messages: unknown[] = [];
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-rpc-error"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+  });
+  vi.spyOn(session as never, "dispatchInboundMessage" as never).mockRejectedValueOnce(
+    new Error("boom"),
+  );
+  await session.handleMessage({ type: "daemon.get_status.request", requestId: "rpc-error-1" });
+  expect(messages.some((message) => (message as { type?: string }).type === "rpc_error")).toBe(
+    true,
+  );
+  await session.cleanup();
+});
+
+test("explicit transport context is required and validated per emission", async () => {
+  const messages: unknown[] = [];
+  const canEmit = vi.fn(async () => true);
+  const session = createSessionForTest({
+    messages,
+    enterpriseContext: enterpriseContext("generation-explicit-transport"),
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: new MemoryAuthorityReceiptState(),
+    resourceAuthorization: { canEmit } as never,
+  });
+  session.publish(
+    { type: "pong", payload: { requestId: "pong-explicit", serverReceivedAt: 1, serverSentAt: 2 } },
+    {
+      kind: "transport_control",
+      control: "pong",
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  await session.cleanup();
+  expect(canEmit).toHaveBeenCalledTimes(1);
+  expect(messages).toHaveLength(1);
+});
+
+test("construction rollback preserves registration and release errors", () => {
+  const authorityReceiptState = {
+    registerSessionBinding: vi.fn(() => {
+      throw new Error("registration failed");
+    }),
+    releaseSession: vi.fn(() => {
+      throw new Error("release failed");
+    }),
+  } as unknown as SessionOptions["authorityReceiptState"];
+  try {
+    createSessionForTest({
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState,
+    });
+    throw new Error("expected construction failure");
+  } catch (error) {
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((entry) => (entry as Error).message)).toEqual([
+      "registration failed",
+      "release failed",
+    ]);
+  }
+  expect(authorityReceiptState.releaseSession).toHaveBeenCalledTimes(1);
+});
+
+test("construction rollback continues after a non-authority cleanup failure", () => {
+  const releaseSession = vi.fn();
+  const authorityReceiptState = {
+    registerSessionBinding: vi.fn(() => {
+      throw new Error("registration failed");
+    }),
+    releaseSession,
+  } as unknown as SessionOptions["authorityReceiptState"];
+  const unsubscribeAgent = vi.fn(() => {
+    throw new Error("unsubscribe failed");
+  });
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const releaseRegistry = vi.fn(() => {
+    throw new Error("registry release failed");
+  });
+  const registryWithThrowingRelease = { ...registry, releaseSession: releaseRegistry };
+  const voiceCleanup = vi.spyOn(VoiceSession.prototype, "cleanup").mockResolvedValue(undefined);
+  expect(() =>
+    createSessionForTest({
+      enterpriseContext: enterpriseContext(),
+      enterpriseAgentContextRegistry: registryWithThrowingRelease,
+      authorityReceiptState,
+      agentManager: { subscribe: vi.fn(() => unsubscribeAgent) },
+    }),
+  ).toThrow();
+  expect(unsubscribeAgent).toHaveBeenCalledTimes(1);
+  expect(releaseSession).toHaveBeenCalledTimes(1);
+  expect(releaseRegistry).toHaveBeenCalledTimes(1);
+  expect(voiceCleanup).toHaveBeenCalledTimes(1);
+  voiceCleanup.mockRestore();
+});
+
+test("Session normalizes and recursively freezes caller enterprise context", () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const original = enterpriseContext();
+  const session = createSessionForTest({
+    enterpriseContext: original,
+    enterpriseAgentContextRegistry: registry,
+  });
+  original.principal.grants[0].selector.workspaceIds.push("wks_bbbbbbbbbbbbbbbb");
+  original.principal.grants.push({
+    action: "workspace.metadata.read",
+    selector: { kind: "workspace", workspaceIds: ["wks_bbbbbbbbbbbbbbbb"] },
+  });
+  const normalized = session.getEnterpriseSessionContext();
+  expect(normalized?.principal.grants).toHaveLength(1);
+  expect(normalized?.principal.grants[0].selector).toEqual({
+    kind: "workspace",
+    workspaceIds: ["wks_aaaaaaaaaaaaaaaa"],
+  });
+  expect(Object.isFrozen(normalized)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal.grants)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal.grants[0].selector)).toBe(true);
+  expect(Object.isFrozen(normalized?.principal.grants[0].selector.workspaceIds)).toBe(true);
+});
+
+test("Session binds and resolves the exact enterprise agent context", () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const session = createSessionForTest({
+    enterpriseContext: enterpriseContext(),
+    enterpriseAgentContextRegistry: registry,
+  });
+  const handle = session.bindAgentPrincipalContext("agent-a");
+  expect(handle).not.toBeNull();
+  expect(session.resolveAgentPrincipalContext("agent-a")).toBe(handle);
+});
+
+test("replacement and cleanup are generation-scoped across Sessions", async () => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const sessionA = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-a"),
+    enterpriseAgentContextRegistry: registry,
+  });
+  const sessionB = createSessionForTest({
+    enterpriseContext: enterpriseContext("generation-b", { principalId: "usr_bbbbbbbbbbbbbbbb" }),
+    enterpriseAgentContextRegistry: registry,
+  });
+  const handleA = sessionA.bindAgentPrincipalContext("agent-a");
+  const handleB = sessionB.bindAgentPrincipalContext("agent-a");
+  expect(sessionA.resolveAgentPrincipalContext("agent-a")).toBeNull();
+  expect(sessionB.resolveAgentPrincipalContext("agent-a")).toBe(handleB);
+  await sessionA.cleanup();
+  expect(sessionB.resolveAgentPrincipalContext("agent-a")).toBe(handleB);
+  await sessionB.cleanup();
+  await sessionB.cleanup();
+  expect(sessionB.resolveAgentPrincipalContext("agent-a")).toBeNull();
+  expect(handleA).not.toBeNull();
+});
+
+test.each([
+  ["credentialId", { credentialId: "cred-b" }, {}],
+  ["grantVersion", { grantVersion: "grant-v2" }, {}],
+  ["nodeId", {}, { nodeId: "nod_bbbbbbbbbbbbbbbb" }],
+  ["paseoServerId", {}, { paseoServerId: "server-b" }],
+  ["mode", {}, { mode: "managed" }],
+  ["principal", { principalId: "usr_bbbbbbbbbbbbbbbb" }, {}],
+])("Session rejects %s mismatch", (_field, principalOverrides, nodeOverrides) => {
+  const registry = createEnterpriseAgentSessionContextRegistry();
+  const base = enterpriseContext();
+  const session = createSessionForTest({
+    enterpriseContext: base,
+    enterpriseAgentContextRegistry: registry,
+  });
+  session.bindAgentPrincipalContext("agent-a");
+  registry.bind({
+    agentId: "agent-a",
+    context: enterpriseContext("generation-a", principalOverrides, nodeOverrides),
+  });
+  expect(session.resolveAgentPrincipalContext("agent-a")).toBeNull();
+});
 
 test("routes host-scoped agent skills requests through the daemon owner", async () => {
   const messages: SessionOutboundMessage[] = [];
@@ -748,7 +4873,6 @@ describe("session authorization permissions", () => {
         invalidateAuthority: vi.fn(),
       },
     });
-
     await session.handleMessage({
       type: "hub.execution.agent.validate.request",
       requestId: "validate-agent",
@@ -1364,6 +5488,10 @@ function createStoredAgentRecord(
     provider: overrides.provider ?? "codex",
     cwd: overrides.cwd,
     workspaceId: overrides.workspaceId,
+    organizationId: overrides.organizationId,
+    nodeId: overrides.nodeId,
+    ownerPrincipalId: overrides.ownerPrincipalId,
+    createdByPrincipalId: overrides.createdByPrincipalId,
     createdAt: overrides.createdAt ?? "2026-01-01T00:00:00.000Z",
     updatedAt: overrides.updatedAt ?? "2026-01-01T00:00:00.000Z",
     lastUserMessageAt: overrides.lastUserMessageAt ?? null,
@@ -5761,3 +9889,3876 @@ test("provider snapshots preserve versionless visibility while capabilities upda
   ]);
   expect(references.compactSnapshot!.entries[0]!.modes![0]!.icon).toBe("ShieldCheck");
 });
+
+describe("enterprise dispatcher integration seam", () => {
+  test("legacy sessions leave enterprise requests unavailable", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({ messages });
+    await session.handleMessage({
+      type: "enterprise.access.list_grants.request",
+      requestId: "legacy-enterprise",
+    });
+    expect(messages.at(-1)).toMatchObject({
+      type: "rpc_error",
+      payload: { requestId: "legacy-enterprise", code: "unavailable" },
+    });
+  });
+
+  test.each([
+    {
+      name: "workspaces",
+      request: {
+        type: "fetch_workspaces_request",
+        requestId: "legacy-fetch-workspaces-empty",
+      } as const,
+      responseType: "fetch_workspaces_response",
+    },
+    {
+      name: "agents",
+      request: { type: "fetch_agents_request", requestId: "legacy-fetch-agents-empty" } as const,
+      responseType: "fetch_agents_response",
+    },
+    {
+      name: "agent history",
+      request: {
+        type: "fetch_agent_history_request",
+        requestId: "legacy-fetch-agent-history-empty",
+      } as const,
+      responseType: "fetch_agent_history_response",
+    },
+  ])("legacy $name empty-page delivery remains unchanged", async ({ request, responseType }) => {
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({ messages });
+
+    await session.handleMessage(request);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: responseType,
+      payload: { requestId: request.requestId, entries: [] },
+    });
+    await session.cleanup();
+  });
+
+  test("enterprise legacy archive fails closed before manager access without a current runtime", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const getAgent = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-legacy-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentManager: { getAgent },
+    });
+
+    await session.handleMessage({
+      type: "archive_agent_request",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      requestId: "legacy-archive-denied",
+    });
+
+    expect(getAgent).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "legacy-archive-denied",
+          requestType: "archive_agent_request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test("enterprise fetch-agent guesses are denied before identifier enumeration", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const listAgents = vi.fn(() => []);
+    const getAgent = vi.fn();
+    const listStorage = vi.fn().mockResolvedValue([]);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-fetch-agent-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentManager: { listAgents, getAgent },
+      agentStorage: { list: listStorage },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_request",
+      agentId: "title-or-prefix",
+      requestId: "fetch-agent-denied",
+    });
+
+    expect(listStorage).not.toHaveBeenCalled();
+    expect(listAgents).not.toHaveBeenCalled();
+    expect(getAgent).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "fetch-agent-denied",
+        requestType: "fetch_agent_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+  });
+
+  test("enterprise send-agent authorizes the exact agent once and delivers its accepted response", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseSendAgentHarness("send-agent-accepted");
+    const assertAgent = vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent");
+    const canEmit = vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit");
+    const response = {
+      type: "send_agent_message_response",
+      payload: {
+        requestId: "send-agent-accepted",
+        agentId: enterpriseSendAgentId,
+        accepted: true,
+        error: null,
+      },
+    } as const;
+
+    await h.session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: response.payload.requestId,
+      agentId: enterpriseSendAgentId,
+      text: "Run the authorized task",
+      attachments: [],
+    });
+
+    await vi.waitFor(() => expect(h.messages).toContainEqual(response));
+    expect(assertAgent).toHaveBeenCalledExactlyOnceWith(
+      h.fixture.enterpriseSessionContext.principal,
+      "workspace.write",
+      enterpriseSendAgentId,
+    );
+    expect(h.streamAgent).toHaveBeenCalledTimes(1);
+    expect(h.waitForAgentRunStart).toHaveBeenCalledExactlyOnceWith(
+      enterpriseSendAgentId,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(h.listAgents).not.toHaveBeenCalled();
+    expect(h.listStorage).not.toHaveBeenCalled();
+    const outboundContext = canEmit.mock.calls.find(
+      ([, event]) => event.type === "send_agent_message_response",
+    )?.[2];
+    expect(outboundContext).toEqual({
+      kind: "resources",
+      resources: [
+        {
+          resourceKind: "workspace",
+          organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+          nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+          localResourceId: enterpriseSendWorkspaceId,
+        },
+        {
+          resourceKind: "agent",
+          organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+          nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+          localResourceId: enterpriseSendAgentId,
+        },
+      ],
+    });
+    expect(Object.isFrozen(outboundContext)).toBe(true);
+    expect(
+      outboundContext?.kind === "resources" && Object.isFrozen(outboundContext.resources),
+    ).toBe(true);
+    if (outboundContext?.kind === "resources") {
+      expect(outboundContext.resources.every((resource) => Object.isFrozen(resource))).toBe(true);
+    }
+    await h.session.cleanup();
+  });
+
+  test("enterprise send-agent delivers a provider rejection with the authorized resource context", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseSendAgentHarness("send-agent-rejected", {
+      streamError: new Error("provider rejected prompt"),
+    });
+    const canEmit = vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit");
+
+    await h.session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: "send-agent-rejected",
+      agentId: enterpriseSendAgentId,
+      text: "Run the rejected task",
+      attachments: [],
+    });
+
+    await vi.waitFor(() =>
+      expect(h.messages).toContainEqual({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: "send-agent-rejected",
+          agentId: enterpriseSendAgentId,
+          accepted: false,
+          error: "provider rejected prompt",
+        },
+      }),
+    );
+    expect(h.streamAgent).toHaveBeenCalledTimes(1);
+    const outboundContext = canEmit.mock.calls.find(
+      ([, event]) => event.type === "send_agent_message_response",
+    )?.[2];
+    expect(outboundContext).toMatchObject({
+      kind: "resources",
+      resources: [
+        { resourceKind: "workspace", localResourceId: enterpriseSendWorkspaceId },
+        { resourceKind: "agent", localResourceId: enterpriseSendAgentId },
+      ],
+    });
+    await h.session.cleanup();
+  });
+
+  test("enterprise send-agent uniformly denies foreign, guessed, and stale ids before manager access", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseSendAgentHarness("send-agent-denied");
+    const foreignWorkspaceId = "wks_bbbbbbbbbbbbbbbb";
+    const foreignAgentId = "agt_bbbbbbbbbbbbbbbb";
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    h.fixture.owners.registerWorkspace({
+      id: foreignWorkspaceId,
+      organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+      nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    h.fixture.owners.registerAgent({ id: foreignAgentId, workspaceId: foreignWorkspaceId });
+    const denied = [
+      { requestId: "send-agent-foreign", agentId: foreignAgentId },
+      { requestId: "send-agent-prefix", agentId: "agt_aaaa" },
+      { requestId: "send-agent-title", agentId: "owned agent title" },
+    ];
+    for (const request of denied) {
+      await h.session.handleMessage({
+        type: "send_agent_message_request",
+        ...request,
+        text: "must not run",
+        attachments: [],
+      });
+    }
+    await h.fixture.runtime.release();
+    denied.push({ requestId: "send-agent-stale", agentId: enterpriseSendAgentId });
+    await h.session.handleMessage({
+      type: "send_agent_message_request",
+      ...denied.at(-1)!,
+      text: "must not run",
+      attachments: [],
+    });
+
+    expect(h.messages).toEqual(
+      denied.map(({ requestId }) => ({
+        type: "rpc_error",
+        payload: {
+          requestId,
+          requestType: "send_agent_message_request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      })),
+    );
+    expect(h.getAgent).not.toHaveBeenCalled();
+    expect(h.streamAgent).not.toHaveBeenCalled();
+    expect(h.listAgents).not.toHaveBeenCalled();
+    expect(h.listStorage).not.toHaveBeenCalled();
+    await h.session.cleanup();
+  });
+
+  test("legacy send-agent keeps title resolution and response delivery", async () => {
+    const managedAgent = makeEnterpriseSendManagedAgent();
+    const listStorage = vi.fn(async () => [
+      createStoredAgentRecord({
+        id: enterpriseSendAgentId,
+        cwd: managedAgent.cwd,
+        title: "legacy named agent",
+      }),
+    ]);
+    const streamAgent = vi.fn(() => emptyAgentRun());
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: {
+        getAgent: vi.fn(() => managedAgent),
+        listAgents: vi.fn(() => []),
+        waitForAgentClose: vi.fn(async () => {}),
+        tryRunOutOfBand: vi.fn(() => false),
+        hasInFlightRun: vi.fn(() => false),
+        streamAgent,
+        waitForAgentRunStart: vi.fn(async () => {}),
+      },
+      agentStorage: {
+        get: vi.fn(async () => undefined),
+        list: listStorage,
+      },
+    });
+
+    await session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: "send-agent-legacy-title",
+      agentId: "legacy named agent",
+      text: "legacy task",
+      attachments: [],
+    });
+
+    expect(listStorage).toHaveBeenCalledTimes(1);
+    expect(streamAgent).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: "send-agent-legacy-title",
+        agentId: enterpriseSendAgentId,
+        accepted: true,
+        error: null,
+      },
+    });
+    await session.cleanup();
+  });
+
+  test("enterprise timeline denial precedes load and timeline fetch", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const fetchTimeline = vi.fn();
+    const listStorage = vi.fn().mockResolvedValue([]);
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-timeline-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentStorage: { list: listStorage },
+      agentManager: { fetchTimeline },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_timeline_request",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      requestId: "timeline-denied",
+      direction: "tail",
+      projection: "projected",
+    });
+
+    expect(listStorage).not.toHaveBeenCalled();
+    expect(fetchTimeline).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "timeline-denied",
+        requestType: "fetch_agent_timeline_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+  });
+
+  test("enterprise timeline subscription and prompt tail deny before manager access", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+    const getTimelineRows = vi.fn();
+    const fetchTimeline = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-timeline-subscription-guard"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentManager: {
+        subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+          agentEventListeners.push(listener);
+          return () => {};
+        }),
+        getTimelineRows,
+        fetchTimeline,
+      },
+    });
+    session.updateClientCapabilities({ selective_agent_timeline: true });
+
+    await session.handleMessage({
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agt_aaaaaaaaaaaaaaaa"],
+      requestId: "timeline-subscription-denied",
+    });
+    await session.handleMessage({
+      type: "agent.timeline.list_prompts.request",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      requestId: "timeline-prompts-denied",
+    });
+
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "timeline-subscription-denied",
+          requestType: "agent.timeline.set_subscription.request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "timeline-prompts-denied",
+          requestType: "agent.timeline.list_prompts.request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+    expect(getTimelineRows).not.toHaveBeenCalled();
+    expect(fetchTimeline).not.toHaveBeenCalled();
+    expect(agentEventListeners).toHaveLength(1);
+    messages.length = 0;
+    agentEventListeners[0]({
+      type: "agent_stream",
+      agentId: "agt_aaaaaaaaaaaaaaaa",
+      event: {
+        type: "timeline",
+        provider: "mock",
+        item: { type: "assistant_message", messageId: "denied-tail", text: "hidden" },
+      },
+    });
+    expect(messages).toEqual([]);
+    await session.cleanup();
+  });
+
+  test("enterprise workspace mutations enforce the current point owner before registry effects", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture(
+      "workspace-mutation-guard",
+      [
+        {
+          action: "workspace.write",
+          selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+        },
+        {
+          action: "workspace.manage",
+          selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+        },
+      ],
+      ["workspace.manage", "hub.execute"],
+    );
+    const context = fixture.enterpriseSessionContext;
+    fixture.owners.registerWorkspace({
+      id: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: context.principal.organizationId,
+      nodeId: context.node.nodeId,
+      ownerPrincipalId: context.principal.principalId,
+      createdByPrincipalId: context.principal.principalId,
+    });
+    const workspace = {
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: context.principal.organizationId,
+      nodeId: context.node.nodeId,
+      ownerPrincipalId: context.principal.principalId,
+      createdByPrincipalId: context.principal.principalId,
+      projectId: "project-mutation",
+      cwd: "/tmp/workspace-mutation",
+      kind: "directory" as const,
+      displayName: "mutation",
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const update = vi.fn(async () => workspace);
+    const get = vi.fn(async () => null);
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: context,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      workspaceRegistry: {
+        get,
+        list: vi.fn(async () => [workspace]),
+        update,
+      },
+    });
+
+    await session.handleMessage({
+      type: "workspace.title.set.request",
+      workspaceId: workspace.workspaceId,
+      title: "renamed",
+      requestId: "workspace-title-allowed",
+    });
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(messages).toContainEqual({
+      type: "workspace.title.set.response",
+      payload: {
+        requestId: "workspace-title-allowed",
+        workspaceId: workspace.workspaceId,
+        accepted: true,
+        title: "renamed",
+        error: null,
+      },
+    });
+
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: "wks_bbbbbbbbbbbbbbbb",
+      requestId: "workspace-archive-foreign",
+    });
+    expect(get).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "workspace-archive-foreign",
+        requestType: "archive_workspace_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+
+    await fixture.runtime.release();
+    await session.handleMessage({
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "workspace-archive-stale",
+    });
+    expect(get).not.toHaveBeenCalled();
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "workspace-archive-stale",
+        requestType: "archive_workspace_request",
+        error: "Resource unavailable",
+        code: "access_denied",
+      },
+    });
+    await session.cleanup();
+  });
+
+  test("enterprise provider and forge searches deny before provider side effects", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const listAgents = vi.fn().mockResolvedValue([]);
+    const searchRepositories = vi.fn();
+    const session = createSessionForTest({
+      messages,
+      enterpriseContext: enterpriseContext("generation-provider-boundary"),
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      agentStorage: { list: listAgents },
+      github: { searchRepositories },
+    });
+
+    await session.handleMessage({
+      type: "fetch_recent_provider_sessions_request",
+      requestId: "provider-boundary",
+    });
+    await session.handleMessage({
+      type: "workspace.github.search_repositories.request",
+      requestId: "forge-boundary",
+      query: "paseo",
+      limit: 10,
+    });
+
+    expect(listAgents).not.toHaveBeenCalled();
+    expect(searchRepositories).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "provider-boundary",
+          requestType: "fetch_recent_provider_sessions_request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "forge-boundary",
+          requestType: "workspace.github.search_repositories.request",
+          error: "Resource unavailable",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test("enterprise fetch-agent success uses the canonical authorized id without enumeration", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agent-success");
+    const agentId = "agt_aaaaaaaaaaaaaaaa";
+    fixture.owners.registerWorkspace({
+      id: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+      nodeId: fixture.enterpriseSessionContext.node.nodeId,
+      ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+      createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    });
+    fixture.owners.registerAgent({
+      id: agentId,
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+      nodeId: fixture.enterpriseSessionContext.node.nodeId,
+      ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+      createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    });
+    const messages: SessionOutboundMessage[] = [];
+    const getAgent = vi.fn(() => null);
+    const listAgents = vi.fn(() => []);
+    const listStorage = vi.fn().mockResolvedValue([]);
+    const storageGet = vi.fn().mockResolvedValue(
+      createStoredAgentRecord({
+        id: agentId,
+        cwd: "/tmp/authorized-agent",
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+        nodeId: fixture.enterpriseSessionContext.node.nodeId,
+        ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+        createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+      }),
+    );
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { getAgent, listAgents },
+      agentStorage: { get: storageGet, list: listStorage },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_request",
+      agentId,
+      requestId: "fetch-agent-success",
+    });
+
+    expect(getAgent).toHaveBeenCalledTimes(1);
+    expect(getAgent).toHaveBeenCalledWith(agentId);
+    expect(listAgents).not.toHaveBeenCalled();
+    expect(listStorage).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toEqual(
+      expect.objectContaining({
+        type: "fetch_agent_response",
+        payload: expect.objectContaining({
+          requestId: "fetch-agent-success",
+          agent: expect.objectContaining({ id: agentId }),
+        }),
+      }),
+    );
+    await session.cleanup();
+  });
+
+  test("enterprise fetch-workspaces delivers an authorized empty page", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-workspaces-empty", [
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+    ]);
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "fetch-workspaces-empty",
+    });
+
+    await vi.waitFor(() =>
+      expect(messages).toContainEqual({
+        type: "fetch_workspaces_response",
+        payload: {
+          requestId: "fetch-workspaces-empty",
+          entries: [],
+          emptyProjects: [],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    const context = canEmit.mock.calls.find(
+      ([, event]) => event.type === "fetch_workspaces_response",
+    )?.[2];
+    expect(context).toEqual({ kind: "resources", resources: [] });
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(Object.isFrozen(context?.kind === "resources" ? context.resources : null)).toBe(true);
+    await session.cleanup();
+  });
+
+  test("enterprise fetch-agents delivers an authorized empty page", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-empty");
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-empty",
+    });
+
+    await vi.waitFor(() =>
+      expect(messages).toContainEqual({
+        type: "fetch_agents_response",
+        payload: {
+          requestId: "fetch-agents-empty",
+          entries: [],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    const context = canEmit.mock.calls.find(
+      ([, event]) => event.type === "fetch_agents_response",
+    )?.[2];
+    expect(context).toEqual({ kind: "resources", resources: [] });
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(Object.isFrozen(context?.kind === "resources" ? context.resources : null)).toBe(true);
+    await session.cleanup();
+  });
+
+  test("enterprise fetch-agent-history delivers an authorized empty page", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agent-history-empty");
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-agent-history-empty",
+    });
+
+    await vi.waitFor(() =>
+      expect(messages).toContainEqual({
+        type: "fetch_agent_history_response",
+        payload: {
+          requestId: "fetch-agent-history-empty",
+          entries: [],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    const context = canEmit.mock.calls.find(
+      ([, event]) => event.type === "fetch_agent_history_response",
+    )?.[2];
+    expect(context).toEqual({ kind: "resources", resources: [] });
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(Object.isFrozen(context?.kind === "resources" ? context.resources : null)).toBe(true);
+    await session.cleanup();
+  });
+
+  test("enterprise agent directory drops a nonempty page without a canonical workspace id", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-malformed-page");
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+    });
+    vi.spyOn(asSessionInternals(session), "listFetchAgentsEntries").mockResolvedValue({
+      entries: [
+        {
+          agent: {
+            id: "agt_malformed",
+            provider: "codex",
+            cwd: "/repo/malformed",
+            model: null,
+            features: [],
+            thinkingOptionId: null,
+            effectiveThinkingOptionId: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            lastUserMessageAt: null,
+            status: "idle",
+            capabilities: {
+              supportsStreaming: true,
+              supportsSessionPersistence: true,
+              supportsDynamicModes: true,
+              supportsMcpServers: true,
+              supportsReasoningStream: true,
+              supportsToolInvocations: true,
+            },
+            currentModeId: null,
+            availableModes: [],
+            pendingPermissions: [],
+            persistence: null,
+            title: "Malformed",
+            labels: {},
+            requiresAttention: false,
+            attentionReason: null,
+          },
+          project: {
+            projectKey: "project-malformed",
+            projectName: "malformed",
+            checkout: {
+              cwd: "/repo/malformed",
+              isGit: false,
+              currentBranch: null,
+              remoteUrl: null,
+              isPaseoOwnedWorktree: false,
+              mainRepoRoot: null,
+            },
+          },
+        },
+      ],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-malformed-page",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(canEmit).not.toHaveBeenCalled();
+    expect(messages).toEqual([]);
+    await session.cleanup();
+  });
+
+  test("enterprise agent lists filter ownership before page and history projection", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-filter");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const currentPrincipalId = fixture.enterpriseSessionContext.principal.principalId;
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    const workspaceA = "wks_aaaaaaaaaaaaaaaa";
+    const workspaceB = "wks_bbbbbbbbbbbbbbbb";
+    fixture.owners.registerWorkspace({
+      id: workspaceA,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: currentPrincipalId,
+      createdByPrincipalId: currentPrincipalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: workspaceB,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    const agentA = "agt_aaaaaaaaaaaaaaaa";
+    const agentB = "agt_bbbbbbbbbbbbbbbb";
+    fixture.owners.registerAgent({
+      id: agentA,
+      workspaceId: workspaceA,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: currentPrincipalId,
+      createdByPrincipalId: currentPrincipalId,
+    });
+    fixture.owners.registerAgent({
+      id: agentB,
+      workspaceId: workspaceB,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    const workspaces = new Map([
+      [
+        workspaceA,
+        {
+          workspaceId: workspaceA,
+          projectId: "project-a",
+          cwd: "/repo/a",
+          kind: "checkout" as const,
+          displayName: "A",
+          archivedAt: null,
+        },
+      ],
+      [
+        workspaceB,
+        {
+          workspaceId: workspaceB,
+          projectId: "project-b",
+          cwd: "/repo/b",
+          kind: "checkout" as const,
+          displayName: "B",
+          archivedAt: null,
+        },
+      ],
+    ]);
+    const projects = new Map([
+      [
+        "project-a",
+        { projectId: "project-a", rootPath: "/repo/a", kind: "git" as const, displayName: "A" },
+      ],
+      [
+        "project-b",
+        { projectId: "project-b", rootPath: "/repo/b", kind: "git" as const, displayName: "B" },
+      ],
+    ]);
+    const records = [
+      createStoredAgentRecord({
+        id: agentA,
+        cwd: "/repo/a",
+        title: "z-authorized",
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: agentB,
+        cwd: "/repo/b",
+        title: "a-foreign",
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      }),
+      // This row is malformed and must be quarantined without making the page
+      // distinguishable from an authorized empty result.
+      createStoredAgentRecord({
+        id: "agt_cccccccccccccccc",
+        cwd: "/repo/malformed",
+        title: "b-malformed",
+        workspaceId: workspaceA,
+        organizationId: "not-an-org",
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      }),
+    ];
+    const listStorage = vi.fn().mockResolvedValue(records);
+    const messages: SessionOutboundMessage[] = [];
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentStorage: { list: listStorage },
+      workspaceRegistry: {
+        get: vi.fn(async (id: string) => workspaces.get(id)),
+        list: vi.fn(async () => [...workspaces.values()]),
+      },
+      projectRegistry: {
+        get: vi.fn(async (id: string) => projects.get(id)),
+        list: vi.fn(async () => [...projects.values()]),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const listEntries = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-filtered",
+      sort: [{ key: "title", direction: "asc" }],
+      page: { limit: 1 },
+    })) as {
+      entries: Array<{ agent: { id: string } }>;
+      pageInfo: { hasMore: boolean; nextCursor: string | null };
+    };
+    expect(listEntries.entries.map((entry) => entry.agent.id)).toEqual([agentA]);
+    expect(listEntries.pageInfo).toEqual({ hasMore: false, nextCursor: null, prevCursor: null });
+
+    const historyEntries = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-agent-history-filtered",
+      page: { limit: 1 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+    expect(historyEntries.entries.map((entry) => entry.agent.id)).toEqual([agentA]);
+    const syncEntries = (await asSessionInternals(session).readAgentDirectorySync({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-sync-filtered",
+      scope: "active",
+      sync: { generation: "sync-generation", afterSeq: 0 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+    expect(syncEntries.entries.map((entry) => entry.agent.id)).toEqual([agentA]);
+    await session.cleanup();
+  });
+
+  test("enterprise fetch and history asynchronously authorize only a ten-row synchronous shortlist", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-ten-row-shortlist");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    const ownedWorkspaceId = "wks_aaaaaaaaaaaaaaaa";
+    const foreignWorkspaceId = "wks_bbbbbbbbbbbbbbbb";
+    const ownedAgentId = "agt_shortlist_owned_a";
+    const foreignAgentIds = Array.from(
+      { length: 9 },
+      (_, index) => `agt_shortlist_foreign_${index}`,
+    );
+    fixture.owners.registerWorkspace({
+      id: ownedWorkspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: foreignWorkspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    fixture.owners.registerAgent({
+      id: ownedAgentId,
+      workspaceId: ownedWorkspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    for (const id of foreignAgentIds) {
+      fixture.owners.registerAgent({
+        id,
+        workspaceId: foreignWorkspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      });
+    }
+    const agents = [
+      makeEnterpriseDirectoryManagedAgent({
+        id: ownedAgentId,
+        workspaceId: ownedWorkspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+      }),
+      ...foreignAgentIds.map((id) =>
+        makeEnterpriseDirectoryManagedAgent({
+          id,
+          workspaceId: foreignWorkspaceId,
+          organizationId,
+          nodeId,
+          ownerPrincipalId: foreignPrincipalId,
+        }),
+      ),
+    ];
+    const records = agents.map((agent) =>
+      createStoredAgentRecord({
+        id: agent.id,
+        cwd: agent.cwd,
+        workspaceId: agent.workspaceId,
+        organizationId: agent.enterpriseOwnership?.organizationId,
+        nodeId: agent.enterpriseOwnership?.nodeId,
+        ownerPrincipalId: agent.enterpriseOwnership?.ownerPrincipalId,
+        createdByPrincipalId: agent.enterpriseOwnership?.createdByPrincipalId,
+      }),
+    );
+    const recordById = new Map(records.map((record) => [record.id, record] as const));
+    const getStorage = vi.fn(async (id: string) => recordById.get(id));
+    const prefilterAgentContentRows = vi.spyOn(
+      fixture.runtime.resourceAuthorization,
+      "prefilterAgentContentRows",
+    );
+    const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { listAgents: vi.fn(() => agents) },
+      agentStorage: { get: getStorage, list: vi.fn(async () => records) },
+      workspaceRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === ownedWorkspaceId
+            ? {
+                workspaceId: ownedWorkspaceId,
+                projectId: "project-shortlist",
+                cwd: "/tmp/enterprise-agent-events",
+                kind: "checkout" as const,
+                displayName: "shortlist",
+                archivedAt: null,
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      projectRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === "project-shortlist"
+            ? {
+                projectId: "project-shortlist",
+                rootPath: "/tmp/enterprise-agent-events",
+                kind: "git" as const,
+                displayName: "shortlist",
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const fetch = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-ten-row-shortlist",
+      page: { limit: 200 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+    const history = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agent_history_request",
+      requestId: "fetch-history-ten-row-shortlist",
+      page: { limit: 200 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+
+    expect(fetch.entries.map((entry) => entry.agent.id)).toEqual([ownedAgentId]);
+    expect(history.entries.map((entry) => entry.agent.id)).toEqual([ownedAgentId]);
+    expect(prefilterAgentContentRows).toHaveBeenCalledTimes(2);
+    for (const [, rows] of prefilterAgentContentRows.mock.calls) {
+      expect(rows).toHaveLength(10);
+      expect(rows.map((row) => row.id)).toEqual([ownedAgentId, ...foreignAgentIds]);
+      expect(Object.keys(rows[0] ?? {}).sort()).toEqual([
+        "createdByPrincipalId",
+        "id",
+        "nodeId",
+        "organizationId",
+        "ownerPrincipalId",
+        "workspaceId",
+      ]);
+    }
+    expect(assertAgent.mock.calls.map(([, , agentId]) => agentId)).toEqual([
+      ownedAgentId,
+      ownedAgentId,
+    ]);
+    expect(getStorage.mock.calls).toEqual([[ownedAgentId], [ownedAgentId]]);
+    await session.cleanup();
+  });
+
+  test("enterprise agent lists authorize mixed raw rows before live-agent enrichment", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-raw-prefilter");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const currentPrincipalId = fixture.enterpriseSessionContext.principal.principalId;
+    const foreignPrincipalId = "usr_bbbbbbbbbbbbbbbb";
+    const workspaceA = "wks_aaaaaaaaaaaaaaaa";
+    const workspaceB = "wks_bbbbbbbbbbbbbbbb";
+    const ownedLiveId = "agt_owned_live_aaaa";
+    const foreignLiveId = "agt_foreign_live_b";
+    const malformedLiveId = "agt_malformed_live";
+    const ownedPersistedId = "agt_owned_stored_a";
+    const foreignPersistedId = "agt_foreign_store";
+    const malformedPersistedId = "agt_malformed_store";
+    fixture.owners.registerWorkspace({
+      id: workspaceA,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: currentPrincipalId,
+      createdByPrincipalId: currentPrincipalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: workspaceB,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+      createdByPrincipalId: foreignPrincipalId,
+    });
+    for (const id of [ownedLiveId, malformedLiveId, ownedPersistedId, malformedPersistedId]) {
+      fixture.owners.registerAgent({
+        id,
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      });
+    }
+    for (const id of [foreignLiveId, foreignPersistedId]) {
+      fixture.owners.registerAgent({
+        id,
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      });
+    }
+
+    const ownedLive = makeEnterpriseDirectoryManagedAgent({
+      id: ownedLiveId,
+      workspaceId: workspaceA,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: currentPrincipalId,
+    });
+    const foreignLive = makeEnterpriseDirectoryManagedAgent({
+      id: foreignLiveId,
+      workspaceId: workspaceB,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: foreignPrincipalId,
+    });
+    const malformedLive = {
+      ...makeEnterpriseDirectoryManagedAgent({
+        id: malformedLiveId,
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+      }),
+      enterpriseOwnership: {
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      },
+    } satisfies ManagedAgent;
+    const records = [
+      createStoredAgentRecord({
+        id: ownedLiveId,
+        cwd: ownedLive.cwd,
+        title: "a-owned-live",
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: foreignLiveId,
+        cwd: foreignLive.cwd,
+        title: "foreign-live",
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: malformedLiveId,
+        cwd: malformedLive.cwd,
+        title: "malformed-live",
+        workspaceId: workspaceA,
+      }),
+      createStoredAgentRecord({
+        id: ownedPersistedId,
+        cwd: "/repo/a/persisted",
+        title: "b-owned-persisted",
+        workspaceId: workspaceA,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: currentPrincipalId,
+        createdByPrincipalId: currentPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: foreignPersistedId,
+        cwd: "/repo/b/persisted",
+        title: "foreign-persisted",
+        workspaceId: workspaceB,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: foreignPrincipalId,
+        createdByPrincipalId: foreignPrincipalId,
+      }),
+      createStoredAgentRecord({
+        id: malformedPersistedId,
+        cwd: "/repo/a/malformed",
+        title: "malformed-persisted",
+        workspaceId: workspaceA,
+      }),
+    ];
+    const recordById = new Map(records.map((record) => [record.id, record] as const));
+    const getStorage = vi.fn(async (id: string) => recordById.get(id));
+    const messages: SessionOutboundMessage[] = [];
+    const canEmit = vi.spyOn(fixture.runtime.resourceAuthorization, "canEmit");
+    const prefilterAgentContentRows = vi.spyOn(
+      fixture.runtime.resourceAuthorization,
+      "prefilterAgentContentRows",
+    );
+    const assertAgent = vi.spyOn(fixture.runtime.resourceAuthorization, "assertAgent");
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { listAgents: vi.fn(() => [ownedLive, foreignLive, malformedLive]) },
+      agentStorage: { get: getStorage, list: vi.fn(async () => records) },
+      workspaceRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === workspaceA
+            ? {
+                workspaceId: workspaceA,
+                projectId: "project-a",
+                cwd: "/repo/a",
+                kind: "checkout" as const,
+                displayName: "A",
+                archivedAt: null,
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      projectRegistry: {
+        get: vi.fn(async (id: string) =>
+          id === "project-a"
+            ? {
+                projectId: "project-a",
+                rootPath: "/repo/a",
+                kind: "git" as const,
+                displayName: "A",
+              }
+            : undefined,
+        ),
+        list: vi.fn(async () => []),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-raw-prefilter",
+      sort: [{ key: "title", direction: "asc" }],
+      page: { limit: 200 },
+    });
+
+    expect(getStorage.mock.calls).toEqual([[ownedLiveId]]);
+    expect(prefilterAgentContentRows).toHaveBeenCalledTimes(1);
+    expect(prefilterAgentContentRows.mock.calls[0]?.[1].map((row) => row.id)).toEqual([
+      ownedLiveId,
+      foreignLiveId,
+      ownedPersistedId,
+      foreignPersistedId,
+    ]);
+    expect(assertAgent.mock.calls.map(([, , agentId]) => agentId)).toEqual([
+      ownedLiveId,
+      ownedPersistedId,
+    ]);
+    expect(messages).toContainEqual({
+      type: "fetch_agents_response",
+      payload: {
+        requestId: "fetch-agents-raw-prefilter",
+        entries: [
+          expect.objectContaining({ agent: expect.objectContaining({ id: ownedLiveId }) }),
+          expect.objectContaining({ agent: expect.objectContaining({ id: ownedPersistedId }) }),
+        ],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      },
+    });
+    expect(canEmit).toHaveBeenCalledWith(
+      fixture.enterpriseSessionContext.principal,
+      expect.objectContaining({ type: "fetch_agents_response" }),
+      expect.objectContaining({ kind: "resources" }),
+    );
+    await session.cleanup();
+  });
+
+  test.each(["owner", "grant"] as const)(
+    "enterprise agent shortlist is rechecked asynchronously after a %s change",
+    async (change) => {
+      if (process.platform !== "darwin") return;
+      const fixture = await createBinaryAuthorizationFixture(`fetch-agents-${change}-recheck`);
+      const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+      const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+      const principalId = fixture.enterpriseSessionContext.principal.principalId;
+      const workspaceId = "wks_aaaaaaaaaaaaaaaa";
+      const agentId = `agt_async_recheck_${change}`;
+      fixture.owners.registerWorkspace({
+        id: workspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+        createdByPrincipalId: principalId,
+      });
+      fixture.owners.registerAgent({
+        id: agentId,
+        workspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+        createdByPrincipalId: principalId,
+      });
+      const liveAgent = makeEnterpriseDirectoryManagedAgent({
+        id: agentId,
+        workspaceId,
+        organizationId,
+        nodeId,
+        ownerPrincipalId: principalId,
+      });
+      const prefilterAgentContentRows = vi.spyOn(
+        fixture.runtime.resourceAuthorization,
+        "prefilterAgentContentRows",
+      );
+      const originalAssertAgent = fixture.runtime.resourceAuthorization.assertAgent.bind(
+        fixture.runtime.resourceAuthorization,
+      );
+      const assertAgent = vi
+        .spyOn(fixture.runtime.resourceAuthorization, "assertAgent")
+        .mockImplementationOnce(async (principal, action, candidateAgentId) => {
+          if (change === "owner") {
+            fixture.owners.registerWorkspace({
+              id: workspaceId,
+              organizationId,
+              nodeId,
+              ownerPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+              createdByPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+            });
+          } else {
+            await fixture.grantStore.update({
+              organizationId,
+              principalId,
+              expectedVersion: fixture.runtime.principal.grantVersion,
+              grants: [],
+              actor: fixture.runtime.principal,
+            });
+          }
+          return originalAssertAgent(principal, action, candidateAgentId);
+        });
+      const session = createSessionForTest({
+        clientId: "client-test",
+        enterpriseContext: fixture.enterpriseSessionContext,
+        enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+        authorityReceiptState: fixture.authorityState,
+        principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+        resourceAuthorization: fixture.runtime.resourceAuthorization,
+        sessionId: fixture.sessionId,
+        sessionAuthorization: fixture.sessionAuthorization,
+        admissionAuthorizationIssuer: fixture.issuer,
+        admissionAuthorizationHandle: fixture.handle,
+        enterpriseAuthorizationRuntime: fixture.runtime,
+      });
+
+      const filtering = asSessionInternals(session).filterEnterpriseAgentProjectionSources(
+        [liveAgent],
+        [],
+      );
+      if (change === "grant") {
+        await expect(filtering).rejects.toMatchObject({ code: "access_denied" });
+      } else {
+        await expect(filtering).resolves.toEqual({ liveAgents: [], persistedRecords: [] });
+      }
+      expect(prefilterAgentContentRows).toHaveBeenCalledTimes(1);
+      expect(prefilterAgentContentRows.mock.results[0]?.value).toEqual([
+        expect.objectContaining({ id: agentId, workspaceId }),
+      ]);
+      expect(assertAgent).toHaveBeenCalledTimes(1);
+      await session.cleanup();
+    },
+  );
+
+  test("enterprise agent lists fail closed when authorization changes during live projection", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-projection-current");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const workspaceId = "wks_aaaaaaaaaaaaaaaa";
+    const agentId = "agt_projection_current";
+    fixture.owners.registerWorkspace({
+      id: workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerAgent({
+      id: agentId,
+      workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const liveAgent = makeEnterpriseDirectoryManagedAgent({
+      id: agentId,
+      workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+    });
+    const record = createStoredAgentRecord({
+      id: agentId,
+      cwd: liveAgent.cwd,
+      workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const projectionStarted = deferred<void>();
+    const releaseProjection = deferred<void>();
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentManager: { listAgents: vi.fn(() => [liveAgent]) },
+      agentStorage: {
+        list: vi.fn(async () => [record]),
+        get: vi.fn(async () => {
+          projectionStarted.resolve();
+          await releaseProjection.promise;
+          return record;
+        }),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const listing = asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-projection-current",
+      page: { limit: 200 },
+    });
+    await projectionStarted.promise;
+    await fixture.runtime.release();
+    releaseProjection.resolve();
+
+    await expect(listing).rejects.toMatchObject({ code: "access_denied" });
+    await session.cleanup();
+  });
+
+  test("legacy agent lists retain live and persisted projection behavior", async () => {
+    const prefilterAgentContentRows = vi.spyOn(
+      ResourceAuthorizationService.prototype,
+      "prefilterAgentContentRows",
+    );
+    const workspaceId = "workspace-legacy-list";
+    const liveAgentIds = ["agent-legacy-live-a", "agent-legacy-live-b"];
+    const liveAgents = liveAgentIds.map((id) => makeEnterpriseEventManagedAgent(id, workspaceId));
+    const records = [
+      ...liveAgentIds.map((id) =>
+        createStoredAgentRecord({ id, cwd: "/repo/legacy", workspaceId, title: id }),
+      ),
+      createStoredAgentRecord({
+        id: "agent-legacy-persisted",
+        cwd: "/repo/legacy",
+        workspaceId,
+        title: "agent-legacy-persisted",
+      }),
+    ];
+    const recordById = new Map(records.map((record) => [record.id, record] as const));
+    const getStorage = vi.fn(async (id: string) => recordById.get(id));
+    const providerSnapshot = createProviderSnapshotManagerStub();
+    providerSnapshot.manager.listRegisteredProviderIds = vi.fn(() => ["codex"]);
+    const session = createSessionForTest({
+      agentManager: { listAgents: vi.fn(() => liveAgents) },
+      agentStorage: { get: getStorage, list: vi.fn(async () => records) },
+      workspaceRegistry: {
+        get: vi.fn(async () => ({
+          workspaceId,
+          projectId: "project-legacy",
+          cwd: "/repo/legacy",
+          kind: "checkout" as const,
+          displayName: "legacy",
+          archivedAt: null,
+        })),
+        list: vi.fn(async () => []),
+      },
+      projectRegistry: {
+        get: vi.fn(async () => ({
+          projectId: "project-legacy",
+          rootPath: "/repo/legacy",
+          kind: "git" as const,
+          displayName: "legacy",
+        })),
+        list: vi.fn(async () => []),
+      },
+      providerSnapshotManager: providerSnapshot.manager,
+    });
+
+    const response = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "fetch-agents-legacy-projection",
+      page: { limit: 200 },
+    })) as { entries: Array<{ agent: { id: string } }> };
+
+    expect(response.entries.map((entry) => entry.agent.id).sort()).toEqual(
+      [...liveAgentIds, "agent-legacy-persisted"].sort(),
+    );
+    expect(getStorage.mock.calls).toEqual(liveAgentIds.map((id) => [id]));
+    expect(prefilterAgentContentRows).not.toHaveBeenCalled();
+    prefilterAgentContentRows.mockRestore();
+    await session.cleanup();
+  });
+
+  test("metadata-only enterprise grants produce no agent content", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-agents-metadata", [
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+    ]);
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    fixture.owners.registerWorkspace({
+      id: "wks_aaaaaaaaaaaaaaaa",
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerAgent({
+      id: "agt_aaaaaaaaaaaaaaaa",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      agentStorage: {
+        list: vi.fn().mockResolvedValue([
+          createStoredAgentRecord({
+            id: "agt_aaaaaaaaaaaaaaaa",
+            cwd: "/repo/a",
+            workspaceId: "wks_aaaaaaaaaaaaaaaa",
+            organizationId,
+            nodeId,
+            ownerPrincipalId: principalId,
+            createdByPrincipalId: principalId,
+          }),
+        ]),
+      },
+    });
+    const entries = (await asSessionInternals(session).listFetchAgentsEntries({
+      type: "fetch_agents_request",
+      requestId: "metadata-only",
+    })) as { entries: unknown[] };
+    expect(entries.entries).toEqual([]);
+    await session.cleanup();
+  });
+
+  test("enterprise workspaces filter ownership before paging and sync", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-workspaces-filter", [
+      {
+        action: "workspace.content.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: ["wks_aaaaaaaaaaaaaaaa"] },
+      },
+    ]);
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const workspaceA = {
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+      projectId: "project-a",
+      cwd: "/repo/a",
+      kind: "directory" as const,
+      displayName: "z-authorized",
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const workspaceB = {
+      ...workspaceA,
+      workspaceId: "wks_bbbbbbbbbbbbbbbb",
+      ownerPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+      createdByPrincipalId: "usr_bbbbbbbbbbbbbbbb",
+      projectId: "project-b",
+      cwd: "/repo/b",
+      displayName: "a-foreign",
+    };
+    fixture.owners.registerWorkspace({
+      id: workspaceA.workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    fixture.owners.registerWorkspace({
+      id: workspaceB.workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: workspaceB.ownerPrincipalId,
+      createdByPrincipalId: workspaceB.createdByPrincipalId,
+    });
+    const projects = [
+      {
+        projectId: "project-a",
+        rootPath: "/repo/a",
+        kind: "git" as const,
+        displayName: "A",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        archivedAt: null,
+      },
+      {
+        projectId: "project-b",
+        rootPath: "/repo/b",
+        kind: "git" as const,
+        displayName: "B",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        archivedAt: null,
+      },
+    ];
+    const workspaceById = new Map(
+      [workspaceA, workspaceB].map((workspace) => [workspace.workspaceId, workspace] as const),
+    );
+    const projectById = new Map(projects.map((project) => [project.projectId, project] as const));
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      workspaceRegistry: {
+        list: vi.fn().mockResolvedValue([workspaceA, workspaceB]),
+        get: vi.fn((id: string) => Promise.resolve(workspaceById.get(id))),
+      },
+      projectRegistry: {
+        list: vi.fn().mockResolvedValue(projects),
+        get: vi.fn((id: string) => Promise.resolve(projectById.get(id))),
+      },
+    });
+    const request = {
+      type: "fetch_workspaces_request" as const,
+      requestId: "fetch-workspaces-filtered",
+      sort: [{ key: "name" as const, direction: "asc" as const }],
+      page: { limit: 1 },
+    };
+    const page = (await asSessionInternals(session).listFetchWorkspacesEntries(request)) as {
+      entries: Array<{ id: string }>;
+      emptyProjects: unknown[];
+      pageInfo: { hasMore: boolean };
+    };
+    expect(page.entries.map((entry) => entry.id)).toEqual([workspaceA.workspaceId]);
+    expect(page.pageInfo.hasMore).toBe(false);
+    expect(page.emptyProjects).toEqual([]);
+    const sync = (await asSessionInternals(session).readWorkspaceDirectorySync({
+      ...request,
+      sync: { generation: "workspace-sync", afterSeq: 0 },
+    })) as { entries: Array<{ id: string }> };
+    expect(sync.entries.map((entry) => entry.id)).toEqual([workspaceA.workspaceId]);
+    await session.cleanup();
+  });
+
+  test("enterprise workspace directory denies a revocation during descriptor loading", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createBinaryAuthorizationFixture("fetch-workspaces-current-race");
+    const organizationId = fixture.enterpriseSessionContext.principal.organizationId;
+    const nodeId = fixture.enterpriseSessionContext.node.nodeId;
+    const principalId = fixture.enterpriseSessionContext.principal.principalId;
+    const workspace = {
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+      projectId: "project-race",
+      cwd: "/repo/race",
+      kind: "directory" as const,
+      displayName: "race",
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    fixture.owners.registerWorkspace({
+      id: workspace.workspaceId,
+      organizationId,
+      nodeId,
+      ownerPrincipalId: principalId,
+      createdByPrincipalId: principalId,
+    });
+    const project = {
+      projectId: workspace.projectId,
+      rootPath: workspace.cwd,
+      kind: "git" as const,
+      displayName: "Race",
+      createdAt: workspace.createdAt,
+      updatedAt: workspace.updatedAt,
+      archivedAt: null,
+    };
+    const descriptorLoadStarted = deferred<void>();
+    const releaseDescriptorLoad = deferred<void>();
+    let workspaceListCalls = 0;
+    const workspaceList = vi.fn(async () => {
+      workspaceListCalls += 1;
+      if (workspaceListCalls === 2) {
+        descriptorLoadStarted.resolve();
+        await releaseDescriptorLoad.promise;
+      }
+      return [workspace];
+    });
+    const session = createSessionForTest({
+      clientId: "client-test",
+      enterpriseContext: fixture.enterpriseSessionContext,
+      enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+      authorityReceiptState: fixture.authorityState,
+      principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+      resourceAuthorization: fixture.runtime.resourceAuthorization,
+      sessionId: fixture.sessionId,
+      sessionAuthorization: fixture.sessionAuthorization,
+      admissionAuthorizationIssuer: fixture.issuer,
+      admissionAuthorizationHandle: fixture.handle,
+      enterpriseAuthorizationRuntime: fixture.runtime,
+      workspaceRegistry: {
+        list: workspaceList,
+        get: vi.fn(async () => workspace),
+      },
+      projectRegistry: {
+        list: vi.fn(async () => [project]),
+        get: vi.fn(async () => project),
+      },
+    });
+
+    const loading = asSessionInternals(session).listFetchWorkspacesEntries({
+      type: "fetch_workspaces_request",
+      requestId: "fetch-workspaces-current-race",
+    });
+    await descriptorLoadStarted.promise;
+    await fixture.runtime.release();
+    releaseDescriptorLoad.resolve();
+
+    await expect(loading).rejects.toMatchObject({ code: "access_denied" });
+    await session.cleanup();
+  });
+});
+
+type TestAgentEventListener = (event: AgentManagerEvent) => void | Promise<void>;
+
+const enterpriseEventAgentId = "agt_aaaaaaaaaaaaaaaa";
+const enterpriseEventForeignAgentId = "agt_bbbbbbbbbbbbbbbb";
+const enterpriseEventWorkspaceId = "workspace-1";
+
+function makeEnterpriseEventManagedAgent(
+  agentId = enterpriseEventAgentId,
+  workspaceId = enterpriseEventWorkspaceId,
+): ManagedAgent {
+  const timestamp = new Date("2026-09-10T12:00:00.000Z");
+  return {
+    id: agentId,
+    provider: "codex",
+    cwd: "/tmp/enterprise-agent-events",
+    workspaceId,
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: true,
+      supportsMcpServers: true,
+      supportsReasoningStream: true,
+      supportsToolInvocations: true,
+    },
+    config: { provider: "codex", cwd: "/tmp/enterprise-agent-events" },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    availableModes: [],
+    currentModeId: null,
+    pendingPermissions: new Map(),
+    persistence: null,
+    lastUserMessageAt: null,
+    activeTurnId: null,
+    activeTurnStartedAt: null,
+    attention: { requiresAttention: false },
+    labels: {},
+    lifecycle: "running",
+    activeForegroundTurnId: null,
+  } as unknown as ManagedAgent;
+}
+
+function makeEnterpriseDirectoryManagedAgent(input: {
+  id: string;
+  workspaceId: string;
+  organizationId: string;
+  nodeId: string;
+  ownerPrincipalId: string;
+}): ManagedAgent {
+  return {
+    ...makeEnterpriseEventManagedAgent(input.id, input.workspaceId),
+    enterpriseOwnership: {
+      workspaceId: input.workspaceId,
+      organizationId: input.organizationId,
+      nodeId: input.nodeId,
+      ownerPrincipalId: input.ownerPrincipalId,
+      createdByPrincipalId: input.ownerPrincipalId,
+    },
+  };
+}
+
+function enterpriseTimelineEvent(
+  text: string,
+  agentId = enterpriseEventAgentId,
+): AgentManagerEvent {
+  return {
+    type: "agent_stream",
+    agentId,
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: `message-${text}`, text },
+    },
+    timestamp: "2026-09-10T12:00:00.000Z",
+  };
+}
+
+async function createEnterpriseAgentEventHarness(
+  name: string,
+  options: {
+    logger?: pino.Logger;
+    agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
+    agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
+    workspaceRegistry?: Partial<SessionOptions["workspaceRegistry"]>;
+    projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
+    grants?: Parameters<typeof createBinaryAuthorizationFixture>[1];
+  } = {},
+) {
+  const fixture = await createBinaryAuthorizationFixture(
+    name,
+    options.grants ?? [
+      {
+        action: "workspace.content.read",
+        selector: { kind: "workspace", workspaceIds: [enterpriseEventWorkspaceId] },
+      },
+      {
+        action: "workspace.metadata.read",
+        selector: { kind: "workspace", workspaceIds: [enterpriseEventWorkspaceId] },
+      },
+    ],
+    ["workspace.read", "hub.execute"],
+  );
+  fixture.owners.registerAgent({
+    id: enterpriseEventAgentId,
+    workspaceId: enterpriseEventWorkspaceId,
+  });
+  const workspace = {
+    workspaceId: enterpriseEventWorkspaceId,
+    organizationId: fixture.enterpriseSessionContext.principal.organizationId,
+    nodeId: fixture.enterpriseSessionContext.node.nodeId,
+    ownerPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    createdByPrincipalId: fixture.enterpriseSessionContext.principal.principalId,
+    projectId: `project-${name}`,
+    cwd: "/tmp/enterprise-agent-events",
+    kind: "directory" as const,
+    displayName: "enterprise-agent-events",
+    title: null,
+    branch: null,
+    worktreeRoot: null,
+    baseBranch: null,
+    isPaseoOwnedWorktree: false,
+    mainRepoRoot: null,
+    createdAt: "2026-09-10T12:00:00.000Z",
+    updatedAt: "2026-09-10T12:00:00.000Z",
+    archivedAt: null,
+  };
+  const project = createPersistedProjectRecord({
+    projectId: workspace.projectId,
+    rootPath: workspace.cwd,
+    kind: "git",
+    displayName: "enterprise-agent-events",
+    createdAt: workspace.createdAt,
+    updatedAt: workspace.updatedAt,
+  });
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: TestAgentEventListener[] = [];
+  const unsubscribe = vi.fn();
+  const subscribe = vi.fn((listener: TestAgentEventListener) => {
+    listeners.push(listener);
+    return unsubscribe;
+  });
+  const session = createSessionForTest({
+    logger: options.logger,
+    messages,
+    clientId: "client-test",
+    enterpriseContext: fixture.enterpriseSessionContext,
+    enterpriseAgentContextRegistry: createEnterpriseAgentSessionContextRegistry(),
+    authorityReceiptState: fixture.authorityState,
+    principalGrantVersionGuard: fixture.runtime.grantVersionGuard,
+    resourceAuthorization: fixture.runtime.resourceAuthorization,
+    sessionId: fixture.sessionId,
+    sessionAuthorization: fixture.sessionAuthorization,
+    admissionAuthorizationIssuer: fixture.issuer,
+    admissionAuthorizationHandle: fixture.handle,
+    enterpriseAuthorizationRuntime: fixture.runtime,
+    agentManager: { ...options.agentManager, subscribe },
+    agentStorage: options.agentStorage,
+    workspaceRegistry: {
+      get: vi.fn(async (workspaceId: string) =>
+        workspaceId === workspace.workspaceId ? workspace : undefined,
+      ),
+      list: vi.fn(async () => [workspace]),
+      ...options.workspaceRegistry,
+    },
+    projectRegistry: {
+      get: vi.fn(async (projectId: string) =>
+        projectId === project.projectId ? project : undefined,
+      ),
+      list: vi.fn(async () => [project]),
+      ...options.projectRegistry,
+    },
+  });
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+  return { fixture, listener, messages, project, session, subscribe, unsubscribe, workspace };
+}
+
+const transferWorkspaceAId = "wks_aaaaaaaaaaaaaaaa";
+const transferWorkspaceBId = "wks_bbbbbbbbbbbbbbbb";
+const transferAgentAId = "agt_aaaaaaaaaaaaaaaa";
+const transferAgentBId = "agt_bbbbbbbbbbbbbbbb";
+const transferNewOwnerId = "usr_bbbbbbbbbbbbbbbb";
+
+async function createEnterpriseOwnershipTransferHarness(
+  name: string,
+  onMessage?: (message: SessionOutboundMessage) => void,
+) {
+  if (process.platform !== "darwin") throw new Error("Darwin authorization fixture unavailable");
+  const context = enterpriseContext(`generation-${name}`, {
+    grants: [
+      {
+        action: "workspace.content.read",
+        selector: {
+          kind: "workspace",
+          workspaceIds: [transferWorkspaceAId, transferWorkspaceBId],
+        },
+      },
+      {
+        action: "workspace.metadata.read",
+        selector: {
+          kind: "workspace",
+          workspaceIds: [transferWorkspaceAId, transferWorkspaceBId],
+        },
+      },
+      {
+        action: "workspace.manage",
+        selector: {
+          kind: "organization",
+          organizationId: "org_aaaaaaaaaaaaaaaa",
+        },
+      },
+    ],
+  });
+  const root = join(binaryAuthorizationRoot, `ownership-transfer-${name}`);
+  const audit = await createProductionAuditRuntime({
+    node: context.node,
+    auditRoot: join(root, "audit"),
+    nativeAddonPath: binaryAuthorizationAddonPath,
+  });
+  const provider = createProductionAuthorizationRuntimeProvider({
+    audit,
+    grantFilePath: join(root, "grants.json"),
+  });
+  if (!provider) throw new Error("Expected production authorization provider");
+
+  await provider.grantStore.update({
+    actor: context.principal,
+    principalId: context.principal.principalId,
+    organizationId: context.principal.organizationId,
+    grants: context.principal.grants,
+    expectedVersion: null,
+  });
+  await provider.grantStore.update({
+    actor: context.principal,
+    principalId: transferNewOwnerId,
+    organizationId: context.principal.organizationId,
+    grants: [],
+    expectedVersion: null,
+  });
+  const grantRecord = await provider.grantStore.get(context.principal.principalId);
+  if (!grantRecord) throw new Error("Expected transfer principal grant record");
+
+  const principalFilePath = join(root, "principals.json");
+  const principalProvisioning = createProductionPrincipalProvisioning({
+    filePath: principalFilePath,
+    audit,
+  });
+  await principalProvisioning.ensurePrincipal({
+    principalId: transferNewOwnerId,
+    organizationId: context.principal.organizationId,
+    principalType: "human",
+    status: "active",
+    createdAt: "2026-09-11T00:00:00.000Z",
+    updatedAt: "2026-09-11T00:00:00.000Z",
+  });
+  const principalSource = createProductionPrincipalGrantSource({
+    filePath: principalFilePath,
+    grantStore: provider.grantStore,
+    audit,
+  });
+  await principalSource.ready();
+
+  const workspaceRegistry = new FileBackedWorkspaceRegistry(
+    join(root, "workspaces.json"),
+    pino({ level: "silent" }),
+  );
+  await workspaceRegistry.initialize();
+  const workspaceA = {
+    ...createPersistedWorkspaceRecord({
+      workspaceId: transferWorkspaceAId,
+      projectId: "project-transfer-a",
+      cwd: "/tmp/transfer-a",
+      kind: "directory",
+      displayName: "Transfer A",
+      createdAt: "2026-09-11T00:00:00.000Z",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+    }),
+    organizationId: context.principal.organizationId,
+    nodeId: context.node.nodeId,
+    ownerPrincipalId: context.principal.principalId,
+    createdByPrincipalId: context.principal.principalId,
+  };
+  const workspaceB = {
+    ...createPersistedWorkspaceRecord({
+      workspaceId: transferWorkspaceBId,
+      projectId: "project-transfer-b",
+      cwd: "/tmp/transfer-b",
+      kind: "directory",
+      displayName: "Transfer B",
+      createdAt: "2026-09-11T00:00:00.000Z",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+    }),
+    organizationId: context.principal.organizationId,
+    nodeId: context.node.nodeId,
+    ownerPrincipalId: context.principal.principalId,
+    createdByPrincipalId: context.principal.principalId,
+  };
+  await workspaceRegistry.upsert(workspaceA);
+  await workspaceRegistry.upsert(workspaceB);
+
+  const storedAgents: StoredAgentRecord[] = [
+    {
+      id: transferAgentAId,
+      provider: "codex",
+      cwd: workspaceA.cwd,
+      workspaceId: workspaceA.workspaceId,
+      organizationId: workspaceA.organizationId,
+      nodeId: workspaceA.nodeId,
+      ownerPrincipalId: workspaceA.ownerPrincipalId,
+      createdByPrincipalId: workspaceA.createdByPrincipalId,
+      createdAt: workspaceA.createdAt,
+      updatedAt: workspaceA.updatedAt,
+      lastStatus: "running",
+      config: null,
+      labels: {},
+      persistence: null,
+    },
+    {
+      id: transferAgentBId,
+      provider: "codex",
+      cwd: workspaceB.cwd,
+      workspaceId: workspaceB.workspaceId,
+      organizationId: workspaceB.organizationId,
+      nodeId: workspaceB.nodeId,
+      ownerPrincipalId: workspaceB.ownerPrincipalId,
+      createdByPrincipalId: workspaceB.createdByPrincipalId,
+      createdAt: workspaceB.createdAt,
+      updatedAt: workspaceB.updatedAt,
+      lastStatus: "running",
+      config: null,
+      labels: {},
+      persistence: null,
+    },
+  ];
+  const resourceBundle = await createProductionResourceBundle({
+    provider,
+    workspaceRegistry,
+    agentRecords: { list: () => storedAgents },
+    nodeId: context.node.nodeId,
+    audit,
+    principalSource,
+  });
+  if (!resourceBundle) throw new Error("Expected production resource bundle");
+  const dispatcherRegistration = resourceBundle.dispatcherFactory;
+
+  const mintSecret = Object.freeze({});
+  const issuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret);
+  const authorityState = new MemoryAuthorityReceiptState();
+  const sessionContextRegistry = createEnterpriseAgentSessionContextRegistry();
+  const managedAgents = [
+    makeEnterpriseEventManagedAgent(transferAgentAId, transferWorkspaceAId),
+    makeEnterpriseEventManagedAgent(transferAgentBId, transferWorkspaceBId),
+  ];
+  const projects = [
+    createPersistedProjectRecord({
+      projectId: workspaceA.projectId,
+      rootPath: workspaceA.cwd,
+      kind: "git",
+      displayName: "Transfer A",
+      createdAt: workspaceA.createdAt,
+      updatedAt: workspaceA.updatedAt,
+    }),
+    createPersistedProjectRecord({
+      projectId: workspaceB.projectId,
+      rootPath: workspaceB.cwd,
+      kind: "git",
+      displayName: "Transfer B",
+      createdAt: workspaceB.createdAt,
+      updatedAt: workspaceB.updatedAt,
+    }),
+  ];
+  const projectById = new Map(projects.map((project) => [project.projectId, project] as const));
+  // oxlint-disable-next-line complexity -- fixture wiring preserves the exact production binding lifecycle.
+  const createTransferSession = async (input: {
+    suffix: string;
+    principalId?: string;
+    permissions?: readonly DaemonPermission[];
+    registry?: EnterpriseAgentSessionContextRegistry;
+    onMessage?: (message: SessionOutboundMessage) => void;
+    includeProductionRuntime?: boolean;
+  }) => {
+    const principalId = input.principalId ?? context.principal.principalId;
+    const currentGrantRecord = await provider.grantStore.get(principalId);
+    if (!currentGrantRecord) throw new Error(`Expected grant record for ${principalId}`);
+    const principal = {
+      ...context.principal,
+      principalId,
+      grants: currentGrantRecord.grants,
+      credentialId: `credential-${input.suffix}`,
+      grantVersion: currentGrantRecord.grantVersion,
+    };
+    const evidence = issueEnterpriseAdmissionEvidence(issuer, mintSecret, principal, context.node, {
+      node: context.node,
+      transport: "direct",
+      peer: "loopback",
+    });
+    if (!evidence) throw new Error("Expected transfer admission evidence");
+    const clientId = `client-${input.suffix}`;
+    const handle = bindEnterpriseAdmissionSession(issuer, evidence, clientId);
+    if (!handle) throw new Error("Expected transfer admission handle");
+    const sessionId = `session-${input.suffix}`;
+    const sessionAuthorization = new SessionAuthorization(input.permissions ?? OWNER_PERMISSIONS);
+    const runtime =
+      input.includeProductionRuntime === false
+        ? null
+        : await createProductionAuthorizationRuntimeForSession(provider, {
+            admissionAuthorizationIssuer: issuer,
+            admissionAuthorizationHandle: handle,
+            sessionAuthorization,
+            sessionId,
+            authorityState,
+          });
+    if (input.includeProductionRuntime !== false && !runtime)
+      throw new Error("Expected transfer authorization runtime");
+    const enterpriseSessionContext: EnterpriseSessionContext = runtime
+      ? {
+          principal: runtime.principal,
+          node: runtime.node,
+          sessionBindingGeneration: runtime.binding.sessionBindingGeneration,
+        }
+      : enterpriseContext(`generation-${input.suffix}`, principal);
+    const messages: SessionOutboundMessage[] = [];
+    const listeners: TestAgentEventListener[] = [];
+    const session = createSessionForTest({
+      messages,
+      onMessage: (message) => {
+        messages.push(message);
+        input.onMessage?.(message);
+      },
+      clientId,
+      enterpriseContext: enterpriseSessionContext,
+      enterpriseAgentContextRegistry: input.registry ?? sessionContextRegistry,
+      authorityReceiptState: authorityState,
+      principalGrantVersionGuard: runtime?.grantVersionGuard ?? { isCurrent: () => true },
+      resourceAuthorization:
+        runtime?.resourceAuthorization ?? ({ canEmit: vi.fn(async () => true) } as never),
+      sessionId: runtime ? sessionId : undefined,
+      sessionAuthorization: runtime ? sessionAuthorization : undefined,
+      admissionAuthorizationIssuer: runtime ? issuer : undefined,
+      admissionAuthorizationHandle: runtime ? handle : undefined,
+      enterpriseAuthorizationRuntime: runtime ?? undefined,
+      enterpriseDispatcherRegistration: runtime ? dispatcherRegistration : undefined,
+      workspaceRegistry: {
+        get: (workspaceId: string) => workspaceRegistry.get(workspaceId),
+        list: () => workspaceRegistry.list(),
+      },
+      projectRegistry: {
+        get: vi.fn((projectId: string) => Promise.resolve(projectById.get(projectId))),
+        list: vi.fn(async () => projects),
+      },
+      agentManager: {
+        listAgents: vi.fn(() => managedAgents),
+        getAgent: vi.fn((agentId: string) => managedAgents.find((agent) => agent.id === agentId)),
+        subscribe: vi.fn((listener: TestAgentEventListener) => {
+          listeners.push(listener);
+          return () => {};
+        }),
+      },
+      agentStorage: {
+        get: vi.fn((agentId: string) =>
+          Promise.resolve(storedAgents.find((agent) => agent.id === agentId)),
+        ),
+        list: vi.fn(async () => storedAgents),
+      },
+    });
+    return {
+      enterpriseSessionContext,
+      listener: listeners[0],
+      messages,
+      runtime,
+      session,
+      sessionAuthorization,
+    };
+  };
+  const primary = await createTransferSession({ suffix: name, onMessage });
+  const { enterpriseSessionContext, listener, messages, runtime, session } = primary;
+  if (!listener) throw new Error("Transfer Agent event listener was not installed");
+  if (!runtime) throw new Error("Expected primary transfer runtime");
+  return {
+    audit,
+    authorityState,
+    createTransferSession,
+    enterpriseSessionContext,
+    listener,
+    messages,
+    resourceBundle,
+    runtime,
+    session,
+    workspaceA,
+    workspaceB,
+    workspaceRegistry,
+  };
+}
+
+describe("enterprise agent event publication", () => {
+  test("preauthorizes every global Agent event with its canonical Agent before tail admission", async () => {
+    if (process.platform !== "darwin") return;
+    const respondToPermission = vi.fn(async () => true);
+    const activeVoice = vi.spyOn(VoiceSession.prototype, "isActiveForAgent").mockReturnValue(true);
+    const h = await createEnterpriseAgentEventHarness("agent-event-preauth-targets", {
+      agentManager: { respondToPermission },
+    });
+    const preauthorize = vi
+      .spyOn(h.fixture.runtime.resourceAuthorization, "preauthorizeAgentEvent")
+      .mockReturnValue(false);
+    const assertAgent = vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent");
+    const providerSubagent = {
+      id: "provider-child-preauth",
+      parentAgentId: "agt_provider_upsert_parent",
+      parentSubagentId: null,
+      provider: "codex" as const,
+      title: "child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-09-10T12:00:00.000Z",
+      updatedAt: "2026-09-10T12:00:01.000Z",
+      toolCallId: null,
+      cwd: null,
+      subtitle: null,
+    };
+    const events: AgentManagerEvent[] = [
+      {
+        type: "agent_state",
+        agent: makeEnterpriseEventManagedAgent("agt_state_preapproval"),
+      },
+      { type: "provider_subagent", event: { type: "upsert", subagent: providerSubagent } },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "timeline",
+          parentAgentId: "agt_provider_timeline_parent",
+          subagentId: providerSubagent.id,
+          provider: "codex",
+          row: {
+            item: { type: "assistant_message", messageId: "provider-preauth", text: "child" },
+            timestamp: "2026-09-10T12:00:02.000Z",
+            seq: 1,
+          },
+          epoch: "provider-preauth-epoch",
+        },
+      },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "remove",
+          parentAgentId: "agt_provider_remove_parent",
+          subagentId: providerSubagent.id,
+        },
+      },
+      {
+        type: "timeline_replacement",
+        agentId: "agt_timeline_replacement_preapproval",
+        epoch: "replacement-preauth-epoch",
+      },
+      enterpriseTimelineEvent("preauth-stream", "agt_stream_preapproval"),
+      {
+        type: "agent_stream",
+        agentId: "agt_voice_preapproval",
+        event: {
+          type: "permission_requested",
+          provider: "codex",
+          request: {
+            id: "voice-preauth-request",
+            provider: "codex",
+            name: "paseo_voice.speak",
+            kind: "tool",
+          },
+        },
+      },
+    ];
+
+    try {
+      expect(events.map((event) => h.listener(event))).toEqual(events.map(() => undefined));
+      expect(preauthorize.mock.calls.map(([, agentId]) => agentId)).toEqual([
+        "agt_state_preapproval",
+        "agt_provider_upsert_parent",
+        "agt_provider_timeline_parent",
+        "agt_provider_remove_parent",
+        "agt_timeline_replacement_preapproval",
+        "agt_stream_preapproval",
+        "agt_voice_preapproval",
+      ]);
+      expect(assertAgent).not.toHaveBeenCalled();
+      expect(respondToPermission).not.toHaveBeenCalled();
+      expect(h.messages).toEqual([]);
+    } finally {
+      activeVoice.mockRestore();
+      await h.session.cleanup();
+    }
+  });
+
+  test("keeps denied Session events out of a blocked authorized Session tail", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-event-preauth-before-tail");
+    const authorizeDelivery = deferred<void>();
+    const deliveryStarted = deferred<void>();
+    const preauthorize = vi.spyOn(
+      h.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const assertAgent = vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent");
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        deliveryStarted.resolve();
+        await authorizeDelivery.promise;
+        return originalCanEmit(principal, event, context);
+      },
+    );
+
+    const authorized = h.listener(enterpriseTimelineEvent("authorized-before-tail"));
+    await deliveryStarted.promise;
+    const denied = h.listener(
+      enterpriseTimelineEvent("foreign-before-tail", enterpriseEventForeignAgentId),
+    );
+
+    expect(denied).toBeUndefined();
+    expect(preauthorize.mock.calls.map(([, agentId]) => agentId)).toEqual([
+      enterpriseEventAgentId,
+      enterpriseEventForeignAgentId,
+    ]);
+    expect(assertAgent).toHaveBeenCalledTimes(1);
+    authorizeDelivery.resolve();
+    await authorized;
+
+    expect(h.messages).toHaveLength(1);
+    expect(h.messages[0]).toMatchObject({
+      type: "agent_stream",
+      payload: { agentId: enterpriseEventAgentId },
+    });
+    await h.session.cleanup();
+  });
+
+  test("admits a shared global event only to production Sessions passing nominal preauthorization", async () => {
+    if (process.platform !== "darwin") return;
+    const allowed = await createEnterpriseAgentEventHarness("agent-event-preauth-multisession");
+    const denied = await createEnterpriseAgentEventHarness("agent-event-preauth-no-grant", {
+      grants: [],
+    });
+    const allowedPreauthorize = vi.spyOn(
+      allowed.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const deniedPreauthorize = vi.spyOn(
+      denied.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const allowedAssertAgent = vi.spyOn(
+      allowed.fixture.runtime.resourceAuthorization,
+      "assertAgent",
+    );
+    const deniedAssertAgent = vi.spyOn(denied.fixture.runtime.resourceAuthorization, "assertAgent");
+    const event = enterpriseTimelineEvent("shared-global-event");
+
+    try {
+      const allowedPublication = allowed.listener(event);
+      const deniedPublication = denied.listener(event);
+      expect(deniedPublication).toBeUndefined();
+      await allowedPublication;
+
+      expect(allowedPreauthorize).toHaveBeenCalledExactlyOnceWith(
+        allowed.fixture.runtime.principal,
+        enterpriseEventAgentId,
+      );
+      expect(deniedPreauthorize).toHaveBeenCalledExactlyOnceWith(
+        denied.fixture.runtime.principal,
+        enterpriseEventAgentId,
+      );
+      expect(allowedAssertAgent).toHaveBeenCalledTimes(1);
+      expect(deniedAssertAgent).not.toHaveBeenCalled();
+      expect(allowed.messages).toHaveLength(1);
+      expect(denied.messages).toEqual([]);
+    } finally {
+      await Promise.all([allowed.session.cleanup(), denied.session.cleanup()]);
+    }
+  });
+
+  test("serializes authorized stream delivery and uses the exact canonical workspace context", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-event-order");
+    const authorizeFirst = deferred<void>();
+    const firstAuthorizationStarted = deferred<void>();
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    let calls = 0;
+    const canEmit = vi
+      .spyOn(h.fixture.runtime.resourceAuthorization, "canEmit")
+      .mockImplementation(async (principal, event, context) => {
+        calls += 1;
+        if (calls === 1) {
+          firstAuthorizationStarted.resolve();
+          await authorizeFirst.promise;
+        }
+        return originalCanEmit(principal, event, context);
+      });
+
+    const first = h.listener(enterpriseTimelineEvent("first"));
+    const second = h.listener(enterpriseTimelineEvent("second"));
+    await firstAuthorizationStarted.promise;
+    expect(canEmit).toHaveBeenCalledTimes(1);
+    authorizeFirst.resolve();
+    await Promise.all([first, second]);
+
+    expect(
+      h.messages.flatMap((message) =>
+        message.type === "agent_stream" && message.payload.event.type === "timeline"
+          ? [message.payload.event.item]
+          : [],
+      ),
+    ).toEqual([
+      expect.objectContaining({ type: "assistant_message", text: "first" }),
+      expect.objectContaining({ type: "assistant_message", text: "second" }),
+    ]);
+    expect(canEmit).toHaveBeenCalledTimes(2);
+    for (const [, , context] of canEmit.mock.calls) {
+      expect(context).toEqual({
+        kind: "resources",
+        resources: [
+          {
+            resourceKind: "workspace",
+            organizationId: h.fixture.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.fixture.enterpriseSessionContext.node.nodeId,
+            localResourceId: enterpriseEventWorkspaceId,
+          },
+        ],
+      });
+      expect(Object.isFrozen(context)).toBe(true);
+      expect(context.kind === "resources" && Object.isFrozen(context.resources)).toBe(true);
+    }
+    await h.session.cleanup();
+  });
+
+  test("drops foreign and revoked stream events, including revocation at outbound authorization", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-event-revoke");
+
+    await h.listener(enterpriseTimelineEvent("foreign", enterpriseEventForeignAgentId));
+    expect(h.messages).toEqual([]);
+
+    const authorizeDelivery = deferred<void>();
+    const deliveryStarted = deferred<void>();
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        deliveryStarted.resolve();
+        await authorizeDelivery.promise;
+        return originalCanEmit(principal, event, context);
+      },
+    );
+    const publishing = h.listener(enterpriseTimelineEvent("revoked"));
+    await deliveryStarted.promise;
+    await h.fixture.runtime.release();
+    authorizeDelivery.resolve();
+    await publishing;
+
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("publishes agent updates only while content authorization remains current across enrichment", async () => {
+    if (process.platform !== "darwin") return;
+    const storageRead = deferred<StoredAgentRecord | undefined>();
+    const storageReadStarted = deferred<void>();
+    const h = await createEnterpriseAgentEventHarness("agent-update-enrichment", {
+      agentStorage: {
+        get: vi.fn(async () => {
+          storageReadStarted.resolve();
+          return storageRead.promise;
+        }),
+        list: vi.fn(async () => []),
+      },
+    });
+    await h.session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "agent-update-subscribe",
+      subscribe: { subscriptionId: "agent-update-subscription" },
+    });
+    h.messages.length = 0;
+
+    const publishing = h.listener({
+      type: "agent_state",
+      agent: makeEnterpriseEventManagedAgent(),
+    });
+    await storageReadStarted.promise;
+    await h.fixture.runtime.release();
+    storageRead.resolve(undefined);
+    await publishing;
+
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("keeps the async current fence after nominally admitting a timeline replacement", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("timeline-replacement-current-fence");
+    const authorizationStarted = deferred<void>();
+    const releaseAuthorization = deferred<void>();
+    const preauthorize = vi.spyOn(
+      h.fixture.runtime.resourceAuthorization,
+      "preauthorizeAgentEvent",
+    );
+    const originalAssertAgent = h.fixture.runtime.resourceAuthorization.assertAgent.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    const assertAgent = vi
+      .spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent")
+      .mockImplementation(async (...args) => {
+        authorizationStarted.resolve();
+        await releaseAuthorization.promise;
+        return originalAssertAgent(...args);
+      });
+
+    const publishing = h.listener({
+      type: "timeline_replacement",
+      agentId: enterpriseEventAgentId,
+      epoch: "replacement-current-fence",
+    });
+    await authorizationStarted.promise;
+    expect(preauthorize).toHaveBeenCalledExactlyOnceWith(
+      h.fixture.runtime.principal,
+      enterpriseEventAgentId,
+    );
+    await h.fixture.runtime.release();
+    releaseAuthorization.resolve();
+    await publishing;
+
+    expect(assertAgent).toHaveBeenCalledExactlyOnceWith(
+      h.fixture.runtime.principal,
+      "workspace.content.read",
+      enterpriseEventAgentId,
+    );
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("publishes an authorized agent update through content and outbound resource gates", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-update-authorized");
+    const canEmit = vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit");
+    await h.session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "agent-update-authorized-subscribe",
+      subscribe: { subscriptionId: "agent-update-authorized-subscription" },
+    });
+    h.messages.length = 0;
+    canEmit.mockClear();
+
+    await h.listener({ type: "agent_state", agent: makeEnterpriseEventManagedAgent() });
+
+    expect(h.messages).toContainEqual(
+      expect.objectContaining({
+        type: "agent_update",
+        payload: expect.objectContaining({
+          kind: "upsert",
+          agent: expect.objectContaining({ id: enterpriseEventAgentId }),
+        }),
+      }),
+    );
+    expect(canEmit).toHaveBeenCalledWith(
+      h.fixture.enterpriseSessionContext.principal,
+      expect.objectContaining({ type: "agent_update" }),
+      {
+        kind: "resources",
+        resources: [
+          expect.objectContaining({
+            resourceKind: "workspace",
+            localResourceId: enterpriseEventWorkspaceId,
+          }),
+        ],
+      },
+    );
+    await h.session.cleanup();
+  });
+
+  test("awaits bootstrap flush and clears the subscription when its post-flush fence is stale", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("agent-update-flush-fence");
+    const flushStarted = deferred<void>();
+    const releaseFlush = deferred<void>();
+    const internals = asSessionInternals(h.session);
+    vi.spyOn(internals.agentUpdates, "flushBootstrapped").mockImplementation(async () => {
+      flushStarted.resolve();
+      await releaseFlush.promise;
+    });
+
+    const request = h.session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "agent-update-flush-fence",
+      subscribe: { subscriptionId: "agent-update-flush-subscription" },
+    });
+    await flushStarted.promise;
+    expect(internals.agentUpdates.hasSubscription()).toBe(true);
+    await h.fixture.runtime.release();
+    releaseFlush.resolve();
+    await request;
+
+    expect(internals.agentUpdates.hasSubscription()).toBe(false);
+    await h.session.cleanup();
+  });
+
+  test("authorizes provider subagent update, timeline, and remove by canonical parent", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("provider-subagent-current");
+    h.session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true });
+    const subagent = {
+      id: "provider-child",
+      parentAgentId: enterpriseEventAgentId,
+      parentSubagentId: null,
+      provider: "codex" as const,
+      title: "child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-09-10T12:00:00.000Z",
+      updatedAt: "2026-09-10T12:00:01.000Z",
+      toolCallId: "tool-call-1",
+      cwd: "/tmp/enterprise-agent-events",
+      subtitle: null,
+    };
+    const events: AgentManagerEvent[] = [
+      { type: "provider_subagent", event: { type: "upsert", subagent } },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "timeline",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+          provider: "codex",
+          row: {
+            item: { type: "assistant_message", messageId: "provider-message", text: "child" },
+            timestamp: "2026-09-10T12:00:02.000Z",
+            seq: 1,
+          },
+          epoch: "provider-epoch",
+        },
+      },
+      {
+        type: "provider_subagent",
+        event: {
+          type: "remove",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+        },
+      },
+    ];
+    for (const event of events) await h.listener(event);
+
+    expect(h.messages).toEqual([
+      {
+        type: "agent.provider_subagents.update",
+        payload: { kind: "upsert", subagent },
+      },
+      {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "timeline",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+          provider: "codex",
+          item: { type: "assistant_message", messageId: "provider-message", text: "child" },
+          timestamp: "2026-09-10T12:00:02.000Z",
+          seq: 1,
+          epoch: "provider-epoch",
+        },
+      },
+      {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "remove",
+          parentAgentId: enterpriseEventAgentId,
+          subagentId: subagent.id,
+        },
+      },
+    ]);
+
+    await h.listener({
+      type: "provider_subagent",
+      event: {
+        type: "upsert",
+        subagent: {
+          ...subagent,
+          id: enterpriseEventAgentId,
+          parentAgentId: enterpriseEventForeignAgentId,
+        },
+      },
+    });
+    expect(h.messages).toHaveLength(3);
+    await h.session.cleanup();
+  });
+
+  test("rechecks a provider subagent parent after its awaited workspace publication", async () => {
+    if (process.platform !== "darwin") return;
+    const h = await createEnterpriseAgentEventHarness("provider-subagent-revoke");
+    h.session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true });
+    const workspaceUpdateStarted = deferred<void>();
+    const releaseWorkspaceUpdate = deferred<void>();
+    vi.spyOn(asSessionInternals(h.session), "emitWorkspaceUpdateForWorkspaceId").mockImplementation(
+      async () => {
+        workspaceUpdateStarted.resolve();
+        await releaseWorkspaceUpdate.promise;
+      },
+    );
+
+    const publishing = h.listener({
+      type: "provider_subagent",
+      event: {
+        type: "upsert",
+        subagent: {
+          id: "provider-child-revoked",
+          parentAgentId: enterpriseEventAgentId,
+          parentSubagentId: null,
+          provider: "codex",
+          title: null,
+          description: null,
+          status: "running",
+          createdAt: "2026-09-10T12:00:00.000Z",
+          updatedAt: "2026-09-10T12:00:00.000Z",
+          toolCallId: null,
+          cwd: null,
+          subtitle: null,
+        },
+      },
+    });
+    await workspaceUpdateStarted.promise;
+    await h.fixture.runtime.release();
+    releaseWorkspaceUpdate.resolve();
+    await publishing;
+
+    expect(h.messages).toEqual([]);
+    await h.session.cleanup();
+  });
+
+  test("auto-allows voice speak only at an exact current agent gate", async () => {
+    if (process.platform !== "darwin") return;
+    const activeVoice = vi
+      .spyOn(VoiceSession.prototype, "isActiveForAgent")
+      .mockImplementation((agentId) => agentId === enterpriseEventAgentId);
+    const respondToPermission = vi.fn(async () => true);
+    const h = await createEnterpriseAgentEventHarness("voice-auto-allow-current", {
+      agentManager: { respondToPermission },
+    });
+    const permissionEvent: AgentManagerEvent = {
+      type: "agent_stream",
+      agentId: enterpriseEventAgentId,
+      event: {
+        type: "permission_requested",
+        provider: "codex",
+        request: {
+          id: "speak-current",
+          provider: "codex",
+          name: "paseo_voice.speak",
+          kind: "tool",
+        },
+      },
+    };
+
+    await h.listener(permissionEvent);
+    expect(respondToPermission).toHaveBeenCalledExactlyOnceWith(
+      enterpriseEventAgentId,
+      "speak-current",
+      { behavior: "allow" },
+    );
+    expect(h.messages.map((message) => message.type)).toEqual([
+      "agent_stream",
+      "agent_permission_request",
+    ]);
+
+    const authorizationStarted = deferred<void>();
+    const releaseAuthorization = deferred<void>();
+    const originalAssertAgent = h.fixture.runtime.resourceAuthorization.assertAgent.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "assertAgent").mockImplementation(
+      async (...args) => {
+        authorizationStarted.resolve();
+        await releaseAuthorization.promise;
+        return originalAssertAgent(...args);
+      },
+    );
+    const revoked = h.listener({
+      ...permissionEvent,
+      event: {
+        ...permissionEvent.event,
+        request: { ...permissionEvent.event.request, id: "speak-revoked" },
+      },
+    });
+    await authorizationStarted.promise;
+    await h.fixture.runtime.release();
+    releaseAuthorization.resolve();
+    await revoked;
+    expect(respondToPermission).toHaveBeenCalledTimes(1);
+    expect(h.messages).toHaveLength(2);
+    activeVoice.mockRestore();
+    await h.session.cleanup();
+  });
+
+  test("cleanup seals and unsubscribes before draining queued voice work", async () => {
+    if (process.platform !== "darwin") return;
+    const activeVoice = vi
+      .spyOn(VoiceSession.prototype, "isActiveForAgent")
+      .mockImplementation((agentId) => agentId === enterpriseEventAgentId);
+    const respondToPermission = vi.fn(async () => true);
+    const h = await createEnterpriseAgentEventHarness("agent-event-cleanup-drain", {
+      agentManager: { respondToPermission },
+    });
+    const authorizeDelivery = deferred<void>();
+    const deliveryStarted = deferred<void>();
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        deliveryStarted.resolve();
+        await authorizeDelivery.promise;
+        return originalCanEmit(principal, event, context);
+      },
+    );
+
+    const accepted = h.listener(enterpriseTimelineEvent("before-cleanup"));
+    const queuedVoice = h.listener({
+      type: "agent_stream",
+      agentId: enterpriseEventAgentId,
+      event: {
+        type: "permission_requested",
+        provider: "codex",
+        request: { id: "speak-cleanup", provider: "codex", name: "speak", kind: "tool" },
+      },
+    });
+    await deliveryStarted.promise;
+    const cleanup = h.session.cleanup();
+    expect(h.unsubscribe).toHaveBeenCalledTimes(1);
+    const late = h.listener(enterpriseTimelineEvent("after-cleanup"));
+    authorizeDelivery.resolve();
+    await Promise.all([accepted, queuedVoice, late, cleanup]);
+
+    expect(h.messages).toEqual([]);
+    expect(respondToPermission).not.toHaveBeenCalled();
+    expect(h.unsubscribe).toHaveBeenCalledTimes(1);
+    activeVoice.mockRestore();
+  });
+
+  test("records an outbound rejection and continues the Session tail without an unhandled rejection", async () => {
+    if (process.platform !== "darwin") return;
+    const logger = pino({ level: "silent" });
+    const logError = vi.spyOn(logger, "error");
+    const h = await createEnterpriseAgentEventHarness("agent-event-rejection", { logger });
+    const originalCanEmit = h.fixture.runtime.resourceAuthorization.canEmit.bind(
+      h.fixture.runtime.resourceAuthorization,
+    );
+    let calls = 0;
+    vi.spyOn(h.fixture.runtime.resourceAuthorization, "canEmit").mockImplementation(
+      async (principal, event, context) => {
+        calls += 1;
+        if (calls === 1) throw new Error("authorization transport rejected");
+        return originalCanEmit(principal, event, context);
+      },
+    );
+
+    await Promise.all([
+      h.listener(enterpriseTimelineEvent("rejected")),
+      h.listener(enterpriseTimelineEvent("continued")),
+    ]);
+
+    expect(h.messages).toHaveLength(1);
+    expect(h.messages[0]).toMatchObject({
+      type: "agent_stream",
+      payload: { event: { type: "timeline", item: { text: "continued" } } },
+    });
+    expect(logError).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error) }),
+      "Failed to authorize outbound message",
+    );
+    await h.session.cleanup();
+  });
+
+  test("keeps legacy stream and provider-subagent publication synchronous", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const listeners: TestAgentEventListener[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: {
+        getAgent: vi.fn(() => null),
+        subscribe: vi.fn((listener: TestAgentEventListener) => {
+          listeners.push(listener);
+          return () => {};
+        }),
+      },
+    });
+    session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true });
+    const listener = listeners[0];
+    if (!listener) throw new Error("Agent event listener was not installed");
+
+    const streamResult = listener(enterpriseTimelineEvent("legacy"));
+    expect(streamResult).toBeUndefined();
+    expect(messages).toHaveLength(1);
+    const providerResult = listener({
+      type: "provider_subagent",
+      event: {
+        type: "remove",
+        parentAgentId: enterpriseEventAgentId,
+        subagentId: "legacy-provider-child",
+      },
+    });
+    expect(providerResult).toBeUndefined();
+    expect(messages.map((message) => message.type)).toEqual([
+      "agent_stream",
+      "agent.provider_subagents.update",
+    ]);
+    const stateResult = listener({
+      type: "agent_state",
+      agent: makeEnterpriseEventManagedAgent("agt_legacy_state"),
+    });
+    const replacementResult = listener({
+      type: "timeline_replacement",
+      agentId: "agt_legacy_replacement",
+      epoch: "legacy-replacement",
+    });
+    expect(stateResult).toBeUndefined();
+    expect(replacementResult).toBeUndefined();
+    expect(messages.map((message) => message.type)).toEqual([
+      "agent_stream",
+      "agent.provider_subagents.update",
+    ]);
+    await session.cleanup();
+  });
+});
+
+describe.runIf(process.platform === "darwin")(
+  "enterprise ownership transfer Session invalidation",
+  () => {
+    test("fans one exact tombstone to every current old-principal Session in the same runtime", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-fanout");
+      const sibling = await h.createTransferSession({
+        suffix: "session-transfer-fanout-sibling",
+        permissions: ["workspace.read"],
+      });
+      const newOwner = await h.createTransferSession({
+        suffix: "session-transfer-fanout-new-owner",
+        principalId: transferNewOwnerId,
+        permissions: [],
+      });
+      const isolated = await h.createTransferSession({
+        suffix: "session-transfer-fanout-isolated",
+        registry: createEnterpriseAgentSessionContextRegistry(),
+        permissions: ["workspace.read"],
+      });
+      const stale = await h.createTransferSession({
+        suffix: "session-transfer-fanout-stale",
+        permissions: ["workspace.read"],
+      });
+      const missingRuntime = await h.createTransferSession({
+        suffix: "session-transfer-fanout-missing-runtime",
+        includeProductionRuntime: false,
+      });
+      const missingSession = await h.createTransferSession({
+        suffix: "session-transfer-fanout-missing-session",
+        permissions: ["workspace.read"],
+      });
+      const closed = await h.createTransferSession({
+        suffix: "session-transfer-fanout-closed",
+        permissions: ["workspace.read"],
+      });
+      if (!stale.runtime || !sibling.runtime) throw new Error("Expected peer runtimes");
+      const sourceInternals = asSessionInternals(h.session);
+      const siblingInternals = asSessionInternals(sibling.session);
+      const missingRuntimeInternals = asSessionInternals(missingRuntime.session);
+      const sourceInvalidate = vi.spyOn(sourceInternals.agentUpdates, "invalidateWorkspace");
+      const siblingInvalidate = vi.spyOn(siblingInternals.agentUpdates, "invalidateWorkspace");
+      const missingRuntimeInvalidate = vi.spyOn(
+        missingRuntimeInternals.agentUpdates,
+        "invalidateWorkspace",
+      );
+      const missingSessionInternals = asSessionInternals(missingSession.session);
+      const missingSessionInvalidate = vi.spyOn(
+        missingSessionInternals.agentUpdates,
+        "invalidateWorkspace",
+      );
+      const missingProductionSession = missingSessionInternals.productionAuthorizationSession;
+      missingSessionInternals.productionAuthorizationSession = undefined;
+      const siblingCanEmit = vi.spyOn(sibling.runtime.resourceAuthorization, "canEmit");
+
+      try {
+        sibling.session.updateClientCapabilities({ [CLIENT_CAPS.selectiveAgentTimeline]: true });
+        await sibling.session.handleMessage({
+          type: "agent.timeline.set_subscription.request",
+          requestId: "timeline-before-fanout",
+          agentIds: [transferAgentAId, transferAgentBId],
+        });
+        await sibling.session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: "agents-before-fanout",
+          subscribe: { subscriptionId: "agents-fanout-subscription" },
+        });
+        await sibling.session.handleMessage({
+          type: "fetch_workspaces_request",
+          requestId: "workspaces-before-fanout",
+          subscribe: { subscriptionId: "workspaces-fanout-subscription" },
+        });
+        sibling.messages.length = 0;
+        siblingCanEmit.mockClear();
+        await stale.runtime.release();
+        await closed.session.cleanup();
+
+        const request = {
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-session-fanout",
+          resource: {
+            organizationId: h.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.enterpriseSessionContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: transferWorkspaceAId,
+          },
+          expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+          expectedRevision: "0",
+          newPrincipalId: transferNewOwnerId,
+        } as const satisfies SessionInboundMessage;
+        await h.session.handleMessage(request);
+
+        const response = h.messages.find(
+          (message) => message.type === "enterprise.resource.ownership.transfer.response",
+        );
+        if (!response || response.type !== "enterprise.resource.ownership.transfer.response")
+          throw new Error("Expected transfer response");
+        const sourceTombstones = h.messages.filter(
+          (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+        );
+        const siblingTombstones = sibling.messages.filter(
+          (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+        );
+        expect(sourceTombstones).toHaveLength(1);
+        expect(siblingTombstones).toEqual(sourceTombstones);
+        expect(sourceTombstones[0]).toEqual({
+          type: "enterprise.workspace.ownership.transfer.tombstone",
+          payload: {
+            eventId: expect.any(String),
+            resource: request.resource,
+            oldPrincipalId: request.expectedOwnerPrincipalId,
+            newRevision: response.payload.revision,
+            transferReceiptId: response.payload.receiptId,
+          },
+        });
+        expect("requestId" in sourceTombstones[0]!.payload).toBe(false);
+        expect(Object.isFrozen(sourceTombstones[0])).toBe(true);
+        expect(Object.isFrozen(sourceTombstones[0]!.payload)).toBe(true);
+        expect(Object.isFrozen(sourceTombstones[0]!.payload.resource)).toBe(true);
+        expect(newOwner.messages).toEqual([]);
+        expect(isolated.messages).toEqual([]);
+        expect(stale.messages).toEqual([]);
+        expect(missingRuntime.messages).toEqual([]);
+        expect(missingSession.messages).toEqual([]);
+        expect(closed.messages).toEqual([]);
+        expect(sourceInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(missingRuntimeInvalidate).not.toHaveBeenCalled();
+        expect(missingSessionInvalidate).not.toHaveBeenCalled();
+        expect(siblingCanEmit).not.toHaveBeenCalled();
+        expect(siblingInternals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
+        expect(siblingInternals.workspaceUpdatesSubscription?.excludedWorkspaceIds).toEqual(
+          new Set([transferWorkspaceAId]),
+        );
+
+        await sibling.listener?.(enterpriseTimelineEvent("late-a", transferAgentAId));
+        await sibling.listener?.(enterpriseTimelineEvent("still-current-b", transferAgentBId));
+        expect(
+          sibling.messages.some(
+            (message) =>
+              message.type === "agent_stream" &&
+              message.payload.agentId === transferAgentAId &&
+              message.payload.event.type === "timeline",
+          ),
+        ).toBe(false);
+        expect(sibling.messages).toContainEqual(
+          expect.objectContaining({
+            type: "agent_stream",
+            payload: expect.objectContaining({ agentId: transferAgentBId }),
+          }),
+        );
+
+        await h.session.handleMessage(request);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(
+          sibling.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(sourceInvalidate).toHaveBeenCalledTimes(1);
+        expect(siblingInvalidate).toHaveBeenCalledTimes(1);
+      } finally {
+        missingSessionInternals.productionAuthorizationSession = missingProductionSession;
+        await Promise.allSettled([
+          h.session.cleanup(),
+          sibling.session.cleanup(),
+          newOwner.session.cleanup(),
+          isolated.session.cleanup(),
+          stale.session.cleanup(),
+          missingRuntime.session.cleanup(),
+          missingSession.session.cleanup(),
+        ]);
+        await h.audit.close();
+      }
+    });
+
+    test("fans out after a committed transfer even when the response is denied", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-fanout-denied");
+      const sibling = await h.createTransferSession({
+        suffix: "session-transfer-fanout-denied-sibling",
+        permissions: [],
+      });
+      if (!sibling.runtime) throw new Error("Expected sibling runtime");
+      const sourceInvalidate = vi.spyOn(
+        asSessionInternals(h.session).agentUpdates,
+        "invalidateWorkspace",
+      );
+      const siblingInvalidate = vi.spyOn(
+        asSessionInternals(sibling.session).agentUpdates,
+        "invalidateWorkspace",
+      );
+      const siblingCanEmit = vi.spyOn(sibling.runtime.resourceAuthorization, "canEmit");
+      const sourceCanEmit = vi.spyOn(h.runtime.resourceAuthorization, "canEmit");
+      const originalCanEmit = h.runtime.resourceAuthorization.canEmit.bind(
+        h.runtime.resourceAuthorization,
+      );
+      sourceCanEmit.mockImplementation((principal, event, context) =>
+        event.type === "enterprise.resource.ownership.transfer.response"
+          ? Promise.resolve(false)
+          : originalCanEmit(principal, event, context),
+      );
+
+      try {
+        await h.session.handleMessage({
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-session-fanout-denied",
+          resource: {
+            organizationId: h.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.enterpriseSessionContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: transferWorkspaceAId,
+          },
+          expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+          expectedRevision: "0",
+          newPrincipalId: transferNewOwnerId,
+        });
+
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.resource.ownership.transfer.response",
+          ),
+        ).toEqual([]);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(
+          sibling.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(sourceInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingCanEmit).not.toHaveBeenCalled();
+        expect(sourceCanEmit).toHaveBeenCalledTimes(1);
+      } finally {
+        await Promise.allSettled([h.session.cleanup(), sibling.session.cleanup()]);
+        await h.audit.close();
+      }
+    });
+
+    test("fans out and seals in finally while preserving a response enqueue rejection", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-fanout-throw");
+      const sibling = await h.createTransferSession({
+        suffix: "session-transfer-fanout-throw-sibling",
+        permissions: ["workspace.read"],
+      });
+      const sourceInternals = asSessionInternals(h.session);
+      const sourceInvalidate = vi.spyOn(sourceInternals.agentUpdates, "invalidateWorkspace");
+      const siblingInvalidate = vi.spyOn(
+        asSessionInternals(sibling.session).agentUpdates,
+        "invalidateWorkspace",
+      );
+      const request = {
+        type: "enterprise.resource.ownership.transfer.request",
+        requestId: "transfer-session-fanout-throw",
+        resource: {
+          organizationId: h.enterpriseSessionContext.principal.organizationId,
+          nodeId: h.enterpriseSessionContext.node.nodeId,
+          resourceKind: "workspace",
+          localResourceId: transferWorkspaceAId,
+        },
+        expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+        expectedRevision: "0",
+        newPrincipalId: transferNewOwnerId,
+      } as const satisfies SessionInboundMessage;
+      const dispatchContext: EnterpriseDispatchContext = Object.freeze({
+        sessionId: h.session.getSessionId(),
+        clientId: h.runtime.binding.clientId,
+        credentialId: h.enterpriseSessionContext.principal.credentialId,
+        sessionBindingGeneration: h.enterpriseSessionContext.sessionBindingGeneration,
+        enterpriseContext: h.enterpriseSessionContext,
+      });
+      const dispatcher = sourceInternals.enterpriseWorkspaceOwnershipTransferDispatcher;
+
+      try {
+        const response = await dispatcher.handle({
+          sessionContext: dispatchContext,
+          message: request,
+        });
+        if (response === false) throw new Error("Expected direct transfer response");
+        const contextual = dispatcher.consumeResponse?.({
+          sessionContext: dispatchContext,
+          message: request,
+          response,
+        });
+        if (!contextual) throw new Error("Expected direct contextual transfer response");
+        const enqueueError = new Error("response enqueue failed");
+        vi.spyOn(sourceInternals, "enqueueAuthorizedEmit").mockRejectedValueOnce(enqueueError);
+
+        await expect(
+          sourceInternals.emitEnterpriseDispatcherResponse(request, contextual),
+        ).rejects.toBe(enqueueError);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(
+          sibling.messages.filter(
+            (message) => message.type === "enterprise.workspace.ownership.transfer.tombstone",
+          ),
+        ).toHaveLength(1);
+        expect(sourceInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(siblingInvalidate).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+      } finally {
+        await Promise.allSettled([h.session.cleanup(), sibling.session.cleanup()]);
+        await h.audit.close();
+      }
+    });
+
+    test("publishes the real receipt response before sealing only the old owner's workspace state", async () => {
+      const responseTriggeredPublications: Promise<void>[] = [];
+      let transferListener: TestAgentEventListener | undefined;
+      const h = await createEnterpriseOwnershipTransferHarness(
+        "session-transfer-seal",
+        (message) => {
+          if (
+            message.type === "enterprise.resource.ownership.transfer.response" &&
+            transferListener
+          ) {
+            responseTriggeredPublications.push(
+              Promise.resolve(
+                transferListener(enterpriseTimelineEvent("during-response", transferAgentAId)),
+              ),
+            );
+          }
+        },
+      );
+      transferListener = h.listener;
+      const internals = asSessionInternals(h.session);
+      const invalidateWorkspace = vi.spyOn(internals.agentUpdates, "invalidateWorkspace");
+      const releasePreTransferPublications = deferred<void>();
+
+      try {
+        h.session.updateClientCapabilities({ [CLIENT_CAPS.selectiveAgentTimeline]: true });
+        await h.session.handleMessage({
+          type: "agent.timeline.set_subscription.request",
+          requestId: "timeline-before-transfer",
+          agentIds: [transferAgentAId, transferAgentBId],
+        });
+        await h.session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: "agents-before-transfer",
+          subscribe: { subscriptionId: "agents-transfer-subscription" },
+        });
+        await h.session.handleMessage({
+          type: "fetch_workspaces_request",
+          requestId: "workspaces-before-transfer",
+          subscribe: { subscriptionId: "workspaces-transfer-subscription" },
+        });
+        await vi.waitFor(() => {
+          expect(findByType(h.messages, "fetch_workspaces_response")).toBeDefined();
+        });
+        h.messages.length = 0;
+
+        const agentPublicationAuthorized = deferred<void>();
+        const workspaceAPublicationAuthorized = deferred<void>();
+        const workspaceBPublicationAuthorized = deferred<void>();
+        const originalCanEmit = h.runtime.resourceAuthorization.canEmit.bind(
+          h.runtime.resourceAuthorization,
+        );
+        vi.spyOn(h.runtime.resourceAuthorization, "canEmit").mockImplementation(
+          async (principal, event, authorizationContext) => {
+            const isAgentPublication =
+              event.type === "agent_stream" &&
+              event.payload.agentId === transferAgentAId &&
+              event.payload.event.type === "timeline" &&
+              event.payload.event.item.type === "assistant_message" &&
+              event.payload.event.item.text === "pre-transfer";
+            const workspacePublicationId =
+              event.type === "workspace_update" && event.payload.kind === "upsert"
+                ? event.payload.workspace.id
+                : null;
+            if (!isAgentPublication && !workspacePublicationId) {
+              return originalCanEmit(principal, event, authorizationContext);
+            }
+            const allowed = await originalCanEmit(principal, event, authorizationContext);
+            if (isAgentPublication) agentPublicationAuthorized.resolve();
+            if (workspacePublicationId === transferWorkspaceAId) {
+              workspaceAPublicationAuthorized.resolve();
+            }
+            if (workspacePublicationId === transferWorkspaceBId) {
+              workspaceBPublicationAuthorized.resolve();
+            }
+            await releasePreTransferPublications.promise;
+            return allowed;
+          },
+        );
+
+        const preTransferAgentPublication = h.listener(
+          enterpriseTimelineEvent("pre-transfer", transferAgentAId),
+        );
+        await h.workspaceRegistry.upsert({
+          ...h.workspaceA,
+          displayName: "Transfer A queued",
+          updatedAt: "2026-09-11T00:01:00.000Z",
+        });
+        const queuedWorkspaceA = internals.emitWorkspaceUpdateForWorkspaceId(transferWorkspaceAId);
+        await h.workspaceRegistry.upsert({
+          ...h.workspaceB,
+          displayName: "Transfer B queued",
+          updatedAt: "2026-09-11T00:01:00.000Z",
+        });
+        const queuedWorkspaceB = internals.emitWorkspaceUpdateForWorkspaceId(transferWorkspaceBId);
+        await Promise.all([
+          agentPublicationAuthorized.promise,
+          workspaceAPublicationAuthorized.promise,
+          workspaceBPublicationAuthorized.promise,
+        ]);
+
+        const transferRequest = {
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-session-workspace",
+          resource: {
+            organizationId: h.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.enterpriseSessionContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: transferWorkspaceAId,
+          },
+          expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+          expectedRevision: "0",
+          newPrincipalId: transferNewOwnerId,
+        } as const satisfies SessionInboundMessage;
+        await h.session.handleMessage(transferRequest);
+
+        const transferResponses = h.messages.filter(
+          (message) => message.type === "enterprise.resource.ownership.transfer.response",
+        );
+        expect(transferResponses).toEqual([
+          {
+            type: "enterprise.resource.ownership.transfer.response",
+            payload: {
+              requestId: transferRequest.requestId,
+              resource: transferRequest.resource,
+              ownerPrincipalId: transferNewOwnerId,
+              revision: "1",
+              receiptId: expect.any(String),
+            },
+          },
+        ]);
+        expect(h.messages[0]).toEqual(transferResponses[0]);
+        expect(responseTriggeredPublications).toHaveLength(1);
+        expect(invalidateWorkspace).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(internals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
+        expect(internals.workspaceUpdatesSubscription?.excludedWorkspaceIds).toEqual(
+          new Set([transferWorkspaceAId]),
+        );
+        expect(
+          internals.workspaceUpdatesSubscription?.lastEmittedByWorkspaceId.has(
+            transferWorkspaceAId,
+          ),
+        ).toBe(false);
+        expect(
+          internals.workspaceUpdatesSubscription?.lastEmittedByWorkspaceId.has(
+            transferWorkspaceBId,
+          ),
+        ).toBe(true);
+        expect(internals.workspaceUpdateTails.has(transferWorkspaceAId)).toBe(false);
+
+        releasePreTransferPublications.resolve();
+        await Promise.all([
+          Promise.resolve(preTransferAgentPublication),
+          queuedWorkspaceA,
+          queuedWorkspaceB,
+          ...responseTriggeredPublications,
+        ]);
+        expect(h.messages).toContainEqual(
+          expect.objectContaining({
+            type: "workspace_update",
+            payload: expect.objectContaining({
+              kind: "upsert",
+              workspace: expect.objectContaining({
+                id: transferWorkspaceBId,
+                name: "Transfer B queued",
+              }),
+            }),
+          }),
+        );
+        await internals.emitWorkspaceUpdateForWorkspaceId(transferWorkspaceAId);
+        await h.listener({
+          type: "agent_state",
+          agent: makeEnterpriseEventManagedAgent(transferAgentAId, transferWorkspaceAId),
+        });
+        await h.listener(enterpriseTimelineEvent("after-transfer-a", transferAgentAId));
+
+        await h.listener({
+          type: "agent_state",
+          agent: makeEnterpriseEventManagedAgent(transferAgentBId, transferWorkspaceBId),
+        });
+        await h.listener(enterpriseTimelineEvent("after-transfer-b", transferAgentBId));
+        await h.workspaceRegistry.upsert({
+          ...h.workspaceB,
+          displayName: "Transfer B remains visible",
+          updatedAt: "2026-09-11T00:02:00.000Z",
+        });
+        await internals.emitWorkspaceUpdateForWorkspaceId(transferWorkspaceBId);
+
+        expect(
+          h.messages.some(
+            (message) =>
+              message.type === "agent_stream" && message.payload.agentId === transferAgentAId,
+          ),
+        ).toBe(false);
+        expect(
+          h.messages.some(
+            (message) =>
+              message.type === "agent_update" &&
+              ((message.payload.kind === "upsert" &&
+                message.payload.agent.id === transferAgentAId) ||
+                (message.payload.kind === "remove" &&
+                  message.payload.agentId === transferAgentAId)),
+          ),
+        ).toBe(false);
+        expect(
+          h.messages.some(
+            (message) =>
+              message.type === "workspace_update" &&
+              ((message.payload.kind === "upsert" &&
+                message.payload.workspace.id === transferWorkspaceAId) ||
+                (message.payload.kind === "remove" && message.payload.id === transferWorkspaceAId)),
+          ),
+        ).toBe(false);
+        expect(h.messages).toContainEqual(
+          expect.objectContaining({
+            type: "agent_stream",
+            payload: expect.objectContaining({ agentId: transferAgentBId }),
+          }),
+        );
+        expect(h.messages).toContainEqual(
+          expect.objectContaining({
+            type: "agent_update",
+            payload: expect.objectContaining({
+              kind: "upsert",
+              agent: expect.objectContaining({ id: transferAgentBId }),
+            }),
+          }),
+        );
+        expect(h.messages).toContainEqual(
+          expect.objectContaining({
+            type: "workspace_update",
+            payload: expect.objectContaining({
+              kind: "upsert",
+              workspace: expect.objectContaining({ id: transferWorkspaceBId }),
+            }),
+          }),
+        );
+
+        const responseCount = transferResponses.length;
+        await h.session.handleMessage(transferRequest);
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.resource.ownership.transfer.response",
+          ),
+        ).toHaveLength(responseCount);
+        expect(invalidateWorkspace).toHaveBeenCalledTimes(1);
+        expect(internals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
+        await h.listener(enterpriseTimelineEvent("after-replay-b", transferAgentBId));
+        expect(h.messages).toContainEqual(
+          expect.objectContaining({
+            type: "agent_stream",
+            payload: expect.objectContaining({
+              agentId: transferAgentBId,
+              event: expect.objectContaining({
+                type: "timeline",
+                item: expect.objectContaining({ text: "after-replay-b" }),
+              }),
+            }),
+          }),
+        );
+      } finally {
+        releasePreTransferPublications.resolve();
+        await h.session.cleanup();
+        await h.audit.close();
+      }
+    });
+
+    test("seals a committed transfer once even when its response is not delivered", async () => {
+      const h = await createEnterpriseOwnershipTransferHarness("session-transfer-response-denied");
+      const internals = asSessionInternals(h.session);
+      const invalidateWorkspace = vi.spyOn(internals.agentUpdates, "invalidateWorkspace");
+      const releaseLatePublication = deferred<void>();
+      try {
+        h.session.updateClientCapabilities({ [CLIENT_CAPS.selectiveAgentTimeline]: true });
+        await h.session.handleMessage({
+          type: "agent.timeline.set_subscription.request",
+          requestId: "timeline-before-denied-response",
+          agentIds: [transferAgentAId, transferAgentBId],
+        });
+        await h.session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: "agents-before-denied-response",
+          subscribe: { subscriptionId: "agents-denied-response-subscription" },
+        });
+        await h.session.handleMessage({
+          type: "fetch_workspaces_request",
+          requestId: "workspaces-before-denied-response",
+          subscribe: { subscriptionId: "workspaces-denied-response-subscription" },
+        });
+        h.messages.length = 0;
+
+        const originalCanEmit = h.runtime.resourceAuthorization.canEmit.bind(
+          h.runtime.resourceAuthorization,
+        );
+        const latePublicationAuthorized = deferred<void>();
+        vi.spyOn(h.runtime.resourceAuthorization, "canEmit").mockImplementation(
+          async (principal, event, authorizationContext) => {
+            if (event.type === "enterprise.resource.ownership.transfer.response") return false;
+            if (
+              event.type === "agent_stream" &&
+              event.payload.agentId === transferAgentAId &&
+              event.payload.event.type === "timeline" &&
+              event.payload.event.item.type === "assistant_message" &&
+              event.payload.event.item.text === "late-after-denied-response"
+            ) {
+              const allowed = await originalCanEmit(principal, event, authorizationContext);
+              latePublicationAuthorized.resolve();
+              await releaseLatePublication.promise;
+              return allowed;
+            }
+            return originalCanEmit(principal, event, authorizationContext);
+          },
+        );
+        const latePublication = h.listener(
+          enterpriseTimelineEvent("late-after-denied-response", transferAgentAId),
+        );
+        await latePublicationAuthorized.promise;
+        const transferRequest = {
+          type: "enterprise.resource.ownership.transfer.request",
+          requestId: "transfer-session-response-denied",
+          resource: {
+            organizationId: h.enterpriseSessionContext.principal.organizationId,
+            nodeId: h.enterpriseSessionContext.node.nodeId,
+            resourceKind: "workspace",
+            localResourceId: transferWorkspaceAId,
+          },
+          expectedOwnerPrincipalId: h.enterpriseSessionContext.principal.principalId,
+          expectedRevision: "0",
+          newPrincipalId: transferNewOwnerId,
+        } as const satisfies SessionInboundMessage;
+        await h.session.handleMessage(transferRequest);
+
+        expect(
+          h.messages.filter(
+            (message) => message.type === "enterprise.resource.ownership.transfer.response",
+          ),
+        ).toEqual([]);
+        expect(invalidateWorkspace).toHaveBeenCalledExactlyOnceWith(transferWorkspaceAId);
+        expect(internals.viewedTimelineAgentIds).toEqual(new Set([transferAgentBId]));
+        expect(internals.workspaceUpdatesSubscription?.excludedWorkspaceIds).toEqual(
+          new Set([transferWorkspaceAId]),
+        );
+        expect(
+          internals.workspaceUpdatesSubscription?.lastEmittedByWorkspaceId.has(
+            transferWorkspaceAId,
+          ),
+        ).toBe(false);
+        expect(
+          internals.workspaceUpdatesSubscription?.lastEmittedByWorkspaceId.has(
+            transferWorkspaceBId,
+          ),
+        ).toBe(true);
+        await expect(h.workspaceRegistry.get(transferWorkspaceAId)).resolves.toMatchObject({
+          ownerPrincipalId: transferNewOwnerId,
+          ownershipRevision: "1",
+        });
+
+        releaseLatePublication.resolve();
+        await Promise.resolve(latePublication);
+        expect(
+          h.messages.some(
+            (message) =>
+              message.type === "agent_stream" && message.payload.agentId === transferAgentAId,
+          ),
+        ).toBe(false);
+        await h.session.handleMessage(transferRequest);
+        expect(invalidateWorkspace).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseLatePublication.resolve();
+        await h.session.cleanup();
+        await h.audit.close();
+      }
+    });
+  },
+);

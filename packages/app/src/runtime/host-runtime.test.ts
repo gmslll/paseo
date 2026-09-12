@@ -7,23 +7,81 @@ import type {
   FetchAgentsEntry,
   FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
+import type {
+  EnterpriseFileRequestTransport,
+  EnterpriseIdentityLifecyclePorts,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
+import {
+  MemoryEnterpriseIdentityLifecycle,
+  type ProcessCredentialVault,
+} from "@getpaseo/client/internal/enterprise-identity-lifecycle";
 import type { ConnectionOffer } from "@getpaseo/protocol/connection-offer";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { HostConnection, HostProfile } from "@/types/host-connection";
 import { defaultHostAppearance } from "@/hosts/appearance";
-import { useSessionStore, type Agent } from "@/stores/session-store";
+import { normalizeWorkspaceDescriptor, useSessionStore, type Agent } from "@/stores/session-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
 import { queryClient } from "@/data/query-client";
 import {
+  createEnterpriseFileRequestFactory,
   HostRuntimeController,
   HostRuntimeStore,
   readInitialDaemonConnectionHint,
+  type BrowserProfileRuntimeAuthorization,
+  type BrowserProfileRuntimeBridge,
   type HostRuntimeControllerDeps,
   type HostRuntimeStorage,
 } from "./host-runtime";
 import type { ReplicaRow, ReplicaRowStore } from "./replica-cache/row-store";
+import { createEnterpriseResidueResetAdapter } from "@/stores/enterprise/enterprise-residue-reset";
+import {
+  createWorkspaceLayoutWithExplorerSidebar,
+  useWorkspaceLayoutStore,
+} from "@/stores/workspace-layout-store";
+import { mountBrowserPageIdentityDaemonClientHandler } from "@/desktop/browser/page-identity-transport";
+
+const mountedPageIdentityHandlers: Array<{
+  ready: ReturnType<typeof vi.fn>;
+  seal: ReturnType<typeof vi.fn>;
+  drain: ReturnType<typeof vi.fn>;
+  dispose: ReturnType<typeof vi.fn>;
+}> = [];
+const pageIdentityEvents: string[] = [];
+const pageIdentityLifecycleEvents: string[] = [];
+let pageIdentityReadyGate: Promise<void> | null = null;
+
+vi.mock("@/desktop/browser/page-identity-transport", async () => {
+  const actual = await vi.importActual<typeof import("@/desktop/browser/page-identity-transport")>(
+    "@/desktop/browser/page-identity-transport",
+  );
+  return {
+    ...actual,
+    mountBrowserPageIdentityDaemonClientHandler: vi.fn(() => {
+      const handler = {
+        ready: vi.fn(async () => {
+          if (pageIdentityReadyGate) await pageIdentityReadyGate;
+          pageIdentityEvents.push("ready");
+        }),
+        seal: vi.fn(() => {
+          pageIdentityEvents.push("seal");
+          pageIdentityLifecycleEvents.push("seal");
+        }),
+        drain: vi.fn(async () => {
+          pageIdentityEvents.push("drain");
+          pageIdentityLifecycleEvents.push("drain");
+        }),
+        dispose: vi.fn(async () => {
+          pageIdentityEvents.push("dispose");
+          pageIdentityLifecycleEvents.push("dispose");
+        }),
+      };
+      mountedPageIdentityHandlers.push(handler);
+      return handler;
+    }),
+  };
+});
 
 class FakeDaemonClient {
   private state: ConnectionState = { status: "idle" };
@@ -42,27 +100,41 @@ class FakeDaemonClient {
   public sentAgentMessages: Array<Parameters<DaemonClient["sendAgentMessage"]>> = [];
   public sendAgentMessageFailures: Error[] = [];
   public sendAgentMessageResponses: Promise<void>[] = [];
-  private agentUpdateListeners = new Set<
-    (message: Extract<SessionOutboundMessage, { type: "agent_update" }>) => void
+  private outboundListeners = new Map<
+    SessionOutboundMessage["type"],
+    Set<(message: SessionOutboundMessage) => void>
   >();
   private fetchWaiters = new Set<() => void>();
   private agentListenerWaiters = new Set<() => void>();
   private sentMessageWaiters = new Set<() => void>();
+  public serverInfo: {
+    serverId?: string;
+    features?: {
+      enterpriseIdentityV1?: boolean;
+      enterpriseBrowserPageIdentityObservationV1?: boolean;
+      enterpriseBrowserPageIdentityInvalidationV1?: boolean;
+    };
+  } | null = null;
+  public enterpriseResponses: Array<Readonly<Record<string, unknown>>> = [];
+  public enterpriseIdentity: Readonly<Record<string, unknown>> | null = null;
 
-  on(
-    type: "agent_update",
-    listener: (message: Extract<SessionOutboundMessage, { type: "agent_update" }>) => void,
+  on<TType extends SessionOutboundMessage["type"]>(
+    type: TType,
+    listener: (message: Extract<SessionOutboundMessage, { type: TType }>) => void,
   ): () => void {
-    if (type === "agent_update") this.agentUpdateListeners.add(listener);
+    const listeners = this.outboundListeners.get(type) ?? new Set();
+    const registered = listener as unknown as (message: SessionOutboundMessage) => void;
+    listeners.add(registered);
+    this.outboundListeners.set(type, listeners);
     for (const waiter of this.agentListenerWaiters) waiter();
-    return () => this.agentUpdateListeners.delete(listener);
+    return () => listeners.delete(registered);
   }
 
   async waitForAgentUpdates(): Promise<void> {
-    if (this.agentUpdateListeners.size > 0) return;
+    if ((this.outboundListeners.get("agent_update")?.size ?? 0) > 0) return;
     await new Promise<void>((resolve) => {
       const waiter = () => {
-        if (this.agentUpdateListeners.size === 0) return;
+        if ((this.outboundListeners.get("agent_update")?.size ?? 0) === 0) return;
         this.agentListenerWaiters.delete(waiter);
         resolve();
       };
@@ -71,9 +143,21 @@ class FakeDaemonClient {
   }
 
   agentUpdate(payload: Extract<SessionOutboundMessage, { type: "agent_update" }>["payload"]): void {
-    for (const listener of this.agentUpdateListeners) {
-      listener({ type: "agent_update", payload });
-    }
+    this.emit({ type: "agent_update", payload });
+  }
+
+  emit<TType extends SessionOutboundMessage["type"]>(
+    message: Extract<SessionOutboundMessage, { type: TType }>,
+  ): void {
+    for (const listener of this.outboundListeners.get(message.type) ?? []) listener(message);
+  }
+
+  snapshotHandlers<TType extends SessionOutboundMessage["type"]>(
+    type: TType,
+  ): Array<(message: Extract<SessionOutboundMessage, { type: TType }>) => void> {
+    return [...(this.outboundListeners.get(type) ?? [])] as Array<
+      (message: Extract<SessionOutboundMessage, { type: TType }>) => void
+    >;
   }
 
   async connect(): Promise<void> {
@@ -119,8 +203,20 @@ class FakeDaemonClient {
     return this.state;
   }
 
-  getLastServerInfoMessage(): null {
-    return null;
+  getLastServerInfoMessage(): FakeDaemonClient["serverInfo"] {
+    return this.serverInfo;
+  }
+
+  async requestEnterprise(
+    _type?: string,
+    _payload?: Readonly<Record<string, unknown>>,
+    requestId?: string,
+  ): Promise<Readonly<Record<string, unknown>>> {
+    if (this.enterpriseIdentity)
+      return { requestId: requestId ?? "request", identity: this.enterpriseIdentity };
+    const response = this.enterpriseResponses.shift();
+    if (!response) throw new Error("missing enterprise response");
+    return response;
   }
 
   subscribeConnectionStatus(listener: (status: ConnectionState) => void): () => void {
@@ -216,6 +312,12 @@ class FakeDaemonClient {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.mocked(mountBrowserPageIdentityDaemonClientHandler).mockClear();
+  mountedPageIdentityHandlers.length = 0;
+  pageIdentityEvents.length = 0;
+  pageIdentityLifecycleEvents.length = 0;
+  pageIdentityReadyGate = null;
   delete (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__;
   delete (globalThis as { window?: unknown }).window;
 });
@@ -366,6 +468,34 @@ function makeHost(input?: Partial<HostProfile>): HostProfile {
     preferredConnectionId: input?.preferredConnectionId ?? direct.id,
     createdAt: input?.createdAt ?? new Date(0).toISOString(),
     updatedAt: input?.updatedAt ?? new Date(0).toISOString(),
+  };
+}
+
+function makeLifecyclePorts(host: HostProfile): EnterpriseIdentityLifecyclePorts {
+  return {
+    authenticate: async () => ({
+      projection: {
+        principalType: "human",
+        principalId: "usr_aaaaaaaaaaaaaaaa",
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        paseoServerId: host.serverId,
+        displayName: "Test",
+        grantVersion: "grant-v1",
+        navigation: [],
+        allowedOperations: [],
+      },
+      sessionBindingKey: "binding-a",
+      teardownAttempt: async () => {},
+    }),
+    teardown: {
+      stopNetworkAndSubscriptions: async () => {},
+      disposeRuntimeAndCachePartition: async () => {},
+      destroyDaemonClient: async () => {},
+      startNewClient: async () => {},
+      hydrateScope: async () => {},
+    },
+    remoteLogout: { logoutAll: async () => {} },
   };
 }
 
@@ -550,6 +680,624 @@ class BrowserClientLifecycle {
 }
 
 describe("HostRuntimeController", () => {
+  it("uses the production identity ports to replace an anonymous enterprise client", async () => {
+    const host = makeHost({
+      serverId: "srv_enterprise_login",
+      preferredConnectionId: "direct:lan:6767",
+    });
+    const anonymous = new FakeDaemonClient();
+    anonymous.serverInfo = {
+      serverId: host.serverId,
+      features: { enterpriseIdentityV1: true },
+    };
+    const authenticated = new FakeDaemonClient();
+    authenticated.serverInfo = {
+      serverId: host.serverId,
+      features: { enterpriseIdentityV1: true },
+    };
+    authenticated.enterpriseIdentity = {
+      principalType: "human",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: host.serverId,
+      displayName: "Employee",
+      grantVersion: "grant-password",
+      navigation: [],
+      allowedOperations: [],
+    };
+    const createdConnections: HostConnection[] = [];
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: ({ connection }) => {
+          createdConnections.push(connection);
+          return (createdConnections.length === 1
+            ? anonymous
+            : authenticated) as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_enterprise_login",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(lifecycle.readSnapshot()).toMatchObject({
+      state: "signed_out",
+      target: "enterprise_host",
+    });
+    const snapshot = await controller.authenticateEnterpriseHost({
+      serverId: host.serverId,
+      token: "pmt_v1.private-ticket",
+    });
+    expect(snapshot).toMatchObject({
+      state: "signed_in",
+      projection: { principalId: "usr_aaaaaaaaaaaaaaaa" },
+    });
+    expect(controller.getClient()).toBe(authenticated);
+    expect(createdConnections).toHaveLength(2);
+    expect(createdConnections[0]).not.toHaveProperty("password");
+    expect(createdConnections[1]).toMatchObject({
+      type: "directTcp",
+      password: "pmt_v1.private-ticket",
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("private-ticket");
+    await controller.stop();
+  });
+
+  it("bootstraps an ordinary host as legacy and hides enterprise authentication", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = { serverId: host.serverId, features: {} };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_legacy_login",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(lifecycle.readSnapshot()).toEqual({ state: "signed_out", target: "legacy_passthrough" });
+    await controller.stop();
+  });
+
+  it("recovers a disconnected managed node with an account password", async () => {
+    const host = makeHost({
+      serverId: "srv_password_login",
+      preferredConnectionId: "direct:lan:6767",
+    });
+    const authenticated = new FakeDaemonClient();
+    authenticated.serverInfo = {
+      serverId: host.serverId,
+      features: { enterpriseIdentityV1: true },
+    };
+    authenticated.enterpriseIdentity = {
+      principalType: "human",
+      principalId: "usr_bbbbbbbbbbbbbbbb",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: host.serverId,
+      displayName: "Employee B",
+      grantVersion: "grant-password",
+      navigation: [],
+      allowedOperations: [],
+    };
+    const createdConnections: HostConnection[] = [];
+    const request = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).endsWith("/api/enterprise/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            mode: "managed",
+            managementBaseUrl: "https://management.test:17443",
+            nodeId: "nod_aaaaaaaaaaaaaaaa",
+            paseoServerId: host.serverId,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          ticket: "pmt_v1.short-lived-ticket",
+          endpoint: "wss://node.test:6768",
+          expiresAt: "2026-09-12T08:05:00.000Z",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", request);
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: ({ connection }) => {
+          createdConnections.push(connection);
+          return authenticated as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_password_login",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+    expect(controller.getSnapshot().activeConnectionId).toBeNull();
+    await expect(controller.discoverEnterpriseManagement()).resolves.toMatchObject({
+      mode: "managed",
+      paseoServerId: host.serverId,
+    });
+    const snapshot = await controller.authenticateEnterpriseHostWithPassword({
+      serverId: host.serverId,
+      username: "employee.b",
+      password: "employee-password-2026",
+    });
+    expect(snapshot).toMatchObject({
+      state: "signed_in",
+      projection: { principalId: "usr_bbbbbbbbbbbbbbbb" },
+    });
+    expect(controller.getSnapshot().activeConnectionId).toBe("direct:lan:6767");
+    expect(createdConnections).toEqual([
+      expect.objectContaining({
+        id: "direct:lan:6767",
+        password: "pmt_v1.short-lived-ticket",
+      }),
+    ]);
+    expect(String(request.mock.calls[0]?.[0])).toBe("http://lan:6767/api/enterprise/bootstrap");
+    expect(String(request.mock.calls[2]?.[0])).toBe(
+      "https://management.test:17443/v1/auth/password/session",
+    );
+    expect(JSON.parse(String(request.mock.calls[2]?.[1]?.body))).toMatchObject({
+      username: "employee.b",
+      password: "employee-password-2026",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      clientId: expect.stringMatching(/^cid_password_login:enterprise:/),
+    });
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain("employee-password-2026");
+    expect(JSON.stringify(lifecycle.readSnapshot())).not.toContain("employee-password-2026");
+    await controller.stop();
+  });
+
+  it("uses a fresh ticket-bound client id when switching password accounts", async () => {
+    const host = makeHost({
+      serverId: "srv_password_switch",
+      preferredConnectionId: "direct:lan:6767",
+    });
+    const principals = ["usr_aaaaaaaaaaaaaaaa", "usr_bbbbbbbbbbbbbbbb"];
+    const clients = principals.map((principalId, index) => {
+      const client = new FakeDaemonClient();
+      client.serverInfo = {
+        serverId: host.serverId,
+        features: { enterpriseIdentityV1: true },
+      };
+      client.enterpriseIdentity = {
+        principalType: "human",
+        principalId,
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        paseoServerId: host.serverId,
+        displayName: index === 0 ? "Administrator" : "Employee",
+        grantVersion: `grant-${index + 1}`,
+        navigation: [],
+        allowedOperations: [],
+      };
+      return client;
+    });
+    const ticketClientIds: string[] = [];
+    const createdClientIds: string[] = [];
+    const request = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).endsWith("/api/enterprise/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            mode: "managed",
+            managementBaseUrl: "https://management.test:17443",
+            nodeId: "nod_aaaaaaaaaaaaaaaa",
+            paseoServerId: host.serverId,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      const body = JSON.parse(String(init?.body)) as { clientId: string };
+      ticketClientIds.push(body.clientId);
+      return new Response(
+        JSON.stringify({
+          ticket: `pmt_v1.ticket-${ticketClientIds.length}`,
+          endpoint: "wss://node.test:6768",
+          expiresAt: "2026-09-12T08:05:00.000Z",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", request);
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: ({ clientId }) => {
+          createdClientIds.push(clientId);
+          return clients[createdClientIds.length - 1] as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_password_switch",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+
+    const admin = await controller.authenticateEnterpriseHostWithPassword({
+      serverId: host.serverId,
+      username: "admin",
+      password: "admin-password",
+    });
+    expect(admin.projection?.principalId).toBe(principals[0]);
+    await lifecycle.logoutCurrent(host.serverId);
+    const employee = await controller.authenticateEnterpriseHostWithPassword({
+      serverId: host.serverId,
+      username: "employee",
+      password: "employee-password",
+    });
+
+    expect(employee.projection?.principalId).toBe(principals[1]);
+    expect(ticketClientIds).toEqual(createdClientIds);
+    expect(new Set(ticketClientIds).size).toBe(2);
+    expect(ticketClientIds).toEqual([
+      expect.stringMatching(/^cid_password_switch:enterprise:/),
+      expect.stringMatching(/^cid_password_switch:enterprise:/),
+    ]);
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain("admin-password");
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain("employee-password");
+    await controller.stop();
+  });
+
+  it("mounts page identity only after connected enterprise client and both capabilities", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    const revokeGate = createDeferred<void>();
+    const browserProfileRuntimeBridge: BrowserProfileRuntimeBridge = {
+      hydrateBrowserProfileAuthorizations: vi.fn(async () => {}),
+      revokeBrowserProfileGeneration: vi.fn(async () => {
+        pageIdentityLifecycleEvents.push("revoke-start");
+        await revokeGate.promise;
+        pageIdentityLifecycleEvents.push("revoke-end");
+      }),
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity",
+        browserProfileRuntimeBridge,
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => {
+          const ports = makeLifecyclePorts(host);
+          ports.teardown.stopNetworkAndSubscriptions = async () => {
+            pageIdentityLifecycleEvents.push("network-stop");
+          };
+          return ports;
+        },
+      },
+    });
+
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+
+    expect(vi.mocked(mountBrowserPageIdentityDaemonClientHandler)).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers).toHaveLength(1);
+    expect(mountedPageIdentityHandlers[0]?.ready).toHaveBeenCalledTimes(1);
+
+    pageIdentityLifecycleEvents.length = 0;
+    const logout = lifecycle.logoutCurrent(host.serverId);
+    await vi.waitFor(() => expect(pageIdentityLifecycleEvents).toContain("revoke-start"));
+    expect(pageIdentityLifecycleEvents).not.toContain("seal");
+    revokeGate.resolve();
+    await logout;
+    expect(pageIdentityLifecycleEvents).toEqual([
+      "revoke-start",
+      "revoke-end",
+      "seal",
+      "drain",
+      "dispose",
+      "network-stop",
+    ]);
+    expect(mountedPageIdentityHandlers[0]?.seal).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers[0]?.drain).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers[0]?.dispose).toHaveBeenCalledTimes(1);
+    await controller.stop();
+  });
+
+  it.each([
+    { label: "observation only", observation: true, invalidation: false },
+    { label: "invalidation only", observation: false, invalidation: true },
+    { label: "legacy", observation: false, invalidation: false },
+  ])(
+    "does not mount page identity when $label capability is absent",
+    async ({ observation, invalidation }) => {
+      const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+      const client = new FakeDaemonClient();
+      client.serverInfo = {
+        features: {
+          enterpriseBrowserPageIdentityObservationV1: observation,
+          enterpriseBrowserPageIdentityInvalidationV1: invalidation,
+        },
+      };
+      let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+      const controller = new HostRuntimeController({
+        host,
+        deps: {
+          createClient: () => client as unknown as DaemonClient,
+          connectToDaemon: async () => {
+            throw new Error("probe unavailable");
+          },
+          getClientId: async () => "cid_page_identity_absent",
+          createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+            lifecycle = new MemoryEnterpriseIdentityLifecycle(
+              vault,
+              ports.authenticate,
+              ports.teardown,
+              ports.remoteLogout,
+            );
+            return lifecycle;
+          },
+          createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+        },
+      });
+
+      await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+      await controller.activateConnection({ connectionId: "direct:lan:6767" });
+      expect(vi.mocked(mountBrowserPageIdentityDaemonClientHandler)).not.toHaveBeenCalled();
+      await controller.stop();
+    },
+  );
+
+  it("seals and drains the old page identity handler before switching clients", async () => {
+    const firstConnection: HostConnection = {
+      id: "direct:first",
+      type: "directTcp",
+      endpoint: "first:6767",
+    };
+    const secondConnection: HostConnection = {
+      id: "direct:second",
+      type: "directTcp",
+      endpoint: "second:6767",
+    };
+    const host = makeHost({
+      connections: [firstConnection, secondConnection],
+      preferredConnectionId: firstConnection.id,
+    });
+    const clients = [new FakeDaemonClient(), new FakeDaemonClient()];
+    for (const client of clients) {
+      client.serverInfo = {
+        features: {
+          enterpriseBrowserPageIdentityObservationV1: true,
+          enterpriseBrowserPageIdentityInvalidationV1: true,
+        },
+      };
+    }
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    let clientIndex = 0;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => clients[clientIndex++] as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_switch",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    await controller.activateConnection({ connectionId: firstConnection.id });
+    await controller.activateConnection({ connectionId: secondConnection.id });
+    const firstDisposeIndex = pageIdentityEvents.indexOf("dispose");
+    const secondReadyIndex = pageIdentityEvents.lastIndexOf("ready");
+
+    expect(mountedPageIdentityHandlers).toHaveLength(2);
+    expect(firstDisposeIndex).toBeGreaterThanOrEqual(0);
+    expect(secondReadyIndex).toBeGreaterThan(firstDisposeIndex);
+    await controller.stop();
+  });
+
+  it("discards a mount that becomes stale while ready is pending", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const readyGate = createDeferred<void>();
+    pageIdentityReadyGate = readyGate.promise;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_stale",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    const activation = controller.activateConnection({ connectionId: "direct:lan:6767" });
+    await vi.waitFor(() => expect(mountedPageIdentityHandlers).toHaveLength(1));
+    const logout = lifecycle.logoutCurrent(host.serverId);
+    readyGate.resolve();
+    await logout;
+    await activation;
+    expect(mountedPageIdentityHandlers[0]?.seal).toHaveBeenCalledTimes(1);
+    expect(mountedPageIdentityHandlers[0]?.dispose).toHaveBeenCalledTimes(1);
+    await controller.stop();
+  });
+
+  it("coalesces connect and signed-in callbacks into one post-handshake mount", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    const connected = createDeferred<void>();
+    client.connect = async () => {
+      client.connectCalls += 1;
+      await connected.promise;
+      client.setConnectionState({ status: "connected" });
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_concurrent",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    const activation = controller.activateConnection({ connectionId: "direct:lan:6767" });
+    await vi.waitFor(() => expect(controller.getSnapshot().client).toBe(client));
+    await lifecycle.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    expect(mountBrowserPageIdentityDaemonClientHandler).not.toHaveBeenCalled();
+    connected.resolve();
+    await activation;
+    expect(mountBrowserPageIdentityDaemonClientHandler).toHaveBeenCalledTimes(1);
+    await controller.stop();
+  });
+
+  it("does not mount page identity for an unsigned enterprise lifecycle", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = {
+      features: {
+        enterpriseBrowserPageIdentityObservationV1: true,
+        enterpriseBrowserPageIdentityInvalidationV1: true,
+      },
+    };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_page_identity_unsigned",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(mountBrowserPageIdentityDaemonClientHandler).not.toHaveBeenCalled();
+    await controller.stop();
+  });
+
   it("replaces the active relay client when re-pairing changes the daemon public key", async () => {
     const oldRelay: HostConnection = {
       id: "relay:wss:relay.paseo.sh:443",
@@ -663,6 +1411,639 @@ describe("HostRuntimeController", () => {
 
     expect(seenClientIds).toEqual(["cid_runtime_stable"]);
     expect(controller.getSnapshot().connectionStatus).toBe("online");
+  });
+
+  it("injects the host-owned enterprise file request closure into new clients", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const enterpriseFileRequest = vi.fn(async () => new Response(null, { status: 200 }));
+    let received: Parameters<HostRuntimeControllerDeps["createClient"]>[0] | null = null;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createEnterpriseFileRequest: (enterpriseFileRequestFactoryInput) => {
+          expect(enterpriseFileRequestFactoryInput.host.serverId).toBe(host.serverId);
+          return enterpriseFileRequest;
+        },
+        createClient: (input) => {
+          received = input;
+          return new FakeDaemonClient() as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_enterprise_file",
+      },
+    });
+
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+
+    expect(received).not.toBeNull();
+    expect(received!.enterpriseFileRequest).toBe(enterpriseFileRequest);
+  });
+
+  it("binds lifecycle-owned auth to an HTTP file request without putting it in the URL", async () => {
+    const host = makeHost({ serverId: "server-enterprise" });
+    const fetchMock = vi.fn(async () => new Response("file", { status: 200 }));
+    let capturedTransport: EnterpriseFileRequestTransport | null = null;
+    const createEnterpriseFileRequest = vi.fn(
+      ({ transport }: { transport: EnterpriseFileRequestTransport }) => {
+        capturedTransport = transport;
+        return vi.fn();
+      },
+    );
+    const factory = createEnterpriseFileRequestFactory({
+      lifecycle: { createEnterpriseFileRequest },
+      fetch: fetchMock,
+    });
+    const request = factory({
+      host,
+      connection: host.connections[0]!,
+      clientId: "cid_enterprise",
+      runtimeGeneration: 1,
+    });
+
+    expect(request).toBeTypeOf("function");
+    expect(capturedTransport).not.toBeNull();
+    await capturedTransport!.request({
+      serverId: host.serverId,
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      relativePath: "src/main.ts",
+      scopeGeneration: "generation-a",
+      authorization: "Bearer opaque",
+      signal: new AbortController().signal,
+    });
+    const [url, options] = fetchMock.mock.calls[0] as unknown as [
+      RequestInfo | URL,
+      RequestInit | undefined,
+    ];
+    expect(String(url)).toBe(
+      "http://lan:6767/api/files/download?workspaceId=wks_aaaaaaaaaaaaaaaa&relativePath=src%2Fmain.ts",
+    );
+    expect(options?.headers).toEqual({ Authorization: "Bearer opaque" });
+    expect(String(url)).not.toContain("opaque");
+  });
+
+  it("creates and exposes lifecycle generation changes without exposing credentials", async () => {
+    const host = makeHost({ serverId: "server-lifecycle" });
+    let receivedVault: ProcessCredentialVault | null = null;
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          receivedVault = vault;
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            async () => ({
+              projection: {
+                principalType: "human",
+                principalId: "usr_aaaaaaaaaaaaaaaa",
+                organizationId: "org_aaaaaaaaaaaaaaaa",
+                nodeId: "nod_aaaaaaaaaaaaaaaa",
+                paseoServerId: host.serverId,
+                displayName: "Test",
+                grantVersion: "grant-v1",
+                navigation: [],
+                allowedOperations: [],
+              },
+              sessionBindingKey: "binding-a",
+              teardownAttempt: async () => {},
+            }),
+            ports.teardown,
+            { logoutAll: async () => {} },
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async () => {
+            throw new Error("unused");
+          },
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {},
+            disposeRuntimeAndCachePartition: async () => {},
+            destroyDaemonClient: async () => {},
+            startNewClient: async () => {},
+            hydrateScope: async () => {},
+          },
+          remoteLogout: { logoutAll: async () => {} },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_lifecycle",
+      },
+    });
+
+    expect(receivedVault).not.toBeNull();
+    expect(JSON.stringify(receivedVault)).toBe("{}");
+    expect(controller.getEnterpriseIdentitySnapshot()?.state).toBe("booting");
+    expect(controller.getEnterpriseScopeGeneration()).toBeNull();
+
+    const identity = lifecycle;
+    const generations: Array<string | undefined> = [];
+    const unsubscribe = controller.subscribeEnterpriseIdentity((snapshot) => {
+      generations.push(snapshot.generation);
+    });
+    await identity!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    const firstGeneration = controller.getEnterpriseScopeGeneration();
+    expect(firstGeneration).toEqual(expect.any(String));
+    const enterpriseLayoutKey = `${host.serverId}:default-workspace`;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: {
+          getItem: () => null,
+          setItem: () => {},
+          removeItem: () => {},
+        },
+      },
+    });
+    useWorkspaceLayoutStore.setState((state) => ({
+      layoutByWorkspace: {
+        ...state.layoutByWorkspace,
+        [enterpriseLayoutKey]: createWorkspaceLayoutWithExplorerSidebar(),
+      },
+    }));
+    expect(useWorkspaceLayoutStore.getState().layoutByWorkspace).toHaveProperty(
+      enterpriseLayoutKey,
+    );
+    expect(generations.at(-1)).toBe(firstGeneration);
+    await identity!.logoutCurrent(host.serverId);
+    expect(controller.getEnterpriseScopeGeneration()).toBeNull();
+    expect(useWorkspaceLayoutStore.getState().layoutByWorkspace).not.toHaveProperty(
+      enterpriseLayoutKey,
+    );
+    expect(generations.at(-1)).toBeUndefined();
+    unsubscribe();
+  });
+
+  it("revokes browser authorizations before lifecycle teardown and rejects late generations", async () => {
+    const host = makeHost({ serverId: "server-browser-runtime" });
+    const events: string[] = [];
+    const residueReset = vi.fn((scope) => events.push(`residue:${scope.lifecycleGeneration}`));
+    const residueAdapter = createEnterpriseResidueResetAdapter({ reset: residueReset });
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const bridge: BrowserProfileRuntimeBridge = {
+      hydrateBrowserProfileAuthorizations: vi.fn(async ({ authorizations }) => {
+        events.push(`hydrate:${authorizations[0]?.lifecycleGeneration}`);
+      }),
+      revokeBrowserProfileGeneration: vi.fn(async ({ lifecycleGeneration }) => {
+        events.push(`revoke:${lifecycleGeneration}`);
+      }),
+    };
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        browserProfileRuntimeBridge: bridge,
+        enterpriseResidueResetAdapter: residueAdapter,
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async ({ token }) => {
+            return {
+              projection: {
+                principalType: "human",
+                principalId: "usr_aaaaaaaaaaaaaaaa",
+                organizationId: "org_aaaaaaaaaaaaaaaa",
+                nodeId: "nod_aaaaaaaaaaaaaaaa",
+                paseoServerId: host.serverId,
+                displayName: "Test",
+                grantVersion: token === "pat-a" ? "grant-a" : "grant-b",
+                navigation: [],
+                allowedOperations: [],
+              },
+              sessionBindingKey: token === "pat-a" ? "binding-a" : "binding-b",
+              teardownAttempt: async () => {},
+            };
+          },
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {
+              events.push("stop");
+            },
+            disposeRuntimeAndCachePartition: async () => {
+              events.push("dispose");
+            },
+            destroyDaemonClient: async () => {
+              events.push("destroy");
+            },
+            startNewClient: async () => {
+              events.push("start");
+            },
+            hydrateScope: async () => {
+              events.push("scope");
+            },
+          },
+          remoteLogout: {
+            logoutAll: async () => {
+              events.push("remote-logout");
+            },
+          },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_browser_runtime",
+      },
+    });
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-a" });
+    const generationA = controller.getEnterpriseScopeGeneration();
+    expect(generationA).toEqual(expect.any(String));
+    const fileFetch = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Response(init?.headers ? "ok" : "missing-auth", { status: 200 }),
+    );
+    const createEnterpriseFileRequest = createEnterpriseFileRequestFactory({
+      lifecycle: lifecycle!,
+      fetch: fileFetch,
+    });
+    const enterpriseFileRequest = createEnterpriseFileRequest({
+      host,
+      connection: host.connections[0]!,
+      clientId: "cid_browser_runtime",
+      runtimeGeneration: 1,
+    });
+    expect(enterpriseFileRequest).toBeTypeOf("function");
+    await expect(
+      enterpriseFileRequest!({
+        serverId: host.serverId,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "tabs/A.json",
+        scopeGeneration: generationA!,
+      }),
+    ).resolves.toMatchObject({ status: 200 });
+    const authorizationA: BrowserProfileRuntimeAuthorization = {
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      homeNodeId: "nod_aaaaaaaaaaaaaaaa",
+      workspaceId: "wks_aaaaaaaaaaaaaaaa",
+      browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+      bindingRevision: "revision-a",
+      lifecycleGeneration: generationA!,
+    };
+    await controller.hydrateBrowserProfileAuthorizations({
+      authorizations: [authorizationA],
+      lifecycleGeneration: generationA!,
+    });
+    expect(events).toContain(`hydrate:${generationA}`);
+    expect(
+      Object.isFrozen(
+        (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
+          .authorizations,
+      ),
+    ).toBe(true);
+    expect(
+      (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
+        .lifecycleGeneration,
+    ).toBe(generationA);
+    expect(
+      (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
+        .homeNodeId,
+    ).toBe("nod_aaaaaaaaaaaaaaaa");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, browserProfileId: "brw_invalid" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, organizationId: "org_invalid" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, homeNodeId: "nod_invalid" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, workspaceId: "" }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+    expect(bridge.hydrateBrowserProfileAuthorizations).toHaveBeenCalledTimes(1);
+
+    await lifecycle!.logoutCurrent(host.serverId);
+    expect(events).toContain(`revoke:${generationA}`);
+    expect(events).toContain(`residue:${generationA}`);
+    expect(events.indexOf(`residue:${generationA}`)).toBeLessThan(
+      events.indexOf(`revoke:${generationA}`),
+    );
+    expect(events.indexOf(`revoke:${generationA}`)).toBeLessThan(events.lastIndexOf("stop"));
+    expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
+    expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledWith({
+      homeNodeId: "nod_aaaaaaaaaaaaaaaa",
+      lifecycleGeneration: generationA,
+    });
+    await lifecycle!.logoutCurrent(host.serverId);
+    expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
+    await expect(
+      enterpriseFileRequest!({
+        serverId: host.serverId,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "tabs/A-late.json",
+        scopeGeneration: generationA!,
+      }),
+    ).rejects.toThrow();
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat-b" });
+    const generationB = controller.getEnterpriseScopeGeneration();
+    expect(generationB).toEqual(expect.any(String));
+    expect(residueAdapter.getActiveScope()).toEqual({
+      serverId: host.serverId,
+      lifecycleGeneration: generationB,
+    });
+    await expect(
+      enterpriseFileRequest!({
+        serverId: host.serverId,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        relativePath: "attachments/B.json",
+        scopeGeneration: generationB!,
+      }),
+    ).resolves.toMatchObject({ status: 200 });
+    expect(fileFetch).toHaveBeenCalledTimes(2);
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [authorizationA],
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("generation");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [{ ...authorizationA, lifecycleGeneration: generationB! }],
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow("generation");
+    await controller.hydrateBrowserProfileAuthorizations({
+      authorizations: [{ ...authorizationA, lifecycleGeneration: generationB! }],
+      lifecycleGeneration: generationB!,
+    });
+    expect(bridge.hydrateBrowserProfileAuthorizations).toHaveBeenCalledTimes(2);
+
+    const profiles = [
+      {
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa" as const,
+        organizationId: "org_aaaaaaaaaaaaaaaa" as const,
+        homeNodeId: "nod_aaaaaaaaaaaaaaaa" as const,
+        ownerPrincipalId: "usr_aaaaaaaaaaaaaaaa" as const,
+        platform: "generic" as const,
+        label: "Profile A",
+        status: "ready" as const,
+      },
+    ];
+    const bindings = [
+      {
+        organizationId: "org_aaaaaaaaaaaaaaaa" as const,
+        nodeId: "nod_aaaaaaaaaaaaaaaa" as const,
+        workspaceId: "wks_aaaaaaaaaaaaaaaa",
+        browserProfileId: "brp_aaaaaaaaaaaaaaaa" as const,
+        boundAt: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles,
+        bindings,
+        lifecycleGeneration: generationA!,
+      }),
+    ).rejects.toThrow("not current");
+    const hydrateSpy = bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>;
+    expect(hydrateSpy).toHaveBeenCalledTimes(2);
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles,
+      bindings,
+      lifecycleGeneration: generationB!,
+    });
+    const projectionCallCount = hydrateSpy.mock.calls.length;
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles,
+      bindings,
+      lifecycleGeneration: generationB!,
+    });
+    expect(hydrateSpy).toHaveBeenCalledTimes(projectionCallCount);
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles,
+      bindings: [{ ...bindings[0], boundAt: "2026-01-02T00:00:00.000Z" }],
+      lifecycleGeneration: generationB!,
+    });
+    expect(hydrateSpy).toHaveBeenCalledTimes(projectionCallCount + 1);
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles,
+        bindings: [{ ...bindings[0], organizationId: "org_bbbbbbbbbbbbbbbb" }],
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("does not match");
+    expect(hydrateSpy).toHaveBeenCalledTimes(projectionCallCount + 1);
+    const profilesWithSecond = [
+      ...profiles,
+      {
+        ...profiles[0],
+        browserProfileId: "brp_bbbbbbbbbbbbbbbb" as const,
+        label: "Profile B",
+      },
+    ];
+    const bindingsWithSecond = [
+      ...bindings,
+      {
+        ...bindings[0],
+        browserProfileId: "brp_bbbbbbbbbbbbbbbb" as const,
+        boundAt: "2026-01-03T00:00:00.000Z",
+      },
+    ];
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles: profilesWithSecond,
+      bindings: bindingsWithSecond,
+      lifecycleGeneration: generationB!,
+    });
+    const sortedCallCount = hydrateSpy.mock.calls.length;
+    await controller.hydrateBrowserProfileAuthorizationsFromProjections({
+      profiles: profilesWithSecond.toReversed(),
+      bindings: bindingsWithSecond.toReversed(),
+      lifecycleGeneration: generationB!,
+    });
+    expect(hydrateSpy).toHaveBeenCalledTimes(sortedCallCount);
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles: [...profilesWithSecond, profilesWithSecond[0]!],
+        bindings: bindingsWithSecond,
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("Duplicate browser profile");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections({
+        profiles: profilesWithSecond,
+        bindings: [...bindingsWithSecond, bindingsWithSecond[0]!],
+        lifecycleGeneration: generationB!,
+      }),
+    ).rejects.toThrow("Duplicate browser profile binding");
+    const extraInput = Object.assign(
+      {
+        profiles: profilesWithSecond,
+        bindings: bindingsWithSecond,
+        lifecycleGeneration: generationB!,
+      },
+      { extra: true },
+    );
+    await expect(
+      controller.hydrateBrowserProfileAuthorizationsFromProjections(extraInput),
+    ).rejects.toThrow("projection generation");
+    expect(hydrateSpy).toHaveBeenCalledTimes(sortedCallCount);
+  });
+
+  it("wires root residue targets so A partitions are cleared before B is published", async () => {
+    const host = makeHost({ serverId: "server-residue-targets" });
+    const cleared: string[] = [];
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        enterpriseResidueResetTargets: {
+          reset: ({ lifecycleGeneration }) => cleared.push(lifecycleGeneration),
+        },
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async ({ token }) => ({
+            projection: {
+              principalType: "human",
+              principalId: "usr_aaaaaaaaaaaaaaaa",
+              organizationId: "org_aaaaaaaaaaaaaaaa",
+              nodeId: "nod_aaaaaaaaaaaaaaaa",
+              paseoServerId: host.serverId,
+              displayName: token,
+              grantVersion: token,
+              navigation: [],
+              allowedOperations: [],
+            },
+            sessionBindingKey: `binding-${token}`,
+            teardownAttempt: async () => {},
+          }),
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {},
+            disposeRuntimeAndCachePartition: async () => {},
+            destroyDaemonClient: async () => {},
+            startNewClient: async () => {},
+            hydrateScope: async () => {},
+          },
+          remoteLogout: { logoutAll: async () => {} },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_residue_targets",
+      },
+    });
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "A" });
+    const generationA = controller.getEnterpriseScopeGeneration();
+    expect(generationA).toEqual(expect.any(String));
+    await lifecycle!.logoutCurrent(host.serverId);
+    expect(cleared).toEqual([generationA!]);
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "B" });
+    expect(controller.getEnterpriseScopeGeneration()).not.toBe(generationA);
+    expect(cleared).toEqual([generationA!]);
+  });
+
+  it("seals browser capability when generation revoke fails", async () => {
+    const host = makeHost({ serverId: "server-browser-sealed" });
+    const revoke = vi.fn(async () => {
+      throw new Error("browser revoke failed");
+    });
+    const residueReset = vi.fn(() => {
+      throw new Error("residue reset failed");
+    });
+    const residueAdapter = createEnterpriseResidueResetAdapter({ reset: residueReset });
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        browserProfileRuntimeBridge: {
+          hydrateBrowserProfileAuthorizations: vi.fn(async () => {}),
+          revokeBrowserProfileGeneration: revoke,
+        },
+        enterpriseResidueResetAdapter: residueAdapter,
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => ({
+          authenticate: async () => ({
+            projection: {
+              principalType: "human",
+              principalId: "usr_aaaaaaaaaaaaaaaa",
+              organizationId: "org_aaaaaaaaaaaaaaaa",
+              nodeId: "nod_aaaaaaaaaaaaaaaa",
+              paseoServerId: host.serverId,
+              displayName: "Test",
+              grantVersion: "grant-v1",
+              navigation: [],
+              allowedOperations: [],
+            },
+            sessionBindingKey: "binding-a",
+            teardownAttempt: async () => {},
+          }),
+          teardown: {
+            stopNetworkAndSubscriptions: async () => {},
+            disposeRuntimeAndCachePartition: async () => {},
+            destroyDaemonClient: async () => {},
+            startNewClient: async () => {},
+            hydrateScope: async () => {},
+          },
+          remoteLogout: { logoutAll: async () => {} },
+        }),
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_browser_sealed",
+      },
+    });
+
+    await lifecycle!.authenticateEnterpriseHost({ serverId: host.serverId, token: "pat" });
+    await expect(lifecycle!.logoutCurrent(host.serverId)).rejects.toThrow("teardown failed");
+    expect(residueReset).toHaveBeenCalledTimes(1);
+    expect(revoke).toHaveBeenCalledTimes(1);
+    expect(controller.getEnterpriseIdentitySnapshot()?.state).toBe("unavailable");
+    await expect(
+      controller.hydrateBrowserProfileAuthorizations({
+        authorizations: [
+          {
+            organizationId: "org_aaaaaaaaaaaaaaaa",
+            homeNodeId: "nod_aaaaaaaaaaaaaaaa",
+            workspaceId: "wks_aaaaaaaaaaaaaaaa",
+            browserProfileId: "brp_aaaaaaaaaaaaaaaa",
+            bindingRevision: "revision-a",
+            lifecycleGeneration: controller.getEnterpriseScopeGeneration() ?? "generation-a",
+          },
+        ],
+        lifecycleGeneration: controller.getEnterpriseScopeGeneration() ?? "generation-a",
+      }),
+    ).rejects.toThrow("unavailable");
   });
 
   it("keeps browser client lifecycle tied to the active host runtime client", async () => {
@@ -2022,6 +3403,158 @@ describe("HostRuntimeStore", () => {
       subscribe: { subscriptionId: "app:srv_no_session" },
       page: { limit: 200 },
     });
+
+    store.syncHosts([]);
+    expect(useSessionStore.getState().sessions[host.serverId]).toBeUndefined();
+  });
+
+  it("routes ownership tombstones through the current enterprise identity generation", async () => {
+    const host = makeHost({
+      serverId: "srv_transfer_identity",
+      connections: [
+        {
+          id: "direct:lan:6767",
+          type: "directTcp",
+          endpoint: "lan:6767",
+        },
+      ],
+    });
+    const client = new FakeDaemonClient();
+    client.setConnectionState({ status: "connected" });
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => {
+          throw new Error("initial client is supplied");
+        },
+        connectToDaemon: async () => {
+          throw new Error("single-connection host reuses its active client");
+        },
+        getClientId: async () => "cid_transfer_identity",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: () => makeLifecyclePorts(host),
+      },
+    });
+    store.syncHosts([host], {
+      initialConnectionByServerId: new Map([
+        [
+          host.serverId,
+          {
+            connectionId: host.connections[0]!.id,
+            existingClient: client as unknown as DaemonClient,
+          },
+        ],
+      ]),
+    });
+    await waitForHostOnline(store, host.serverId);
+    const identityA = await lifecycle.authenticateEnterpriseHost({
+      serverId: host.serverId,
+      token: "pat-a",
+    });
+    expect(identityA.state).toBe("signed_in");
+    const generationA = identityA.generation;
+    expect(generationA).toEqual(expect.any(String));
+
+    const workspaceId = "wks_aaaaaaaaaaaaaaaa";
+    const workspace = normalizeWorkspaceDescriptor({
+      id: workspaceId,
+      projectId: "project-transfer",
+      projectDisplayName: "Transfer project",
+      projectRootPath: "/repo/transfer",
+      workspaceDirectory: "/repo/transfer",
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: "transfer",
+      status: "done",
+      statusEnteredAt: null,
+      activityAt: null,
+      archivingAt: null,
+      diffStat: null,
+      scripts: [],
+    });
+    const agent = {
+      ...replicaAgent(
+        makeFetchAgentsEntry({
+          id: "agent-transfer",
+          cwd: workspace.workspaceDirectory,
+          updatedAt: "2026-09-11T00:00:00.000Z",
+        }).agent,
+        host.serverId,
+      ),
+      workspaceId,
+    };
+    const tombstone = {
+      type: "enterprise.workspace.ownership.transfer.tombstone" as const,
+      payload: {
+        eventId: "evt_transfer_a",
+        resource: {
+          organizationId: "org_aaaaaaaaaaaaaaaa",
+          nodeId: "nod_aaaaaaaaaaaaaaaa",
+          resourceKind: "workspace" as const,
+          localResourceId: workspaceId,
+        },
+        oldPrincipalId: "usr_aaaaaaaaaaaaaaaa",
+        newRevision: "opaque-revision-a",
+        transferReceiptId: "receipt-transfer-a",
+      },
+    };
+    store.acceptWorkspaceSnapshots(host.serverId, [workspace]);
+    store.acceptAgentSnapshot(host.serverId, agent);
+    const generationAHandler = client.snapshotHandlers(
+      "enterprise.workspace.ownership.transfer.tombstone",
+    )[0];
+    expect(generationAHandler).toBeDefined();
+
+    client.emit(tombstone);
+    expect(store.isAgentPublicationBlocked(host.serverId, agent.id)).toBe(true);
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      false,
+    );
+
+    await lifecycle.logoutCurrent(host.serverId);
+    expect(store.isAgentPublicationBlocked(host.serverId, agent.id)).toBe(false);
+    store.acceptWorkspaceSnapshots(host.serverId, [workspace]);
+    store.acceptAgentSnapshot(host.serverId, agent);
+    generationAHandler?.(tombstone);
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      true,
+    );
+
+    const identityB = await lifecycle.authenticateEnterpriseHost({
+      serverId: host.serverId,
+      token: "pat-b",
+    });
+    expect(identityB.state).toBe("signed_in");
+    expect(identityB.generation).not.toBe(generationA);
+    generationAHandler?.({
+      ...tombstone,
+      payload: { ...tombstone.payload, eventId: "evt_transfer_stale_a" },
+    });
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      true,
+    );
+
+    client.emit({
+      ...tombstone,
+      payload: {
+        ...tombstone.payload,
+        eventId: "evt_transfer_b",
+        transferReceiptId: "receipt-transfer-b",
+        newRevision: "opaque-revision-b",
+      },
+    });
+    expect(store.isAgentPublicationBlocked(host.serverId, agent.id)).toBe(true);
+    expect(useSessionStore.getState().sessions[host.serverId]?.workspaces.has(workspaceId)).toBe(
+      false,
+    );
 
     store.syncHosts([]);
     expect(useSessionStore.getState().sessions[host.serverId]).toBeUndefined();
