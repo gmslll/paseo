@@ -46,48 +46,45 @@ function deferred<T>() {
 
 function metadataResponse(requestId: string) {
   return {
-    type: "enterprise.organization.list_resources.response",
-    payload: {
-      requestId,
-      principals: [
-        {
-          principalId: "usr_0123456789abcdef",
-          displayName: "Avery",
-          status: "active",
-          credentialId: "credential-must-be-dropped",
-        },
-      ],
-      resources: [
-        {
-          organizationId: "org_0123456789abcdef",
-          nodeId: "nod_0123456789abcdef",
-          resourceKind: "agent",
-          agentId: "agent-1",
-          workspaceId: "workspace-1",
-          ownerPrincipalId: "usr_0123456789abcdef",
-          label: "Checkout agent",
-          status: "running",
-          provider: "codex",
-          model: null,
-          startedAt: "2026-09-10T00:00:00.000Z",
-          lastActivityAt: "2026-09-10T00:01:00.000Z",
-          durationMs: 60_000,
-          rawTranscript: "must-be-dropped",
-        },
-        {
-          organizationId: "org_0123456789abcdef",
-          nodeId: "nod_0123456789abcdef",
-          resourceKind: "workspace",
-          workspaceId: "workspace-1",
-          ownerPrincipalId: "usr_0123456789abcdef",
-          label: "Checkout",
-          status: "active",
-          updatedAt: "2026-09-10T00:01:00.000Z",
-        },
-      ],
-      nextCursor: null,
-      rawGrants: ["must-be-dropped"],
-    },
+    requestId,
+    principals: [
+      {
+        principalId: "usr_0123456789abcdef",
+        displayName: "Avery",
+        status: "active",
+        credentialId: "credential-must-be-dropped",
+      },
+    ],
+    resources: [
+      {
+        organizationId: "org_0123456789abcdef",
+        nodeId: "nod_0123456789abcdef",
+        resourceKind: "agent",
+        agentId: "agent-1",
+        workspaceId: "workspace-1",
+        ownerPrincipalId: "usr_0123456789abcdef",
+        label: "Checkout agent",
+        status: "running",
+        provider: "codex",
+        model: null,
+        startedAt: "2026-09-10T00:00:00.000Z",
+        lastActivityAt: "2026-09-10T00:01:00.000Z",
+        durationMs: 60_000,
+        rawTranscript: "must-be-dropped",
+      },
+      {
+        organizationId: "org_0123456789abcdef",
+        nodeId: "nod_0123456789abcdef",
+        resourceKind: "workspace",
+        workspaceId: "workspace-1",
+        ownerPrincipalId: "usr_0123456789abcdef",
+        label: "Checkout",
+        status: "active",
+        updatedAt: "2026-09-10T00:01:00.000Z",
+      },
+    ],
+    nextCursor: null,
+    rawGrants: ["must-be-dropped"],
   };
 }
 
@@ -273,7 +270,7 @@ describe("Boss resource store", () => {
     const port = new MemoryBossResourcePort();
     port.list = async ({ requestId }) => {
       const response = metadataResponse(requestId);
-      response.payload.resources[1]!.organizationId = "org_ffffffffffffffff";
+      response.resources[1]!.organizationId = "org_ffffffffffffffff";
       return response;
     };
     const { store } = createStore(port);
@@ -545,13 +542,10 @@ describe("Boss resource store", () => {
     });
 
     metadataResult.resolve({
-      type: "enterprise.organization.list_resources.response",
-      payload: {
-        requestId: "boss-request-3",
-        principals: [],
-        resources: [],
-        nextCursor: null,
-      },
+      requestId: "boss-request-3",
+      principals: [],
+      resources: [],
+      nextCursor: null,
     });
     await expect(reloading).resolves.toEqual({ ok: true });
 
@@ -646,7 +640,7 @@ describe("Boss resource store", () => {
       }
 
       const currentResponse = metadataResponse("reused-request-id");
-      currentResponse.payload.resources[0]!.label = "Current metadata";
+      currentResponse.resources[0]!.label = "Current metadata";
       second.resolve(currentResponse);
       await expect(currentLoad).resolves.toEqual({ ok: true });
 
@@ -819,7 +813,7 @@ describe("Boss resource store", () => {
       receivedCursor = cursor;
       receivedGeneration = sessionGeneration;
       const response = metadataResponse(requestId);
-      response.payload.resources = [response.payload.resources[1]!];
+      response.resources = [response.resources[1]!];
       return response;
     };
 
@@ -945,8 +939,10 @@ describe("Boss resource store", () => {
       port.list =
         failure === "malformed"
           ? async () => ({
-              type: "enterprise.organization.list_resources.response",
-              payload: { requestId: "wrong", principals: [], resources: [], nextCursor: null },
+              requestId: "wrong",
+              principals: [],
+              resources: [],
+              nextCursor: null,
             })
           : async () => {
               throw { reasonCode: "raw pat-error-canary", detail: "pat-error-canary" };

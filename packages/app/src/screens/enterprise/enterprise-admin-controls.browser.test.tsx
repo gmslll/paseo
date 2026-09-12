@@ -135,24 +135,18 @@ describe("EnterpriseAdminControls", () => {
         sessionGeneration: "generation-1",
         port: {
           listGrants: async (input) => ({
-            type: "enterprise.access.list_grants.response",
-            payload: {
-              requestId: input.requestId,
-              principalId,
-              grants: [],
-              revision: "revision-1",
-            },
+            requestId: input.requestId,
+            principalId,
+            grants: [],
+            revision: "revision-1",
           }),
           updateGrants: async (input) => {
             grantUpdates.push(input);
             return {
-              type: "enterprise.access.update_grants.response",
-              payload: {
-                requestId: input.requestId,
-                principalId,
-                grants: input.grants,
-                revision: "revision-2",
-              },
+              requestId: input.requestId,
+              principalId,
+              grants: input.grants,
+              revision: "revision-2",
             };
           },
         },
@@ -166,36 +160,30 @@ describe("EnterpriseAdminControls", () => {
         sessionGeneration: "generation-1",
         port: {
           listProfiles: async (input) => ({
-            type: "enterprise.browser.list_profiles.response",
-            payload: {
-              requestId: input.requestId,
-              profiles: [
-                {
-                  browserProfileId: PROFILE_ID,
-                  organizationId: ORGANIZATION_ID,
-                  homeNodeId: NODE_ID,
-                  ownerPrincipalId: ADMIN_ID,
-                  platform: "generic",
-                  label: "Support browser",
-                  status: "ready",
-                },
-              ],
-              bindings: [],
-            },
+            requestId: input.requestId,
+            profiles: [
+              {
+                browserProfileId: PROFILE_ID,
+                organizationId: ORGANIZATION_ID,
+                homeNodeId: NODE_ID,
+                ownerPrincipalId: ADMIN_ID,
+                platform: "generic",
+                label: "Support browser",
+                status: "ready",
+              },
+            ],
+            bindings: [],
           }),
           bindProfile: async (input) => {
             browserBindings.push(input);
             return {
-              type: "enterprise.browser.bind_profile.response",
-              payload: {
-                requestId: input.requestId,
-                binding: {
-                  organizationId: ORGANIZATION_ID,
-                  nodeId: NODE_ID,
-                  workspaceId: WORKSPACE_ID,
-                  browserProfileId: input.browserProfileId,
-                  boundAt: "2026-09-12T00:00:00.000Z",
-                },
+              requestId: input.requestId,
+              binding: {
+                organizationId: ORGANIZATION_ID,
+                nodeId: NODE_ID,
+                workspaceId: WORKSPACE_ID,
+                browserProfileId: input.browserProfileId,
+                boundAt: "2026-09-12T00:00:00.000Z",
               },
             };
           },
@@ -208,30 +196,27 @@ describe("EnterpriseAdminControls", () => {
         <EnterpriseAdminControls
           principalPort={{
             listPrincipals: async ({ requestId }) => ({
-              type: "enterprise.identity.list_principals.response",
-              payload: {
-                requestId,
-                principals: [
-                  {
-                    principalType: "human",
-                    principalId: ADMIN_ID,
-                    organizationId: ORGANIZATION_ID,
-                    displayName: "Administrator",
-                    status: "active",
-                    createdAt: "2026-09-12T00:00:00.000Z",
-                    updatedAt: "2026-09-12T00:00:00.000Z",
-                  },
-                  {
-                    principalType: "human",
-                    principalId: EMPLOYEE_ID,
-                    organizationId: ORGANIZATION_ID,
-                    displayName: "Employee One",
-                    status: "active",
-                    createdAt: "2026-09-12T00:00:00.000Z",
-                    updatedAt: "2026-09-12T00:00:00.000Z",
-                  },
-                ],
-              },
+              requestId,
+              principals: [
+                {
+                  principalType: "human",
+                  principalId: ADMIN_ID,
+                  organizationId: ORGANIZATION_ID,
+                  displayName: "Administrator",
+                  status: "active",
+                  createdAt: "2026-09-12T00:00:00.000Z",
+                  updatedAt: "2026-09-12T00:00:00.000Z",
+                },
+                {
+                  principalType: "human",
+                  principalId: EMPLOYEE_ID,
+                  organizationId: ORGANIZATION_ID,
+                  displayName: "Employee One",
+                  status: "active",
+                  createdAt: "2026-09-12T00:00:00.000Z",
+                  updatedAt: "2026-09-12T00:00:00.000Z",
+                },
+              ],
             }),
           }}
           bossStore={createBossStore()}

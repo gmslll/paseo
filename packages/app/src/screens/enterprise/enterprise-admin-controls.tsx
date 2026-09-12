@@ -448,14 +448,15 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
       .listPrincipals({ requestId, sessionGeneration: generation, signal: controller.signal })
       .then((response) => {
         if (controller.signal.aborted) return undefined;
-        const parsed = EnterpriseIdentityListPrincipalsResponseSchema.safeParse(response);
-        if (!parsed.success || parsed.data.payload.requestId !== requestId) {
+        const parsed =
+          EnterpriseIdentityListPrincipalsResponseSchema.shape.payload.safeParse(response);
+        if (!parsed.success || parsed.data.requestId !== requestId) {
           setDirectory({ status: "failed" });
           return undefined;
         }
         setDirectory({
           status: "loaded",
-          principals: Object.freeze(parsed.data.payload.principals),
+          principals: Object.freeze(parsed.data.principals),
         });
         return undefined;
       })

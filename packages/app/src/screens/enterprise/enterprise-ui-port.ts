@@ -328,10 +328,11 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         signal,
         sessionGeneration,
       ).then(async (response) => {
-        const parsed = EnterpriseBrowserListProfilesResponseSchema.safeParse(response);
+        const parsed =
+          EnterpriseBrowserListProfilesResponseSchema.shape.payload.safeParse(response);
         if (parsed.success) {
-          const nextProfiles = parsed.data.payload.profiles;
-          const nextBindings = parsed.data.payload.bindings;
+          const nextProfiles = parsed.data.profiles;
+          const nextBindings = parsed.data.bindings;
           await hydrateBrowserProfileAuthorizations({
             serverId,
             profiles: nextProfiles,
@@ -362,9 +363,9 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         signal,
         sessionGeneration,
       ).then(async (response) => {
-        const parsed = EnterpriseBrowserBindProfileResponseSchema.safeParse(response);
+        const parsed = EnterpriseBrowserBindProfileResponseSchema.shape.payload.safeParse(response);
         if (parsed.success) {
-          const binding = parsed.data.payload.binding;
+          const binding = parsed.data.binding;
           const nextBindings = [
             ...hydratedBindings.filter(
               (candidate) => candidate.workspaceId !== binding.workspaceId,

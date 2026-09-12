@@ -412,19 +412,14 @@ export function createBrowserBindingFormModel<TGeneration extends string>(option
   }
 
   function parseListResponse(response: unknown, requestId: string) {
-    if (
-      !isRecord(response) ||
-      !hasOnlyKeys(response, ["type", "payload"]) ||
-      !isRecord(response.payload)
-    ) {
+    if (!isRecord(response) || !hasOnlyKeys(response, ["requestId", "profiles", "bindings"])) {
       return undefined;
     }
-    if (!hasOnlyKeys(response.payload, ["requestId", "profiles", "bindings"])) return undefined;
-    const parsed = EnterpriseBrowserListProfilesResponseSchema.safeParse(response);
-    if (!parsed.success || parsed.data.payload.requestId !== requestId) return undefined;
-    const parsedProfiles = parseProfiles(response.payload.profiles);
+    const parsed = EnterpriseBrowserListProfilesResponseSchema.shape.payload.safeParse(response);
+    if (!parsed.success || parsed.data.requestId !== requestId) return undefined;
+    const parsedProfiles = parseProfiles(response.profiles);
     if (!parsedProfiles) return undefined;
-    const bindings = parseBindings(response.payload.bindings, parsedProfiles.profileIds);
+    const bindings = parseBindings(response.bindings, parsedProfiles.profileIds);
     if (!bindings) return undefined;
     return {
       profiles: cloneProfiles(parsedProfiles.profiles),
@@ -433,17 +428,12 @@ export function createBrowserBindingFormModel<TGeneration extends string>(option
   }
 
   function parseBindResponse(response: unknown, requestId: string, profileId: string) {
-    if (
-      !isRecord(response) ||
-      !hasOnlyKeys(response, ["type", "payload"]) ||
-      !isRecord(response.payload)
-    ) {
+    if (!isRecord(response) || !hasOnlyKeys(response, ["requestId", "binding"])) {
       return undefined;
     }
-    if (!hasOnlyKeys(response.payload, ["requestId", "binding"])) return undefined;
-    const parsed = EnterpriseBrowserBindProfileResponseSchema.safeParse(response);
-    if (!parsed.success || parsed.data.payload.requestId !== requestId) return undefined;
-    const binding = parseBinding(response.payload.binding);
+    const parsed = EnterpriseBrowserBindProfileResponseSchema.shape.payload.safeParse(response);
+    if (!parsed.success || parsed.data.requestId !== requestId) return undefined;
+    const binding = parseBinding(response.binding);
     if (
       !binding ||
       binding.workspaceId !== workspaceId ||

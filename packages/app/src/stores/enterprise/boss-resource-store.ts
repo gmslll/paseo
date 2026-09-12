@@ -313,13 +313,12 @@ export function createBossResourceStore<TContent, TSessionGeneration>(input: {
       return { ok: false, reasonCode: "enterprise.metadata.stale" };
     }
     metadataAttempt = undefined;
-    const parsed = EnterpriseOrganizationListResourcesResponseSchema.safeParse(response);
+    const parsed =
+      EnterpriseOrganizationListResourcesResponseSchema.shape.payload.safeParse(response);
     if (
       !parsed.success ||
-      parsed.data.payload.requestId !== requestId ||
-      parsed.data.payload.resources.some(
-        (resource) => resource.organizationId !== input.organizationId,
-      )
+      parsed.data.requestId !== requestId ||
+      parsed.data.resources.some((resource) => resource.organizationId !== input.organizationId)
     ) {
       const reasonCode: BossResourceStoreReason = "enterprise.metadata.invalid_response";
       publish({
@@ -330,10 +329,10 @@ export function createBossResourceStore<TContent, TSessionGeneration>(input: {
     }
 
     const principals = Object.freeze(
-      parsed.data.payload.principals.map((principal) => deepFreezeProjection(principal)),
+      parsed.data.principals.map((principal) => deepFreezeProjection(principal)),
     );
     const resources = Object.freeze(
-      parsed.data.payload.resources.map((resource) => deepFreezeProjection(resource)),
+      parsed.data.resources.map((resource) => deepFreezeProjection(resource)),
     );
     // P0 pagination is replace-only. Appending needs a separate cursor and deduplication contract.
     publish({
@@ -344,7 +343,7 @@ export function createBossResourceStore<TContent, TSessionGeneration>(input: {
         sessionGeneration,
         principals,
         resources,
-        nextCursor: parsed.data.payload.nextCursor,
+        nextCursor: parsed.data.nextCursor,
       }),
     });
     return { ok: true };

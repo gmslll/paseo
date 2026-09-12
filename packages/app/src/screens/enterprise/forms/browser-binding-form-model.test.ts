@@ -54,17 +54,11 @@ function listResponse(
   profiles: readonly unknown[] = [profile()],
   bindings: readonly unknown[] = [],
 ) {
-  return {
-    type: "enterprise.browser.list_profiles.response" as const,
-    payload: { requestId, profiles, bindings },
-  };
+  return { requestId, profiles, bindings };
 }
 
 function bindResponse(requestId = "bind-1", nextBinding: unknown = binding()) {
-  return {
-    type: "enterprise.browser.bind_profile.response" as const,
-    payload: { requestId, binding: nextBinding },
-  };
+  return { requestId, binding: nextBinding };
 }
 
 function deferred<T>() {

@@ -80,8 +80,8 @@ function parseGrantList(value: unknown): readonly ResourceGrant[] | undefined {
 }
 
 function parseResponseGrantList(response: unknown): readonly ResourceGrant[] | undefined {
-  if (!isRecord(response) || !isRecord(response.payload)) return undefined;
-  return parseGrantList(response.payload.grants);
+  if (!isRecord(response)) return undefined;
+  return parseGrantList(response.grants);
 }
 
 function cloneGrants(grants: readonly ResourceGrant[]): readonly ResourceGrant[] {
@@ -416,11 +416,11 @@ export function createGrantEditorFormModel<TGeneration>(options: {
       return { ok: false, reasonCode: reason };
     }
     if (!isCurrentList(attempt)) return { ok: false, reasonCode: "enterprise.grants.stale" };
-    const parsed = EnterpriseAccessListGrantsResponseSchema.safeParse(response);
+    const parsed = EnterpriseAccessListGrantsResponseSchema.shape.payload.safeParse(response);
     if (
       !parsed.success ||
-      parsed.data.payload.requestId !== attempt.requestId ||
-      parsed.data.payload.principalId !== attempt.principalId
+      parsed.data.requestId !== attempt.requestId ||
+      parsed.data.principalId !== attempt.principalId
     ) {
       failList(attempt, "enterprise.grants.invalid_response");
       return { ok: false, reasonCode: "enterprise.grants.invalid_response" };
@@ -436,7 +436,7 @@ export function createGrantEditorFormModel<TGeneration>(options: {
       status: "loaded",
       requestId: attempt.requestId,
       sessionGeneration: attempt.sessionGeneration,
-      revision: parsed.data.payload.revision,
+      revision: parsed.data.revision,
       grants: cloneGrants(grants),
     };
     draft = cloneGrants(grants);
@@ -494,11 +494,11 @@ export function createGrantEditorFormModel<TGeneration>(options: {
       return { ok: false, reasonCode: reason };
     }
     if (!isCurrentUpdate(attempt)) return { ok: false, reasonCode: "enterprise.grants.stale" };
-    const parsed = EnterpriseAccessUpdateGrantsResponseSchema.safeParse(response);
+    const parsed = EnterpriseAccessUpdateGrantsResponseSchema.shape.payload.safeParse(response);
     if (
       !parsed.success ||
-      parsed.data.payload.requestId !== attempt.requestId ||
-      parsed.data.payload.principalId !== attempt.principalId
+      parsed.data.requestId !== attempt.requestId ||
+      parsed.data.principalId !== attempt.principalId
     ) {
       failUpdate(attempt, "enterprise.grants.invalid_response");
       return { ok: false, reasonCode: "enterprise.grants.invalid_response" };
@@ -514,7 +514,7 @@ export function createGrantEditorFormModel<TGeneration>(options: {
       status: "loaded",
       requestId: attempt.requestId,
       sessionGeneration: attempt.sessionGeneration,
-      revision: parsed.data.payload.revision,
+      revision: parsed.data.revision,
       grants: cloneGrants(grants),
     };
     draft = cloneGrants(grants);

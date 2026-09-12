@@ -24,10 +24,7 @@ function listResponse(
   revision = "rev-1",
   grants = [grant],
 ) {
-  return {
-    type: "enterprise.access.list_grants.response" as const,
-    payload: { requestId, principalId, revision, grants },
-  };
+  return { requestId, principalId, revision, grants };
 }
 
 function updateResponse(
@@ -36,10 +33,7 @@ function updateResponse(
   revision = "rev-2",
   grants = [grant],
 ) {
-  return {
-    type: "enterprise.access.update_grants.response" as const,
-    payload: { requestId, principalId, revision, grants },
-  };
+  return { requestId, principalId, revision, grants };
 }
 
 function deferred<T>() {

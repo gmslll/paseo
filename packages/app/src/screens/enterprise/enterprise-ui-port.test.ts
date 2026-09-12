@@ -189,4 +189,78 @@ describe("createEnterpriseUiBundle", () => {
     ).rejects.toThrow("feature_unavailable");
     expect(calls).toHaveLength(0);
   });
+
+  it("hydrates browser authorizations from correlated response payloads", async () => {
+    const { lifecycle } = makeLifecycle();
+    const hydrations: unknown[] = [];
+    const profile = {
+      browserProfileId: "brp_1111111111111111",
+      organizationId: "org_1111111111111111",
+      homeNodeId: "nod_1111111111111111",
+      ownerPrincipalId: "usr_1111111111111111",
+      platform: "generic" as const,
+      label: "Support browser",
+      status: "ready" as const,
+    };
+    const binding = {
+      organizationId: profile.organizationId,
+      nodeId: profile.homeNodeId,
+      workspaceId: "workspace-1",
+      browserProfileId: profile.browserProfileId,
+      boundAt: "2026-09-12T00:00:00.000Z",
+    };
+    const bundle = createEnterpriseUiBundle({
+      ...makeOptions(lifecycle, async (type, payload) => {
+        if (type === "enterprise.browser.list_profiles.request") {
+          return {
+            requestId: payload?.requestId,
+            profiles: [profile],
+            bindings: [],
+          } as never;
+        }
+        if (type === "enterprise.browser.bind_profile.request") {
+          return { requestId: payload?.requestId, binding } as never;
+        }
+        return {} as never;
+      }),
+      browserProfilesEnabled: () => true,
+      hydrateBrowserProfileAuthorizations: async (input) => {
+        hydrations.push(input);
+      },
+    });
+    await bundle.uiPort.authenticatePat({
+      serverId: "server-a",
+      token: "opaque",
+      signal: new AbortController().signal,
+    });
+
+    await bundle.browserPort.listProfiles({
+      workspaceId: binding.workspaceId,
+      requestId: "profiles-1",
+      sessionGeneration: generation,
+      signal: new AbortController().signal,
+    });
+    await bundle.browserPort.bindProfile({
+      workspaceId: binding.workspaceId,
+      browserProfileId: profile.browserProfileId,
+      requestId: "binding-1",
+      sessionGeneration: generation,
+      signal: new AbortController().signal,
+    });
+
+    expect(hydrations).toEqual([
+      {
+        serverId: "server-a",
+        profiles: [profile],
+        bindings: [],
+        lifecycleGeneration: generation,
+      },
+      {
+        serverId: "server-a",
+        profiles: [profile],
+        bindings: [binding],
+        lifecycleGeneration: generation,
+      },
+    ]);
+  });
 });
