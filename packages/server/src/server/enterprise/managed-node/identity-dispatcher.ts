@@ -1,20 +1,29 @@
 import type {
+  EnterprisePrincipalRecord,
+  OrganizationId,
+  SessionInboundMessage,
+} from "@getpaseo/protocol/messages";
+import type {
   EnterpriseDispatchContext,
   EnterpriseDispatchResult,
   EnterpriseSessionDispatcherFactoryRegistration,
 } from "../../session/enterprise-dispatcher.js";
-import type { SessionInboundMessage } from "@getpaseo/protocol/messages";
 import { createEnterpriseIdentityDispatcher } from "../identity/handlers.js";
+import { createEnterpriseIdentityDisplayProjection } from "../identity/projection.js";
 import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
 } from "../audit/production-audit-runtime.js";
-import type { ManagedEnterpriseAdmission } from "./admission.js";
-import type { ManagedPrincipalGrantSource } from "./principal-source.js";
+
+export interface ManagedIdentityPrincipalSource {
+  isCurrent(): boolean;
+  listPrincipalRecords(
+    organizationId: OrganizationId,
+  ): Promise<readonly EnterprisePrincipalRecord[]>;
+}
 
 export function createManagedIdentityDispatcherRegistration(input: {
-  readonly admission: ManagedEnterpriseAdmission;
-  readonly source: ManagedPrincipalGrantSource;
+  readonly source: ManagedIdentityPrincipalSource;
   readonly audit: ProductionAuditCapability;
 }): EnterpriseSessionDispatcherFactoryRegistration {
   return Object.freeze({
@@ -28,15 +37,33 @@ export function createManagedIdentityDispatcherRegistration(input: {
       productionAuditCapabilityIssuer.requireCurrent(input.audit);
       if (!input.source.isCurrent()) throw new Error("managed identity source is unavailable");
       let active = true;
+      const listCurrentPrincipalRecords = async (organizationId: OrganizationId) => {
+        if (!active) throw new Error("managed identity lease is closed");
+        const result = await input.source.listPrincipalRecords(organizationId);
+        productionAuditCapabilityIssuer.requireCurrent(input.audit);
+        if (!active || !input.source.isCurrent()) {
+          throw new Error("managed identity source is unavailable");
+        }
+        return result;
+      };
       const delegate = createEnterpriseIdentityDispatcher({
-        listPrincipals: async ({ enterpriseContext }) => {
-          if (!active) throw new Error("managed identity lease is closed");
-          const result = await input.source.listPrincipalRecords(
-            enterpriseContext.principal.organizationId,
+        display: async ({ enterpriseContext }) => {
+          const principal = enterpriseContext.principal;
+          if (principal.principalType === "break_glass_owner") {
+            return createEnterpriseIdentityDisplayProjection(principal);
+          }
+          const records = await listCurrentPrincipalRecords(principal.organizationId);
+          const record = records.find(
+            (candidate) =>
+              candidate.principalId === principal.principalId &&
+              candidate.organizationId === principal.organizationId &&
+              candidate.status === "active",
           );
-          productionAuditCapabilityIssuer.requireCurrent(input.audit);
-          if (!active) throw new Error("managed identity lease is closed");
-          return result;
+          if (!record) throw new Error("managed identity projection is not current");
+          return createEnterpriseIdentityDisplayProjection(principal, record.displayName);
+        },
+        listPrincipals: async ({ enterpriseContext }) => {
+          return listCurrentPrincipalRecords(enterpriseContext.principal.organizationId);
         },
         logoutAll: async () => false,
       });

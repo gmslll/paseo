@@ -157,7 +157,6 @@ export async function createManagedEnterpriseRuntime(
       appSlots,
     });
     const identityDispatcherRegistration = createManagedIdentityDispatcherRegistration({
-      admission,
       source: principalSource,
       audit,
     });
