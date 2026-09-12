@@ -260,6 +260,13 @@ function parseCapability(value: unknown) {
 
 const DISABLED_CAPABILITY = Object.freeze({ enterpriseIdentityV1: false });
 
+const MUTATION_STATUS_LABELS = Object.freeze({
+  idle: "空闲",
+  pending: "处理中",
+  success: "已完成",
+  failed: "失败",
+});
+
 function BossMetadataPanel<TContent, TGeneration extends string>({
   store,
   generation,
@@ -273,7 +280,7 @@ function BossMetadataPanel<TContent, TGeneration extends string>({
   const resources = snapshot.metadata.status === "loaded" ? snapshot.metadata.resources : [];
   return (
     <View style={styles.card} testID="enterprise-boss-metadata">
-      <Text style={styles.title}>Organization resources</Text>
+      <Text style={styles.title}>组织资源</Text>
       <Button
         size="sm"
         variant="outline"
@@ -282,13 +289,13 @@ function BossMetadataPanel<TContent, TGeneration extends string>({
         onPress={() => void store.loadMetadata(generation)}
         testID="enterprise-boss-load-metadata"
       >
-        Load metadata
+        加载资源
       </Button>
       {snapshot.metadata.status === "loading" ? (
-        <Text style={styles.muted}>Loading metadata…</Text>
+        <Text style={styles.muted}>正在加载资源…</Text>
       ) : null}
       {snapshot.metadata.status === "failed" ? (
-        <Text style={styles.error}>Metadata unavailable.</Text>
+        <Text style={styles.error}>资源信息当前不可用。</Text>
       ) : null}
       {resources.map((resource) => {
         const ref = metadataRef(resource);
@@ -306,7 +313,7 @@ function BossMetadataPanel<TContent, TGeneration extends string>({
               }}
               testID={`enterprise-boss-select-${resourceRefKey(ref)}`}
             >
-              {selected ? "Selected" : "Details"}
+              {selected ? "已选择" : "详情"}
             </Button>
             {selected ? (
               <Button
@@ -316,21 +323,21 @@ function BossMetadataPanel<TContent, TGeneration extends string>({
                 onPress={() => void store.openContent(generation)}
                 testID={`enterprise-boss-open-${resourceRefKey(ref)}`}
               >
-                Open content
+                查看内容
               </Button>
             ) : null}
           </View>
         );
       })}
       {snapshot.content.status === "failed" ? (
-        <Text style={styles.error}>Content unavailable.</Text>
+        <Text style={styles.error}>内容当前不可用。</Text>
       ) : null}
       {snapshot.content.status === "loaded" ? (
         <View testID="enterprise-boss-content">
           {renderContent ? (
             renderContent(snapshot.content.value)
           ) : (
-            <Text style={styles.body}>Content loaded.</Text>
+            <Text style={styles.body}>内容已加载。</Text>
           )}
         </View>
       ) : null}
@@ -352,7 +359,7 @@ function AdminProjectionPanel<TGeneration extends string>({
   if (!grantEditor && !browserBinding) return null;
   return (
     <View style={styles.card} testID="enterprise-admin-projections">
-      <Text style={styles.title}>Administration</Text>
+      <Text style={styles.title}>企业管理</Text>
       {grantEditor ? (
         <GrantProjectionStatus
           model={grantEditor}
@@ -384,9 +391,9 @@ function GrantProjectionStatus<TGeneration>({
   return (
     <View style={styles.adminBlock}>
       <View style={styles.row}>
-        <Text style={styles.body}>Principal grants</Text>
+        <Text style={styles.body}>账号权限</Text>
         <StatusBadge
-          label={snapshot.mutation.status}
+          label={MUTATION_STATUS_LABELS[snapshot.mutation.status]}
           variant={snapshot.mutation.status === "failed" ? "error" : "muted"}
         />
       </View>
@@ -400,7 +407,7 @@ function GrantProjectionStatus<TGeneration>({
         }
         testID="enterprise-admin-load-grants"
       >
-        Load grants
+        加载权限
       </Button>
       <Button
         size="sm"
@@ -411,7 +418,7 @@ function GrantProjectionStatus<TGeneration>({
         }
         testID="enterprise-admin-save-grants"
       >
-        Save grants
+        保存权限
       </Button>
     </View>
   );
@@ -430,9 +437,9 @@ function BrowserProjectionStatus<TGeneration extends string>({
   return (
     <View style={styles.adminBlock}>
       <View style={styles.row}>
-        <Text style={styles.body}>Browser profile binding</Text>
+        <Text style={styles.body}>浏览器配置绑定</Text>
         <StatusBadge
-          label={snapshot.mutation.status}
+          label={MUTATION_STATUS_LABELS[snapshot.mutation.status]}
           variant={snapshot.mutation.status === "failed" ? "error" : "muted"}
         />
       </View>
@@ -446,7 +453,7 @@ function BrowserProjectionStatus<TGeneration extends string>({
         }
         testID="enterprise-admin-load-profiles"
       >
-        Load profiles
+        加载浏览器配置
       </Button>
       <Button
         size="sm"
@@ -457,7 +464,7 @@ function BrowserProjectionStatus<TGeneration extends string>({
         }
         testID="enterprise-admin-bind-profile"
       >
-        Bind profile
+        绑定浏览器配置
       </Button>
     </View>
   );
@@ -501,14 +508,14 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
   if (identity.state === "booting") {
     return (
       <View style={styles.card} testID="enterprise-identity-booting">
-        <Text style={styles.muted}>Loading enterprise identity…</Text>
+        <Text style={styles.muted}>正在加载企业身份…</Text>
       </View>
     );
   }
   if (identity.state === "unavailable") {
     return (
       <View style={styles.card} testID="enterprise-identity-unavailable">
-        <Text style={styles.error}>Enterprise identity unavailable.</Text>
+        <Text style={styles.error}>企业身份当前不可用。</Text>
       </View>
     );
   }
@@ -609,7 +616,7 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
         }}
         testID="enterprise-logout-current"
       >
-        Sign out
+        退出登录
       </Button>
       <Button
         variant="ghost"
@@ -619,7 +626,7 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
         }}
         testID="enterprise-refresh-scope"
       >
-        Refresh session scope
+        刷新会话权限
       </Button>
       {canLogoutAll ? (
         <Button
@@ -630,7 +637,7 @@ export function EnterpriseWorkbenchScreen<TGeneration extends string, TContent>(
           }}
           testID="enterprise-logout-all"
         >
-          Sign out all sessions
+          退出所有会话
         </Button>
       ) : null}
     </View>

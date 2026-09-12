@@ -267,7 +267,7 @@ describe("EnterpriseAdminControls", () => {
         selector: { kind: "workspace", workspaceIds: [WORKSPACE_ID] },
       },
     ]);
-    expect(container.textContent).toContain("Permissions saved.");
+    expect(container.textContent).toContain("权限已保存。");
 
     act(() => {
       const profile = container.querySelector(
@@ -284,7 +284,7 @@ describe("EnterpriseAdminControls", () => {
     });
     expect(browserBindings).toHaveLength(1);
     expect(browserBindings[0].browserProfileId).toBe(PROFILE_ID);
-    expect(container.textContent).toContain("Browser profile bound.");
+    expect(container.textContent).toContain("浏览器配置已绑定。");
   });
 
   it("shows a retry action when the account directory is unavailable", async () => {
@@ -311,8 +311,8 @@ describe("EnterpriseAdminControls", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(container.textContent).toContain("Could not load enterprise accounts.");
-    expect(container.textContent).toContain("Retry");
+    expect(container.textContent).toContain("无法加载企业账号。");
+    expect(container.textContent).toContain("重试");
     expect(listPrincipals).toHaveBeenCalledOnce();
   });
 });

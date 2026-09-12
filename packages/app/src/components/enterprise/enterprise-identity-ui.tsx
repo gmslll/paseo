@@ -49,8 +49,8 @@ export function EnterpriseCapabilityGate({
         accessibilityRole="alert"
         testID="enterprise-capability-unavailable"
       >
-        <Text style={styles.title}>Enterprise sign-in unavailable</Text>
-        <Text style={styles.muted}>Update the host to enable enterprise identity.</Text>
+        <Text style={styles.title}>企业登录不可用</Text>
+        <Text style={styles.muted}>请更新主机以启用企业身份认证。</Text>
       </View>
     )
   );
@@ -101,20 +101,20 @@ export function EnterprisePatLoginForm<T>({
   if (snapshot.status === "closed") return null;
   return (
     <View style={styles.card} testID="enterprise-pat-login-form">
-      <Text style={styles.title}>Sign in to enterprise host</Text>
+      <Text style={styles.title}>登录企业主机</Text>
       <Field
-        label="Personal access token"
-        hint="Stored in memory only and cleared after authentication."
+        label="个人访问令牌"
+        hint="仅保存在内存中，身份验证完成后即清除。"
         testID="enterprise-pat-field"
       >
         <FormTextInput
           ref={inputRef}
-          accessibilityLabel="Personal access token"
+          accessibilityLabel="个人访问令牌"
           autoCapitalize="none"
           autoCorrect={false}
           editable={snapshot.status === "idle"}
           onChangeText={model.setToken}
-          placeholder="Paste your token"
+          placeholder="粘贴令牌"
           secureTextEntry
           testID="enterprise-pat-input"
         />
@@ -122,22 +122,22 @@ export function EnterprisePatLoginForm<T>({
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <View style={styles.actions}>
         <Button
-          accessibilityLabel="Sign in"
+          accessibilityLabel="登录"
           disabled={!snapshot.canSubmit}
           loading={snapshot.status === "pending"}
           onPress={submit}
           testID="enterprise-pat-submit"
         >
-          Sign in
+          登录
         </Button>
         {onCancel ? (
           <Button
-            accessibilityLabel="Cancel"
+            accessibilityLabel="取消"
             onPress={cancel}
             variant="ghost"
             testID="enterprise-pat-cancel"
           >
-            Cancel
+            取消
           </Button>
         ) : null}
       </View>
@@ -197,31 +197,31 @@ export function EnterprisePasswordLoginForm<T>({
   };
   return (
     <View style={styles.card} testID="enterprise-password-login-form">
-      <Text style={styles.title}>Sign in with your company account</Text>
-      <Field label="Account" testID="enterprise-account-field">
+      <Text style={styles.title}>使用企业账号登录</Text>
+      <Field label="账号" testID="enterprise-account-field">
         <FormTextInput
-          accessibilityLabel="Enterprise account"
+          accessibilityLabel="企业账号"
           autoCapitalize="none"
           autoCorrect={false}
           editable={!pending}
           onChangeText={setUsername}
-          placeholder="name@company"
+          placeholder="请输入账号"
           testID="enterprise-account-input"
         />
       </Field>
       <Field
-        label="Password"
-        hint="Your password is exchanged for a short-lived node ticket and is never saved."
+        label="密码"
+        hint="密码仅用于换取短期节点票据，不会被保存。"
         testID="enterprise-password-field"
       >
         <FormTextInput
           ref={passwordRef}
-          accessibilityLabel="Enterprise password"
+          accessibilityLabel="企业账号密码"
           autoCapitalize="none"
           autoCorrect={false}
           editable={!pending}
           onChangeText={setPassword}
-          placeholder="Enter your password"
+          placeholder="请输入密码"
           secureTextEntry
           testID="enterprise-password-input"
         />
@@ -229,13 +229,13 @@ export function EnterprisePasswordLoginForm<T>({
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <View style={styles.actions}>
         <Button
-          accessibilityLabel="Sign in with company account"
+          accessibilityLabel="使用企业账号登录"
           disabled={pending || username.trim().length < 3 || password.length < 12}
           loading={pending}
           onPress={submit}
           testID="enterprise-password-submit"
         >
-          Sign in
+          登录
         </Button>
       </View>
     </View>
@@ -257,19 +257,21 @@ export function EnterpriseIdentityNavigation({
   const identity = parsed.data;
   return (
     <View style={styles.card} testID="enterprise-identity-navigation">
-      <Text style={styles.title}>{identity.displayName ?? "Current identity"}</Text>
+      <Text style={styles.title}>{identity.displayName ?? "当前身份"}</Text>
       <Text style={styles.muted}>{identity.principalId}</Text>
       <View style={styles.navigation}>
         {policy.navigation.map((destination) => (
           <Pressable
-            accessibilityLabel={destination}
+            accessibilityLabel={NAVIGATION_LABELS[destination] ?? destination}
             accessibilityRole="button"
             key={destination}
             onPress={() => onNavigate?.(destination)}
             style={styles.navItem}
             testID={`enterprise-nav-${destination}`}
           >
-            <Text style={styles.navText}>{destination.replaceAll("_", " ")}</Text>
+            <Text style={styles.navText}>
+              {NAVIGATION_LABELS[destination] ?? destination.replaceAll("_", " ")}
+            </Text>
           </Pressable>
         ))}
       </View>
@@ -278,31 +280,39 @@ export function EnterpriseIdentityNavigation({
 }
 
 const STATUS_LABELS = {
-  ready: "Ready",
-  resource_waiting: "Waiting for resource",
-  login_required: "Login required",
-  mfa_required: "MFA required",
-  risk_control: "Risk control",
-  disabled: "Disabled",
+  ready: "可用",
+  resource_waiting: "等待资源",
+  login_required: "需要登录",
+  mfa_required: "需要多重验证",
+  risk_control: "风控限制",
+  disabled: "已停用",
 } as const;
 
+const NAVIGATION_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  workspaces: "工作空间",
+  organization: "组织资源",
+  identity: "身份管理",
+  browser_profiles: "浏览器配置",
+  audit: "审计记录",
+});
+
 const PAT_REASON_COPY: Record<string, string> = {
-  "identity.invalid_token": "The token was rejected.",
-  "identity.invalid_password": "The account or password was rejected.",
-  "identity.host_upgrade_required": "Update the host to enable enterprise sign-in.",
-  "identity.unavailable": "Enterprise sign-in is unavailable.",
-  "identity.logout_failed": "Unable to sign out. Try again.",
-  "identity.authentication_incomplete": "Enterprise sign-in did not complete.",
-  "identity.logout_incomplete": "Sign-out did not complete.",
-  "identity.mutation_in_progress": "Another identity change is in progress.",
-  "identity.credential_revoked": "The credential was revoked.",
-  "identity.token_required": "Enter a personal access token.",
-  "identity.authentication_pending": "Sign-in is already in progress.",
-  "identity.form_closed": "Sign-in was cancelled.",
+  "identity.invalid_token": "令牌无效。",
+  "identity.invalid_password": "账号或密码错误。",
+  "identity.host_upgrade_required": "请更新主机以启用企业登录。",
+  "identity.unavailable": "企业登录当前不可用。",
+  "identity.logout_failed": "退出失败，请重试。",
+  "identity.authentication_incomplete": "企业登录未完成。",
+  "identity.logout_incomplete": "退出未完成。",
+  "identity.mutation_in_progress": "正在进行另一项身份变更。",
+  "identity.credential_revoked": "登录凭据已被撤销。",
+  "identity.token_required": "请输入个人访问令牌。",
+  "identity.authentication_pending": "正在登录，请稍候。",
+  "identity.form_closed": "登录已取消。",
 };
 
 const RESOURCE_REASON_COPY: Record<string, string> = {
-  capacity_wait: "Waiting for resource capacity.",
+  capacity_wait: "正在等待可用资源。",
 };
 
 export function EnterpriseResourceStatus({ projection }: { readonly projection: unknown }) {
@@ -314,17 +324,17 @@ export function EnterpriseResourceStatus({ projection }: { readonly projection: 
         <Text style={styles.title}>{policy.label ?? policy.resource.localResourceId}</Text>
         <StatusBadge label={STATUS_LABELS[policy.status]} variant={policy.tone} />
       </View>
-      {policy.workspaceId ? <Text style={styles.muted}>Workspace {policy.workspaceId}</Text> : null}
-      {policy.agentId ? <Text style={styles.muted}>Agent {policy.agentId}</Text> : null}
+      {policy.workspaceId ? <Text style={styles.muted}>工作空间 {policy.workspaceId}</Text> : null}
+      {policy.agentId ? <Text style={styles.muted}>智能体 {policy.agentId}</Text> : null}
       {policy.reasonCode ? (
         <Text style={styles.error}>
-          {RESOURCE_REASON_COPY[policy.reasonCode] ?? "Resource unavailable."}
+          {RESOURCE_REASON_COPY[policy.reasonCode] ?? "资源当前不可用。"}
         </Text>
       ) : null}
       {policy.queue ? (
         <View style={styles.queue} testID="enterprise-resource-queue">
           <Text style={styles.muted}>
-            {policy.queue.position ? `Position ${policy.queue.position}` : "Queued"}
+            {policy.queue.position ? `队列位置：${policy.queue.position}` : "已进入队列"}
           </Text>
         </View>
       ) : null}

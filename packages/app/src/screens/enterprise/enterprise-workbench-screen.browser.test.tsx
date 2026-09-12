@@ -85,8 +85,7 @@ vi.mock("@/components/enterprise/enterprise-identity-ui", () => ({
   }: {
     capability: { enterpriseIdentityV1?: boolean };
     children: React.ReactNode;
-  }) =>
-    capability.enterpriseIdentityV1 ? <>{children}</> : <div>Enterprise sign-in unavailable</div>,
+  }) => (capability.enterpriseIdentityV1 ? <>{children}</> : <div>企业登录不可用</div>),
   EnterpriseResourceStatus: ({ projection }: { projection: unknown }) => {
     if (typeof projection !== "object" || projection === null || !("status" in projection))
       return null;
@@ -390,9 +389,9 @@ describe("enterprise workbench screen", () => {
         ),
       );
     render("booting");
-    expect(container.textContent).toContain("Loading enterprise identity");
+    expect(container.textContent).toContain("正在加载企业身份");
     render("unavailable");
-    expect(container.textContent).toContain("Enterprise identity unavailable");
+    expect(container.textContent).toContain("企业身份当前不可用");
     expect(uiPort.authenticatePat).not.toHaveBeenCalled();
     const throwingCapability = new Proxy(
       { enterpriseIdentityV1: true },
@@ -415,7 +414,7 @@ describe("enterprise workbench screen", () => {
         />,
       ),
     );
-    expect(container.textContent).toContain("Enterprise sign-in unavailable");
+    expect(container.textContent).toContain("企业登录不可用");
     expect(uiPort.authenticatePat).not.toHaveBeenCalled();
     render("signed_out");
     expect(container.textContent).toContain("login");

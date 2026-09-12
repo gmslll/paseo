@@ -139,17 +139,17 @@ type TestResourceStatus =
 function statusLabel(status: TestResourceStatus) {
   switch (status) {
     case "ready":
-      return "Ready";
+      return "可用";
     case "resource_waiting":
-      return "Waiting";
+      return "等待资源";
     case "login_required":
-      return "Login required";
+      return "需要登录";
     case "mfa_required":
-      return "MFA required";
+      return "需要多重验证";
     case "risk_control":
-      return "Risk control";
+      return "风控限制";
     case "disabled":
-      return "Disabled";
+      return "已停用";
   }
 }
 
@@ -193,7 +193,7 @@ describe("enterprise identity UI", () => {
         </EnterpriseCapabilityGate>,
       ),
     );
-    expect(container.textContent).toContain("Enterprise sign-in unavailable");
+    expect(container.textContent).toContain("企业登录不可用");
     expect(container.textContent).not.toContain("do-not-render");
 
     act(() =>
@@ -229,8 +229,8 @@ describe("enterprise identity UI", () => {
       root.render(<EnterpriseIdentityNavigation projection={identity} onNavigate={onNavigate} />),
     );
     expect(container.textContent).toContain("Avery");
-    expect(container.textContent).toContain("organization");
-    expect(container.textContent).toContain("identity");
+    expect(container.textContent).toContain("组织资源");
+    expect(container.textContent).toContain("身份管理");
     expect(container.textContent).not.toContain("future_navigation");
     expect(container.textContent).not.toContain("future.operation");
     (container.querySelector('[data-testid="enterprise-nav-organization"]') as HTMLElement).click();
@@ -260,8 +260,8 @@ describe("enterprise identity UI", () => {
         />,
       ),
     );
-    expect(container.textContent).toContain("Position 2");
-    expect(container.textContent).toContain("Waiting for resource capacity.");
+    expect(container.textContent).toContain("队列位置：2");
+    expect(container.textContent).toContain("正在等待可用资源。");
     expect(container.textContent).not.toContain("capacity_wait");
     expect(container.textContent).not.toContain("secret");
   });
@@ -350,6 +350,9 @@ describe("enterprise identity UI", () => {
         <EnterprisePasswordLoginForm authenticate={authenticate} onAuthenticated={authenticated} />,
       ),
     );
+    expect(container.textContent).toContain("使用企业账号登录");
+    expect(container.textContent).toContain("账号");
+    expect(container.textContent).toContain("密码");
     const username = container.querySelector(
       '[data-testid="enterprise-account-input"]',
     ) as HTMLInputElement;
@@ -461,7 +464,7 @@ describe("enterprise identity UI", () => {
       (container.querySelector('[data-testid="enterprise-pat-submit"]') as HTMLElement).click();
       await Promise.resolve();
     });
-    expect(container.textContent).toContain("Enterprise sign-in is unavailable.");
+    expect(container.textContent).toContain("企业登录当前不可用。");
     expect(container.textContent).not.toContain("secret-canary");
   });
 
@@ -477,7 +480,7 @@ describe("enterprise identity UI", () => {
       (container.querySelector('[data-testid="enterprise-pat-submit"]') as HTMLElement).click();
       await Promise.resolve();
     });
-    expect(container.textContent).toContain("The token was rejected.");
+    expect(container.textContent).toContain("令牌无效。");
     expect(container.textContent).not.toContain("identity.invalid_token");
   });
 
@@ -496,7 +499,7 @@ describe("enterprise identity UI", () => {
     act(() =>
       root.render(<EnterpriseIdentityNavigation projection={changing} onNavigate={onNavigate} />),
     );
-    expect(container.textContent).toContain("organization");
+    expect(container.textContent).toContain("组织资源");
     (container.querySelector('[data-testid="enterprise-nav-organization"]') as HTMLElement).click();
     expect(onNavigate).toHaveBeenCalledWith("organization");
   });

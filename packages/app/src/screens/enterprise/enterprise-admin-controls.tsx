@@ -57,26 +57,60 @@ type PrincipalDirectoryState =
 const EMPTY_PRINCIPALS: readonly EnterprisePrincipalRecord[] = Object.freeze([]);
 
 const ACTION_LABELS: Readonly<Record<EnterpriseAction, string>> = Object.freeze({
-  "workspace.metadata.read": "View workspace and agent names",
-  "workspace.content.read": "Read workspace and agent content",
-  "workspace.write": "Send messages and modify workspace content",
-  "workspace.manage": "Create and manage workspaces and agents",
-  "browser.use": "Use the assigned browser profile",
-  "browser.profile.manage": "Manage browser profiles",
-  "app.use": "Use assigned app slots",
-  "audit.read": "View audit events",
-  "identity.manage": "Manage employees and permissions",
-  "terminal.use": "Use terminals",
-  "provider.history.read": "Read provider history",
-  "provider.history.import": "Import provider history",
-  "workspace.script.execute": "Run workspace scripts",
-  "workspace.script.configure": "Configure workspace scripts",
-  "workspace.editor.open": "Open workspace editors",
+  "workspace.metadata.read": "查看工作空间和智能体名称",
+  "workspace.content.read": "读取工作空间和智能体内容",
+  "workspace.write": "发送消息和修改工作空间内容",
+  "workspace.manage": "创建和管理工作空间及智能体",
+  "browser.use": "使用已分配的浏览器配置",
+  "browser.profile.manage": "管理浏览器配置",
+  "app.use": "使用已分配的应用执行位",
+  "audit.read": "查看审计记录",
+  "identity.manage": "管理员工和权限",
+  "terminal.use": "使用终端",
+  "provider.history.read": "读取模型提供方历史记录",
+  "provider.history.import": "导入模型提供方历史记录",
+  "workspace.script.execute": "运行工作空间脚本",
+  "workspace.script.configure": "配置工作空间脚本",
+  "workspace.editor.open": "打开工作空间编辑器",
+});
+
+const MUTATION_STATUS_LABELS = Object.freeze({
+  idle: "空闲",
+  pending: "处理中",
+  success: "已完成",
+  failed: "失败",
+});
+
+const PRINCIPAL_TYPE_LABELS = Object.freeze({
+  human: "员工",
+  service: "服务账号",
+  break_glass_owner: "应急管理员",
+});
+const PRINCIPAL_STATUS_LABELS = Object.freeze({
+  active: "已启用",
+  disabled: "已停用",
+  revoked: "已撤销",
+});
+
+const PROFILE_STATUS_LABELS = Object.freeze({
+  ready: "可用",
+  login_required: "需要登录",
+  mfa_required: "需要多重验证",
+  risk_control: "风控限制",
+  disabled: "已停用",
+});
+
+const PROFILE_PLATFORM_LABELS = Object.freeze({
+  douyin: "抖音",
+  pinduoduo: "拼多多",
+  taobao: "淘宝",
+  feishu_web: "飞书网页版",
+  generic: "通用网站",
 });
 
 function principalLabel(principal: EnterprisePrincipalRecord, currentPrincipalId: string): string {
   const label = principal.displayName ?? principal.principalId;
-  return principal.principalId === currentPrincipalId ? `${label} (you)` : label;
+  return principal.principalId === currentPrincipalId ? `${label}（当前账号）` : label;
 }
 
 function scopeKeyForGrant(grant: ResourceGrant): string[] {
@@ -192,20 +226,20 @@ function GrantEditorControls<TGeneration extends string>({
       {
         id: "scope-self",
         value: "self",
-        label: "Own resources",
-        description: "Resources owned by this employee",
+        label: "本人资源",
+        description: "由该员工拥有的资源",
       },
       {
         id: "scope-organization",
         value: `organization:${organizationId}`,
-        label: "Entire organization",
-        description: "Every current resource in the organization",
+        label: "整个组织",
+        description: "组织内的全部现有资源",
       },
       ...workspaces.map((workspace) => ({
         id: `scope-workspace-${workspace.workspaceId}`,
         value: `workspace:${workspace.workspaceId}`,
         label: workspace.label,
-        description: `Workspace · ${workspace.nodeId}`,
+        description: `工作空间 · 节点 ${workspace.nodeId}`,
       })),
     ],
     [organizationId, workspaces],
@@ -220,29 +254,29 @@ function GrantEditorControls<TGeneration extends string>({
   return (
     <View style={styles.section} testID="enterprise-admin-grant-editor">
       <View style={styles.row}>
-        <Text style={styles.subtitle}>Employee permissions</Text>
+        <Text style={styles.subtitle}>员工权限</Text>
         <StatusBadge
-          label={snapshot.mutation.status}
+          label={MUTATION_STATUS_LABELS[snapshot.mutation.status]}
           variant={snapshot.mutation.status === "failed" ? "error" : "muted"}
         />
       </View>
       <SelectField
-        label="Permission scope"
+        label="权限范围"
         value={scopeKey}
         selectedDisplay={selectedScopeDisplay}
         options={scopeOptions}
         onChange={(value) => setScopeKey(value)}
-        placeholder="Choose a scope"
-        emptyText="No scopes available"
+        placeholder="选择权限范围"
+        emptyText="暂无可用范围"
         testID="enterprise-admin-grant-scope"
         triggerTestID="enterprise-admin-grant-scope-trigger"
       />
       {snapshot.server.status === "loading" ? (
-        <Text style={styles.muted}>Loading current permissions…</Text>
+        <Text style={styles.muted}>正在加载当前权限…</Text>
       ) : null}
       {snapshot.server.status === "failed" ? (
         <View style={styles.feedback}>
-          <Text style={styles.error}>Could not load permissions.</Text>
+          <Text style={styles.error}>无法加载权限。</Text>
           <Button
             size="sm"
             variant="outline"
@@ -251,7 +285,7 @@ function GrantEditorControls<TGeneration extends string>({
             }
             testID="enterprise-admin-retry-grants"
           >
-            Retry
+            重试
           </Button>
         </View>
       ) : null}
@@ -267,7 +301,7 @@ function GrantEditorControls<TGeneration extends string>({
                 <Switch
                   value={enabled}
                   disabled={!canManage || snapshot.mutation.status === "pending"}
-                  accessibilityLabel={`${ACTION_LABELS[action]} for selected scope`}
+                  accessibilityLabel={`${ACTION_LABELS[action]}，当前所选范围`}
                   onValueChange={(value) => {
                     model.setDraft(
                       updateGrantForScope(snapshot.draft, action, scopeKey, value, organizationId),
@@ -281,10 +315,10 @@ function GrantEditorControls<TGeneration extends string>({
         </View>
       ) : null}
       {snapshot.mutation.status === "success" ? (
-        <Text style={styles.success}>Permissions saved.</Text>
+        <Text style={styles.success}>权限已保存。</Text>
       ) : null}
       {snapshot.mutation.status === "failed" ? (
-        <Text style={styles.error}>Could not save permissions. Reload and try again.</Text>
+        <Text style={styles.error}>无法保存权限，请重新加载后再试。</Text>
       ) : null}
       <View style={styles.actions}>
         <Button
@@ -297,7 +331,7 @@ function GrantEditorControls<TGeneration extends string>({
           }
           testID="enterprise-admin-load-grants"
         >
-          Reload
+          重新加载
         </Button>
         {canManage ? (
           <Button
@@ -309,7 +343,7 @@ function GrantEditorControls<TGeneration extends string>({
             }
             testID="enterprise-admin-save-grants"
           >
-            Save permissions
+            保存权限
           </Button>
         ) : null}
       </View>
@@ -335,7 +369,7 @@ function BrowserBindingControls<TGeneration extends string>({
         id: profile.browserProfileId,
         value: profile.browserProfileId,
         label: profile.label,
-        description: `${profile.platform} · ${profile.status}`,
+        description: `${PROFILE_PLATFORM_LABELS[profile.platform]} · ${PROFILE_STATUS_LABELS[profile.status]}`,
       })),
     [snapshot.server.profiles],
   );
@@ -351,37 +385,37 @@ function BrowserBindingControls<TGeneration extends string>({
   return (
     <View style={styles.section} testID="enterprise-admin-browser-binding">
       <View style={styles.row}>
-        <Text style={styles.subtitle}>Browser profile binding</Text>
+        <Text style={styles.subtitle}>浏览器配置绑定</Text>
         <StatusBadge
-          label={snapshot.mutation.status}
+          label={MUTATION_STATUS_LABELS[snapshot.mutation.status]}
           variant={snapshot.mutation.status === "failed" ? "error" : "muted"}
         />
       </View>
       {snapshot.server.status === "loading" ? (
-        <Text style={styles.muted}>Loading browser profiles…</Text>
+        <Text style={styles.muted}>正在加载浏览器配置…</Text>
       ) : null}
       {snapshot.server.status === "failed" ? (
-        <Text style={styles.error}>Could not load browser profiles.</Text>
+        <Text style={styles.error}>无法加载浏览器配置。</Text>
       ) : null}
       {snapshot.server.status === "loaded" ? (
         <SelectField
-          label="Browser profile"
+          label="浏览器配置"
           value={snapshot.draftBrowserProfileId}
           selectedDisplay={selectedProfileDisplay}
           options={profileOptions}
           onChange={(profileId) => model.selectProfile(profileId)}
-          placeholder="Choose a browser profile"
-          emptyText="No browser profiles registered on this node"
+          placeholder="选择浏览器配置"
+          emptyText="此节点尚未注册浏览器配置"
           disabled={!canBind || snapshot.mutation.status === "pending"}
           testID="enterprise-admin-browser-profile"
           triggerTestID="enterprise-admin-browser-profile-trigger"
         />
       ) : null}
       {snapshot.mutation.status === "success" ? (
-        <Text style={styles.success}>Browser profile bound.</Text>
+        <Text style={styles.success}>浏览器配置已绑定。</Text>
       ) : null}
       {snapshot.mutation.status === "failed" ? (
-        <Text style={styles.error}>Could not bind this browser profile.</Text>
+        <Text style={styles.error}>无法绑定此浏览器配置。</Text>
       ) : null}
       <View style={styles.actions}>
         <Button
@@ -394,7 +428,7 @@ function BrowserBindingControls<TGeneration extends string>({
           }
           testID="enterprise-admin-load-profiles"
         >
-          Reload
+          重新加载
         </Button>
         {canBind ? (
           <Button
@@ -406,7 +440,7 @@ function BrowserBindingControls<TGeneration extends string>({
             }
             testID="enterprise-admin-bind-profile"
           >
-            Bind profile
+            绑定配置
           </Button>
         ) : null}
       </View>
@@ -486,7 +520,7 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
         id: principal.principalId,
         value: principal.principalId,
         label: principalLabel(principal, currentPrincipalId),
-        description: `${principal.principalType.replaceAll("_", " ")} · ${principal.status}`,
+        description: `${PRINCIPAL_TYPE_LABELS[principal.principalType]} · ${PRINCIPAL_STATUS_LABELS[principal.status]}`,
       })),
     [currentPrincipalId, principals],
   );
@@ -525,7 +559,7 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
         id: `${workspace.nodeId}:${workspace.workspaceId}`,
         value: `${workspace.nodeId}:${workspace.workspaceId}`,
         label: workspace.label,
-        description: `Node ${workspace.nodeId}`,
+        description: `节点 ${workspace.nodeId}`,
       })),
     [workspaces],
   );
@@ -567,11 +601,11 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
     <View style={styles.card} testID="enterprise-admin-controls">
       <View style={styles.header}>
         <View style={styles.headerText}>
-          <Text style={styles.title}>Enterprise administration</Text>
-          <Text style={styles.muted}>Assign employee access and workspace browser identities.</Text>
+          <Text style={styles.title}>企业管理</Text>
+          <Text style={styles.muted}>分配员工权限和工作空间的浏览器身份。</Text>
         </View>
         {bossSnapshot.metadata.status === "loading" || directory.status === "loading" ? (
-          <StatusBadge label="loading" variant="muted" />
+          <StatusBadge label="加载中" variant="muted" />
         ) : null}
       </View>
 
@@ -580,23 +614,23 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
           {canViewPrincipals ? (
             <>
               <SelectField
-                label="Employee or service account"
+                label="员工或服务账号"
                 value={effectivePrincipalId ?? null}
                 selectedDisplay={selectedPrincipalDisplay}
                 options={principalOptions}
                 onChange={(principalId) => setSelectedPrincipalId(principalId)}
-                placeholder="Choose an account"
-                emptyText="No enterprise accounts found"
+                placeholder="选择账号"
+                emptyText="未找到企业账号"
                 loading={directory.status === "loading"}
                 disabled={directory.status !== "loaded"}
                 searchable
-                searchPlaceholder="Search accounts"
+                searchPlaceholder="搜索账号"
                 testID="enterprise-admin-principal"
                 triggerTestID="enterprise-admin-principal-trigger"
               />
               {directory.status === "failed" ? (
                 <View style={styles.feedback}>
-                  <Text style={styles.error}>Could not load enterprise accounts.</Text>
+                  <Text style={styles.error}>无法加载企业账号。</Text>
                   <Button
                     size="sm"
                     variant="outline"
@@ -604,13 +638,13 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
                       startPrincipalLoad();
                     }}
                   >
-                    Retry
+                    重试
                   </Button>
                 </View>
               ) : null}
             </>
           ) : (
-            <Text style={styles.error}>This session cannot view enterprise accounts.</Text>
+            <Text style={styles.error}>当前会话无权查看企业账号。</Text>
           )}
           {grantEditor ? (
             <GrantEditorControls
@@ -628,13 +662,13 @@ export function EnterpriseAdminControls<TContent, TGeneration extends string>({
       {canViewProfiles && createBrowserBinding ? (
         <View style={styles.section}>
           <SelectField
-            label="Workspace for browser access"
+            label="浏览器访问对应的工作空间"
             value={effectiveWorkspaceKey ?? null}
             selectedDisplay={selectedWorkspaceFieldDisplay}
             options={workspaceOptions}
             onChange={(workspaceKey) => setSelectedWorkspaceKey(workspaceKey)}
-            placeholder="Choose a workspace"
-            emptyText="Load a workspace before assigning a browser profile"
+            placeholder="选择工作空间"
+            emptyText="请先加载工作空间，再分配浏览器配置"
             loading={bossSnapshot.metadata.status === "loading"}
             disabled={bossSnapshot.metadata.status !== "loaded" || workspaceOptions.length === 0}
             testID="enterprise-admin-browser-workspace"
