@@ -1240,6 +1240,7 @@ export class HostRuntimeController {
         serverId,
         token,
         signal,
+        clientId: requestedClientId,
       }): Promise<EnterpriseAuthenticationResult> => {
         if (serverId !== this.host.serverId || signal.aborted) {
           throw new DOMException("Aborted", "AbortError");
@@ -1250,7 +1251,7 @@ export class HostRuntimeController {
           throw new Error("Enterprise authentication requires a direct node connection");
         }
         await closePendingAuthentication();
-        const clientId = await this.resolveClientId();
+        const clientId = requestedClientId ?? (await this.resolveClientId());
         const runtimeGeneration = this.snapshot.clientGeneration + 1;
         const authenticatedConnection = { ...connection, password: token };
         const candidate = this.deps.createClient({
@@ -1397,6 +1398,7 @@ export class HostRuntimeController {
       throw new Error("Enterprise identity unavailable");
     }
     if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const clientId = `${await this.resolveClientId()}:enterprise:${crypto.randomUUID()}`;
     const bootstrap = await this.discoverEnterpriseManagement({ signal: input.signal });
     if (!bootstrap) throw new Error("Enterprise password login requires a managed node connection");
     const ticketResponse = await fetch(
@@ -1409,7 +1411,7 @@ export class HostRuntimeController {
           username: input.username,
           password: input.password,
           nodeId: bootstrap.nodeId,
-          clientId: await this.resolveClientId(),
+          clientId,
           ttlMs: 5 * 60_000,
         }),
       },
@@ -1432,6 +1434,7 @@ export class HostRuntimeController {
       serverId: input.serverId,
       token: ticket.ticket,
       signal: input.signal,
+      clientId,
     });
   }
 

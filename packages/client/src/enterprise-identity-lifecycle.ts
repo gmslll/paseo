@@ -133,10 +133,22 @@ export interface EnterpriseIdentityLifecyclePorts {
     serverId: string;
     token: string;
     signal: AbortSignal;
+    clientId?: string;
   }) => Promise<EnterpriseAuthenticationResult>;
   teardown: EnterpriseLifecycleTeardown;
   remoteLogout: EnterpriseRemoteLogout;
 }
+
+function toAuthenticationPortInput(input: {
+  serverId: string;
+  token: string;
+  signal: AbortSignal;
+  clientId: string | undefined;
+}): Parameters<EnterpriseIdentityLifecyclePorts["authenticate"]>[0] {
+  const { clientId, ...base } = input;
+  return clientId === undefined ? base : { ...base, clientId };
+}
+
 export interface EnterpriseIdentityLifecycle {
   bootstrap(input: {
     target: EnterpriseIdentityTarget;
@@ -148,6 +160,7 @@ export interface EnterpriseIdentityLifecycle {
     serverId: string;
     token: string;
     signal?: AbortSignal;
+    clientId?: string;
   }): Promise<EnterpriseIdentitySnapshot>;
   logoutCurrent(serverId: string): Promise<void>;
   logoutEnterpriseHost(serverId: string): Promise<void>;
@@ -191,6 +204,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
   private attempt = 0;
   private handle?: CredentialHandle;
   private handleServerId?: string;
+  private authenticationClientId?: string;
   private readonly activeFileRequestControllers = new Set<AbortController>();
 
   constructor(
@@ -199,6 +213,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
       serverId: string;
       token: string;
       signal: AbortSignal;
+      clientId?: string;
     }) => Promise<EnterpriseAuthenticationResult>,
     private readonly teardown: EnterpriseLifecycleTeardown,
     private readonly remoteLogout: EnterpriseRemoteLogout,
@@ -312,11 +327,15 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
     serverId: string;
     token: string;
     signal?: AbortSignal;
+    clientId?: string;
   }): Promise<EnterpriseIdentitySnapshot> {
     const serverId = input.serverId;
     const token = input.token;
     const signal = input.signal;
-    if (!serverId || !token) return Promise.reject(new Error("Invalid authentication input"));
+    const clientId = input.clientId;
+    if (!serverId || !token || (clientId !== undefined && clientId.trim().length === 0)) {
+      return Promise.reject(new Error("Invalid authentication input"));
+    }
     this.abortPending();
     const attempt = ++this.attempt;
     const controller = new AbortController();
@@ -331,6 +350,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
         this.publish({ state: "unavailable", target: "enterprise_host" });
         const oldTeardown = await this.bestEffortTeardown();
         this.deleteHandle();
+        this.authenticationClientId = undefined;
         if (oldTeardown.length) throw new AggregateError(oldTeardown, "teardown failed");
         if (!this.isCurrent(attempt, controller)) throw new DOMException("Aborted", "AbortError");
         let result: EnterpriseAuthenticationResult | undefined;
@@ -342,11 +362,9 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
           }
         };
         try {
-          const remoteResult = await this.authenticate({
-            serverId,
-            token,
-            signal: controller.signal,
-          });
+          const remoteResult = await this.authenticate(
+            toAuthenticationPortInput({ serverId, token, signal: controller.signal, clientId }),
+          );
           result = await parseAuthenticationResult(remoteResult);
           if (!this.isCurrent(attempt, controller) || signal?.aborted) {
             await compensatePreserving(new DOMException("Aborted", "AbortError"), compensate);
@@ -384,6 +402,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
           }
           this.handle = handle;
           this.handleServerId = serverId;
+          this.authenticationClientId = clientId;
           this.publish({
             state: "signed_in",
             target: "enterprise_host",
@@ -479,6 +498,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
         const generation = createLifecycleGeneration();
         const handle = this.handle;
         const serverId = this.handleServerId;
+        const authenticationClientId = this.authenticationClientId;
         if (!handle || !serverId) {
           await this.localTeardown(true);
           return;
@@ -497,11 +517,19 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
         this.publish({ state: "unavailable", target: "enterprise_host" });
         const errors = await this.bestEffortTeardown();
         this.deleteHandle();
+        this.authenticationClientId = undefined;
         if (errors.length) throw new AggregateError(errors, "teardown failed");
         if (!this.isCurrent(attempt, controller)) throw new DOMException("Aborted", "AbortError");
         this.deleteHandle();
         const refreshed = await parseAuthenticationResult(
-          await this.authenticate({ serverId, token, signal: controller.signal }),
+          await this.authenticate(
+            toAuthenticationPortInput({
+              serverId,
+              token,
+              signal: controller.signal,
+              clientId: authenticationClientId,
+            }),
+          ),
         );
         let compensated = false;
         const compensate = async () => {
@@ -544,6 +572,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
         }
         this.handle = newHandle;
         this.handleServerId = serverId;
+        this.authenticationClientId = authenticationClientId;
         this.publish({
           state: "signed_in",
           target: "enterprise_host",
@@ -591,6 +620,7 @@ export class MemoryEnterpriseIdentityLifecycle implements EnterpriseIdentityLife
     this.publish({ state: "unavailable", target: "enterprise_host" });
     const errors = await this.bestEffortTeardown();
     this.deleteHandle();
+    this.authenticationClientId = undefined;
     if (errors.length || force) {
       this.publish({ state: "unavailable", target: "enterprise_host" });
       if (errors.length) throw new AggregateError(errors, "teardown failed");

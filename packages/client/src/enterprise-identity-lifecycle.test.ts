@@ -421,6 +421,38 @@ describe("enterprise identity lifecycle", () => {
     expect(lifecycle.readSnapshot().sessionBindingKey).toBe("binding-a");
   });
 
+  it("keeps a ticket-bound client id across refresh and clears it on logout", async () => {
+    const p = ports();
+    const authenticate = vi.fn(async () => result());
+    const lifecycle = new MemoryEnterpriseIdentityLifecycle(
+      new MemoryCredentialVault(),
+      authenticate,
+      p.teardown,
+      p.remoteLogout,
+    );
+    await lifecycle.bootstrap({ target: "enterprise_host", enterpriseIdentityV1: true });
+    await lifecycle.authenticateEnterpriseHost({
+      serverId: "server-a",
+      token: "ticket-a",
+      clientId: "client-session-a",
+    });
+    const current = lifecycle.readSnapshot();
+    await lifecycle.scopeRefreshed({
+      serverId: "server-a",
+      generation: current.generation!,
+      sessionBindingKey: current.sessionBindingKey!,
+      projection: { ...projection, grantVersion: "grant-v2" },
+    });
+    await lifecycle.logoutCurrent("server-a");
+    await lifecycle.authenticateEnterpriseHost({ serverId: "server-a", token: "pat-b" });
+
+    expect(authenticate.mock.calls.map(([input]) => input.clientId)).toEqual([
+      "client-session-a",
+      "client-session-a",
+      undefined,
+    ]);
+  });
+
   it("rejects wrong server and isolates listener failures", async () => {
     const p = ports();
     let compensated = 0;

@@ -885,10 +885,111 @@ describe("HostRuntimeController", () => {
       username: "employee.b",
       password: "employee-password-2026",
       nodeId: "nod_aaaaaaaaaaaaaaaa",
-      clientId: "cid_password_login",
+      clientId: expect.stringMatching(/^cid_password_login:enterprise:/),
     });
     expect(JSON.stringify(controller.getSnapshot())).not.toContain("employee-password-2026");
     expect(JSON.stringify(lifecycle.readSnapshot())).not.toContain("employee-password-2026");
+    await controller.stop();
+  });
+
+  it("uses a fresh ticket-bound client id when switching password accounts", async () => {
+    const host = makeHost({
+      serverId: "srv_password_switch",
+      preferredConnectionId: "direct:lan:6767",
+    });
+    const principals = ["usr_aaaaaaaaaaaaaaaa", "usr_bbbbbbbbbbbbbbbb"];
+    const clients = principals.map((principalId, index) => {
+      const client = new FakeDaemonClient();
+      client.serverInfo = {
+        serverId: host.serverId,
+        features: { enterpriseIdentityV1: true },
+      };
+      client.enterpriseIdentity = {
+        principalType: "human",
+        principalId,
+        organizationId: "org_aaaaaaaaaaaaaaaa",
+        nodeId: "nod_aaaaaaaaaaaaaaaa",
+        paseoServerId: host.serverId,
+        displayName: index === 0 ? "Administrator" : "Employee",
+        grantVersion: `grant-${index + 1}`,
+        navigation: [],
+        allowedOperations: [],
+      };
+      return client;
+    });
+    const ticketClientIds: string[] = [];
+    const createdClientIds: string[] = [];
+    const request = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).endsWith("/api/enterprise/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            mode: "managed",
+            managementBaseUrl: "https://management.test:17443",
+            nodeId: "nod_aaaaaaaaaaaaaaaa",
+            paseoServerId: host.serverId,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      const body = JSON.parse(String(init?.body)) as { clientId: string };
+      ticketClientIds.push(body.clientId);
+      return new Response(
+        JSON.stringify({
+          ticket: `pmt_v1.ticket-${ticketClientIds.length}`,
+          endpoint: "wss://node.test:6768",
+          expiresAt: "2026-09-12T08:05:00.000Z",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", request);
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: ({ clientId }) => {
+          createdClientIds.push(clientId);
+          return clients[createdClientIds.length - 1] as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_password_switch",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+
+    const admin = await controller.authenticateEnterpriseHostWithPassword({
+      serverId: host.serverId,
+      username: "admin",
+      password: "admin-password",
+    });
+    expect(admin.projection?.principalId).toBe(principals[0]);
+    await lifecycle.logoutCurrent(host.serverId);
+    const employee = await controller.authenticateEnterpriseHostWithPassword({
+      serverId: host.serverId,
+      username: "employee",
+      password: "employee-password",
+    });
+
+    expect(employee.projection?.principalId).toBe(principals[1]);
+    expect(ticketClientIds).toEqual(createdClientIds);
+    expect(new Set(ticketClientIds).size).toBe(2);
+    expect(ticketClientIds).toEqual([
+      expect.stringMatching(/^cid_password_switch:enterprise:/),
+      expect.stringMatching(/^cid_password_switch:enterprise:/),
+    ]);
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain("admin-password");
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain("employee-password");
     await controller.stop();
   });
 
