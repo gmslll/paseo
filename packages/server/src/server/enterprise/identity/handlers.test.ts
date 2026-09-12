@@ -23,15 +23,38 @@ const context = {
 
 describe("enterprise identity handlers", () => {
   test("returns canonical current identity", async () => {
+    const display = vi.fn(async () => ({
+      displayName: "Avery",
+      navigation: ["identity", "future-navigation"],
+      allowedOperations: ["identity.logout_all", "future-operation"],
+    }));
     const dispatcher = createEnterpriseIdentityDispatcher({
       listPrincipals: vi.fn(async () => []),
       logoutAll: vi.fn(async () => false),
+      display,
     });
     const result = await dispatcher.handle({
       sessionContext: context,
       message: { type: "enterprise.identity.get_current.request", requestId: "r1" },
     });
-    expect(result).toMatchObject({ type: "enterprise.identity.get_current.response" });
+    expect(result).toEqual({
+      type: "enterprise.identity.get_current.response",
+      payload: {
+        requestId: "r1",
+        identity: {
+          principalType: "human",
+          principalId: "usr_aaaaaaaaaaaaaaaa",
+          organizationId: "org_aaaaaaaaaaaaaaaa",
+          nodeId: "nod_aaaaaaaaaaaaaaaa",
+          paseoServerId: "srv",
+          displayName: "Avery",
+          grantVersion: "grant",
+          navigation: ["identity"],
+          allowedOperations: ["identity.logout_all"],
+        },
+      },
+    });
+    expect(display).toHaveBeenCalledWith(context);
   });
 
   test("delegates list and logout to W1 dependencies", async () => {

@@ -1,5 +1,4 @@
 import {
-  projectCurrentIdentity,
   type CurrentIdentityProjection,
   type EnterprisePrincipalRecord,
   type SessionOutboundMessage,
@@ -18,17 +17,24 @@ import {
   productionAuditCapabilityIssuer,
   type ProductionAuditCapability,
 } from "../audit/production-audit-runtime.js";
+import {
+  createCurrentIdentityProjection,
+  createEnterpriseIdentityDisplayProjection,
+  type EnterpriseIdentityDisplayProjection,
+} from "./projection.js";
 
 export interface EnterpriseIdentityHandlerDeps {
   readonly listPrincipals: (
     context: EnterpriseDispatchContext,
   ) => Promise<readonly EnterprisePrincipalRecord[]>;
   readonly logoutAll: (context: EnterpriseDispatchContext) => Promise<boolean>;
-  readonly display?: {
-    readonly displayName?: string;
-    readonly navigation?: readonly string[];
-    readonly allowedOperations?: readonly string[];
-  };
+  readonly display?:
+    | Partial<EnterpriseIdentityDisplayProjection>
+    | ((
+        context: EnterpriseDispatchContext,
+      ) =>
+        | Partial<EnterpriseIdentityDisplayProjection>
+        | Promise<Partial<EnterpriseIdentityDisplayProjection>>);
 }
 
 export function createEnterpriseIdentityDispatcher(
@@ -37,13 +43,17 @@ export function createEnterpriseIdentityDispatcher(
   return {
     async handle({ sessionContext, message }): Promise<SessionOutboundMessage | false> {
       if (message.type === "enterprise.identity.get_current.request") {
-        const identity: CurrentIdentityProjection = projectCurrentIdentity(
+        const resolvedDisplay =
+          typeof deps.display === "function"
+            ? await deps.display(sessionContext)
+            : (deps.display ?? {});
+        const identity: CurrentIdentityProjection = createCurrentIdentityProjection(
           sessionContext.enterpriseContext.principal,
           sessionContext.enterpriseContext.node,
           {
-            displayName: deps.display?.displayName,
-            navigation: deps.display?.navigation ?? [],
-            allowedOperations: deps.display?.allowedOperations ?? [],
+            displayName: resolvedDisplay.displayName,
+            navigation: resolvedDisplay.navigation ?? [],
+            allowedOperations: resolvedDisplay.allowedOperations ?? [],
           },
         );
         return {
@@ -102,6 +112,29 @@ export function createProductionEnterpriseIdentityDispatcherRegistration(input: 
         throw new Error("enterprise identity registration is not current");
       let active = true;
       const dispatcher = createEnterpriseIdentityDispatcher({
+        display: async ({ enterpriseContext }) => {
+          if (!active) throw new Error("enterprise identity lease is closed");
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          if (enterpriseContext.principal.principalType === "break_glass_owner") {
+            return createEnterpriseIdentityDisplayProjection(enterpriseContext.principal);
+          }
+          const records = await input.source.listPrincipalRecords(
+            enterpriseContext.principal.organizationId,
+          );
+          productionAuditCapabilityIssuer.requireCurrent(input.audit);
+          if (!active) throw new Error("enterprise identity lease is closed");
+          const record = records.find(
+            (candidate) =>
+              candidate.principalId === enterpriseContext.principal.principalId &&
+              candidate.organizationId === enterpriseContext.principal.organizationId &&
+              candidate.status === "active",
+          );
+          if (!record) throw new Error("enterprise identity projection is not current");
+          return createEnterpriseIdentityDisplayProjection(
+            enterpriseContext.principal,
+            record.displayName,
+          );
+        },
         listPrincipals: async ({ enterpriseContext }) => {
           if (!active) throw new Error("enterprise identity lease is closed");
           productionAuditCapabilityIssuer.requireCurrent(input.audit);
