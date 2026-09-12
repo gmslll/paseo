@@ -541,6 +541,8 @@ function isSafeEmptyLegacyDirectoryResponse(
     case "fetch_agents_response":
     case "fetch_agent_history_response":
       return event.payload.entries.length === 0;
+    case "workspace.create.response":
+      return event.payload.workspace === null && event.payload.error !== null;
     default:
       return false;
   }
@@ -8177,7 +8179,7 @@ export class Session {
         "Failed to create workspace",
       );
       const errorCode = error instanceof WorkspaceProvisioningError ? error.code : undefined;
-      this.emit({
+      this.emitWorkspaceCreateResponse({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
@@ -8200,7 +8202,7 @@ export class Session {
     const cwd = expandTilde(request.source.path);
     const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
     if (!directoryExists) {
-      this.emit({
+      this.emitWorkspaceCreateResponse({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
@@ -8226,15 +8228,18 @@ export class Session {
     );
     await this.syncWorkspaceGitObserverForWorkspace(workspace);
     const descriptor = await this.describeWorkspaceRecord(workspace);
-    this.emit({
-      type: "workspace.create.response",
-      payload: {
-        requestId: request.requestId,
-        workspace: descriptor,
-        setupTerminalId: null,
-        error: null,
+    this.emitWorkspaceCreateResponse(
+      {
+        type: "workspace.create.response",
+        payload: {
+          requestId: request.requestId,
+          workspace: descriptor,
+          setupTerminalId: null,
+          error: null,
+        },
       },
-    });
+      workspace.workspaceId,
+    );
     await this.emitCreatedWorkspaceUpdate(
       descriptor,
       request.firstAgentContext ? "running" : undefined,
@@ -8270,7 +8275,7 @@ export class Session {
     const source = request.source;
 
     if (!source.cwd && !source.projectId) {
-      this.emit({
+      this.emitWorkspaceCreateResponse({
         type: "workspace.create.response",
         payload: {
           requestId: request.requestId,
@@ -8304,22 +8309,25 @@ export class Session {
     );
 
     const descriptor = await this.describeCreatedWorktreeWorkspace(result);
-    this.emit({
-      type: "workspace.create.response",
-      payload: {
-        requestId: request.requestId,
-        workspace: descriptor,
-        setupTerminalId: null,
-        ...(result.workspace.untrustedSource
-          ? {
-              setupSkippedReason: formatWorkspaceAutomationBlockedMessage(
-                result.workspace.untrustedSource,
-              ),
-            }
-          : {}),
-        error: null,
+    this.emitWorkspaceCreateResponse(
+      {
+        type: "workspace.create.response",
+        payload: {
+          requestId: request.requestId,
+          workspace: descriptor,
+          setupTerminalId: null,
+          ...(result.workspace.untrustedSource
+            ? {
+                setupSkippedReason: formatWorkspaceAutomationBlockedMessage(
+                  result.workspace.untrustedSource,
+                ),
+              }
+            : {}),
+          error: null,
+        },
       },
-    });
+      result.workspace.workspaceId,
+    );
     await this.emitCreatedWorkspaceUpdate(
       descriptor,
       request.firstAgentContext ? "running" : undefined,
@@ -10215,6 +10223,24 @@ export class Session {
       return;
     }
     void this.enqueueAuthorizedEmit(msg, context);
+  }
+
+  private emitWorkspaceCreateResponse(
+    message: Extract<SessionOutboundMessage, { type: "workspace.create.response" }>,
+    workspaceId?: string,
+  ): void {
+    if (!this.enterpriseContext) {
+      this.emit(message);
+      return;
+    }
+    const context = workspaceId
+      ? this.createWorkspaceOutboundContext(workspaceId)
+      : this.createWorkspaceOutboundContextForIds([]);
+    if (!context) {
+      this.emitLegacyResourceDenied(message.payload.requestId, "workspace.create.request");
+      return;
+    }
+    this.emit(message, context);
   }
 
   private emitForSource(

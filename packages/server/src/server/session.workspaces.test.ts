@@ -19,6 +19,11 @@ import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
+import {
+  createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "./session/enterprise-agent-session-context-registry.js";
+import { createAuthorityReceiptStatePort } from "./session/enterprise-authority-receipt-state.js";
 import { OWNER_PERMISSIONS } from "./authorization/index.js";
 import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-service.js";
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
@@ -568,6 +573,8 @@ function createSessionForWorkspaceTests(
       newName: string,
     ) => Promise<{ previousBranch: string | null; currentBranch: string | null }>;
     generateWorkspaceName?: () => Promise<GeneratedWorkspaceName | null>;
+    enterpriseContext?: EnterpriseSessionContext;
+    resourceAuthorization?: SessionOptions["resourceAuthorization"];
   } = {},
 ): TestSession {
   const logger = {
@@ -742,6 +749,15 @@ function createSessionForWorkspaceTests(
       tts: null,
       providerSnapshotManager,
       terminalManager: options.terminalManager ?? null,
+      enterpriseContext: options.enterpriseContext,
+      enterpriseAgentContextRegistry: options.enterpriseContext
+        ? createEnterpriseAgentSessionContextRegistry()
+        : undefined,
+      authorityReceiptState: options.enterpriseContext
+        ? createAuthorityReceiptStatePort()
+        : undefined,
+      principalGrantVersionGuard: options.enterpriseContext ? { isCurrent: () => true } : undefined,
+      resourceAuthorization: options.resourceAuthorization,
     }),
   );
   return session;
@@ -9460,6 +9476,79 @@ test("workspace.create.response persists the first prompt as the initial title",
   const persisted = await session.workspaceRegistry.get(workspaceId as string);
   expect(persisted?.title).toBe("Add retries to the payments flow");
   expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
+});
+
+test("enterprise workspace.create.response carries the newly created workspace authorization context", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
+  const canEmit = vi.fn(async () => true);
+  const enterpriseContext: EnterpriseSessionContext = {
+    principal: {
+      principalType: "human",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      grants: [
+        {
+          action: "workspace.manage",
+          selector: { kind: "organization", organizationId: "org_aaaaaaaaaaaaaaaa" },
+        },
+      ],
+      credentialId: "cred_workspace_create",
+      grantVersion: "grant-workspace-create",
+    },
+    node: {
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: "server-workspace-create",
+      mode: "managed",
+    },
+    sessionBindingGeneration: "generation-workspace-create",
+  };
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    enterpriseContext,
+    resourceAuthorization: { canEmit } as SessionOptions["resourceAuthorization"],
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(workspaces.values()),
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+      upsert: async (workspace) => {
+        workspaces.set(workspace.workspaceId, workspace);
+      },
+      archive: async () => {},
+      remove: async () => {},
+    },
+  });
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-enterprise-create-context",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+
+  const response = findByType(emitted, "workspace.create.response");
+  expect(response?.payload.error).toBeNull();
+  const workspaceId = response?.payload.workspace?.id;
+  expect(workspaceId).toEqual(expect.any(String));
+  expect(canEmit).toHaveBeenCalledWith(
+    expect.objectContaining({ principalId: enterpriseContext.principal.principalId }),
+    expect.objectContaining({
+      type: "workspace.create.response",
+      payload: expect.objectContaining({ requestId: "req-enterprise-create-context" }),
+    }),
+    {
+      kind: "resources",
+      resources: [
+        {
+          resourceKind: "workspace",
+          organizationId: enterpriseContext.principal.organizationId,
+          nodeId: enterpriseContext.node.nodeId,
+          localResourceId: workspaceId,
+        },
+      ],
+    },
+  );
+  await session.cleanup();
 });
 
 test("workspace create emits through a matching workspace subscription", async () => {
