@@ -9,6 +9,98 @@ const ORG = "org_0123456789abcdef";
 const START = Date.parse("2026-09-12T00:00:00.000Z");
 
 describe("EnterpriseManagementPlane", () => {
+  test("authenticates a human account and rotates its password session authority", async () => {
+    const ticketKeys = generateKeyPairSync("ed25519");
+    const nodeKeys = generateKeyPairSync("ed25519");
+    const plane = new EnterpriseManagementPlane({
+      databasePath: ":memory:",
+      organizationId: ORG,
+      organizationName: "Password Test",
+      issuer: "https://management.test:17443",
+      bootstrapSecret: "bootstrap-password-test-secret",
+      ticketPrivateKey: ticketKeys.privateKey,
+      ticketPublicKey: ticketKeys.publicKey,
+      clock: { nowMs: () => START },
+    });
+    const bootstrap = await plane.bootstrapAdministrator({
+      bootstrapSecret: "bootstrap-password-test-secret",
+      displayName: "Admin",
+    });
+    const admin = await plane.authenticatePersonalAccessToken(bootstrap.token);
+    const employee = await plane.createPrincipal(admin!, {
+      displayName: "Employee",
+      principalType: "human",
+      role: "employee",
+    });
+    await expect(
+      plane.setPrincipalPassword(admin!, employee.principalId, {
+        username: "Employee.One",
+        password: "employee-password-2026",
+      }),
+    ).resolves.toEqual({ principalId: employee.principalId, username: "employee.one" });
+    await expect(
+      plane.authenticatePassword("EMPLOYEE.ONE", "employee-password-2026"),
+    ).resolves.toMatchObject({
+      principalId: employee.principalId,
+      credentialId: expect.stringMatching(/^cred_[0-9a-f]{24}$/),
+    });
+    await expect(
+      plane.authenticatePassword("employee.one", "wrong-password-2026"),
+    ).resolves.toBeNull();
+
+    const enrollment = await plane.createEnrollmentToken(admin!, { expiresInMs: 60_000 });
+    const enrolled = await plane.enrollNode({
+      token: enrollment.token,
+      paseoServerId: "server-password",
+      endpoint: "wss://node-password.test:6768",
+      bootId: "boot-password",
+      version: "0.8.0",
+      publicKeyPem: nodeKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+      capabilities: {},
+      capacity: {
+        cpuLogical: 8,
+        memoryTotalBytes: 16_000_000_000,
+        memoryAvailableBytes: 12_000_000_000,
+        activeAgents: 0,
+        activeBrowserProfiles: 0,
+      },
+    });
+    await plane.setNodeStatus(admin!, enrolled.node.nodeId, "active");
+    const first = await plane.issueNodeSessionTicketWithPassword({
+      username: "employee.one",
+      password: "employee-password-2026",
+      nodeId: enrolled.node.nodeId,
+      clientId: "desktop-password",
+      ttlMs: 60_000,
+    });
+    const oldClaims = verifySessionTicket(first.ticket, ticketKeys.publicKey, {
+      nowMs: START,
+      nodeId: enrolled.node.nodeId,
+      paseoServerId: "server-password",
+      issuer: "https://management.test:17443",
+    });
+    await plane.setPrincipalPassword(admin!, employee.principalId, {
+      username: "employee.one",
+      password: "replacement-password-2026",
+    });
+    await expect(
+      plane.authenticatePassword("employee.one", "employee-password-2026"),
+    ).resolves.toBeNull();
+    const current = await plane.authenticatePassword("employee.one", "replacement-password-2026");
+    expect(() =>
+      verifySessionTicket(first.ticket, ticketKeys.publicKey, {
+        nowMs: START,
+        nodeId: enrolled.node.nodeId,
+        paseoServerId: "server-password",
+        issuer: "https://management.test:17443",
+        currentGrantVersion: current!.grantVersion,
+        currentRevocationEpoch: current!.revocationEpoch,
+      }),
+    ).toThrow("revoked");
+    expect(current!.revocationEpoch).toBe(oldClaims.revocationEpoch + 1);
+    plane.close();
+  });
+
   test("runs the employee, node, placement, ticket, lease, and audit authority lifecycle", async () => {
     let nowMs = START;
     const ticketKeys = generateKeyPairSync("ed25519");
@@ -87,6 +179,26 @@ describe("EnterpriseManagementPlane", () => {
       publicKeyPem: nodeBKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
     });
     await plane.setNodeStatus(admin!, nodeB.node.nodeId, "active");
+
+    const bootstrapTicket = await plane.issueNodeSessionTicket(employeeCredential.token, {
+      nodeId: nodeA.node.nodeId,
+      clientId: "client-bootstrap",
+      ttlMs: 60_000,
+    });
+    expect(
+      verifySessionTicket(bootstrapTicket.ticket, ticketKeys.publicKey, {
+        nowMs,
+        nodeId: nodeA.node.nodeId,
+        paseoServerId: "server-a",
+        issuer: "https://management.test:17443",
+      }),
+    ).toMatchObject({
+      kind: "session",
+      principalId: employee.principalId,
+      clientId: "client-bootstrap",
+      nodeId: nodeA.node.nodeId,
+    });
+    expect(bootstrapTicket.endpoint).toBe("wss://node-a.test:6767");
 
     const heartbeatBody = JSON.stringify({
       ...nodeA.request,
@@ -324,6 +436,13 @@ describe("EnterpriseManagementPlane", () => {
     ).toThrow("revoked");
 
     await plane.setNodeStatus(admin!, nodeA.node.nodeId, "draining");
+    await expect(
+      plane.issueNodeSessionTicket(bootstrap.token, {
+        nodeId: nodeA.node.nodeId,
+        clientId: "client-admin",
+        ttlMs: 60_000,
+      }),
+    ).rejects.toThrow("draining");
     await expect(
       plane.issueSessionTicket(bootstrap.token, {
         workspaceId: "workspace-a",

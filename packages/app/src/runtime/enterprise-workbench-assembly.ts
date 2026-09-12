@@ -37,6 +37,11 @@ export function isEnterpriseBrowserProfilesEnabled(capability: unknown): boolean
   return parsed.success && parsed.data.enterpriseBrowserProfilesV1 === true;
 }
 
+export function isEnterpriseIdentityEnabled(capability: unknown): boolean {
+  const parsed = EnterpriseFeatureFlagsWireSchema.safeParse(capability);
+  return parsed.success && parsed.data.enterpriseIdentityV1 === true;
+}
+
 export function createBrowserProfileProjectionHydrator(
   runtime: BrowserProfileProjectionRuntime,
   serverId: string,

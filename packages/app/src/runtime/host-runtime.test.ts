@@ -108,11 +108,15 @@ class FakeDaemonClient {
   private agentListenerWaiters = new Set<() => void>();
   private sentMessageWaiters = new Set<() => void>();
   public serverInfo: {
+    serverId?: string;
     features?: {
+      enterpriseIdentityV1?: boolean;
       enterpriseBrowserPageIdentityObservationV1?: boolean;
       enterpriseBrowserPageIdentityInvalidationV1?: boolean;
     };
   } | null = null;
+  public enterpriseResponses: Array<Readonly<Record<string, unknown>>> = [];
+  public enterpriseIdentity: Readonly<Record<string, unknown>> | null = null;
 
   on<TType extends SessionOutboundMessage["type"]>(
     type: TType,
@@ -201,6 +205,18 @@ class FakeDaemonClient {
 
   getLastServerInfoMessage(): FakeDaemonClient["serverInfo"] {
     return this.serverInfo;
+  }
+
+  async requestEnterprise(
+    _type?: string,
+    _payload?: Readonly<Record<string, unknown>>,
+    requestId?: string,
+  ): Promise<Readonly<Record<string, unknown>>> {
+    if (this.enterpriseIdentity)
+      return { requestId: requestId ?? "request", identity: this.enterpriseIdentity };
+    const response = this.enterpriseResponses.shift();
+    if (!response) throw new Error("missing enterprise response");
+    return response;
   }
 
   subscribeConnectionStatus(listener: (status: ConnectionState) => void): () => void {
@@ -296,6 +312,7 @@ class FakeDaemonClient {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
   vi.mocked(mountBrowserPageIdentityDaemonClientHandler).mockClear();
   mountedPageIdentityHandlers.length = 0;
   pageIdentityEvents.length = 0;
@@ -663,6 +680,210 @@ class BrowserClientLifecycle {
 }
 
 describe("HostRuntimeController", () => {
+  it("uses the production identity ports to replace an anonymous enterprise client", async () => {
+    const host = makeHost({
+      serverId: "srv_enterprise_login",
+      preferredConnectionId: "direct:lan:6767",
+    });
+    const anonymous = new FakeDaemonClient();
+    anonymous.serverInfo = {
+      serverId: host.serverId,
+      features: { enterpriseIdentityV1: true },
+    };
+    const authenticated = new FakeDaemonClient();
+    authenticated.serverInfo = {
+      serverId: host.serverId,
+      features: { enterpriseIdentityV1: true },
+    };
+    authenticated.enterpriseIdentity = {
+      principalType: "human",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: host.serverId,
+      displayName: "Employee",
+      grantVersion: "grant-password",
+      navigation: [],
+      allowedOperations: [],
+    };
+    const createdConnections: HostConnection[] = [];
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: ({ connection }) => {
+          createdConnections.push(connection);
+          return (createdConnections.length === 1
+            ? anonymous
+            : authenticated) as unknown as DaemonClient;
+        },
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_enterprise_login",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(lifecycle.readSnapshot()).toMatchObject({
+      state: "signed_out",
+      target: "enterprise_host",
+    });
+    const snapshot = await controller.authenticateEnterpriseHost({
+      serverId: host.serverId,
+      token: "pmt_v1.private-ticket",
+    });
+    expect(snapshot).toMatchObject({
+      state: "signed_in",
+      projection: { principalId: "usr_aaaaaaaaaaaaaaaa" },
+    });
+    expect(controller.getClient()).toBe(authenticated);
+    expect(createdConnections).toHaveLength(2);
+    expect(createdConnections[0]).not.toHaveProperty("password");
+    expect(createdConnections[1]).toMatchObject({
+      type: "directTcp",
+      password: "pmt_v1.private-ticket",
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("private-ticket");
+    await controller.stop();
+  });
+
+  it("bootstraps an ordinary host as legacy and hides enterprise authentication", async () => {
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    const client = new FakeDaemonClient();
+    client.serverInfo = { serverId: host.serverId, features: {} };
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => client as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_legacy_login",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    expect(lifecycle.readSnapshot()).toEqual({ state: "signed_out", target: "legacy_passthrough" });
+    await controller.stop();
+  });
+
+  it("exchanges an account password for a node ticket without retaining the password", async () => {
+    const host = makeHost({
+      serverId: "srv_password_login",
+      preferredConnectionId: "direct:lan:6767",
+    });
+    const anonymous = new FakeDaemonClient();
+    anonymous.serverInfo = { serverId: host.serverId, features: { enterpriseIdentityV1: true } };
+    const authenticated = new FakeDaemonClient();
+    authenticated.serverInfo = {
+      serverId: host.serverId,
+      features: { enterpriseIdentityV1: true },
+    };
+    authenticated.enterpriseIdentity = {
+      principalType: "human",
+      principalId: "usr_bbbbbbbbbbbbbbbb",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: host.serverId,
+      displayName: "Employee B",
+      grantVersion: "grant-password",
+      navigation: [],
+      allowedOperations: [],
+    };
+    const clients = [anonymous, authenticated];
+    const request = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).endsWith("/api/enterprise/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            mode: "managed",
+            managementBaseUrl: "https://management.test:17443",
+            nodeId: "nod_aaaaaaaaaaaaaaaa",
+            paseoServerId: host.serverId,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          ticket: "pmt_v1.short-lived-ticket",
+          endpoint: "wss://node.test:6768",
+          expiresAt: "2026-09-12T08:05:00.000Z",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", request);
+    let lifecycle!: MemoryEnterpriseIdentityLifecycle;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => clients.shift()! as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new Error("probe unavailable");
+        },
+        getClientId: async () => "cid_password_login",
+        createEnterpriseIdentityLifecycle: ({ vault, ports }) => {
+          lifecycle = new MemoryEnterpriseIdentityLifecycle(
+            vault,
+            ports.authenticate,
+            ports.teardown,
+            ports.remoteLogout,
+          );
+          return lifecycle;
+        },
+        createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
+      },
+    });
+    await controller.activateConnection({ connectionId: "direct:lan:6767" });
+    await expect(controller.discoverEnterpriseManagement()).resolves.toMatchObject({
+      mode: "managed",
+      paseoServerId: host.serverId,
+    });
+    const snapshot = await controller.authenticateEnterpriseHostWithPassword({
+      serverId: host.serverId,
+      username: "employee.b",
+      password: "employee-password-2026",
+    });
+    expect(snapshot).toMatchObject({
+      state: "signed_in",
+      projection: { principalId: "usr_bbbbbbbbbbbbbbbb" },
+    });
+    expect(String(request.mock.calls[0]?.[0])).toBe("http://lan:6767/api/enterprise/bootstrap");
+    expect(String(request.mock.calls[2]?.[0])).toBe(
+      "https://management.test:17443/v1/auth/password/session",
+    );
+    expect(JSON.parse(String(request.mock.calls[2]?.[1]?.body))).toMatchObject({
+      username: "employee.b",
+      password: "employee-password-2026",
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      clientId: "cid_password_login",
+    });
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain("employee-password-2026");
+    expect(JSON.stringify(lifecycle.readSnapshot())).not.toContain("employee-password-2026");
+    await controller.stop();
+  });
+
   it("mounts page identity only after connected enterprise client and both capabilities", async () => {
     const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
     const client = new FakeDaemonClient();

@@ -32,10 +32,12 @@ import {
 import {
   createOpaqueId,
   createSecretToken,
+  digestPassword,
   digestSecret,
   parseSecretToken,
   signSessionTicket,
   verifyNodeRequestSignature,
+  verifyPassword,
   verifySecret,
 } from "./security.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
@@ -47,6 +49,8 @@ const ENROLLMENT_ID_PATTERN = /^enr_[0-9a-f]{24}$/;
 const NODE_REQUEST_MAX_SKEW_MS = 60_000;
 const NODE_DUPLICATE_WINDOW_MS = 90_000;
 const MAX_SESSION_TICKET_TTL_MS = 5 * 60_000;
+const USERNAME_PATTERN = /^[a-z0-9][a-z0-9._-]{2,63}$/;
+const INVALID_PASSWORD_HASH = "$2b$12$FKn7pcGA7X1tiWS5RHYSKed2ng6VB6U4Yo1CzAJGRF.eYHU9Fy4We";
 
 interface Clock {
   nowMs(): number;
@@ -208,6 +212,67 @@ export class EnterpriseManagementPlane {
   ): Promise<ManagementPrincipal> {
     this.assertActor(actor, "identity.manage");
     return this.insertPrincipal(input);
+  }
+
+  async setPrincipalPassword(
+    actor: AuthenticatedManagementPrincipal,
+    principalId: string,
+    input: { readonly username: string; readonly password: string },
+  ): Promise<{ readonly principalId: string; readonly username: string }> {
+    this.assertActor(actor, "identity.manage");
+    const principal = this.requirePrincipal(principalId);
+    if (principal.principalType !== "human")
+      throw new Error("password login requires a human principal");
+    const username = normalizeUsername(input.username);
+    assertPassword(input.password);
+    const digest = await digestPassword(input.password);
+    const credentialId = createOpaqueId("cred_", 12);
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare(
+          "INSERT INTO password_credentials (principal_id, credential_id, username, password_hash, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(principal_id) DO UPDATE SET credential_id = excluded.credential_id, username = excluded.username, password_hash = excluded.password_hash, updated_at = excluded.updated_at, last_used_at = NULL",
+        )
+        .run(principalId, credentialId, username, digest, now, now);
+      this.database
+        .prepare(
+          "UPDATE principals SET grant_version = ?, revocation_epoch = revocation_epoch + 1, updated_at = ? WHERE principal_id = ?",
+        )
+        .run(createOpaqueId("grv_", 16), now, principalId);
+    });
+    return Object.freeze({ principalId, username });
+  }
+
+  async authenticatePassword(
+    usernameInput: string,
+    password: string,
+  ): Promise<AuthenticatedManagementPrincipal | null> {
+    this.assertOpen();
+    let username: string;
+    try {
+      username = normalizeUsername(usernameInput);
+      assertPassword(password);
+    } catch {
+      return null;
+    }
+    const row = this.row(
+      this.database
+        .prepare("SELECT * FROM password_credentials WHERE username = ? COLLATE NOCASE")
+        .get(username),
+    );
+    const passwordMatches = await verifyPassword(
+      password,
+      row ? String(row.password_hash) : INVALID_PASSWORD_HASH,
+    );
+    if (!row || !passwordMatches) {
+      return null;
+    }
+    const principal = this.readPrincipal(String(row.principal_id));
+    if (!principal || principal.status !== "active") return null;
+    this.database
+      .prepare("UPDATE password_credentials SET last_used_at = ? WHERE principal_id = ?")
+      .run(this.nowIso(), principal.principalId);
+    return Object.freeze({ ...principal, credentialId: String(row.credential_id) });
   }
 
   async issuePersonalAccessToken(
@@ -703,42 +768,33 @@ export class EnterpriseManagementPlane {
   ): Promise<{ readonly ticket: string; readonly endpoint: string; readonly expiresAt: string }> {
     const principal = await this.authenticatePersonalAccessToken(token);
     if (!principal) throw new Error("invalid credential");
-    if (
-      !Number.isInteger(input.ttlMs) ||
-      input.ttlMs < 1_000 ||
-      input.ttlMs > MAX_SESSION_TICKET_TTL_MS
-    ) {
-      throw new Error("invalid ticket lifetime");
-    }
+    this.assertSessionTicketLifetime(input.ttlMs);
     const placement = await this.resolveWorkspace(principal, input.workspaceId);
     if (!placement) throw new Error("workspace unavailable");
     const node = this.requireNode(placement.resource.nodeId);
     if (node.status !== "active") throw new Error(`node is ${node.status}`);
-    const issuedAtMs = this.clock.nowMs();
-    const claims: SessionTicketClaims = {
-      version: 1,
-      kind: "session",
-      issuer: this.options.issuer,
-      ticketId: createOpaqueId("tkt_", 16),
-      organizationId: principal.organizationId,
-      principalId: principal.principalId,
-      principalType: principal.principalType,
-      credentialId: principal.credentialId,
-      clientId: input.clientId,
-      grantVersion: principal.grantVersion,
-      revocationEpoch: principal.revocationEpoch,
-      nodeId: node.nodeId,
-      paseoServerId: node.paseoServerId,
-      grants: structuredClone(principal.grants),
-      issuedAtMs,
-      notBeforeMs: issuedAtMs,
-      expiresAtMs: issuedAtMs + input.ttlMs,
-    };
-    return Object.freeze({
-      ticket: signSessionTicket(claims, this.options.ticketPrivateKey),
-      endpoint: node.endpoint,
-      expiresAt: new Date(claims.expiresAtMs).toISOString(),
-    });
+    return this.signNodeSessionTicket(principal, node, input.clientId, input.ttlMs);
+  }
+
+  async issueNodeSessionTicket(
+    token: string,
+    input: { readonly nodeId: string; readonly clientId: string; readonly ttlMs: number },
+  ): Promise<{ readonly ticket: string; readonly endpoint: string; readonly expiresAt: string }> {
+    const principal = await this.authenticatePersonalAccessToken(token);
+    if (!principal) throw new Error("invalid credential");
+    return this.issueNodeSessionTicketForPrincipal(principal, input);
+  }
+
+  async issueNodeSessionTicketWithPassword(input: {
+    readonly username: string;
+    readonly password: string;
+    readonly nodeId: string;
+    readonly clientId: string;
+    readonly ttlMs: number;
+  }): Promise<{ readonly ticket: string; readonly endpoint: string; readonly expiresAt: string }> {
+    const principal = await this.authenticatePassword(input.username, input.password);
+    if (!principal) throw new Error("invalid credential");
+    return this.issueNodeSessionTicketForPrincipal(principal, input);
   }
 
   async issueContentTicket(
@@ -1160,6 +1216,57 @@ export class EnterpriseManagementPlane {
     return Object.freeze({ token: token.token, credentialId });
   }
 
+  private issueNodeSessionTicketForPrincipal(
+    principal: AuthenticatedManagementPrincipal,
+    input: { readonly nodeId: string; readonly clientId: string; readonly ttlMs: number },
+  ): { readonly ticket: string; readonly endpoint: string; readonly expiresAt: string } {
+    this.assertPrincipalCurrent(principal);
+    this.assertSessionTicketLifetime(input.ttlMs);
+    const node = this.requireNode(input.nodeId);
+    if (node.status !== "active") throw new Error(`node is ${node.status}`);
+    return this.signNodeSessionTicket(principal, node, input.clientId, input.ttlMs);
+  }
+
+  private signNodeSessionTicket(
+    principal: AuthenticatedManagementPrincipal,
+    node: ManagedNode,
+    clientId: string,
+    ttlMs: number,
+  ): { readonly ticket: string; readonly endpoint: string; readonly expiresAt: string } {
+    if (clientId.length === 0 || clientId.length > 160) throw new Error("invalid client ID");
+    const issuedAtMs = this.clock.nowMs();
+    const claims: SessionTicketClaims = {
+      version: 1,
+      kind: "session",
+      issuer: this.options.issuer,
+      ticketId: createOpaqueId("tkt_", 16),
+      organizationId: principal.organizationId,
+      principalId: principal.principalId,
+      principalType: principal.principalType,
+      credentialId: principal.credentialId,
+      clientId,
+      grantVersion: principal.grantVersion,
+      revocationEpoch: principal.revocationEpoch,
+      nodeId: node.nodeId,
+      paseoServerId: node.paseoServerId,
+      grants: structuredClone(principal.grants),
+      issuedAtMs,
+      notBeforeMs: issuedAtMs,
+      expiresAtMs: issuedAtMs + ttlMs,
+    };
+    return Object.freeze({
+      ticket: signSessionTicket(claims, this.options.ticketPrivateKey),
+      endpoint: node.endpoint,
+      expiresAt: new Date(claims.expiresAtMs).toISOString(),
+    });
+  }
+
+  private assertSessionTicketLifetime(ttlMs: number): void {
+    if (!Number.isInteger(ttlMs) || ttlMs < 1_000 || ttlMs > MAX_SESSION_TICKET_TTL_MS) {
+      throw new Error("invalid ticket lifetime");
+    }
+  }
+
   private assertActor(actor: AuthenticatedManagementPrincipal, action: string): void {
     this.assertPrincipalCurrent(actor);
     if (
@@ -1368,6 +1475,16 @@ function placementKey(row: DatabaseRow): string {
   ]);
 }
 
+function normalizeUsername(value: string): string {
+  const username = value.trim().toLowerCase();
+  if (!USERNAME_PATTERN.test(username)) throw new Error("invalid username");
+  return username;
+}
+
+function assertPassword(value: string): void {
+  if (value.length < 12 || value.length > 128) throw new Error("invalid password");
+}
+
 function roleGrants(role: ManagementRole, organizationId: string): ResourceGrant[] {
   const self = { kind: "self" as const };
   const organization = { kind: "organization" as const, organizationId };
@@ -1427,6 +1544,15 @@ CREATE TABLE IF NOT EXISTS credentials (
   expires_at TEXT,
   last_used_at TEXT,
   revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS password_credentials (
+  principal_id TEXT PRIMARY KEY REFERENCES principals(principal_id) ON DELETE CASCADE,
+  credential_id TEXT NOT NULL UNIQUE,
+  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_used_at TEXT
 );
 CREATE TABLE IF NOT EXISTS enrollment_tokens (
   enrollment_id TEXT PRIMARY KEY,

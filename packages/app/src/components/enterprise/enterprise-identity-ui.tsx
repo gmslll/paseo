@@ -145,6 +145,103 @@ export function EnterprisePatLoginForm<T>({
   );
 }
 
+export function EnterprisePasswordLoginForm<T>({
+  authenticate,
+  onAuthenticated,
+}: {
+  readonly authenticate: (
+    username: string,
+    password: string,
+    signal: AbortSignal,
+  ) => Promise<PatAuthenticationPortResult<T>>;
+  readonly onAuthenticated?: (value: T) => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+  const passwordRef = useRef<EditingTextInputHandle>(null);
+  const requestRef = useRef<AbortController | null>(null);
+  const pendingRef = useRef(false);
+  useEffect(
+    () => () => {
+      requestRef.current?.abort();
+      passwordRef.current?.reset();
+    },
+    [],
+  );
+  const submit = async () => {
+    if (pendingRef.current || username.trim().length < 3 || password.length < 12) return;
+    pendingRef.current = true;
+    const controller = new AbortController();
+    requestRef.current?.abort();
+    requestRef.current = controller;
+    setPending(true);
+    setError(undefined);
+    try {
+      const result = await authenticate(username.trim(), password, controller.signal);
+      if (requestRef.current !== controller) return;
+      setPassword("");
+      passwordRef.current?.reset();
+      if (result.ok) onAuthenticated?.(result.value);
+      else setError(PAT_REASON_COPY[result.reasonCode] ?? PAT_REASON_COPY["identity.unavailable"]);
+    } catch {
+      if (!controller.signal.aborted) setError(PAT_REASON_COPY["identity.unavailable"]);
+    } finally {
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        pendingRef.current = false;
+        setPending(false);
+      }
+    }
+  };
+  return (
+    <View style={styles.card} testID="enterprise-password-login-form">
+      <Text style={styles.title}>Sign in with your company account</Text>
+      <Field label="Account" testID="enterprise-account-field">
+        <FormTextInput
+          accessibilityLabel="Enterprise account"
+          autoCapitalize="none"
+          autoCorrect={false}
+          editable={!pending}
+          onChangeText={setUsername}
+          placeholder="name@company"
+          testID="enterprise-account-input"
+        />
+      </Field>
+      <Field
+        label="Password"
+        hint="Your password is exchanged for a short-lived node ticket and is never saved."
+        testID="enterprise-password-field"
+      >
+        <FormTextInput
+          ref={passwordRef}
+          accessibilityLabel="Enterprise password"
+          autoCapitalize="none"
+          autoCorrect={false}
+          editable={!pending}
+          onChangeText={setPassword}
+          placeholder="Enter your password"
+          secureTextEntry
+          testID="enterprise-password-input"
+        />
+      </Field>
+      {error ? <Text style={styles.error}>{error}</Text> : null}
+      <View style={styles.actions}>
+        <Button
+          accessibilityLabel="Sign in with company account"
+          disabled={pending || username.trim().length < 3 || password.length < 12}
+          loading={pending}
+          onPress={submit}
+          testID="enterprise-password-submit"
+        >
+          Sign in
+        </Button>
+      </View>
+    </View>
+  );
+}
+
 export interface EnterpriseIdentityNavigationProps {
   readonly projection: unknown;
   readonly onNavigate?: (destination: string) => void;
@@ -191,6 +288,7 @@ const STATUS_LABELS = {
 
 const PAT_REASON_COPY: Record<string, string> = {
   "identity.invalid_token": "The token was rejected.",
+  "identity.invalid_password": "The account or password was rejected.",
   "identity.host_upgrade_required": "Update the host to enable enterprise sign-in.",
   "identity.unavailable": "Enterprise sign-in is unavailable.",
   "identity.logout_failed": "Unable to sign out. Try again.",

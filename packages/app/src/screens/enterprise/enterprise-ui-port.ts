@@ -211,7 +211,7 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         { requestId },
         requestId,
       );
-      const parsed = EnterpriseIdentityGetCurrentResponseSchema.safeParse(response);
+      const parsed = EnterpriseIdentityGetCurrentResponseSchema.shape.payload.safeParse(response);
       if (
         !parsed.success ||
         !hasSameFence(lifecycle, {
@@ -219,7 +219,7 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
           generation: String(start.generation),
           sessionBindingKey: start.sessionBindingKey,
         }) ||
-        parsed.data.payload.identity.paseoServerId !== serverId
+        parsed.data.identity.paseoServerId !== serverId
       ) {
         throw new Error("identity.invalid_response");
       }
@@ -230,7 +230,7 @@ export function createEnterpriseUiBundle<TGeneration extends string, TContent>(
         serverId,
         generation: startGeneration,
         sessionBindingKey: startBinding,
-        projection: parsed.data.payload.identity as CurrentIdentityProjection,
+        projection: parsed.data.identity as CurrentIdentityProjection,
       });
     },
   };

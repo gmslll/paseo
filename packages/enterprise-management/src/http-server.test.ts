@@ -38,6 +38,17 @@ describe("management HTTP API", () => {
     if (!address || typeof address === "string") throw new Error("missing test server address");
     const base = `http://127.0.0.1:${address.port}`;
 
+    const preflight = await fetch(`${base}/v1/auth/password/session`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "paseo://app",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type",
+      },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("paseo://app");
+
     const health = await fetch(`${base}/v1/health`);
     expect(await health.json()).toEqual({ status: "ok" });
     const managementUi = await fetch(`${base}/`);
@@ -45,8 +56,9 @@ describe("management HTTP API", () => {
     const managementUiHtml = await managementUi.text();
     expect(managementUiHtml).toContain("保存 Grant");
     expect(managementUiHtml).toContain("员工、Boss 或管理员 PAT");
-    expect(managementUiHtml).toContain("生成 5 分钟连接票据");
+    expect(managementUiHtml).toContain("生成节点连接地址");
     expect(managementUiHtml).toContain("tcp://");
+    expect(managementUiHtml).toContain("/v1/tickets/node-session");
     expect(managementUiHtml).toContain("/v1/tickets/session");
     const managementScript = managementUiHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     expect(managementScript).toBeDefined();
@@ -65,6 +77,12 @@ describe("management HTTP API", () => {
       body: { displayName: "Employee", principalType: "human", role: "employee" },
     });
     const employee = employeeResponse.principal as { principalId: string };
+    const employeePassword = "employee-password-2026";
+    await jsonRequest(base, `/v1/principals/${employee.principalId}/password`, {
+      method: "PUT",
+      token: adminToken,
+      body: { username: "employee.one", password: employeePassword },
+    });
     const employeeTokenResponse = await jsonRequest(
       base,
       `/v1/principals/${employee.principalId}/credentials`,
@@ -106,6 +124,72 @@ describe("management HTTP API", () => {
       token: adminToken,
       body: { status: "active" },
     });
+
+    const nodeSession = await jsonRequest(base, "/v1/tickets/node-session", {
+      method: "POST",
+      token: employeeToken,
+      body: { nodeId, clientId: "desktop-http", ttlMs: 60_000 },
+    });
+    expect(nodeSession).toMatchObject({
+      endpoint: enrollmentBody.endpoint,
+      expiresAt: expect.any(String),
+    });
+    expect(String(nodeSession.ticket)).toMatch(/^pmt_v1\./);
+
+    const passwordSession = await jsonRequest(base, "/v1/auth/password/session", {
+      method: "POST",
+      body: {
+        username: "Employee.One",
+        password: employeePassword,
+        nodeId,
+        clientId: "desktop-password",
+        ttlMs: 60_000,
+      },
+    });
+    expect(passwordSession).toMatchObject({ endpoint: enrollmentBody.endpoint });
+    expect(String(passwordSession.ticket)).toMatch(/^pmt_v1\./);
+    const wrongPassword = await fetch(`${base}/v1/auth/password/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "employee.one",
+        password: "wrong-password-2026",
+        nodeId,
+        clientId: "desktop-wrong",
+        ttlMs: 60_000,
+      }),
+    });
+    expect(wrongPassword.status).toBe(401);
+    expect(JSON.stringify(await wrongPassword.json())).not.toContain(employeePassword);
+    for (let attempt = 1; attempt < 5; attempt += 1) {
+      const rejected = await fetch(`${base}/v1/auth/password/session`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          username: "employee.one",
+          password: "wrong-password-2026",
+          nodeId,
+          clientId: `desktop-wrong-${attempt}`,
+          ttlMs: 60_000,
+        }),
+      });
+      expect(rejected.status).toBe(401);
+    }
+    const rateLimited = await fetch(`${base}/v1/auth/password/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "employee.one",
+        password: employeePassword,
+        nodeId,
+        clientId: "desktop-rate-limited",
+        ttlMs: 60_000,
+      }),
+    });
+    expect(rateLimited.status).toBe(401);
+    expect(
+      JSON.stringify(await jsonRequest(base, "/v1/principals", { token: adminToken })),
+    ).not.toContain(employeePassword);
 
     const heartbeatBody = JSON.stringify({
       bootId: enrollmentBody.bootId,

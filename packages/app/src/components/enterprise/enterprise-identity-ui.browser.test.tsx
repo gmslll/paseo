@@ -6,6 +6,7 @@ import { createPatLoginFormModel } from "@/stores/enterprise/pat-login-form-mode
 import {
   EnterpriseCapabilityGate,
   EnterpriseIdentityNavigation,
+  EnterprisePasswordLoginForm,
   EnterprisePatLoginForm,
   EnterpriseResourceStatus,
 } from "./enterprise-identity-ui";
@@ -336,6 +337,57 @@ describe("enterprise identity UI", () => {
     expect(model.getSnapshot()).toEqual({ status: "idle", hasToken: false, canSubmit: false });
     expect((input as HTMLInputElement).value).toBe("");
     expect(authenticated).toHaveBeenCalledOnce();
+  });
+
+  it("submits an enterprise account password once and clears the password", async () => {
+    let resolve!: (value: { ok: true; value: string }) => void;
+    const authenticate = vi.fn(
+      () => new Promise<{ ok: true; value: string }>((done) => (resolve = done)),
+    );
+    const authenticated = vi.fn();
+    act(() =>
+      root.render(
+        <EnterprisePasswordLoginForm authenticate={authenticate} onAuthenticated={authenticated} />,
+      ),
+    );
+    const username = container.querySelector(
+      '[data-testid="enterprise-account-input"]',
+    ) as HTMLInputElement;
+    const password = container.querySelector(
+      '[data-testid="enterprise-password-input"]',
+    ) as HTMLInputElement;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+        username,
+        "employee.one",
+      );
+      username.dispatchEvent(new Event("input", { bubbles: true }));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+        password,
+        "employee-password-2026",
+      );
+      password.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const submit = container.querySelector(
+      '[data-testid="enterprise-password-submit"]',
+    ) as HTMLElement;
+    await act(async () => {
+      submit.click();
+      submit.click();
+    });
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(authenticate).toHaveBeenCalledWith(
+      "employee.one",
+      "employee-password-2026",
+      expect.any(AbortSignal),
+    );
+    expect(container.textContent).not.toContain("employee-password-2026");
+    await act(async () => {
+      resolve({ ok: true, value: "signed-in" });
+      await Promise.resolve();
+    });
+    expect(password.value).toBe("");
+    expect(authenticated).toHaveBeenCalledWith("signed-in");
   });
 
   it("closes and aborts before invoking cancel, suppressing late auth", async () => {

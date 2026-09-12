@@ -9,6 +9,7 @@ import {
   type FetchAgentsOptions,
 } from "@getpaseo/client/internal/daemon-client";
 import type {
+  EnterpriseAuthenticationResult,
   EnterpriseFileRequestTransport,
   EnterpriseIdentityLifecyclePorts,
   EnterpriseIdentityLifecycle,
@@ -43,6 +44,7 @@ import {
   BrowserProfileBindingProjectionSchema,
   BrowserProfileIdSchema,
   BrowserProfileSummarySchema,
+  CurrentIdentityProjectionSchema,
   NodeIdSchema,
   OrganizationIdSchema,
   type BrowserProfileBindingProjection,
@@ -119,6 +121,16 @@ import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
 export type HostRegistryStatus = "loading" | "ready";
+
+const EnterpriseManagementBootstrapSchema = z
+  .object({
+    mode: z.literal("managed"),
+    managementBaseUrl: z.string().url(),
+    nodeId: NodeIdSchema,
+    paseoServerId: z.string().min(1),
+  })
+  .strict();
+export type EnterpriseManagementBootstrap = z.infer<typeof EnterpriseManagementBootstrapSchema>;
 
 export type ActiveConnection =
   | { type: "directTcp"; endpoint: string; display: string }
@@ -219,6 +231,7 @@ export interface HostRuntimeControllerDeps {
    */
   createEnterpriseIdentityLifecyclePorts?: (input: {
     serverId: string;
+    productionPorts: EnterpriseIdentityLifecyclePorts;
   }) => EnterpriseIdentityLifecyclePorts;
   /** W3-owned bridge to the W4 browser runtime authorization registry. */
   browserProfileRuntimeBridge?: BrowserProfileRuntimeBridge;
@@ -705,8 +718,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
 
   return {
     ...(browserProfileRuntimeBridge ? { browserProfileRuntimeBridge } : {}),
-    createEnterpriseIdentityLifecyclePorts: ({ serverId }) =>
-      createUnavailableEnterpriseIdentityLifecyclePorts(serverId),
+    createEnterpriseIdentityLifecyclePorts: ({ productionPorts }) => productionPorts,
     createEnterpriseIdentityLifecycle: ({ vault, ports }) =>
       createEnterpriseIdentityLifecycle({ vault, ports }),
     createClient: ({ host, connection, clientId, runtimeGeneration }) => {
@@ -842,6 +854,12 @@ export class HostRuntimeController {
   private probeCycleInFlight: Promise<void> | null = null;
   private readonly enterpriseCredentialVault: ProcessCredentialVault | null;
   private readonly enterpriseIdentityLifecycle: EnterpriseIdentityLifecycle | null;
+  private readonly productionEnterpriseIdentityPortsEnabled: boolean;
+  private pendingEnterpriseAuthentication: {
+    readonly client: DaemonClient;
+    readonly connectionId: string;
+  } | null = null;
+  private enterpriseAuthenticationActivationInProgress = false;
   private readonly browserProfileRuntimeBridge: BrowserProfileRuntimeBridge | null;
   private readonly enterpriseResidueResetAdapter:
     | EnterpriseResidueResetAdapter
@@ -892,11 +910,14 @@ export class HostRuntimeController {
     this.enterpriseCredentialVault = this.deps.createEnterpriseIdentityLifecycle
       ? createProcessCredentialVault()
       : null;
+    const productionIdentityPorts = this.createProductionEnterpriseIdentityLifecyclePorts();
     const identityPorts = this.deps.createEnterpriseIdentityLifecycle
       ? (this.deps.createEnterpriseIdentityLifecyclePorts?.({
           serverId: this.host.serverId,
+          productionPorts: productionIdentityPorts,
         }) ?? createUnavailableEnterpriseIdentityLifecyclePorts(this.host.serverId))
       : null;
+    this.productionEnterpriseIdentityPortsEnabled = identityPorts === productionIdentityPorts;
     const lifecyclePorts =
       identityPorts && (this.browserProfileRuntimeBridge || this.enterpriseResidueResetAdapter)
         ? {
@@ -1187,12 +1208,207 @@ export class HostRuntimeController {
     return promise;
   }
 
+  private createProductionEnterpriseIdentityLifecyclePorts(): EnterpriseIdentityLifecyclePorts {
+    const closePendingAuthentication = async (): Promise<void> => {
+      const pending = this.pendingEnterpriseAuthentication;
+      this.pendingEnterpriseAuthentication = null;
+      if (pending) await pending.client.close().catch(() => undefined);
+    };
+    return {
+      authenticate: async ({
+        serverId,
+        token,
+        signal,
+      }): Promise<EnterpriseAuthenticationResult> => {
+        if (serverId !== this.host.serverId || signal.aborted) {
+          throw new DOMException("Aborted", "AbortError");
+        }
+        const connectionId = this.snapshot.activeConnectionId;
+        const connection = findConnectionById(this.host, connectionId);
+        if (!connection || !connectionId || connection.type !== "directTcp") {
+          throw new Error("Enterprise authentication requires a direct node connection");
+        }
+        await closePendingAuthentication();
+        const clientId = await this.resolveClientId();
+        const runtimeGeneration = this.snapshot.clientGeneration + 1;
+        const authenticatedConnection = { ...connection, password: token };
+        const candidate = this.deps.createClient({
+          host: this.host,
+          connection: authenticatedConnection,
+          clientId,
+          runtimeGeneration,
+          enterpriseFileRequest: this.enterpriseIdentityLifecycle
+            ? createEnterpriseFileRequestFactory({ lifecycle: this.enterpriseIdentityLifecycle })({
+                host: this.host,
+                connection: authenticatedConnection,
+                clientId,
+                runtimeGeneration,
+              })
+            : undefined,
+        });
+        candidate.setReconnectEnabled(false);
+        const teardownAttempt = async () => {
+          if (this.pendingEnterpriseAuthentication?.client === candidate) {
+            this.pendingEnterpriseAuthentication = null;
+          }
+          await candidate.close().catch(() => undefined);
+        };
+        try {
+          await candidate.connect();
+          if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+          const info = candidate.getLastServerInfoMessage();
+          if (info?.serverId !== serverId || info.features?.enterpriseIdentityV1 !== true) {
+            throw new Error("Enterprise identity is unavailable on this host");
+          }
+          const requestId = `identity-login-${crypto.randomUUID()}`;
+          const response = z
+            .object({ requestId: z.string().min(1), identity: CurrentIdentityProjectionSchema })
+            .strict()
+            .parse(
+              await candidate.requestEnterprise(
+                "enterprise.identity.get_current.request",
+                {},
+                requestId,
+              ),
+            );
+          if (response.requestId !== requestId || response.identity.paseoServerId !== serverId) {
+            throw new Error("Enterprise identity response did not match the host");
+          }
+          this.pendingEnterpriseAuthentication = { client: candidate, connectionId };
+          return Object.freeze({
+            projection: response.identity,
+            sessionBindingKey: crypto.randomUUID(),
+            teardownAttempt,
+          });
+        } catch (error) {
+          await teardownAttempt();
+          throw error;
+        }
+      },
+      teardown: {
+        stopNetworkAndSubscriptions: async () => undefined,
+        disposeRuntimeAndCachePartition: async () => undefined,
+        destroyDaemonClient: async () => {
+          await this.disposePreviousActiveClient();
+          await closePendingAuthentication();
+        },
+        startNewClient: async ({ serverId }) => {
+          if (serverId !== this.host.serverId) throw new Error("Enterprise host changed");
+          const pending = this.pendingEnterpriseAuthentication;
+          if (!pending) throw new Error("Enterprise authenticated client unavailable");
+          this.pendingEnterpriseAuthentication = null;
+          this.enterpriseAuthenticationActivationInProgress = true;
+          try {
+            await this.switchToConnection({
+              connectionId: pending.connectionId,
+              existingClient: pending.client,
+            });
+          } finally {
+            this.enterpriseAuthenticationActivationInProgress = false;
+          }
+          if (this.activeClient !== pending.client) {
+            await pending.client.close().catch(() => undefined);
+            throw new Error("Enterprise authenticated client was not activated");
+          }
+        },
+        hydrateScope: async () => undefined,
+      },
+      remoteLogout: {
+        logoutAll: async (serverId) => {
+          if (serverId !== this.host.serverId || !this.activeClient) return;
+          const requestId = `identity-logout-${crypto.randomUUID()}`;
+          const response = await this.activeClient.requestEnterprise(
+            "enterprise.identity.logout_all.request",
+            {},
+            requestId,
+          );
+          if (response.requestId !== requestId || response.loggedOut !== true) {
+            throw new Error("Enterprise logout failed");
+          }
+        },
+      },
+    };
+  }
+
   authenticateEnterpriseHost(
     input: Parameters<EnterpriseIdentityLifecycle["authenticateEnterpriseHost"]>[0],
   ): Promise<ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]>> {
     if (!this.enterpriseIdentityLifecycle)
       return Promise.reject(new Error("Enterprise identity unavailable"));
     return this.enterpriseIdentityLifecycle.authenticateEnterpriseHost(input);
+  }
+
+  async discoverEnterpriseManagement(input?: {
+    readonly signal?: AbortSignal;
+  }): Promise<EnterpriseManagementBootstrap | null> {
+    const connection = findConnectionById(this.host, this.snapshot.activeConnectionId);
+    if (!connection || connection.type !== "directTcp") return null;
+    const bootstrapResponse = await fetch(
+      new URL(
+        "/api/enterprise/bootstrap",
+        `${connection.useTls ? "https" : "http"}://${connection.endpoint}`,
+      ),
+      {
+        method: "GET",
+        signal: input?.signal,
+        headers: { accept: "application/json" },
+      },
+    );
+    if (bootstrapResponse.status === 404) return null;
+    if (!bootstrapResponse.ok) throw new Error("Enterprise management discovery failed");
+    const bootstrap = EnterpriseManagementBootstrapSchema.parse(await bootstrapResponse.json());
+    if (bootstrap.paseoServerId !== this.host.serverId) {
+      throw new Error("Enterprise management discovery returned a different host");
+    }
+    return bootstrap;
+  }
+
+  async authenticateEnterpriseHostWithPassword(input: {
+    readonly serverId: string;
+    readonly username: string;
+    readonly password: string;
+    readonly signal?: AbortSignal;
+  }): Promise<ReturnType<EnterpriseIdentityLifecycle["readSnapshot"]>> {
+    if (input.serverId !== this.host.serverId || !this.enterpriseIdentityLifecycle) {
+      throw new Error("Enterprise identity unavailable");
+    }
+    if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const bootstrap = await this.discoverEnterpriseManagement({ signal: input.signal });
+    if (!bootstrap) throw new Error("Enterprise password login requires a managed node connection");
+    const ticketResponse = await fetch(
+      new URL("/v1/auth/password/session", bootstrap.managementBaseUrl),
+      {
+        method: "POST",
+        signal: input.signal,
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          username: input.username,
+          password: input.password,
+          nodeId: bootstrap.nodeId,
+          clientId: await this.resolveClientId(),
+          ttlMs: 5 * 60_000,
+        }),
+      },
+    );
+    const ticketBody = await ticketResponse.json();
+    if (!ticketResponse.ok) {
+      throw new Error(
+        ticketResponse.status === 401 ? "identity.invalid_password" : "identity.unavailable",
+      );
+    }
+    const ticket = z
+      .object({
+        ticket: z.string().startsWith("pmt_v1."),
+        endpoint: z.string().url(),
+        expiresAt: z.string().datetime({ offset: true }),
+      })
+      .strict()
+      .parse(ticketBody);
+    return this.enterpriseIdentityLifecycle.authenticateEnterpriseHost({
+      serverId: input.serverId,
+      token: ticket.ticket,
+      signal: input.signal,
+    });
   }
 
   subscribe(listener: () => void): () => void {
@@ -1852,6 +2068,7 @@ export class HostRuntimeController {
       if (!existingClient) {
         await client.connect();
       }
+      await this.bootstrapEnterpriseIdentityForConnectedClient({ client, connection });
       await this.mountBrowserPageIdentityHandlerIfReady({ client, requestVersion });
     } catch (error) {
       if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) {
@@ -1864,6 +2081,36 @@ export class HostRuntimeController {
       });
       this.updateSnapshot({
         ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
+      });
+    }
+  }
+
+  private async bootstrapEnterpriseIdentityForConnectedClient(input: {
+    readonly client: DaemonClient;
+    readonly connection: HostConnection;
+  }): Promise<void> {
+    const lifecycle = this.enterpriseIdentityLifecycle;
+    if (
+      !lifecycle ||
+      !this.productionEnterpriseIdentityPortsEnabled ||
+      this.enterpriseAuthenticationActivationInProgress
+    )
+      return;
+    const enterpriseIdentityV1 =
+      input.client.getLastServerInfoMessage()?.features?.enterpriseIdentityV1 === true;
+    await lifecycle.bootstrap({
+      target: enterpriseIdentityV1 ? "enterprise_host" : "legacy_passthrough",
+      enterpriseIdentityV1,
+    });
+    if (
+      enterpriseIdentityV1 &&
+      lifecycle.readSnapshot().state !== "signed_in" &&
+      input.connection.type === "directTcp" &&
+      input.connection.password?.startsWith("pmt_v1.")
+    ) {
+      await lifecycle.authenticateEnterpriseHost({
+        serverId: this.host.serverId,
+        token: input.connection.password,
       });
     }
   }
@@ -3057,6 +3304,24 @@ export class HostRuntimeStore {
 
   getEnterpriseIdentityLifecycle(serverId: string): EnterpriseIdentityLifecycle | null {
     return this.controllers.get(serverId)?.getEnterpriseIdentityLifecycle() ?? null;
+  }
+
+  authenticateEnterpriseHostWithPassword(
+    serverId: string,
+    input: { readonly username: string; readonly password: string; readonly signal?: AbortSignal },
+  ): Promise<EnterpriseIdentitySnapshot> {
+    const controller = this.controllers.get(serverId);
+    if (!controller) return Promise.reject(new Error("Enterprise identity unavailable"));
+    return controller.authenticateEnterpriseHostWithPassword({ serverId, ...input });
+  }
+
+  discoverEnterpriseManagement(
+    serverId: string,
+    input?: { readonly signal?: AbortSignal },
+  ): Promise<EnterpriseManagementBootstrap | null> {
+    const controller = this.controllers.get(serverId);
+    if (!controller) return Promise.resolve(null);
+    return controller.discoverEnterpriseManagement(input);
   }
 
   subscribeEnterpriseIdentity(

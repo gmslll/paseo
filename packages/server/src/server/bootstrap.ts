@@ -570,6 +570,24 @@ export interface PaseoDaemonDependencies {
   };
 }
 
+export function resolveEnterpriseManagementBootstrap(
+  config: EnterpriseMultiUserConfig | undefined,
+  paseoServerId: string,
+): Readonly<{
+  mode: "managed";
+  managementBaseUrl: string;
+  nodeId: string;
+  paseoServerId: string;
+}> | null {
+  if (config?.enabled !== true || config.managementMode !== "managed") return null;
+  return Object.freeze({
+    mode: "managed",
+    managementBaseUrl: config.management.baseUrl,
+    nodeId: config.nodeId,
+    paseoServerId,
+  });
+}
+
 async function resolveEnterpriseRuntime(
   paseoHome: string,
   enterpriseConfig: EnterpriseMultiUserConfig | undefined,
@@ -1085,6 +1103,15 @@ export async function createPaseoDaemon(
       express.json(),
       createTerminalActivityRouteHandler(terminalManager),
     );
+
+    app.get("/api/enterprise/bootstrap", (_req, res) => {
+      const bootstrap = resolveEnterpriseManagementBootstrap(capturedEnterpriseMultiUser, serverId);
+      if (!bootstrap) {
+        res.status(404).json({ error: "enterprise management unavailable" });
+        return;
+      }
+      res.json(bootstrap);
+    });
 
     // Serve the bundled browser web UI when enabled. Mounted after service-proxy
     // classification and host/CORS handling, but before daemon bearer auth, so

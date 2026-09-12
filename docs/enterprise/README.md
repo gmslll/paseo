@@ -32,3 +32,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0027: Single-resource ownership transfer contract](decisions/0027-single-resource-ownership-transfer.md)
 - [ADR 0028: Browser page identity observation ownership](decisions/0028-browser-page-identity-observation.md)
 - [ADR 0029: Distributed management plane v1](decisions/0029-distributed-management-plane-v1.md)
+- [ADR 0030: Enterprise password ticket exchange](decisions/0030-enterprise-password-ticket-exchange.md)

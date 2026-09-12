@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   createBrowserProfileProjectionHydrator,
   isEnterpriseBrowserProfilesEnabled,
+  isEnterpriseIdentityEnabled,
   isEnterpriseWorkbenchSignedIn,
 } from "@/runtime/enterprise-workbench-assembly";
 import {
@@ -9,11 +10,15 @@ import {
   useHostEnterpriseIdentityLifecycle,
   useHostEnterpriseIdentitySnapshot,
   useHostRuntimeClient,
+  useHostRuntimeSnapshot,
 } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { createBossResourceStore } from "@/stores/enterprise/boss-resource-store";
 import { createPatLoginFormModel } from "@/stores/enterprise/pat-login-form-model";
-import { EnterprisePatLoginForm } from "@/components/enterprise/enterprise-identity-ui";
+import {
+  EnterprisePasswordLoginForm,
+  EnterprisePatLoginForm,
+} from "@/components/enterprise/enterprise-identity-ui";
 import { EnterpriseWorkbenchContainer } from "@/screens/enterprise/enterprise-workbench-screen";
 import {
   createEnterpriseUiBundle,
@@ -34,6 +39,8 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   const lifecycle = useHostEnterpriseIdentityLifecycle(serverId);
   const identitySnapshot = useHostEnterpriseIdentitySnapshot(serverId);
   const daemonClient = useHostRuntimeClient(serverId);
+  const runtimeSnapshot = useHostRuntimeSnapshot(serverId);
+  const [managedNodeDiscovered, setManagedNodeDiscovered] = useState(false);
   const capability = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features ?? null,
   );
@@ -77,6 +84,26 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
     },
     [bundle, serverId],
   );
+  const authenticatePassword = useCallback(
+    async (username: string, password: string, signal: AbortSignal) => {
+      try {
+        const snapshot = await getHostRuntimeStore().authenticateEnterpriseHostWithPassword(
+          serverId,
+          { username, password, signal },
+        );
+        return { ok: true as const, value: snapshot };
+      } catch (error) {
+        return {
+          ok: false as const,
+          reasonCode:
+            error instanceof Error && error.message === "identity.invalid_password"
+              ? "identity.invalid_password"
+              : "identity.unavailable",
+        };
+      }
+    },
+    [serverId],
+  );
   const signedIn = isEnterpriseWorkbenchSignedIn(identitySnapshot);
   const bossStore = useMemo(
     () =>
@@ -102,10 +129,40 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   const patModel = useMemo(() => (models ? createPatLoginFormModel() : null), [models]);
 
   useEffect(() => () => bossStore?.dispose(), [bossStore]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setManagedNodeDiscovered(false);
+    if (runtimeSnapshot?.activeConnection?.type !== "directTcp") return () => controller.abort();
+    void getHostRuntimeStore()
+      .discoverEnterpriseManagement(serverId, { signal: controller.signal })
+      .then((value) => {
+        if (!controller.signal.aborted) setManagedNodeDiscovered(value !== null);
+        return undefined;
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setManagedNodeDiscovered(false);
+      });
+    return () => controller.abort();
+  }, [runtimeSnapshot?.activeConnection, runtimeSnapshot?.clientGeneration, serverId]);
 
-  if (!models || !bundle || !patModel) return null;
+  const enterpriseIdentityAvailable =
+    managedNodeDiscovered || isEnterpriseIdentityEnabled(capability);
+
+  if (
+    !models ||
+    !bundle ||
+    !patModel ||
+    (identitySnapshot?.target === "legacy_passthrough" && !managedNodeDiscovered) ||
+    !enterpriseIdentityAvailable
+  )
+    return null;
   if (!signedIn) {
-    return <EnterprisePatLoginForm model={patModel} authenticate={authenticatePat} />;
+    return (
+      <>
+        <EnterprisePasswordLoginForm authenticate={authenticatePassword} />
+        <EnterprisePatLoginForm model={patModel} authenticate={authenticatePat} />
+      </>
+    );
   }
   if (!bossStore) return null;
   return (

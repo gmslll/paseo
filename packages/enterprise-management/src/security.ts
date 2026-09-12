@@ -8,6 +8,8 @@ import {
   type KeyObject,
 } from "node:crypto";
 
+import { compare, hash } from "bcryptjs";
+
 import {
   NodeRequestAuthenticationSchema,
   SessionTicketClaimsSchema,
@@ -31,6 +33,8 @@ export interface SecretDigest {
   readonly digest: string;
 }
 
+export const PASSWORD_BCRYPT_COST = 12;
+
 export async function digestSecret(secret: string, salt = randomBytes(16)): Promise<SecretDigest> {
   if (!TOKEN_SECRET_PATTERN.test(secret)) throw new Error("invalid secret");
   const derived = await deriveSecret(secret, salt, 64);
@@ -49,6 +53,15 @@ export async function verifySecret(secret: string, expected: SecretDigest): Prom
   }
   const actual = await deriveSecret(secret, salt, digest.length);
   return actual.length === digest.length && timingSafeEqual(actual, digest);
+}
+
+export async function digestPassword(password: string): Promise<string> {
+  return hash(password, PASSWORD_BCRYPT_COST);
+}
+
+export async function verifyPassword(password: string, expectedHash: string): Promise<boolean> {
+  if (!/^\$2[aby]\$12\$[./A-Za-z0-9]{53}$/.test(expectedHash)) return false;
+  return compare(password, expectedHash);
 }
 
 export function createOpaqueId(prefix: string, bytes: number): string {

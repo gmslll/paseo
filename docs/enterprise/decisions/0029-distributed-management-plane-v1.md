@@ -24,8 +24,9 @@ enrollment, tickets, leases, or audit upload.
 
 ## Trust and authentication
 
-- Employees and administrators authenticate to the management plane with one-time-displayed
-  personal access tokens. Only a memory-hard digest and credential metadata are stored.
+- Administrator automation and recovery use one-time-displayed personal access tokens. Human
+  employee sign-in may exchange a username and password for a node-bound Session Ticket as defined
+  by [ADR-0030](0030-enterprise-password-ticket-exchange.md).
 - An administrator creates a short-lived, one-use enrollment token. The node generates an Ed25519
   key pair locally and submits only its public key during enrollment.
 - Every later node request signs method, path, timestamp, nonce, and body digest. The plane verifies
