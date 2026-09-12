@@ -79,7 +79,6 @@ import {
 } from "./features/browser-webviews/index.js";
 
 import {
-  BrowserProfileRuntimeAuthorizationRegistry,
   clearPaseoBrowserProfile,
   getEnterpriseBrowserProfilePartition,
   getLegacyPaseoBrowserProfileSession,
@@ -96,7 +95,7 @@ import {
   HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL,
   REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL,
 } from "./features/browser-webviews/profile-authorizations.js";
-import { createBrowserProfileAuthorizationHandler } from "./features/browser-webviews/profile-authorizations-handler.js";
+import { BrowserProfileAuthorizationRegistryRouter } from "./features/browser-webviews/profile-authorizations-handler.js";
 import { parseOpenProjectPathFromArgv } from "./open-project-routing.js";
 import {
   createDesktopWindowOwner,
@@ -128,7 +127,6 @@ import {
   type AgentDeepLinkTarget,
 } from "@getpaseo/protocol/agent-deep-link";
 import { AgentNavigationInbox, parseAgentDeepLinkFromArgv } from "./agent-navigation.js";
-import { loadPersistedConfig, resolvePaseoHome } from "@getpaseo/server";
 
 const browserPageIdentityPublisherRegistry = createBrowserPageIdentityPublisherRegistry({
   registry: getPaseoBrowserWebviewRegistry(),
@@ -282,8 +280,8 @@ const PROFILE_SELECTOR_ATTRIBUTES = [
   PROFILE_LIFECYCLE_ATTRIBUTE,
 ] as const;
 
-let browserProfileAuthorizationRegistry: BrowserProfileRuntimeAuthorizationRegistry | null = null;
-const browserProfileLifecycleGenerationByHost = new Map<number, string>();
+let browserProfileAuthorizationRegistryRouter: BrowserProfileAuthorizationRegistryRouter | null =
+  null;
 
 function readBrowserProfileSelectorFromWebviewParams(
   params: Record<string, string>,
@@ -307,7 +305,7 @@ function resolveBrowserProfileAuthorization(
   hostWebContentsId: number,
   selector: BrowserProfileRuntimeSelector,
 ): BrowserProfileRuntimeAuthorization {
-  const authorization = browserProfileAuthorizationRegistry?.resolveExact(
+  const authorization = browserProfileAuthorizationRegistryRouter?.resolveExact(
     hostWebContentsId,
     selector,
   );
@@ -367,31 +365,17 @@ function createBrowserProfileAuthorizationCleanup(hostWebContentsId: number) {
   };
 }
 
-function createBrowserProfileHandler(hostWebContentsId: number) {
-  if (!browserProfileAuthorizationRegistry) {
-    throw new Error("Browser Profile authorization is unavailable.");
-  }
-  return createBrowserProfileAuthorizationHandler({
-    registry: browserProfileAuthorizationRegistry,
-    hostWebContentsId,
-    cleanup: createBrowserProfileAuthorizationCleanup(hostWebContentsId),
-  });
-}
-
 function registerBrowserProfileAuthorizationIpc(): void {
-  const enterprise = loadPersistedConfig(resolvePaseoHome(process.env)).features
-    ?.enterpriseMultiUser;
-  if (!enterprise?.enabled) return;
-  browserProfileAuthorizationRegistry = new BrowserProfileRuntimeAuthorizationRegistry(
-    enterprise.nodeId,
+  browserProfileAuthorizationRegistryRouter = new BrowserProfileAuthorizationRegistryRouter(
+    createBrowserProfileAuthorizationCleanup,
   );
   ipcMain.handle(
     HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL,
     async (event, rawInput: unknown) => {
       const input = readStableIpcRecord(
         rawInput,
-        ["authorizations", "lifecycleGeneration"],
-        ["authorizations", "lifecycleGeneration"],
+        ["authorizations", "homeNodeId", "lifecycleGeneration"],
+        ["authorizations", "homeNodeId", "lifecycleGeneration"],
         "Browser Profile authorization hydration",
       );
       if (!Array.isArray(input.authorizations)) {
@@ -401,43 +385,43 @@ function registerBrowserProfileAuthorizationIpc(): void {
         input.lifecycleGeneration,
         "Browser Profile lifecycle generation",
       );
-      const handler = createBrowserProfileHandler(event.sender.id);
-      const pending = handler.hydrate(input.authorizations, lifecycleGeneration);
-      browserProfileLifecycleGenerationByHost.set(event.sender.id, lifecycleGeneration);
-      return pending;
+      const homeNodeId = readNonEmptyIpcString(input.homeNodeId, "Browser Profile home node ID");
+      return browserProfileAuthorizationRegistryRouter!.hydrate({
+        hostWebContentsId: event.sender.id,
+        homeNodeId,
+        authorizations: input.authorizations,
+        lifecycleGeneration,
+      });
     },
   );
   ipcMain.handle(REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL, async (event, rawInput: unknown) => {
     const input = readStableIpcRecord(
       rawInput,
-      ["lifecycleGeneration"],
-      ["lifecycleGeneration"],
+      ["homeNodeId", "lifecycleGeneration"],
+      ["homeNodeId", "lifecycleGeneration"],
       "Browser Profile generation revocation",
     );
     const lifecycleGeneration = readNonEmptyIpcString(
       input.lifecycleGeneration,
       "Browser Profile lifecycle generation",
     );
-    const pending = createBrowserProfileHandler(event.sender.id).revoke(lifecycleGeneration);
-    if (browserProfileLifecycleGenerationByHost.get(event.sender.id) === lifecycleGeneration) {
-      browserProfileLifecycleGenerationByHost.delete(event.sender.id);
-    }
-    return pending;
+    const homeNodeId = readNonEmptyIpcString(input.homeNodeId, "Browser Profile home node ID");
+    return browserProfileAuthorizationRegistryRouter!.revoke({
+      hostWebContentsId: event.sender.id,
+      homeNodeId,
+      lifecycleGeneration,
+    });
   });
 }
 
 function revokeBrowserProfileHost(hostWebContentsId: number): void {
-  const generation = browserProfileLifecycleGenerationByHost.get(hostWebContentsId);
-  browserProfileLifecycleGenerationByHost.delete(hostWebContentsId);
-  if (!generation || !browserProfileAuthorizationRegistry) return;
-  void createBrowserProfileHandler(hostWebContentsId)
-    .revoke(generation)
-    .catch((error) => {
-      log.error("[browser-profile] failed to cleanup closed host", {
-        hostWebContentsId,
-        error,
-      });
+  if (!browserProfileAuthorizationRegistryRouter) return;
+  void browserProfileAuthorizationRegistryRouter.revokeHost(hostWebContentsId).catch((error) => {
+    log.error("[browser-profile] failed to cleanup closed host", {
+      hostWebContentsId,
+      error,
     });
+  });
 }
 
 function showBrowserWebviewContextMenu(

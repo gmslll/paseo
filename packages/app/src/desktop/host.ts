@@ -156,10 +156,14 @@ export interface DesktopBrowserProfileRuntimeAuthorization {
 
 export interface DesktopBrowserBridge {
   hydrateBrowserProfileAuthorizations?: (input: {
+    homeNodeId: string;
     authorizations: readonly DesktopBrowserProfileRuntimeAuthorization[];
     lifecycleGeneration: string;
   }) => Promise<void>;
-  revokeBrowserProfileGeneration?: (input: { lifecycleGeneration: string }) => Promise<void>;
+  revokeBrowserProfileGeneration?: (input: {
+    homeNodeId: string;
+    lifecycleGeneration: string;
+  }) => Promise<void>;
   setShortcutPolicy?: (input: BrowserKeyboardPolicy) => Promise<void>;
   readonly profilePartition?: string;
   registerAttachedBrowser?: (input: DesktopAttachedBrowserRegistration) => Promise<void>;

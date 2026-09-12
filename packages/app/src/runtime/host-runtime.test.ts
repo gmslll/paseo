@@ -1595,6 +1595,10 @@ describe("HostRuntimeController", () => {
       (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
         .lifecycleGeneration,
     ).toBe(generationA);
+    expect(
+      (bridge.hydrateBrowserProfileAuthorizations as ReturnType<typeof vi.fn>).mock.calls[0][0]
+        .homeNodeId,
+    ).toBe("nod_aaaaaaaaaaaaaaaa");
     await expect(
       controller.hydrateBrowserProfileAuthorizations({
         authorizations: [{ ...authorizationA, browserProfileId: "brw_invalid" }],
@@ -1629,6 +1633,10 @@ describe("HostRuntimeController", () => {
     );
     expect(events.indexOf(`revoke:${generationA}`)).toBeLessThan(events.lastIndexOf("stop"));
     expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
+    expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledWith({
+      homeNodeId: "nod_aaaaaaaaaaaaaaaa",
+      lifecycleGeneration: generationA,
+    });
     await lifecycle!.logoutCurrent(host.serverId);
     expect(bridge.revokeBrowserProfileGeneration).toHaveBeenCalledTimes(1);
     await expect(

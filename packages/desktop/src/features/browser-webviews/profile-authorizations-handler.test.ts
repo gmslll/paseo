@@ -4,7 +4,10 @@ import {
   getEnterpriseBrowserProfilePartition,
   type BrowserProfileRuntimeAuthorization,
 } from "../browser-profile.js";
-import { createBrowserProfileAuthorizationHandler } from "./profile-authorizations-handler.js";
+import {
+  BrowserProfileAuthorizationRegistryRouter,
+  createBrowserProfileAuthorizationHandler,
+} from "./profile-authorizations-handler.js";
 
 const NODE_ID = "nod_1111111111111111";
 const baseAuthorization: BrowserProfileRuntimeAuthorization = {
@@ -101,5 +104,85 @@ describe("browser profile authorization handler", () => {
     expect(getEnterpriseBrowserProfilePartition(baseAuthorization.browserProfileId)).toBe(
       "persist:paseo-enterprise-brp_1111111111111111",
     );
+  });
+});
+
+describe("browser profile authorization registry router", () => {
+  it("treats revoke before hydration as an installed no-op", async () => {
+    const createCleanup = vi.fn(() => ({
+      unregisterProfile: vi.fn(),
+      findGuests: () => [],
+      destroyGuest: vi.fn(),
+    }));
+    const router = new BrowserProfileAuthorizationRegistryRouter(createCleanup);
+
+    await expect(
+      router.revoke({
+        hostWebContentsId: 51,
+        homeNodeId: NODE_ID,
+        lifecycleGeneration: "generation-a",
+      }),
+    ).resolves.toEqual([]);
+    expect(createCleanup).not.toHaveBeenCalled();
+  });
+
+  it("isolates remote node generations in one desktop host", async () => {
+    const nodeB = "nod_2222222222222222";
+    const unregisterProfile = vi.fn();
+    const router = new BrowserProfileAuthorizationRegistryRouter(() => ({
+      unregisterProfile,
+      findGuests: () => [],
+      destroyGuest: vi.fn(),
+    }));
+    const authorizationA = baseAuthorization;
+    const authorizationB = { ...baseAuthorization, homeNodeId: nodeB };
+
+    await router.hydrate({
+      hostWebContentsId: 52,
+      homeNodeId: NODE_ID,
+      authorizations: [authorizationA],
+      lifecycleGeneration: "generation-a",
+    });
+    await router.hydrate({
+      hostWebContentsId: 52,
+      homeNodeId: nodeB,
+      authorizations: [authorizationB],
+      lifecycleGeneration: "generation-a",
+    });
+
+    expect(router.resolveExact(52, authorizationA)).toEqual(authorizationA);
+    expect(router.resolveExact(52, authorizationB)).toEqual(authorizationB);
+    await router.revoke({
+      hostWebContentsId: 52,
+      homeNodeId: NODE_ID,
+      lifecycleGeneration: "generation-a",
+    });
+    expect(router.resolveExact(52, authorizationA)).toBeNull();
+    expect(router.resolveExact(52, authorizationB)).toEqual(authorizationB);
+    expect(unregisterProfile).toHaveBeenCalledTimes(1);
+    expect(unregisterProfile).toHaveBeenCalledWith(authorizationA);
+
+    await router.revokeHost(52);
+    expect(router.resolveExact(52, authorizationB)).toBeNull();
+    expect(unregisterProfile).toHaveBeenCalledTimes(2);
+    expect(unregisterProfile).toHaveBeenLastCalledWith(authorizationB);
+  });
+
+  it("rejects a node claim that does not match the authorization set", async () => {
+    const router = new BrowserProfileAuthorizationRegistryRouter(() => ({
+      unregisterProfile: vi.fn(),
+      findGuests: () => [],
+      destroyGuest: vi.fn(),
+    }));
+
+    await expect(
+      router.hydrate({
+        hostWebContentsId: 53,
+        homeNodeId: "nod_2222222222222222",
+        authorizations: [baseAuthorization],
+        lifecycleGeneration: "generation-a",
+      }),
+    ).rejects.toThrow("generation");
+    expect(router.resolveExact(53, baseAuthorization)).toBeNull();
   });
 });

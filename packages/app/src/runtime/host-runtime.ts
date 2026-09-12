@@ -268,10 +268,14 @@ export interface BrowserProfileRuntimeAuthorization {
 
 export interface BrowserProfileRuntimeBridge {
   hydrateBrowserProfileAuthorizations(input: {
+    readonly homeNodeId: string;
     readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
     readonly lifecycleGeneration: string;
   }): Promise<void>;
-  revokeBrowserProfileGeneration(input: { readonly lifecycleGeneration: string }): Promise<void>;
+  revokeBrowserProfileGeneration(input: {
+    readonly homeNodeId: string;
+    readonly lifecycleGeneration: string;
+  }): Promise<void>;
 }
 
 export interface BrowserProfileRuntimeProjectionInput {
@@ -697,11 +701,14 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
     typeof desktopBrowser.revokeBrowserProfileGeneration === "function"
       ? {
           hydrateBrowserProfileAuthorizations: (input: {
+            readonly homeNodeId: string;
             readonly authorizations: readonly BrowserProfileRuntimeAuthorization[];
             readonly lifecycleGeneration: string;
           }) => desktopBrowser.hydrateBrowserProfileAuthorizations!(input),
-          revokeBrowserProfileGeneration: (input: { readonly lifecycleGeneration: string }) =>
-            desktopBrowser.revokeBrowserProfileGeneration!(input),
+          revokeBrowserProfileGeneration: (input: {
+            readonly homeNodeId: string;
+            readonly lifecycleGeneration: string;
+          }) => desktopBrowser.revokeBrowserProfileGeneration!(input),
         }
       : undefined;
   const browserAutomationCapabilities = browserHostAvailable
@@ -866,6 +873,7 @@ export class HostRuntimeController {
     | ProductionEnterpriseResidueResetAdapter
     | null;
   private browserProfileLifecycleGeneration: string | null = null;
+  private browserProfileHomeNodeId: string | null = null;
   private lastRevokedBrowserProfileGeneration: string | null = null;
   private browserProfileRevocationInFlight: {
     generation: string;
@@ -981,8 +989,9 @@ export class HostRuntimeController {
         : null;
     if (this.enterpriseIdentityLifecycle) {
       this.enterpriseIdentityLifecycle.subscribe((snapshot) => {
-        if (snapshot.state === "signed_in" && snapshot.generation) {
+        if (snapshot.state === "signed_in" && snapshot.generation && snapshot.projection) {
           this.browserProfileLifecycleGeneration = snapshot.generation;
+          this.browserProfileHomeNodeId = snapshot.projection.nodeId;
           this.enterpriseResidueResetAdapter?.activate({
             serverId: this.host.serverId,
             lifecycleGeneration: snapshot.generation,
@@ -1045,9 +1054,10 @@ export class HostRuntimeController {
     }
     const snapshot = lifecycle.readSnapshot();
     const generation = snapshot.generation;
-    if (snapshot.state !== "signed_in" || !generation) {
+    if (snapshot.state !== "signed_in" || !generation || !snapshot.projection) {
       throw new Error("Browser profile identity is not signed in");
     }
+    const homeNodeId = snapshot.projection.nodeId;
     const parsedGeneration = BrowserProfileLifecycleGenerationSchema.safeParse(
       input.lifecycleGeneration,
     );
@@ -1060,13 +1070,18 @@ export class HostRuntimeController {
     }
     const detached = input.authorizations.map((authorization) => {
       const parsed = BrowserProfileRuntimeAuthorizationSchema.safeParse(authorization);
-      if (!parsed.success || parsed.data.lifecycleGeneration !== parsedGeneration.data) {
+      if (
+        !parsed.success ||
+        parsed.data.lifecycleGeneration !== parsedGeneration.data ||
+        parsed.data.homeNodeId !== homeNodeId
+      ) {
         throw new Error("Invalid browser profile authorization generation");
       }
       return Object.freeze(structuredClone(parsed.data));
     });
     try {
       await bridge.hydrateBrowserProfileAuthorizations({
+        homeNodeId,
         authorizations: Object.freeze(detached),
         lifecycleGeneration: parsedGeneration.data,
       });
@@ -1188,12 +1203,18 @@ export class HostRuntimeController {
     }
     const bridge = this.browserProfileRuntimeBridge;
     if (!bridge) return;
+    const homeNodeId = this.browserProfileHomeNodeId;
+    if (!homeNodeId) throw new Error("Browser profile home node is unavailable");
     const promise = (async () => {
       try {
-        await bridge.revokeBrowserProfileGeneration({ lifecycleGeneration: generation });
+        await bridge.revokeBrowserProfileGeneration({
+          homeNodeId,
+          lifecycleGeneration: generation,
+        });
         this.lastRevokedBrowserProfileGeneration = generation;
         if (this.browserProfileLifecycleGeneration === generation) {
           this.browserProfileLifecycleGeneration = null;
+          this.browserProfileHomeNodeId = null;
         }
       } catch (error) {
         this.browserProfileBridgeSealed = true;

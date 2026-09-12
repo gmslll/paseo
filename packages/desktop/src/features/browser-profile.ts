@@ -141,6 +141,10 @@ export function parseBrowserProfileRuntimeAuthorization(
   return deepFreezeClone(authorization);
 }
 
+export function parseBrowserProfileRuntimeNodeId(input: unknown): string {
+  return parsePattern(input, ENTERPRISE_NODE_ID_PATTERN, "home node ID");
+}
+
 export function parseBrowserProfileRuntimeSelector(input: unknown): BrowserProfileRuntimeSelector {
   const record = parseExactRecord(input, RUNTIME_SELECTOR_KEYS, "runtime selector");
   return Object.freeze({

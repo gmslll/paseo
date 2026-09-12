@@ -329,10 +329,11 @@ contextBridge.exposeInMainWorld("paseoDesktop", {
   },
   browser: {
     hydrateBrowserProfileAuthorizations: (input: {
+      homeNodeId: string;
       authorizations: unknown[];
       lifecycleGeneration: string;
     }) => ipcRenderer.invoke(HYDRATE_BROWSER_PROFILE_AUTHORIZATIONS_CHANNEL, input),
-    revokeBrowserProfileGeneration: (input: { lifecycleGeneration: string }) =>
+    revokeBrowserProfileGeneration: (input: { homeNodeId: string; lifecycleGeneration: string }) =>
       ipcRenderer.invoke(REVOKE_BROWSER_PROFILE_GENERATION_CHANNEL, input),
     pageIdentityTransport: {
       mount: async (handler: (request: unknown) => void): Promise<void> => {

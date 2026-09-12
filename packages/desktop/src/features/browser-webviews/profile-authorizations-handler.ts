@@ -1,6 +1,8 @@
-import type {
-  BrowserProfileRuntimeAuthorization,
+import type { BrowserProfileRuntimeAuthorization } from "../browser-profile.js";
+import {
   BrowserProfileRuntimeAuthorizationRegistry,
+  parseBrowserProfileRuntimeNodeId,
+  parseBrowserProfileRuntimeSelector,
 } from "../browser-profile.js";
 
 export interface BrowserProfileAuthorizationCleanup {
@@ -31,6 +33,73 @@ export function createBrowserProfileAuthorizationHandler(input: {
       return revoked;
     },
   };
+}
+
+export class BrowserProfileAuthorizationRegistryRouter {
+  private readonly registriesByNodeId = new Map<
+    string,
+    BrowserProfileRuntimeAuthorizationRegistry
+  >();
+
+  public constructor(
+    private readonly createCleanup: (
+      hostWebContentsId: number,
+    ) => BrowserProfileAuthorizationCleanup,
+  ) {}
+
+  public async hydrate(input: {
+    hostWebContentsId: number;
+    homeNodeId: string;
+    authorizations: readonly unknown[];
+    lifecycleGeneration: string;
+  }): Promise<readonly BrowserProfileRuntimeAuthorization[]> {
+    const homeNodeId = parseBrowserProfileRuntimeNodeId(input.homeNodeId);
+    const existing = this.registriesByNodeId.get(homeNodeId);
+    const registry = existing ?? new BrowserProfileRuntimeAuthorizationRegistry(homeNodeId);
+    const revoked = await createBrowserProfileAuthorizationHandler({
+      registry,
+      hostWebContentsId: input.hostWebContentsId,
+      cleanup: this.createCleanup(input.hostWebContentsId),
+    }).hydrate(input.authorizations, input.lifecycleGeneration);
+    if (!existing) this.registriesByNodeId.set(homeNodeId, registry);
+    return revoked;
+  }
+
+  public async revoke(input: {
+    hostWebContentsId: number;
+    homeNodeId: string;
+    lifecycleGeneration: string;
+  }): Promise<readonly BrowserProfileRuntimeAuthorization[]> {
+    const homeNodeId = parseBrowserProfileRuntimeNodeId(input.homeNodeId);
+    const registry = this.registriesByNodeId.get(homeNodeId);
+    if (!registry) return Object.freeze([]);
+    return createBrowserProfileAuthorizationHandler({
+      registry,
+      hostWebContentsId: input.hostWebContentsId,
+      cleanup: this.createCleanup(input.hostWebContentsId),
+    }).revoke(input.lifecycleGeneration);
+  }
+
+  public resolveExact(
+    hostWebContentsId: number,
+    selectorInput: unknown,
+  ): BrowserProfileRuntimeAuthorization | null {
+    const selector = parseBrowserProfileRuntimeSelector(selectorInput);
+    return (
+      this.registriesByNodeId.get(selector.homeNodeId)?.resolveExact(hostWebContentsId, selector) ??
+      null
+    );
+  }
+
+  public async revokeHost(
+    hostWebContentsId: number,
+  ): Promise<readonly BrowserProfileRuntimeAuthorization[]> {
+    const revoked = [...this.registriesByNodeId.values()].flatMap((registry) =>
+      registry.revokeHost(hostWebContentsId),
+    );
+    await cleanupRevoked(revoked, this.createCleanup(hostWebContentsId));
+    return Object.freeze(revoked);
+  }
 }
 
 async function cleanupRevoked(
