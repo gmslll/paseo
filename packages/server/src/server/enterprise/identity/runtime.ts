@@ -4,6 +4,7 @@ import type {
   ResourceAuthorization,
   LeaseCoordinator,
 } from "@getpaseo/protocol/messages";
+import type { ManagedNodeRuntimeDistribution } from "../managed-node/runtime-policy-source.js";
 import type { EnterpriseAgentSessionContextRegistry } from "../../session/enterprise-agent-session-context-registry.js";
 import type { AuthoritySessionBindingLifecycle } from "../../session/enterprise-authority-receipt-state.js";
 import type { AuthorityReceiptStatePort } from "../access/authority-receipt-verifier.js";
@@ -69,6 +70,7 @@ export interface EnterpriseAdmissionRuntime {
   readonly managedPlacementSource?: Readonly<{
     install(source: ManagedPlacementSnapshotSource): Promise<void>;
   }>;
+  readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;
   close?(): Promise<void>;
 }

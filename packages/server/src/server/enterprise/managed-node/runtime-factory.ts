@@ -33,6 +33,7 @@ import {
   ManagedNodeControlPlaneClient,
 } from "./management-client.js";
 import { ManagedPrincipalGrantSource } from "./principal-source.js";
+import { ManagedNodeRuntimeDistributionState } from "./runtime-policy-source.js";
 import { readManagedNodeRelationship } from "./relationship-store.js";
 
 export interface ManagedEnterpriseRuntimeFactoryInput {
@@ -110,16 +111,23 @@ export async function createManagedEnterpriseRuntime(
       authorizationRuntimeProvider.grantStore,
       audit,
     );
+    const runtimeDistribution = new ManagedNodeRuntimeDistributionState(client);
     const lifecycle = new ManagedNodeLifecycle({
       client,
       audit,
-      refreshPolicy: () => principalSource.ready(),
+      refreshPolicy: async () => {
+        await principalSource.ready();
+        await runtimeDistribution.refresh();
+      },
       heartbeat: async () => ({
         bootId: managedBootId,
         paseoServerId: relationship.node.paseoServerId,
         endpoint: relationship.node.endpoint,
         version: relationship.node.version,
-        capabilities: structuredClone(relationship.node.capabilities),
+        capabilities: {
+          ...structuredClone(relationship.node.capabilities),
+          ...(await runtimeDistribution.capabilities()),
+        },
         capacity: defaultManagedNodeCapacity({
           activeBrowserProfiles: (await browserProfiles.list()).length,
         }),
@@ -200,6 +208,7 @@ export async function createManagedEnterpriseRuntime(
       identityDispatcherRegistration,
       leaseCoordinator: createManagedLeaseCoordinator(client),
       managedPlacementSource,
+      managedRuntimeDistribution: runtimeDistribution,
       nextSessionBindingGeneration: createSessionBindingGeneration,
       close() {
         closePromise ??= (async () => {

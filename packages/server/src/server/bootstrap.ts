@@ -1345,15 +1345,23 @@ export async function createPaseoDaemon(
     // Company-pinned Provider runtimes (ADR-0039). Without runtime-policy.json every Provider
     // resolves exactly as before.
     const runtimePaths = managedRuntimePaths(capturedPaseoHome);
+    // A managed node installs what the management plane pins; runtime-policy.json applies only
+    // to standalone daemons.
+    const managedRuntimeDistribution = enterpriseRuntime?.managedRuntimeDistribution;
     const managedRuntimes = new ManagedRuntimeManager({
       paths: runtimePaths,
-      policySource: staticManagedRuntimePolicySource(
-        await loadLocalManagedRuntimePolicy(runtimePaths.localPolicy),
-        "local_policy",
-      ),
-      artifactSource: createDirectoryArtifactSource(runtimePaths.artifacts),
+      policySource:
+        managedRuntimeDistribution?.policySource ??
+        staticManagedRuntimePolicySource(
+          await loadLocalManagedRuntimePolicy(runtimePaths.localPolicy),
+          "local_policy",
+        ),
+      artifactSource:
+        managedRuntimeDistribution?.artifactSource ??
+        createDirectoryArtifactSource(runtimePaths.artifacts),
       logger: logger.child({ module: "managed-runtimes" }),
     });
+    managedRuntimeDistribution?.reportStatus(() => managedRuntimes.status());
     const agentProviderRuntime = await createAgentProviderRuntime({
       paseoHome: capturedPaseoHome,
       logger,

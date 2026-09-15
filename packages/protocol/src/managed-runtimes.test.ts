@@ -10,6 +10,10 @@ import {
   Sha256HexSchema,
   managedRuntimeMetadataMatchesPin,
   selectManagedRuntimeArtifact,
+  ManagedRuntimeNodePolicyResponseSchema,
+  ManagedRuntimePinUpdateSchema,
+  managedRuntimeCapabilities,
+  parseManagedRuntimeCapabilities,
 } from "./managed-runtimes.js";
 
 const SHA = "a".repeat(64);
@@ -123,6 +127,62 @@ describe("managed runtime policy", () => {
         pin,
         artifact,
       }),
+    ).toBe(false);
+  });
+});
+
+describe("node runtime distribution contracts", () => {
+  test("runtime status round-trips through heartbeat capabilities", () => {
+    const capabilities = managedRuntimeCapabilities([
+      {
+        runtimeName: "claude-code",
+        pinnedVersion: "2.1.258",
+        activeVersion: "2.1.258",
+        installedVersions: ["2.1.258"],
+        status: "installed",
+        commandPath: "/paseo/runtimes/bin/claude-code",
+        error: null,
+      },
+      {
+        runtimeName: "codex",
+        pinnedVersion: "0.153.4",
+        activeVersion: null,
+        installedVersions: [],
+        status: "not_installed",
+        commandPath: null,
+        error: null,
+      },
+    ]);
+
+    expect(capabilities).toEqual({
+      "runtime.claude-code": "2.1.258",
+      "runtime.claude-code.status": "installed",
+      "runtime.codex": "",
+      "runtime.codex.status": "not_installed",
+    });
+    expect(
+      parseManagedRuntimeCapabilities({
+        ...capabilities,
+        platform: "darwin",
+        browserProfiles: true,
+      }),
+    ).toEqual([
+      { runtimeName: "claude-code", activeVersion: "2.1.258", status: "installed" },
+      { runtimeName: "codex", activeVersion: null, status: "not_installed" },
+    ]);
+  });
+
+  test("node policy responses may carry no policy and pin updates reject unknown fields", () => {
+    expect(ManagedRuntimeNodePolicyResponseSchema.parse({ policy: null })).toEqual({
+      policy: null,
+    });
+    expect(
+      ManagedRuntimePinUpdateSchema.safeParse({
+        version: "1.0.0",
+        providerIds: ["claude"],
+        expectedPolicyVersion: 0,
+        artifacts: [],
+      }).success,
     ).toBe(false);
   });
 });

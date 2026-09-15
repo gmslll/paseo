@@ -108,3 +108,89 @@ export function managedRuntimeMetadataMatchesPin(input: {
     metadata.command === artifact.command
   );
 }
+
+export const MANAGED_RUNTIME_ARTIFACT_HEADERS = {
+  sha256: "x-paseo-artifact-sha256",
+  fileName: "x-paseo-artifact-file-name",
+  archiveFormat: "x-paseo-artifact-format",
+  command: "x-paseo-artifact-command",
+  launcher: "x-paseo-artifact-launcher",
+  minNodeVersion: "x-paseo-artifact-min-node-version",
+} as const;
+
+export const ManagedRuntimeNodePolicyResponseSchema = z.object({
+  policy: ManagedRuntimePolicySchema.nullable(),
+});
+
+// Administrator requests are strict so a typo never silently changes the company policy.
+export const ManagedRuntimePinUpdateSchema = z
+  .object({
+    version: ManagedRuntimeVersionSchema,
+    providerIds: z.array(z.string().min(1)).min(1),
+    compatibleSdkRange: z.string().min(1).optional(),
+    expectedPolicyVersion: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const ManagedRuntimePolicySettingsUpdateSchema = z
+  .object({
+    pathFallback: z.enum(["allow", "forbid"]),
+    allowCommandOverride: z.boolean(),
+    autoInstall: z.boolean(),
+    expectedPolicyVersion: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type ManagedRuntimePinUpdate = z.infer<typeof ManagedRuntimePinUpdateSchema>;
+export type ManagedRuntimePolicySettingsUpdate = z.infer<
+  typeof ManagedRuntimePolicySettingsUpdateSchema
+>;
+
+export interface ManagedRuntimeCapabilityStatus {
+  runtimeName: string;
+  activeVersion: string | null;
+  status: string;
+}
+
+const RUNTIME_CAPABILITY_PREFIX = "runtime.";
+const RUNTIME_STATUS_CAPABILITY_SUFFIX = ".status";
+
+/** Heartbeat capability entries through which a node reports its runtimes. */
+export function managedRuntimeCapabilities(
+  statuses: readonly ManagedRuntimeStatus[],
+): Record<string, string> {
+  const capabilities: Record<string, string> = {};
+  for (const status of statuses) {
+    const key = `${RUNTIME_CAPABILITY_PREFIX}${status.runtimeName}`;
+    capabilities[key] = status.activeVersion ?? "";
+    capabilities[`${key}${RUNTIME_STATUS_CAPABILITY_SUFFIX}`] = status.status;
+  }
+  return capabilities;
+}
+
+export function parseManagedRuntimeCapabilities(
+  capabilities: Readonly<Record<string, string | number | boolean>>,
+): ManagedRuntimeCapabilityStatus[] {
+  const runtimes: ManagedRuntimeCapabilityStatus[] = [];
+  for (const [key, value] of Object.entries(capabilities)) {
+    if (
+      !key.startsWith(RUNTIME_CAPABILITY_PREFIX) ||
+      !key.endsWith(RUNTIME_STATUS_CAPABILITY_SUFFIX)
+    ) {
+      continue;
+    }
+    const runtimeName = key.slice(
+      RUNTIME_CAPABILITY_PREFIX.length,
+      -RUNTIME_STATUS_CAPABILITY_SUFFIX.length,
+    );
+    if (!RUNTIME_NAME_PATTERN.test(runtimeName)) continue;
+    const activeVersion = capabilities[`${RUNTIME_CAPABILITY_PREFIX}${runtimeName}`];
+    runtimes.push({
+      runtimeName,
+      activeVersion:
+        typeof activeVersion === "string" && activeVersion.length > 0 ? activeVersion : null,
+      status: String(value),
+    });
+  }
+  return runtimes.sort((left, right) => left.runtimeName.localeCompare(right.runtimeName));
+}

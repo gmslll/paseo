@@ -1,6 +1,8 @@
-import { readFileSync } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { createServer, type Server as HttpsServer } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { pipeline } from "node:stream/promises";
 
 import {
   GlobalResourceRefSchema,
@@ -9,6 +11,11 @@ import {
   LeaseRenewInputSchema,
   ResourceGrantSchema,
 } from "@getpaseo/protocol/messages";
+import {
+  MANAGED_RUNTIME_ARTIFACT_HEADERS,
+  ManagedRuntimePinUpdateSchema,
+  ManagedRuntimePolicySettingsUpdateSchema,
+} from "@getpaseo/protocol/managed-runtimes";
 import { z } from "zod";
 
 import {
@@ -89,6 +96,8 @@ async function handleRequest(
   const path = url.pathname;
   if (handlePublicGet(plane, response, method, path)) return;
 
+  // Artifacts are larger than the JSON body limit, so the upload streams after authentication.
+  if (await handleRuntimeArtifactUpload(plane, request, response, method, path)) return;
   const body = method === "GET" || method === "HEAD" ? "" : await readBody(request);
   if (
     await handleUnauthenticatedPost(plane, request, response, method, path, body, passwordAttempts)
@@ -114,6 +123,7 @@ async function handleRequest(
   if (await handlePrincipalPasswordRequest(context)) return;
   if (await handlePrincipalRequest(context)) return;
   if (await handleManagementInventoryRequest(context)) return;
+  if (await handleRuntimeDistributionRequest(context)) return;
   if (await handleTicketRequest(context)) return;
   sendJson(response, 404, { error: { code: "not_found", message: "route not found" } });
 }
@@ -462,10 +472,101 @@ async function handleNodeRequest(
     return;
   }
   const node = plane.authenticateSignedNodeRequest(authentication, { method, path, body });
+  if (await handleNodeRuntimeRequest(plane, response, method, path, node.nodeId)) return;
   if (await handleNodePlacementRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeLeaseRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeAuditRequest(plane, response, method, path, body, node.nodeId)) return;
   sendJson(response, 404, { error: { code: "not_found", message: "route not found" } });
+}
+
+async function handleRuntimeArtifactUpload(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  method: string,
+  path: string,
+): Promise<boolean> {
+  const match = /^\/v1\/runtime-artifacts\/([^/]+)\/([^/]+)\/([^/]+)$/.exec(path);
+  if (method !== "PUT" || !match) return false;
+  const actor = await authenticateUser(plane, request);
+  const header = (name: string): string => {
+    const value = request.headers[name];
+    return typeof value === "string" ? value : "";
+  };
+  const minNodeVersion = header(MANAGED_RUNTIME_ARTIFACT_HEADERS.minNodeVersion);
+  const artifact = await plane.uploadRuntimeArtifact(actor, {
+    runtimeName: decodeURIComponent(match[1]!),
+    version: decodeURIComponent(match[2]!),
+    platformArch: decodeURIComponent(match[3]!),
+    sha256: header(MANAGED_RUNTIME_ARTIFACT_HEADERS.sha256),
+    fileName: header(MANAGED_RUNTIME_ARTIFACT_HEADERS.fileName),
+    archiveFormat: header(MANAGED_RUNTIME_ARTIFACT_HEADERS.archiveFormat),
+    command: header(MANAGED_RUNTIME_ARTIFACT_HEADERS.command),
+    launcher: header(MANAGED_RUNTIME_ARTIFACT_HEADERS.launcher) || "exec",
+    ...(minNodeVersion ? { minNodeVersion } : {}),
+    body: request,
+  });
+  sendJson(response, 201, { artifact });
+  return true;
+}
+
+async function handleRuntimeDistributionRequest(
+  context: AuthenticatedRouteContext,
+): Promise<boolean> {
+  const { actor, body, method, path, plane, response } = context;
+  if (method === "GET" && path === "/v1/runtime-artifacts") {
+    sendJson(response, 200, { artifacts: await plane.listRuntimeArtifacts(actor) });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/runtime-policy") {
+    sendJson(response, 200, { policy: await plane.getRuntimePolicy(actor) });
+    return true;
+  }
+  if (method === "PUT" && path === "/v1/runtime-policy") {
+    const input = ManagedRuntimePolicySettingsUpdateSchema.parse(parseJson(body));
+    sendJson(response, 200, { policy: await plane.updateRuntimePolicySettings(actor, input) });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/runtime-status") {
+    sendJson(response, 200, { nodes: await plane.listNodeRuntimeStatus(actor) });
+    return true;
+  }
+  const pinMatch = /^\/v1\/runtime-pins\/([^/]+)$/.exec(path);
+  if (method === "PUT" && pinMatch) {
+    const input = ManagedRuntimePinUpdateSchema.parse(parseJson(body));
+    sendJson(response, 200, {
+      policy: await plane.setRuntimePin(actor, decodeURIComponent(pinMatch[1]!), input),
+    });
+    return true;
+  }
+  return false;
+}
+
+async function handleNodeRuntimeRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "GET") return false;
+  if (path === "/v1/node/runtime-policy") {
+    sendJson(response, 200, { policy: plane.getNodeRuntimePolicy(nodeId) });
+    return true;
+  }
+  const match = /^\/v1\/node\/runtime-artifacts\/([0-9a-f]{64})$/.exec(path);
+  if (!match) return false;
+  const filePath = plane.nodeRuntimeArtifactPath(nodeId, match[1]!);
+  const { size } = await stat(filePath);
+  response.writeHead(200, {
+    "content-type": "application/octet-stream",
+    "content-length": size,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    [MANAGED_RUNTIME_ARTIFACT_HEADERS.sha256]: match[1]!,
+  });
+  await pipeline(createReadStream(filePath), response);
+  return true;
 }
 
 async function handleNodePlacementRequest(

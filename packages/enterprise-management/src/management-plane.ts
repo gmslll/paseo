@@ -1,4 +1,5 @@
 import { createPublicKey, randomUUID, timingSafeEqual, type KeyObject } from "node:crypto";
+import path from "node:path";
 
 import {
   FencedLeaseSchema,
@@ -40,6 +41,19 @@ import {
   verifyPassword,
   verifySecret,
 } from "./security.js";
+import {
+  type ManagedRuntimeCapabilityStatus,
+  type ManagedRuntimePinUpdate,
+  type ManagedRuntimePolicy,
+  type ManagedRuntimePolicySettingsUpdate,
+  parseManagedRuntimeCapabilities,
+} from "@getpaseo/protocol/managed-runtimes";
+import {
+  RUNTIME_DISTRIBUTION_SCHEMA,
+  RuntimeDistributionStore,
+  type RuntimeArtifactRecord,
+  type RuntimeArtifactUpload,
+} from "./runtime-distribution.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
@@ -124,6 +138,7 @@ export interface ManagementCredentialSummary {
 export class EnterpriseManagementPlane {
   private readonly database: SqliteDatabase;
   private readonly clock: Clock;
+  private readonly runtimes: RuntimeDistributionStore;
   private closed = false;
 
   constructor(
@@ -136,6 +151,8 @@ export class EnterpriseManagementPlane {
       readonly ticketPrivateKey: KeyObject | string | Buffer;
       readonly ticketPublicKey: KeyObject | string | Buffer;
       readonly clock?: Clock;
+      /** Defaults to runtime-artifacts beside a file database; in-memory planes have none. */
+      readonly runtimeArtifactDirectory?: string;
     },
   ) {
     const organizationId = OrganizationIdSchema.parse(options.organizationId);
@@ -146,6 +163,17 @@ export class EnterpriseManagementPlane {
       "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;",
     );
     this.database.exec(SCHEMA);
+    this.database.exec(RUNTIME_DISTRIBUTION_SCHEMA);
+    this.runtimes = new RuntimeDistributionStore({
+      database: this.database,
+      organizationId,
+      artifactDirectory:
+        options.runtimeArtifactDirectory ??
+        (options.databasePath === ":memory:"
+          ? null
+          : path.join(path.dirname(options.databasePath), "runtime-artifacts")),
+      nowIso: () => this.nowIso(),
+    });
     this.database
       .prepare(
         "INSERT INTO organizations (organization_id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(organization_id) DO NOTHING",
@@ -1136,6 +1164,78 @@ export class EnterpriseManagementPlane {
     if (typeof key === "string") return key;
     if (Buffer.isBuffer(key)) return key.toString("utf8");
     return key.export({ type: "spki", format: "pem" }).toString();
+  }
+
+  async uploadRuntimeArtifact(
+    actor: AuthenticatedManagementPrincipal,
+    input: RuntimeArtifactUpload,
+  ): Promise<RuntimeArtifactRecord> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.runtimes.storeArtifact({ ...input, uploadedBy: actor.principalId });
+  }
+
+  async listRuntimeArtifacts(
+    actor: AuthenticatedManagementPrincipal,
+  ): Promise<readonly RuntimeArtifactRecord[]> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.runtimes.listArtifacts();
+  }
+
+  async getRuntimePolicy(
+    actor: AuthenticatedManagementPrincipal,
+  ): Promise<ManagedRuntimePolicy | null> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.runtimes.currentPolicy();
+  }
+
+  async setRuntimePin(
+    actor: AuthenticatedManagementPrincipal,
+    runtimeName: string,
+    input: ManagedRuntimePinUpdate,
+  ): Promise<ManagedRuntimePolicy> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.runtimes.setPin(runtimeName, { ...input, updatedBy: actor.principalId });
+  }
+
+  async updateRuntimePolicySettings(
+    actor: AuthenticatedManagementPrincipal,
+    input: ManagedRuntimePolicySettingsUpdate,
+  ): Promise<ManagedRuntimePolicy> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.runtimes.updateSettings({ ...input, updatedBy: actor.principalId });
+  }
+
+  async listNodeRuntimeStatus(actor: AuthenticatedManagementPrincipal): Promise<
+    readonly {
+      readonly nodeId: string;
+      readonly status: ManagedNode["status"];
+      readonly runtimes: readonly ManagedRuntimeCapabilityStatus[];
+    }[]
+  > {
+    return (await this.listNodes(actor)).map((node) => ({
+      nodeId: node.nodeId,
+      status: node.status,
+      runtimes: parseManagedRuntimeCapabilities(node.capabilities),
+    }));
+  }
+
+  getNodeRuntimePolicy(nodeId: string): ManagedRuntimePolicy | null {
+    this.assertOpen();
+    this.requireNode(nodeId);
+    return this.runtimes.currentPolicy();
+  }
+
+  nodeRuntimeArtifactPath(nodeId: string, sha256: string): string {
+    this.assertOpen();
+    this.requireNode(nodeId);
+    const filePath = this.runtimes.artifactFilePath(sha256);
+    if (!filePath) throw new Error("runtime artifact not found");
+    return filePath;
   }
 
   authenticateSignedNodeRequest(

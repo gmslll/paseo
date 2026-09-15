@@ -1,5 +1,6 @@
 import { createHash, randomBytes, sign, type KeyObject } from "node:crypto";
 import { request as httpsRequest } from "node:https";
+import type { Readable } from "node:stream";
 
 import {
   ManagedAuditIngestResponseSchema,
@@ -22,6 +23,11 @@ import {
   type ManagedPlacement,
   type ManagedPlacementRegistration,
 } from "@getpaseo/protocol/enterprise-management";
+import {
+  type ManagedRuntimePolicy,
+  ManagedRuntimeNodePolicyResponseSchema,
+  Sha256HexSchema,
+} from "@getpaseo/protocol/managed-runtimes";
 import type {
   FencedLease,
   LeaseAcquireInput,
@@ -194,6 +200,29 @@ export class ManagedNodeControlPlaneClient {
     );
   }
 
+  async refreshRuntimePolicy(): Promise<ManagedRuntimePolicy | null> {
+    return (
+      await this.signedRequest(
+        "GET",
+        "/v1/node/runtime-policy",
+        undefined,
+        ManagedRuntimeNodePolicyResponseSchema,
+      )
+    ).policy;
+  }
+
+  /** Streams a pinned artifact; the installer verifies its size and digest. */
+  async openRuntimeArtifact(sha256: string): Promise<Readable> {
+    const path = `/v1/node/runtime-artifacts/${Sha256HexSchema.parse(sha256)}`;
+    return requestStream({
+      baseUrl: this.relationship.managementBaseUrl,
+      path,
+      caCertificate: this.caCertificate,
+      timeoutMs: this.requestTimeoutMs,
+      headers: this.signedHeaders("GET", path, ""),
+    });
+  }
+
   private async signedRequest<T>(
     method: "GET" | "POST" | "PUT",
     path: string,
@@ -201,15 +230,6 @@ export class ManagedNodeControlPlaneClient {
     schema: z.ZodType<T>,
   ): Promise<T> {
     const body = value === undefined ? "" : JSON.stringify(value);
-    const timestampMs = this.clock.nowMs();
-    const nonce = randomBytes(18).toString("base64url");
-    const signature = signNodeRequest(this.relationship.nodePrivateKeyPem, {
-      method,
-      path,
-      timestampMs,
-      nonce,
-      body,
-    });
     return requestJson({
       baseUrl: this.relationship.managementBaseUrl,
       method,
@@ -217,14 +237,26 @@ export class ManagedNodeControlPlaneClient {
       body,
       caCertificate: this.caCertificate,
       timeoutMs: this.requestTimeoutMs,
-      headers: {
-        "x-paseo-node-id": this.relationship.node.nodeId,
-        "x-paseo-node-timestamp": String(timestampMs),
-        "x-paseo-node-nonce": nonce,
-        "x-paseo-node-signature": signature,
-      },
+      headers: this.signedHeaders(method, path, body),
       schema,
     });
+  }
+
+  private signedHeaders(method: string, path: string, body: string): Record<string, string> {
+    const timestampMs = this.clock.nowMs();
+    const nonce = randomBytes(18).toString("base64url");
+    return {
+      "x-paseo-node-id": this.relationship.node.nodeId,
+      "x-paseo-node-timestamp": String(timestampMs),
+      "x-paseo-node-nonce": nonce,
+      "x-paseo-node-signature": signNodeRequest(this.relationship.nodePrivateKeyPem, {
+        method,
+        path,
+        timestampMs,
+        nonce,
+        body,
+      }),
+    };
   }
 }
 
@@ -363,6 +395,74 @@ function requestJson<T>(input: RequestJsonInput<T>): Promise<T> {
     if (input.body.length > 0) request.write(input.body);
     request.end();
   });
+}
+
+interface RequestStreamInput {
+  readonly baseUrl: string;
+  readonly path: string;
+  readonly caCertificate: string | Buffer;
+  readonly timeoutMs: number;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+function requestStream(input: RequestStreamInput): Promise<Readable> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(input.path, `${normalizeManagementOrigin(input.baseUrl)}/`);
+    const request = httpsRequest(
+      target,
+      {
+        method: "GET",
+        ca: input.caCertificate,
+        rejectUnauthorized: true,
+        timeout: input.timeoutMs,
+        headers: { accept: "application/octet-stream", ...input.headers },
+      },
+      (response) => {
+        const status = response.statusCode ?? 0;
+        if (status >= 200 && status < 300) {
+          // The timeout covers connecting and the response head; the installer bounds the body.
+          request.setTimeout(0);
+          resolve(response);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer | string) => {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > MAX_RESPONSE_BYTES) {
+            response.destroy(new Error("management response too large"));
+            return;
+          }
+          chunks.push(buffer);
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          const failure = ErrorResponseSchema.safeParse(
+            safeJsonParse(Buffer.concat(chunks).toString("utf8")),
+          );
+          reject(
+            new ManagementPlaneRequestError(
+              status,
+              failure.success ? failure.data.error.code : "invalid_response",
+              failure.success ? failure.data.error.message : "management request failed",
+            ),
+          );
+        });
+      },
+    );
+    request.once("timeout", () => request.destroy(new Error("management request timed out")));
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+function safeJsonParse(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }
 
 function signNodeRequest(
