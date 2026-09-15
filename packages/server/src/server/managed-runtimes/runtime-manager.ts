@@ -91,7 +91,13 @@ export interface ManagedRuntimeManagerOptions {
   now?: () => Date;
 }
 
-export class ManagedRuntimeManager implements ManagedRuntimeBindings {
+/** The daemon.runtime RPC surface; the manager is its only implementation. */
+export interface ManagedRuntimeControl {
+  status(): Promise<ManagedRuntimeStatus[]>;
+  install(runtimeName: string): Promise<ManagedRuntimeStatus>;
+}
+
+export class ManagedRuntimeManager implements ManagedRuntimeBindings, ManagedRuntimeControl {
   private readonly platformArch: string | null;
   private readonly installs = new Map<string, Promise<void>>();
   private readonly failures = new Map<string, string>();

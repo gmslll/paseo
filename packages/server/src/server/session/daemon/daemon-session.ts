@@ -1,4 +1,5 @@
 import type pino from "pino";
+import type { ManagedRuntimeControl } from "../../managed-runtimes/runtime-manager.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
@@ -18,6 +19,7 @@ export interface DaemonRuntimeConfig {
   worktreesRoot?: string;
   appBaseUrl?: string;
   desktopManaged?: boolean;
+  managedRuntimes?: ManagedRuntimeControl;
   getRelayConfig(): {
     enabled: boolean;
     endpoint: string;
@@ -204,6 +206,51 @@ export class DaemonSession {
           listen: null,
           relay: null,
           providers: [],
+        },
+      });
+    }
+  }
+
+  async handleRuntimeStatusRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.runtime.get_status.request" }>,
+  ): Promise<void> {
+    await this.respondWithManagedRuntimes(msg, async (runtimes) => ({
+      type: "daemon.runtime.get_status.response",
+      payload: { requestId: msg.requestId, runtimes: await runtimes.status() },
+    }));
+  }
+
+  async handleRuntimeInstallRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.runtime.install.request" }>,
+  ): Promise<void> {
+    await this.respondWithManagedRuntimes(msg, async (runtimes) => ({
+      type: "daemon.runtime.install.response",
+      payload: { requestId: msg.requestId, runtime: await runtimes.install(msg.runtimeName) },
+    }));
+  }
+
+  private async respondWithManagedRuntimes(
+    msg: { type: string; requestId: string },
+    respond: (runtimes: ManagedRuntimeControl) => Promise<SessionOutboundMessage>,
+  ): Promise<void> {
+    try {
+      const runtimes = this.daemonRuntimeConfig?.managedRuntimes;
+      if (!runtimes) {
+        throw new Error("Managed Agent runtimes are unavailable on this daemon");
+      }
+      this.host.emit(await respond(runtimes));
+    } catch (error) {
+      this.logger.error(
+        { err: error, requestType: msg.type },
+        "Failed to handle managed runtime request",
+      );
+      this.host.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : String(error),
+          code: "handler_error",
         },
       });
     }

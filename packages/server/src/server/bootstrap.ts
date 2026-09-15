@@ -2459,6 +2459,7 @@ export async function createPaseoDaemon(
                     return appBaseUrl;
                   },
                   desktopManaged: config.desktopManaged === true,
+                  managedRuntimes,
                   getRelayConfig: () =>
                     relayRuntime?.getConfig() ?? {
                       enabled: daemonConfigStore.get().relay?.enabled ?? relayEnabled,

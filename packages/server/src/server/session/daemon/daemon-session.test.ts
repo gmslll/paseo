@@ -247,6 +247,116 @@ describe("DaemonSession", () => {
     ]);
   });
 
+  test("runtime status reports the managed runtimes", async () => {
+    const runtimes = [
+      {
+        runtimeName: "claude-code",
+        pinnedVersion: "2.1.258",
+        activeVersion: "2.1.258",
+        installedVersions: ["2.1.258"],
+        status: "installed" as const,
+        commandPath: "/paseo/runtimes/bin/claude-code",
+        error: null,
+      },
+    ];
+    const { subsystem, emitted } = makeSubsystem({
+      daemonRuntimeConfig: {
+        listen: null,
+        getRelayConfig: () => null,
+        managedRuntimes: { status: async () => runtimes, install: async () => runtimes[0]! },
+      },
+    });
+
+    await subsystem.handleRuntimeStatusRequest({
+      type: "daemon.runtime.get_status.request",
+      requestId: "rt-1",
+    });
+
+    expect(emitted).toEqual([
+      { type: "daemon.runtime.get_status.response", payload: { requestId: "rt-1", runtimes } },
+    ]);
+  });
+
+  test("runtime install returns the installed status and reports failures as RPC errors", async () => {
+    const installed = {
+      runtimeName: "codex",
+      pinnedVersion: "0.153.4",
+      activeVersion: "0.153.4",
+      installedVersions: ["0.153.4"],
+      status: "installed" as const,
+      commandPath: "/paseo/runtimes/bin/codex",
+      error: null,
+    };
+    const installs: string[] = [];
+    const { subsystem, emitted } = makeSubsystem({
+      daemonRuntimeConfig: {
+        listen: null,
+        getRelayConfig: () => null,
+        managedRuntimes: {
+          status: async () => [installed],
+          install: async (runtimeName) => {
+            installs.push(runtimeName);
+            if (runtimeName !== "codex") {
+              throw new Error(
+                `Managed runtime '${runtimeName}' is not pinned by the current policy`,
+              );
+            }
+            return installed;
+          },
+        },
+      },
+    });
+
+    await subsystem.handleRuntimeInstallRequest({
+      type: "daemon.runtime.install.request",
+      requestId: "rt-2",
+      runtimeName: "codex",
+    });
+    await subsystem.handleRuntimeInstallRequest({
+      type: "daemon.runtime.install.request",
+      requestId: "rt-3",
+      runtimeName: "grok",
+    });
+
+    expect(installs).toEqual(["codex", "grok"]);
+    expect(emitted).toEqual([
+      {
+        type: "daemon.runtime.install.response",
+        payload: { requestId: "rt-2", runtime: installed },
+      },
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "rt-3",
+          requestType: "daemon.runtime.install.request",
+          error: "Managed runtime 'grok' is not pinned by the current policy",
+          code: "handler_error",
+        },
+      },
+    ]);
+  });
+
+  test("runtime requests fail with a correlated RPC error when runtimes are not managed", async () => {
+    const { subsystem, emitted } = makeSubsystem({});
+
+    await subsystem.handleRuntimeStatusRequest({
+      type: "daemon.runtime.get_status.request",
+      requestId: "rt-4",
+    });
+
+    expect(emitted).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "rt-4",
+          requestType: "daemon.runtime.get_status.request",
+          error: "Managed Agent runtimes are unavailable on this daemon",
+          code: "handler_error",
+        },
+      },
+    ]);
+  });
+
   test("pairing offer is empty when relay is disabled", async () => {
     const { subsystem, emitted } = makeSubsystem({
       daemonRuntimeConfig: {

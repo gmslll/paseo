@@ -245,6 +245,7 @@ const perfNow: () => number =
     ? () => performance.now()
     : () => Date.now();
 
+const MANAGED_RUNTIME_INSTALL_TIMEOUT_MS = 10 * 60_000;
 const PROJECT_GITHUB_CLONE_TIMEOUT_MS = 5 * 60 * 1000;
 
 interface ImportAgentInputBase {
@@ -5094,6 +5095,24 @@ export class DaemonClient {
     });
   }
 
+  async getManagedRuntimeStatus(requestId?: string) {
+    this.requireManagedRuntimesSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"daemon.runtime.get_status.response">({
+      requestId,
+      message: { type: "daemon.runtime.get_status.request" },
+    });
+  }
+
+  async installManagedRuntime(runtimeName: string, requestId?: string) {
+    this.requireManagedRuntimesSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"daemon.runtime.install.response">({
+      requestId,
+      message: { type: "daemon.runtime.install.request", runtimeName },
+      // Downloading and extracting a runtime archive takes longer than an ordinary RPC.
+      timeout: MANAGED_RUNTIME_INSTALL_TIMEOUT_MS,
+    });
+  }
+
   async connectHub(
     hubUrl: string,
     token: string,
@@ -6008,6 +6027,13 @@ export class DaemonClient {
     // COMPAT(hubRelationship): added in v0.1.X, drop the gate when floor >= v0.1.X.
     if (this.lastServerInfoMessage?.features?.hubRelationship !== true) {
       throw new Error("Update the host to use Hub relationship management.");
+    }
+  }
+
+  private requireManagedRuntimesSupport(): void {
+    // COMPAT(managedRuntimes): added in v0.9.0, remove gate after 2027-03-16.
+    if (this.lastServerInfoMessage?.features?.managedRuntimes !== true) {
+      throw new Error("Update the host to manage Agent runtimes.");
     }
   }
 

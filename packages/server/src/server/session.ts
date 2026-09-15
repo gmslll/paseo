@@ -3437,6 +3437,7 @@ export class Session {
       this.dispatchHubExecutionMessage(msg) ??
       this.dispatchAgentLifecycleMessage(msg) ??
       this.dispatchAgentConfigMessage(msg) ??
+      this.dispatchManagedRuntimeMessage(msg) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceLifecycleMessage(msg) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
@@ -3896,6 +3897,17 @@ export class Session {
         return this.projectConfigSession.handleReadProjectConfigRequest(msg);
       case "write_project_config_request":
         return this.projectConfigSession.handleWriteProjectConfigRequest(msg);
+      default:
+        return undefined;
+    }
+  }
+
+  private dispatchManagedRuntimeMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "daemon.runtime.get_status.request":
+        return this.daemonSession.handleRuntimeStatusRequest(msg);
+      case "daemon.runtime.install.request":
+        return this.daemonSession.handleRuntimeInstallRequest(msg);
       default:
         return undefined;
     }

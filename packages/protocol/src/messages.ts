@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ManagedRuntimeStatusSchema } from "./managed-runtimes.js";
 import { TerminalActivitySchema } from "./terminal-activity.js";
 import { CLIENT_CAPS } from "./client-capabilities.js";
 import { AGENT_LIFECYCLE_STATUSES } from "./agent-lifecycle.js";
@@ -2339,6 +2340,18 @@ export const DaemonGetPairingOfferRequestSchema = z.object({
 export const DaemonConfigReloadRequestSchema = z.object({
   type: z.literal("daemon.config.reload.request"),
   requestId: z.string(),
+});
+
+// Managed Agent runtimes (ADR-0039). Gated by server_info.features.managedRuntimes.
+export const DaemonRuntimeGetStatusRequestSchema = z.object({
+  type: z.literal("daemon.runtime.get_status.request"),
+  requestId: z.string(),
+});
+
+export const DaemonRuntimeInstallRequestSchema = z.object({
+  type: z.literal("daemon.runtime.install.request"),
+  requestId: z.string(),
+  runtimeName: z.string(),
 });
 
 export const HubManagementDaemonConnectRequestSchema = z.object({
@@ -4782,6 +4795,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   DaemonGetStatusRequestSchema,
   DaemonGetPairingOfferRequestSchema,
   DaemonConfigReloadRequestSchema,
+  DaemonRuntimeGetStatusRequestSchema,
+  DaemonRuntimeInstallRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
@@ -6492,6 +6507,22 @@ export const DaemonGetStatusResponseSchema = z.object({
       ),
     })
     .passthrough(),
+});
+
+export const DaemonRuntimeGetStatusResponseSchema = z.object({
+  type: z.literal("daemon.runtime.get_status.response"),
+  payload: z.object({
+    requestId: z.string(),
+    runtimes: z.array(ManagedRuntimeStatusSchema),
+  }),
+});
+
+export const DaemonRuntimeInstallResponseSchema = z.object({
+  type: z.literal("daemon.runtime.install.response"),
+  payload: z.object({
+    requestId: z.string(),
+    runtime: ManagedRuntimeStatusSchema,
+  }),
 });
 
 export const HubRelationshipStatusSchema = z.object({
@@ -8315,6 +8346,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   DaemonGetStatusResponseSchema,
   DaemonGetPairingOfferResponseSchema,
   DaemonConfigReloadResponseSchema,
+  DaemonRuntimeGetStatusResponseSchema,
+  DaemonRuntimeInstallResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
   HubManagementDaemonDisconnectResponseSchema,

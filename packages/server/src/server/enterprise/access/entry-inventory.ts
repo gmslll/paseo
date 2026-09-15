@@ -158,6 +158,8 @@ export const REVIEWED_INBOUND_ENTRIES = [
   "daemon.config.reload.request",
   "daemon.get_pairing_offer.request",
   "daemon.get_status.request",
+  "daemon.runtime.get_status.request",
+  "daemon.runtime.install.request",
   "daemon.update.request",
   "delete_agent_request",
   "diagnostics.request",

@@ -448,6 +448,8 @@ export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
   authorityReceiptPolicy("daemon.config.reload.response", "daemon.config.reload.request"),
   authorityReceiptPolicy("daemon.get_pairing_offer.response", "daemon.get_pairing_offer.request"),
   authorityReceiptPolicy("daemon.get_status.response", "daemon.get_status.request"),
+  authorityReceiptPolicy("daemon.runtime.get_status.response", "daemon.runtime.get_status.request"),
+  authorityReceiptPolicy("daemon.runtime.install.response", "daemon.runtime.install.request"),
   authorityReceiptPolicy(
     "daemon.update.progress",
     "daemon.update.request",
