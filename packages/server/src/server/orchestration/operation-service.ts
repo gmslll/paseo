@@ -82,6 +82,12 @@ export interface OrchestrationAgentPort extends DeliveryTarget {
   subscribeUserMessages(listener: (message: DelegationUserMessage) => void): () => void;
 }
 
+/** Operation reads and cancel exposed to connected clients. */
+export type OrchestrationOperationControl = Pick<
+  OperationService,
+  "listOperations" | "getOperation" | "cancel"
+>;
+
 export interface OperationServiceOptions {
   store: OperationStore;
   bootId: string;

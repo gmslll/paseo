@@ -13,6 +13,7 @@ import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
 import type { SessionOutboundMessage } from "../../messages.js";
 import type { DaemonConfigReloadResult } from "../../daemon-config-store.js";
+import { OperationStore } from "../../orchestration/operation-store.js";
 
 const tempDirs: string[] = [];
 
@@ -351,6 +352,124 @@ describe("DaemonSession", () => {
           requestId: "rt-4",
           requestType: "daemon.runtime.get_status.request",
           error: "Managed Agent runtimes are unavailable on this daemon",
+          code: "handler_error",
+        },
+      },
+    ]);
+  });
+
+  test("operation RPCs list, read, and cancel recorded delegations without their prompts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "paseo-daemon-operations-"));
+    const store = OperationStore.open({
+      path: join(directory, "operations.sqlite3"),
+      formatCompletion: () => "completed",
+      now: () => Date.parse("2026-09-16T08:00:00.000Z"),
+    });
+    try {
+      const key = { requesterAgentId: "agent-parent", operationId: "fan-out" };
+      store.accept({
+        ...key,
+        kind: "agent_prompt",
+        fingerprint: "fingerprint",
+        authority: { mode: "standalone" },
+        deadlineAt: Date.parse("2026-09-17T08:00:00.000Z"),
+        items: [{ targetAgentId: "agent-child", command: { prompt: "secret task" } }],
+      });
+      const { subsystem, emitted } = makeSubsystem({
+        daemonRuntimeConfig: {
+          listen: null,
+          getRelayConfig: () => null,
+          orchestration: {
+            listOperations: (filter) => store.listOperations(filter),
+            getOperation: (operationKey) => store.getOperation(operationKey),
+            cancel: (operationKey) => store.cancel(operationKey),
+          },
+        },
+      });
+
+      await subsystem.handleOrchestrationOperationListRequest({
+        type: "orchestration.operation.list.request",
+        requestId: "op-1",
+        status: "running",
+      });
+      await subsystem.handleOrchestrationOperationCancelRequest({
+        type: "orchestration.operation.cancel.request",
+        requestId: "op-2",
+        ...key,
+      });
+      await subsystem.handleOrchestrationOperationGetRequest({
+        type: "orchestration.operation.get.request",
+        requestId: "op-3",
+        requesterAgentId: "agent-parent",
+        operationId: "missing",
+      });
+
+      const summary = {
+        ...key,
+        kind: "agent_prompt",
+        status: "running",
+        errorCode: null,
+        chainDepth: 1,
+        createdAt: "2026-09-16T08:00:00.000Z",
+        deadlineAt: "2026-09-17T08:00:00.000Z",
+        finishedAt: null,
+        items: [
+          { itemIndex: 0, agentId: "agent-child", state: "pending", outcome: null, error: null },
+        ],
+      };
+      expect(emitted).toEqual([
+        {
+          type: "orchestration.operation.list.response",
+          payload: { requestId: "op-1", operations: [summary] },
+        },
+        {
+          type: "orchestration.operation.cancel.response",
+          payload: {
+            requestId: "op-2",
+            operation: {
+              ...summary,
+              status: "canceled",
+              errorCode: "CANCELED",
+              finishedAt: "2026-09-16T08:00:00.000Z",
+              items: [
+                {
+                  itemIndex: 0,
+                  agentId: "agent-child",
+                  state: "settled",
+                  outcome: "canceled",
+                  error: "Canceled by the requester",
+                },
+              ],
+            },
+          },
+        },
+        {
+          type: "orchestration.operation.get.response",
+          payload: { requestId: "op-3", operation: null },
+        },
+      ]);
+      expect(JSON.stringify(emitted)).not.toContain("secret task");
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("operation RPCs fail with a correlated RPC error when the outbox is not running", async () => {
+    const { subsystem, emitted } = makeSubsystem({});
+
+    await subsystem.handleOrchestrationOperationListRequest({
+      type: "orchestration.operation.list.request",
+      requestId: "op-4",
+    });
+
+    expect(emitted).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "op-4",
+          requestType: "orchestration.operation.list.request",
+          error: "Delegation operations are unavailable on this daemon",
           code: "handler_error",
         },
       },

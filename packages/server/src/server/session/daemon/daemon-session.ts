@@ -1,5 +1,8 @@
 import type pino from "pino";
 import type { ManagedRuntimeControl } from "../../managed-runtimes/runtime-manager.js";
+import type { OrchestrationOperationControl } from "../../orchestration/operation-service.js";
+import { OperationStatusSchema } from "../../orchestration/operation-store.js";
+import { toOrchestrationOperationSummary } from "../../orchestration/operation-summary.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
@@ -14,12 +17,17 @@ import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../../wor
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
 import type { DaemonConfigReloadResult } from "../../daemon-config-store.js";
 
+const MANAGED_RUNTIMES_UNAVAILABLE = "Managed Agent runtimes are unavailable on this daemon";
+const ORCHESTRATION_UNAVAILABLE = "Delegation operations are unavailable on this daemon";
+const DEFAULT_LISTED_OPERATIONS = 50;
+
 export interface DaemonRuntimeConfig {
   listen: string | null;
   worktreesRoot?: string;
   appBaseUrl?: string;
   desktopManaged?: boolean;
   managedRuntimes?: ManagedRuntimeControl;
+  orchestration?: OrchestrationOperationControl;
   getRelayConfig(): {
     enabled: boolean;
     endpoint: string;
@@ -214,35 +222,107 @@ export class DaemonSession {
   async handleRuntimeStatusRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.runtime.get_status.request" }>,
   ): Promise<void> {
-    await this.respondWithManagedRuntimes(msg, async (runtimes) => ({
-      type: "daemon.runtime.get_status.response",
-      payload: { requestId: msg.requestId, runtimes: await runtimes.status() },
-    }));
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.managedRuntimes,
+      MANAGED_RUNTIMES_UNAVAILABLE,
+      async (runtimes) => ({
+        type: "daemon.runtime.get_status.response",
+        payload: { requestId: msg.requestId, runtimes: await runtimes.status() },
+      }),
+    );
   }
 
   async handleRuntimeInstallRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.runtime.install.request" }>,
   ): Promise<void> {
-    await this.respondWithManagedRuntimes(msg, async (runtimes) => ({
-      type: "daemon.runtime.install.response",
-      payload: { requestId: msg.requestId, runtime: await runtimes.install(msg.runtimeName) },
-    }));
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.managedRuntimes,
+      MANAGED_RUNTIMES_UNAVAILABLE,
+      async (runtimes) => ({
+        type: "daemon.runtime.install.response",
+        payload: { requestId: msg.requestId, runtime: await runtimes.install(msg.runtimeName) },
+      }),
+    );
   }
 
-  private async respondWithManagedRuntimes(
+  async handleOrchestrationOperationListRequest(
+    msg: Extract<SessionInboundMessage, { type: "orchestration.operation.list.request" }>,
+  ): Promise<void> {
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.orchestration,
+      ORCHESTRATION_UNAVAILABLE,
+      async (orchestration) => ({
+        type: "orchestration.operation.list.response",
+        payload: {
+          requestId: msg.requestId,
+          operations: orchestration
+            .listOperations({
+              requesterAgentId: msg.requesterAgentId,
+              status:
+                msg.status === undefined ? undefined : OperationStatusSchema.parse(msg.status),
+              limit: msg.limit ?? DEFAULT_LISTED_OPERATIONS,
+            })
+            .map(toOrchestrationOperationSummary),
+        },
+      }),
+    );
+  }
+
+  async handleOrchestrationOperationGetRequest(
+    msg: Extract<SessionInboundMessage, { type: "orchestration.operation.get.request" }>,
+  ): Promise<void> {
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.orchestration,
+      ORCHESTRATION_UNAVAILABLE,
+      async (orchestration) => {
+        const operation = orchestration.getOperation(msg);
+        return {
+          type: "orchestration.operation.get.response",
+          payload: {
+            requestId: msg.requestId,
+            operation: operation ? toOrchestrationOperationSummary(operation) : null,
+          },
+        };
+      },
+    );
+  }
+
+  async handleOrchestrationOperationCancelRequest(
+    msg: Extract<SessionInboundMessage, { type: "orchestration.operation.cancel.request" }>,
+  ): Promise<void> {
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.orchestration,
+      ORCHESTRATION_UNAVAILABLE,
+      async (orchestration) => ({
+        type: "orchestration.operation.cancel.response",
+        payload: {
+          requestId: msg.requestId,
+          operation: toOrchestrationOperationSummary(orchestration.cancel(msg)),
+        },
+      }),
+    );
+  }
+
+  private async respondWithService<T>(
     msg: { type: string; requestId: string },
-    respond: (runtimes: ManagedRuntimeControl) => Promise<SessionOutboundMessage>,
+    service: T | undefined,
+    unavailableMessage: string,
+    respond: (service: T) => Promise<SessionOutboundMessage>,
   ): Promise<void> {
     try {
-      const runtimes = this.daemonRuntimeConfig?.managedRuntimes;
-      if (!runtimes) {
-        throw new Error("Managed Agent runtimes are unavailable on this daemon");
+      if (!service) {
+        throw new Error(unavailableMessage);
       }
-      this.host.emit(await respond(runtimes));
+      this.host.emit(await respond(service));
     } catch (error) {
       this.logger.error(
         { err: error, requestType: msg.type },
-        "Failed to handle managed runtime request",
+        "Failed to handle daemon service request",
       );
       this.host.emit({
         type: "rpc_error",

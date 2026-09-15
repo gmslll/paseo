@@ -94,6 +94,9 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "browser.automation.execute.response": ["browser.use"],
   capture_terminal_request: ["terminal.use"],
   client_heartbeat: ["workspace.metadata.read"],
+  // Operation summaries carry states and error codes, never prompts or Agent responses.
+  "orchestration.operation.get.request": ["workspace.metadata.read"],
+  "orchestration.operation.list.request": ["workspace.metadata.read"],
   create_terminal_request: ["terminal.use"],
   "enterprise.access.list_grants.request": ["identity.manage"],
   "enterprise.access.update_grants.request": ["identity.manage"],
@@ -161,6 +164,8 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
   {
     policy: workspacePolicy("workspace.metadata.read"),
     events: [
+      "orchestration.operation.get.response",
+      "orchestration.operation.list.response",
       "agent_status",
       "agent_update",
       "agent_attention_required",
@@ -247,6 +252,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "agent.timeline.append.response",
       "agent_permission_resolved",
       "cancel_agent_response",
+      "orchestration.operation.cancel.response",
       "chat/create/response",
       "chat/delete/response",
       "chat/post/response",

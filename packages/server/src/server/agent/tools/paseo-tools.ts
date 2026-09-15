@@ -4,7 +4,10 @@ import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentManager } from "../agent-manager.js";
-import { AgentProfileSchema } from "@getpaseo/protocol/messages";
+import {
+  AgentProfileSchema,
+  OrchestrationOperationSummarySchema,
+} from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../../daemon-config-store.js";
 import {
   AgentFeatureSchema,
@@ -103,6 +106,7 @@ import {
   type OperationService,
 } from "../../orchestration/operation-service.js";
 import type { OperationRecord } from "../../orchestration/operation-store.js";
+import { toOrchestrationOperationSummary } from "../../orchestration/operation-summary.js";
 
 export interface PaseoToolHostDependencies {
   agentManager: AgentManager;
@@ -2152,17 +2156,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     return {
       content: [],
       structuredContent: ensureValidJson({
-        operationId: operation.operationId,
-        kind: operation.kind,
-        status: operation.status,
-        errorCode: operation.errorCode,
-        deadlineAt: new Date(operation.deadlineAt).toISOString(),
-        items: operation.items.map((item) => ({
-          agentId: item.targetAgentId,
-          state: item.state,
-          outcome: item.outcome,
-          error: item.errorMessage,
-        })),
+        ...toOrchestrationOperationSummary(operation),
         ...(guidance ? { guidance } : {}),
       }),
     };
@@ -2173,19 +2167,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     requesterAgentId: string,
   ): void {
     const operationSummaryOutputSchema = {
-      operationId: z.string(),
-      kind: z.string(),
-      status: z.string(),
-      errorCode: z.string().nullable(),
-      deadlineAt: z.string(),
-      items: z.array(
-        z.object({
-          agentId: z.string(),
-          state: z.string(),
-          outcome: z.string().nullable(),
-          error: z.string().nullable(),
-        }),
-      ),
+      ...OrchestrationOperationSummarySchema.shape,
       guidance: z.string().optional(),
     };
     const createAgentsInputSchema = {

@@ -3437,7 +3437,7 @@ export class Session {
       this.dispatchHubExecutionMessage(msg) ??
       this.dispatchAgentLifecycleMessage(msg) ??
       this.dispatchAgentConfigMessage(msg) ??
-      this.dispatchManagedRuntimeMessage(msg) ??
+      this.dispatchDaemonServiceMessage(msg) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceLifecycleMessage(msg) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
@@ -3902,12 +3902,18 @@ export class Session {
     }
   }
 
-  private dispatchManagedRuntimeMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchDaemonServiceMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "daemon.runtime.get_status.request":
         return this.daemonSession.handleRuntimeStatusRequest(msg);
       case "daemon.runtime.install.request":
         return this.daemonSession.handleRuntimeInstallRequest(msg);
+      case "orchestration.operation.list.request":
+        return this.daemonSession.handleOrchestrationOperationListRequest(msg);
+      case "orchestration.operation.get.request":
+        return this.daemonSession.handleOrchestrationOperationGetRequest(msg);
+      case "orchestration.operation.cancel.request":
+        return this.daemonSession.handleOrchestrationOperationCancelRequest(msg);
       default:
         return undefined;
     }

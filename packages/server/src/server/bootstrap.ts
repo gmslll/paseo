@@ -2500,6 +2500,7 @@ export async function createPaseoDaemon(
                   },
                   desktopManaged: config.desktopManaged === true,
                   managedRuntimes,
+                  orchestration: operationService ?? undefined,
                   getRelayConfig: () =>
                     relayRuntime?.getConfig() ?? {
                       enabled: daemonConfigStore.get().relay?.enabled ?? relayEnabled,

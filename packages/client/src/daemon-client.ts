@@ -5113,6 +5113,39 @@ export class DaemonClient {
     });
   }
 
+  async listOrchestrationOperations(
+    filter: { requesterAgentId?: string; status?: string; limit?: number } = {},
+    requestId?: string,
+  ) {
+    this.requireOrchestrationOutboxSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"orchestration.operation.list.response">({
+      requestId,
+      message: { type: "orchestration.operation.list.request", ...filter },
+    });
+  }
+
+  async getOrchestrationOperation(
+    key: { requesterAgentId: string; operationId: string },
+    requestId?: string,
+  ) {
+    this.requireOrchestrationOutboxSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"orchestration.operation.get.response">({
+      requestId,
+      message: { type: "orchestration.operation.get.request", ...key },
+    });
+  }
+
+  async cancelOrchestrationOperation(
+    key: { requesterAgentId: string; operationId: string },
+    requestId?: string,
+  ) {
+    this.requireOrchestrationOutboxSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"orchestration.operation.cancel.response">({
+      requestId,
+      message: { type: "orchestration.operation.cancel.request", ...key },
+    });
+  }
+
   async connectHub(
     hubUrl: string,
     token: string,
@@ -6034,6 +6067,13 @@ export class DaemonClient {
     // COMPAT(managedRuntimes): added in v0.9.0, remove gate after 2027-03-16.
     if (this.lastServerInfoMessage?.features?.managedRuntimes !== true) {
       throw new Error("Update the host to manage Agent runtimes.");
+    }
+  }
+
+  private requireOrchestrationOutboxSupport(): void {
+    // COMPAT(orchestrationOutbox): added in v0.9.0, remove gate after 2027-03-16.
+    if (this.lastServerInfoMessage?.features?.orchestrationOutbox !== true) {
+      throw new Error("Update the host to inspect delegation operations.");
     }
   }
 

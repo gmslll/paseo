@@ -2354,6 +2354,29 @@ export const DaemonRuntimeInstallRequestSchema = z.object({
   runtimeName: z.string(),
 });
 
+// Durable delegation operations (ADR-0042). Gated by server_info.features.orchestrationOutbox.
+export const OrchestrationOperationListRequestSchema = z.object({
+  type: z.literal("orchestration.operation.list.request"),
+  requestId: z.string(),
+  requesterAgentId: z.string().optional(),
+  status: z.string().optional(),
+  limit: z.number().int().positive().max(200).optional(),
+});
+
+export const OrchestrationOperationGetRequestSchema = z.object({
+  type: z.literal("orchestration.operation.get.request"),
+  requestId: z.string(),
+  requesterAgentId: z.string(),
+  operationId: z.string(),
+});
+
+export const OrchestrationOperationCancelRequestSchema = z.object({
+  type: z.literal("orchestration.operation.cancel.request"),
+  requestId: z.string(),
+  requesterAgentId: z.string(),
+  operationId: z.string(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4797,6 +4820,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   DaemonConfigReloadRequestSchema,
   DaemonRuntimeGetStatusRequestSchema,
   DaemonRuntimeInstallRequestSchema,
+  OrchestrationOperationListRequestSchema,
+  OrchestrationOperationGetRequestSchema,
+  OrchestrationOperationCancelRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
@@ -6522,6 +6548,55 @@ export const DaemonRuntimeInstallResponseSchema = z.object({
   payload: z.object({
     requestId: z.string(),
     runtime: ManagedRuntimeStatusSchema,
+  }),
+});
+
+// Metadata only: prompts and Agent responses stay out of operation summaries. Kind, status, state,
+// and outcome are open strings so an older client parses values a newer daemon adds.
+export const OrchestrationOperationItemSchema = z.object({
+  itemIndex: z.number().int().nonnegative(),
+  agentId: z.string(),
+  state: z.string(),
+  outcome: z.string().nullable(),
+  error: z.string().nullable(),
+});
+
+export const OrchestrationOperationSummarySchema = z.object({
+  requesterAgentId: z.string(),
+  operationId: z.string(),
+  kind: z.string(),
+  status: z.string(),
+  errorCode: z.string().nullable(),
+  chainDepth: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  deadlineAt: z.string(),
+  finishedAt: z.string().nullable(),
+  items: z.array(OrchestrationOperationItemSchema),
+});
+
+export type OrchestrationOperationSummary = z.infer<typeof OrchestrationOperationSummarySchema>;
+
+export const OrchestrationOperationListResponseSchema = z.object({
+  type: z.literal("orchestration.operation.list.response"),
+  payload: z.object({
+    requestId: z.string(),
+    operations: z.array(OrchestrationOperationSummarySchema),
+  }),
+});
+
+export const OrchestrationOperationGetResponseSchema = z.object({
+  type: z.literal("orchestration.operation.get.response"),
+  payload: z.object({
+    requestId: z.string(),
+    operation: OrchestrationOperationSummarySchema.nullable(),
+  }),
+});
+
+export const OrchestrationOperationCancelResponseSchema = z.object({
+  type: z.literal("orchestration.operation.cancel.response"),
+  payload: z.object({
+    requestId: z.string(),
+    operation: OrchestrationOperationSummarySchema,
   }),
 });
 
@@ -8348,6 +8423,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   DaemonConfigReloadResponseSchema,
   DaemonRuntimeGetStatusResponseSchema,
   DaemonRuntimeInstallResponseSchema,
+  OrchestrationOperationListResponseSchema,
+  OrchestrationOperationGetResponseSchema,
+  OrchestrationOperationCancelResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
   HubManagementDaemonDisconnectResponseSchema,
