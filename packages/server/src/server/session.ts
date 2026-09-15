@@ -278,7 +278,11 @@ import { WorkspaceFilesSession } from "./session/files/workspace-files-session.j
 import type { EnterpriseWorkspaceFilesRuntime } from "./enterprise/runtime/workspace-files-runtime.js";
 import { AgentConfigSession } from "./session/agent-config/agent-config-session.js";
 import { ProjectConfigSession } from "./session/project-config/project-config-session.js";
-import { DaemonSession, type DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
+import {
+  DaemonSession,
+  type DaemonRuntimeConfig,
+  type OrchestrationOperationRequest,
+} from "./session/daemon/daemon-session.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -3909,14 +3913,41 @@ export class Session {
       case "daemon.runtime.install.request":
         return this.daemonSession.handleRuntimeInstallRequest(msg);
       case "orchestration.operation.list.request":
-        return this.daemonSession.handleOrchestrationOperationListRequest(msg);
       case "orchestration.operation.get.request":
-        return this.daemonSession.handleOrchestrationOperationGetRequest(msg);
       case "orchestration.operation.cancel.request":
-        return this.daemonSession.handleOrchestrationOperationCancelRequest(msg);
+        return this.handleOrchestrationOperationRequest(msg);
       default:
         return undefined;
     }
+  }
+
+  // An enterprise Session answers for one requester Agent the Principal can see, and emits the
+  // response with that Agent as its resource context (ADR-0042, ADR-0043). Errors carry no
+  // operation data, so they go out directly like other enterprise denials.
+  private async handleOrchestrationOperationRequest(
+    msg: OrchestrationOperationRequest,
+  ): Promise<void> {
+    if (!this.enterpriseContext) {
+      await this.daemonSession.handleOrchestrationOperationRequest(msg);
+      return;
+    }
+    const action =
+      msg.type === "orchestration.operation.cancel.request"
+        ? "workspace.write"
+        : "workspace.metadata.read";
+    const scope = msg.requesterAgentId
+      ? await this.resolveEnterpriseLegacyAgentResource(action, msg.requesterAgentId)
+      : null;
+    if (!scope) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const response = await this.daemonSession.buildOrchestrationOperationResponse(msg);
+    if (response.type === "rpc_error") {
+      this.onMessage(response);
+      return;
+    }
+    this.emitForSource(response, undefined, this.createAgentOutboundContext(scope));
   }
 
   // eslint-disable-next-line complexity

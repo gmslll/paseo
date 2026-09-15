@@ -30,8 +30,11 @@ runs, and its completion is delivered back to the requester from that record.
   deadline finish as `timed_out`.
 
 Feature flag: `orchestrationOutbox`. RPCs: `orchestration.operation.list`,
-`orchestration.operation.get`, `orchestration.operation.cancel`, and the push message
-`orchestration.operation.update`.
+`orchestration.operation.get`, and `orchestration.operation.cancel`. Summaries carry states,
+outcomes, error codes, and timestamps, never prompts or Agent responses. On an enterprise node the
+Session answers for one visible requester Agent, so `list` requires `requesterAgentId`, and emits
+with that Agent as the resource context. The push message `orchestration.operation.update` waits
+for a client capability, because a new push reaches every connected client.
 
 ## Amends
 

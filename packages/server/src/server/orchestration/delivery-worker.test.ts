@@ -14,6 +14,7 @@ import {
 import { OperationStore, type AcceptOperationInput } from "./operation-store.js";
 import {
   standaloneOrchestrationAuthority,
+  type OrchestrationAuditEvent,
   type OrchestrationAuthority,
 } from "./orchestration-authority.js";
 
@@ -275,6 +276,69 @@ describe("DeliveryWorker", () => {
     expect(operation.items.map((item) => item.outcome)).toEqual(["authorization_revoked"]);
     expect(operation.deliveries.map((delivery) => [delivery.phase, delivery.errorCode])).toEqual([
       ["abandoned", "AUTHORIZATION_REVOKED"],
+    ]);
+    await worker.stop();
+    store.close();
+  });
+});
+
+describe("DeliveryWorker audit", () => {
+  function recordingAuthority(events: OrchestrationAuditEvent[]): OrchestrationAuthority {
+    return {
+      ...standaloneOrchestrationAuthority,
+      record: async (event) => {
+        events.push(event);
+      },
+    };
+  }
+
+  it("records each consumed delivery once and an uncertain delivery it gives up on", async () => {
+    const timeline = new RequesterTimeline();
+    const events: OrchestrationAuditEvent[] = [];
+    const firstBoot = openStore();
+    finishOperation(firstBoot, "boot-a");
+    runOldBootUntil({
+      store: firstBoot,
+      timeline,
+      phase: "started before injection",
+      bootId: "boot-a",
+    });
+    firstBoot.close();
+    const secondBoot = openStore();
+    secondBoot.recoverBoot("boot-b");
+    runOldBootUntil({
+      store: secondBoot,
+      timeline,
+      phase: "started before injection",
+      bootId: "boot-b",
+    });
+    secondBoot.close();
+
+    const store = openStore();
+    store.recoverBoot("boot-c");
+    const key = { requesterAgentId: REQUESTER, operationId: "op-2" };
+    store.accept({
+      ...key,
+      kind: "agent_create",
+      fingerprint: "fingerprint-2",
+      authority: { mode: "standalone" },
+      deadlineAt: clock + 60_000,
+      items: [{ targetAgentId: "child-two", command: { kind: "create" } }],
+    });
+    const claim = store.claimNextItem("boot-c")!;
+    store.markItemRunning({ ...claim, bootId: "boot-c" });
+    store.settleItem({ ...key, itemIndex: 0, outcome: "finished" });
+    const worker = createWorker({
+      store,
+      bootId: "boot-c",
+      timeline,
+      authority: recordingAuthority(events),
+    });
+    await worker.kick();
+
+    expect(events.map((event) => [event.action, event.operationId, event.metadata])).toEqual([
+      ["orchestration.delivery.uncertain", "op-1", { deliverySeq: "1", kind: "completion" }],
+      ["orchestration.delivery.consumed", "op-2", { deliverySeq: "1", kind: "completion" }],
     ]);
     await worker.stop();
     store.close();

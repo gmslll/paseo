@@ -89,7 +89,9 @@ On a standalone daemon, agent-scoped `create_agent` and background `send_agent_p
 - Delegation chains stop at depth 32. A prompt from a person resets the chain for that Agent.
 - A delivery that may have landed before a crash is matched by its message ID or the `[paseo-delivery op:<operationId>:d:<n>]` marker in the requester timeline before it is sent again.
 
-Enterprise nodes and worktree placements still use the in-memory notification, which a restart loses.
+On an enterprise node, a delegation acts for the owner of the requester Agent's Workspace (ADR-0043): each target must allow that owner `workspace.write`, a denied target creates or prompts nothing and writes a `required` audit event, and a changed grant version finishes the operation with `AUTHORIZATION_REVOKED` before anything else is injected. Blocking and fire-and-forget delegations are checked the same way. Agents cannot place a new Agent in a worktree there, because that Workspace does not exist yet to authorize. A node that cannot resolve Workspace owners keeps the outbox off.
+
+Worktree placements on a standalone daemon still use the in-memory notification, which a restart loses.
 
 ## Provider-managed child agents
 

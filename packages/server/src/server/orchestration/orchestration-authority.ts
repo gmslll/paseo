@@ -12,8 +12,20 @@ export const FrozenOrchestrationAuthoritySchema = z.discriminatedUnion("mode", [
 export type FrozenOrchestrationAuthority = z.infer<typeof FrozenOrchestrationAuthoritySchema>;
 
 export type OrchestrationTarget =
-  | { kind: "create"; workspaceId: string }
-  | { kind: "prompt"; agentId: string };
+  /** `null` when the creation makes its own Workspace, such as a new worktree. */
+  { kind: "create"; workspaceId: string | null } | { kind: "prompt"; agentId: string };
+
+export interface OrchestrationAuditEvent {
+  readonly action:
+    | "orchestration.operation.accepted"
+    | "orchestration.operation.finished"
+    | "orchestration.delivery.consumed"
+    | "orchestration.delivery.uncertain";
+  readonly authority: FrozenOrchestrationAuthority;
+  readonly requesterAgentId: string;
+  readonly operationId: string;
+  readonly metadata?: Readonly<Record<string, string>>;
+}
 
 export interface OrchestrationAuthority {
   /** Throws `OrchestrationError` with `AUTHORIZATION_DENIED` when any target is out of reach. */
@@ -22,6 +34,8 @@ export interface OrchestrationAuthority {
     targets: readonly OrchestrationTarget[];
   }): Promise<FrozenOrchestrationAuthority>;
   isCurrent(authority: FrozenOrchestrationAuthority): boolean;
+  /** Records an operation or delivery lifecycle event. Denials are recorded by `authorizeAccept`. */
+  record?(event: OrchestrationAuditEvent): Promise<void>;
 }
 
 export const standaloneOrchestrationAuthority: OrchestrationAuthority = {

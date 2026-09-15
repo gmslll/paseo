@@ -387,17 +387,17 @@ describe("DaemonSession", () => {
         },
       });
 
-      await subsystem.handleOrchestrationOperationListRequest({
+      await subsystem.handleOrchestrationOperationRequest({
         type: "orchestration.operation.list.request",
         requestId: "op-1",
         status: "running",
       });
-      await subsystem.handleOrchestrationOperationCancelRequest({
+      await subsystem.handleOrchestrationOperationRequest({
         type: "orchestration.operation.cancel.request",
         requestId: "op-2",
         ...key,
       });
-      await subsystem.handleOrchestrationOperationGetRequest({
+      await subsystem.handleOrchestrationOperationRequest({
         type: "orchestration.operation.get.request",
         requestId: "op-3",
         requesterAgentId: "agent-parent",
@@ -458,7 +458,7 @@ describe("DaemonSession", () => {
   test("operation RPCs fail with a correlated RPC error when the outbox is not running", async () => {
     const { subsystem, emitted } = makeSubsystem({});
 
-    await subsystem.handleOrchestrationOperationListRequest({
+    await subsystem.handleOrchestrationOperationRequest({
       type: "orchestration.operation.list.request",
       requestId: "op-4",
     });

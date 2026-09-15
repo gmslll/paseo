@@ -1469,6 +1469,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       if (delegable) {
         return delegateCreateAgent({ ...delegable, args });
       }
+      await authorizeDirectCreate(resolvedArgs);
       const { parsedArgs, worktree } = resolvedArgs;
       let requestedBackground: boolean;
       let notifyOnFinish: boolean;
@@ -1937,6 +1938,13 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       if (delegation) {
         return delegatePrompt({ ...delegation, args, agentId, prompt, sessionMode });
       }
+      const directPrompt = delegationContext();
+      if (directPrompt) {
+        await directPrompt.orchestration.authorize({
+          requesterAgentId: directPrompt.requesterAgentId,
+          targets: [{ kind: "prompt", agentId }],
+        });
+      }
       const shouldNotifyOnFinish = Boolean(callerAgentId && notifyOnFinish && background);
 
       await sendPromptToAgent({
@@ -2012,6 +2020,17 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     return options.orchestration && callerAgentId
       ? { orchestration: options.orchestration, requesterAgentId: callerAgentId }
       : null;
+  }
+
+  // Agent-scoped creations outside the outbox still act for the requester's Workspace owner
+  // (ADR-0043). A worktree placement has no Workspace yet, which enterprise nodes refuse.
+  async function authorizeDirectCreate(resolvedArgs: ResolvedCreateAgentToolArgs): Promise<void> {
+    const delegation = delegationContext();
+    if (!delegation || resolvedArgs.kind !== "agent-scoped") return;
+    await delegation.orchestration.authorize({
+      requesterAgentId: delegation.requesterAgentId,
+      targets: [{ kind: "create", workspaceId: resolvedArgs.workspaceId ?? null }],
+    });
   }
 
   // Worktree placements create their Workspace during creation, so they keep the in-memory

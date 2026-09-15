@@ -169,6 +169,7 @@ import { createAgentOrchestrationPort } from "./orchestration/agent-orchestratio
 import { OperationService, formatOperationCompletion } from "./orchestration/operation-service.js";
 import { OperationStore } from "./orchestration/operation-store.js";
 import { standaloneOrchestrationAuthority } from "./orchestration/orchestration-authority.js";
+import { createEnterpriseRuntimeOrchestrationAuthority } from "./orchestration/enterprise-orchestration-authority.js";
 import { DaemonConfigStore, type MutableDaemonConfig } from "./daemon-config-store.js";
 import { createOrchestrationSkills } from "./orchestration-skills/index.js";
 import { resolveConfigFromPersisted, type CliConfigOverrides } from "./config.js";
@@ -2017,23 +2018,37 @@ export async function createPaseoDaemon(
     });
     constructionCleanupStack.push(() => scheduleService.stop());
     await scheduleService.start();
-    // Durable delegation outbox (ADR-0042). Enterprise nodes keep in-memory finish notifications
-    // until delegations are authorized against Workspace Grants (ADR-0043).
-    const operationStore = enterpriseRuntime
-      ? null
-      : OperationStore.open({
+    // Durable delegation outbox (ADR-0042). Enterprise nodes delegate as the requester Workspace
+    // owner (ADR-0043); a node that cannot resolve owners keeps the outbox off.
+    const orchestrationAuthority = enterpriseRuntime
+      ? createEnterpriseRuntimeOrchestrationAuthority(enterpriseRuntime)
+      : standaloneOrchestrationAuthority;
+    if (!orchestrationAuthority) {
+      logger.warn(
+        "Delegation outbox disabled: this enterprise node cannot resolve Workspace owners",
+      );
+    }
+    const operationStore = orchestrationAuthority
+      ? OperationStore.open({
           path: path.join(capturedPaseoHome, "orchestration", "operations.sqlite3"),
           formatCompletion: formatOperationCompletion,
-        });
-    const operationService = operationStore
-      ? new OperationService({
-          store: operationStore,
-          bootId: randomUUID(),
-          agents: createAgentOrchestrationPort({ agentManager, agentStorage, createAgent, logger }),
-          authority: standaloneOrchestrationAuthority,
-          logger: logger.child({ module: "orchestration" }),
         })
       : null;
+    const operationService =
+      operationStore && orchestrationAuthority
+        ? new OperationService({
+            store: operationStore,
+            bootId: randomUUID(),
+            agents: createAgentOrchestrationPort({
+              agentManager,
+              agentStorage,
+              createAgent,
+              logger,
+            }),
+            authority: orchestrationAuthority,
+            logger: logger.child({ module: "orchestration" }),
+          })
+        : null;
     if (operationStore && operationService) {
       constructionCleanupStack.push(() => operationStore.close());
       constructionCleanupStack.push(() => operationService.stop());

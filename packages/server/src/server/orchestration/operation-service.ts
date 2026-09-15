@@ -20,7 +20,11 @@ import type {
   OperationRecord,
   OperationStore,
 } from "./operation-store.js";
-import type { OrchestrationAuthority, OrchestrationTarget } from "./orchestration-authority.js";
+import type {
+  OrchestrationAuditEvent,
+  OrchestrationAuthority,
+  OrchestrationTarget,
+} from "./orchestration-authority.js";
 import { OrchestrationError } from "./orchestration-error.js";
 
 // Accepts Agent-to-Agent delegations into the outbox, dispatches their items one at a time, watches
@@ -302,7 +306,13 @@ export class OperationService {
         command: item,
       })),
     });
-    if (!result.replayed) void this.pump();
+    if (!result.replayed) {
+      this.recordAudit(result.operation, "orchestration.operation.accepted", {
+        kind,
+        items: String(input.items.length),
+      });
+      void this.pump();
+    }
     return result;
   }
 
@@ -326,6 +336,14 @@ export class OperationService {
     }
   }
 
+  /** Checks a delegation that runs outside the outbox, such as a blocking prompt. */
+  async authorize(input: {
+    requesterAgentId: string;
+    targets: readonly OrchestrationTarget[];
+  }): Promise<void> {
+    await this.options.authority.authorizeAccept(input);
+  }
+
   getOperation(key: OperationKey): OperationRecord | null {
     return this.options.store.getOperation(key);
   }
@@ -335,10 +353,15 @@ export class OperationService {
   }
 
   cancel(key: OperationKey): OperationRecord {
-    for (const item of this.requireOperation(key).items) {
+    const operation = this.requireOperation(key);
+    for (const item of operation.items) {
       this.stopWatch(item);
     }
-    return this.options.store.cancel(key);
+    const canceled = this.options.store.cancel(key);
+    if (operation.status === "running") {
+      this.recordAudit(canceled, "orchestration.operation.finished", { status: canceled.status });
+    }
+    return canceled;
   }
 
   /** Settles unsettled items of operations whose deadline has passed. */
@@ -407,7 +430,11 @@ export class OperationService {
     const operation = store.getOperation(claim);
     if (operation?.status !== "running") return;
     if (!authority.isCurrent(operation.authority)) {
-      store.finishRevoked(claim);
+      const revoked = store.finishRevoked(claim);
+      this.recordAudit(revoked, "orchestration.operation.finished", {
+        status: revoked.status,
+        errorCode: "AUTHORIZATION_REVOKED",
+      });
       return;
     }
     const item = DelegationItemSchema.parse(claim.command);
@@ -477,7 +504,12 @@ export class OperationService {
       errorMessage: input.errorMessage ?? null,
       lastMessage,
     });
-    if (result.operationFinished) void this.worker.kick();
+    if (!result.operationFinished) return;
+    const finished = this.options.store.getOperation(item);
+    if (finished) {
+      this.recordAudit(finished, "orchestration.operation.finished", { status: finished.status });
+    }
+    void this.worker.kick();
   }
 
   private async checkpoint(
@@ -535,6 +567,21 @@ export class OperationService {
         "Failed to reset delegation chain depth",
       );
     }
+  }
+
+  private recordAudit(
+    operation: OperationRecord,
+    action: OrchestrationAuditEvent["action"],
+    metadata: Record<string, string>,
+  ): void {
+    const record = this.options.authority.record?.({
+      action,
+      authority: operation.authority,
+      requesterAgentId: operation.requesterAgentId,
+      operationId: operation.operationId,
+      metadata,
+    });
+    if (record) this.track(record);
   }
 
   private track(promise: Promise<void>): void {

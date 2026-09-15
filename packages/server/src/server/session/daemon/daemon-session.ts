@@ -21,6 +21,57 @@ const MANAGED_RUNTIMES_UNAVAILABLE = "Managed Agent runtimes are unavailable on 
 const ORCHESTRATION_UNAVAILABLE = "Delegation operations are unavailable on this daemon";
 const DEFAULT_LISTED_OPERATIONS = 50;
 
+export type OrchestrationOperationRequest = Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "orchestration.operation.list.request"
+      | "orchestration.operation.get.request"
+      | "orchestration.operation.cancel.request";
+  }
+>;
+
+function orchestrationOperationResponse(
+  orchestration: OrchestrationOperationControl,
+  msg: OrchestrationOperationRequest,
+): SessionOutboundMessage {
+  switch (msg.type) {
+    case "orchestration.operation.list.request":
+      return {
+        type: "orchestration.operation.list.response",
+        payload: {
+          requestId: msg.requestId,
+          operations: orchestration
+            .listOperations({
+              requesterAgentId: msg.requesterAgentId,
+              status:
+                msg.status === undefined ? undefined : OperationStatusSchema.parse(msg.status),
+              limit: msg.limit ?? DEFAULT_LISTED_OPERATIONS,
+            })
+            .map(toOrchestrationOperationSummary),
+        },
+      };
+    case "orchestration.operation.get.request": {
+      const operation = orchestration.getOperation(msg);
+      return {
+        type: "orchestration.operation.get.response",
+        payload: {
+          requestId: msg.requestId,
+          operation: operation ? toOrchestrationOperationSummary(operation) : null,
+        },
+      };
+    }
+    case "orchestration.operation.cancel.request":
+      return {
+        type: "orchestration.operation.cancel.response",
+        payload: {
+          requestId: msg.requestId,
+          operation: toOrchestrationOperationSummary(orchestration.cancel(msg)),
+        },
+      };
+  }
+}
+
 export interface DaemonRuntimeConfig {
   listen: string | null;
   worktreesRoot?: string;
@@ -247,64 +298,19 @@ export class DaemonSession {
     );
   }
 
-  async handleOrchestrationOperationListRequest(
-    msg: Extract<SessionInboundMessage, { type: "orchestration.operation.list.request" }>,
-  ): Promise<void> {
-    await this.respondWithService(
-      msg,
-      this.daemonRuntimeConfig?.orchestration,
-      ORCHESTRATION_UNAVAILABLE,
-      async (orchestration) => ({
-        type: "orchestration.operation.list.response",
-        payload: {
-          requestId: msg.requestId,
-          operations: orchestration
-            .listOperations({
-              requesterAgentId: msg.requesterAgentId,
-              status:
-                msg.status === undefined ? undefined : OperationStatusSchema.parse(msg.status),
-              limit: msg.limit ?? DEFAULT_LISTED_OPERATIONS,
-            })
-            .map(toOrchestrationOperationSummary),
-        },
-      }),
-    );
+  async handleOrchestrationOperationRequest(msg: OrchestrationOperationRequest): Promise<void> {
+    this.host.emit(await this.buildOrchestrationOperationResponse(msg));
   }
 
-  async handleOrchestrationOperationGetRequest(
-    msg: Extract<SessionInboundMessage, { type: "orchestration.operation.get.request" }>,
-  ): Promise<void> {
-    await this.respondWithService(
+  /** Builds the response, or a correlated rpc_error, without emitting it. */
+  buildOrchestrationOperationResponse(
+    msg: OrchestrationOperationRequest,
+  ): Promise<SessionOutboundMessage> {
+    return this.buildServiceResponse(
       msg,
       this.daemonRuntimeConfig?.orchestration,
       ORCHESTRATION_UNAVAILABLE,
-      async (orchestration) => {
-        const operation = orchestration.getOperation(msg);
-        return {
-          type: "orchestration.operation.get.response",
-          payload: {
-            requestId: msg.requestId,
-            operation: operation ? toOrchestrationOperationSummary(operation) : null,
-          },
-        };
-      },
-    );
-  }
-
-  async handleOrchestrationOperationCancelRequest(
-    msg: Extract<SessionInboundMessage, { type: "orchestration.operation.cancel.request" }>,
-  ): Promise<void> {
-    await this.respondWithService(
-      msg,
-      this.daemonRuntimeConfig?.orchestration,
-      ORCHESTRATION_UNAVAILABLE,
-      async (orchestration) => ({
-        type: "orchestration.operation.cancel.response",
-        payload: {
-          requestId: msg.requestId,
-          operation: toOrchestrationOperationSummary(orchestration.cancel(msg)),
-        },
-      }),
+      async (orchestration) => orchestrationOperationResponse(orchestration, msg),
     );
   }
 
@@ -314,17 +320,26 @@ export class DaemonSession {
     unavailableMessage: string,
     respond: (service: T) => Promise<SessionOutboundMessage>,
   ): Promise<void> {
+    this.host.emit(await this.buildServiceResponse(msg, service, unavailableMessage, respond));
+  }
+
+  private async buildServiceResponse<T>(
+    msg: { type: string; requestId: string },
+    service: T | undefined,
+    unavailableMessage: string,
+    respond: (service: T) => Promise<SessionOutboundMessage>,
+  ): Promise<SessionOutboundMessage> {
     try {
       if (!service) {
         throw new Error(unavailableMessage);
       }
-      this.host.emit(await respond(service));
+      return await respond(service);
     } catch (error) {
       this.logger.error(
         { err: error, requestType: msg.type },
         "Failed to handle daemon service request",
       );
-      this.host.emit({
+      return {
         type: "rpc_error",
         payload: {
           requestId: msg.requestId,
@@ -332,7 +347,7 @@ export class DaemonSession {
           error: error instanceof Error ? error.message : String(error),
           code: "handler_error",
         },
-      });
+      };
     }
   }
 

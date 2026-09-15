@@ -1,8 +1,13 @@
 import type { Logger } from "pino";
 
 import { formatSystemNotificationPrompt } from "../agent/agent-prompt.js";
-import type { OrchestrationAuthority } from "./orchestration-authority.js";
-import type { ClaimedDelivery, DeliveryKey, OperationStore } from "./operation-store.js";
+import type { OrchestrationAuditEvent, OrchestrationAuthority } from "./orchestration-authority.js";
+import type {
+  ClaimedDelivery,
+  DeliveryKey,
+  OperationRecord,
+  OperationStore,
+} from "./operation-store.js";
 
 // Delivers queued checkpoints and completions to requester Agents (ADR-0042). A delivery moves
 // claimed -> prepared -> started -> consumed. Only "started" can leave the requester unsure whether
@@ -113,12 +118,18 @@ export class DeliveryWorker {
     if (!operation) return;
     if (!this.options.authority.isCurrent(operation.authority)) {
       store.abandonDelivery(claim, bootId, "AUTHORIZATION_REVOKED");
-      store.finishRevoked(operation);
+      const revoked = store.finishRevoked(operation);
+      if (operation.status === "running") {
+        this.record(revoked, "orchestration.operation.finished", {
+          status: revoked.status,
+          errorCode: "AUTHORIZATION_REVOKED",
+        });
+      }
       return;
     }
     const injection = buildDeliveryInjection(claim);
     try {
-      if (claim.uncertain && !(await this.resolveUncertain(claim, injection))) return;
+      if (claim.uncertain && !(await this.resolveUncertain(operation, claim, injection))) return;
       if ((await this.options.target.prepare(injection)) === "requester_unavailable") {
         store.abandonDelivery(claim, bootId, "REQUESTER_UNAVAILABLE");
         return;
@@ -127,7 +138,9 @@ export class DeliveryWorker {
         return;
       }
       await this.options.target.deliver(injection);
-      store.markDeliveryConsumed(claim, bootId);
+      if (store.markDeliveryConsumed(claim, bootId)) {
+        this.recordDelivery(operation, claim, "orchestration.delivery.consumed");
+      }
     } catch (error) {
       this.options.logger.warn(
         {
@@ -149,19 +162,50 @@ export class DeliveryWorker {
 
   /** Returns true when the delivery should be injected (again). */
   private async resolveUncertain(
+    operation: OperationRecord,
     claim: ClaimedDelivery,
     injection: DeliveryInjection,
   ): Promise<boolean> {
     const { store, bootId } = this.options;
     if (await this.options.target.hasDelivered(injection)) {
-      store.markDeliveryConsumed(claim, bootId);
+      if (store.markDeliveryConsumed(claim, bootId)) {
+        this.recordDelivery(operation, claim, "orchestration.delivery.consumed");
+      }
       return false;
     }
     if (claim.attempts >= MAX_DELIVERY_ATTEMPTS) {
-      store.abandonDelivery(claim, bootId, "DELIVERY_EXECUTION_UNCERTAIN");
+      if (store.abandonDelivery(claim, bootId, "DELIVERY_EXECUTION_UNCERTAIN")) {
+        this.recordDelivery(operation, claim, "orchestration.delivery.uncertain");
+      }
       return false;
     }
     return true;
+  }
+
+  private recordDelivery(
+    operation: OperationRecord,
+    claim: ClaimedDelivery,
+    action: OrchestrationAuditEvent["action"],
+  ): void {
+    this.record(operation, action, { deliverySeq: String(claim.deliverySeq), kind: claim.kind });
+  }
+
+  private record(
+    operation: OperationRecord,
+    action: OrchestrationAuditEvent["action"],
+    metadata: Record<string, string>,
+  ): void {
+    void this.options.authority
+      .record?.({
+        action,
+        authority: operation.authority,
+        requesterAgentId: operation.requesterAgentId,
+        operationId: operation.operationId,
+        metadata,
+      })
+      ?.catch((error: unknown) => {
+        this.options.logger.error({ err: error }, "Failed to audit a delegation delivery");
+      });
   }
 
   private scheduleRetry(): void {
