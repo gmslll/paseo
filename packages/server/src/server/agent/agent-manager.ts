@@ -298,6 +298,13 @@ export interface CreateAgentOptions {
   owner?: AgentOwner;
 }
 
+// Kept outside the constructor so optional wiring does not add constructor branches.
+function resolveMcpCallerTokenMinter(
+  options: AgentManagerOptions | undefined,
+): (agentId: string) => string | null {
+  return options?.mintMcpCallerToken ?? (() => null);
+}
+
 export interface AgentManagerOptions {
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
@@ -310,6 +317,7 @@ export interface AgentManagerOptions {
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
+  mintMcpCallerToken?: (agentId: string) => string;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
@@ -745,6 +753,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
+  private readonly mintMcpCallerToken: (agentId: string) => string | null;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -769,6 +778,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.mintMcpCallerToken = resolveMcpCallerTokenMinter(options);
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -5114,12 +5124,12 @@ export class AgentManager {
     const launchConfig = this.applyDaemonAppendSystemPrompt(
       withRuntimePaseoMcpServer({
         config: storedConfig,
-        agentId,
         mcpBaseUrl:
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
             ? this.mcpBaseUrl
             : null,
         mcpAuthToken: this.mcpAuthToken,
+        mcpCallerToken: this.mintMcpCallerToken(agentId),
       }),
     );
     return { storedConfig, launchConfig, paseoToolPolicy };

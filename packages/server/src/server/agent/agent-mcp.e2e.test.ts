@@ -79,10 +79,18 @@ function getStructuredContent(result: McpToolResult): StructuredContent | null {
   return null;
 }
 
-async function createMcpClient(url: string, authToken?: string): Promise<McpClient> {
+async function createMcpClient(
+  url: string,
+  authToken?: string,
+  extraHeaders: Record<string, string> = {},
+): Promise<McpClient> {
+  const headers = {
+    ...extraHeaders,
+    ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+  };
   const transport = new StreamableHTTPClientTransport(
     new URL(url),
-    authToken ? { requestInit: { headers: { Authorization: `Bearer ${authToken}` } } } : undefined,
+    Object.keys(headers).length > 0 ? { requestInit: { headers } } : undefined,
   );
   const rawClient = await experimental_createMCPClient({ transport });
   const boundCallTool: McpClient["callTool"] = Reflect.get(rawClient, "callTool").bind(rawClient);
@@ -372,7 +380,8 @@ describe("agent MCP end-to-end (offline)", () => {
       expect(recorder.recordedLaunches.at(-1)?.mcpServers).toMatchObject({
         paseo: {
           type: "http",
-          url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
+          url: `http://127.0.0.1:${port}/mcp/agents`,
+          headers: { "x-paseo-agent-caller": expect.any(String) },
         },
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
@@ -461,7 +470,8 @@ describe("agent MCP end-to-end (offline)", () => {
       expect(recorder.recordedLaunches.at(-1)?.mcpServers).toMatchObject({
         paseo: {
           type: "http",
-          url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
+          url: `http://127.0.0.1:${port}/mcp/agents`,
+          headers: { "x-paseo-agent-caller": expect.any(String) },
         },
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
@@ -826,4 +836,107 @@ describe("agent MCP end-to-end (offline)", () => {
       await rm(repoRoot, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test("identifies an Agent caller only from its injected caller token", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const recorder: LaunchRecorder = { recordedLaunches: [] };
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createMcpRecordingAgentClients(recorder),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    const topLevelClient = await createMcpClient(mcpUrl);
+    let agentClient: McpClient | null = null;
+    let agentId: string | null = null;
+    try {
+      const created = getStructuredContent(
+        await topLevelClient.callTool({
+          name: "create_agent",
+          args: {
+            cwd: agentCwd,
+            title: "Caller identity",
+            provider: "claude/claude-test-model",
+            mode: "bypassPermissions",
+            initialPrompt: "reply with done and stop",
+            background: true,
+          },
+        }),
+      );
+      agentId = typeof created?.agentId === "string" ? created.agentId : null;
+      expect(agentId).toBeTruthy();
+
+      const initialize = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "forged-caller", version: "0.0.0" },
+        },
+      });
+      const mcpHeaders = {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      };
+      const namedInQuery = await fetch(`${mcpUrl}?callerAgentId=${agentId!}`, {
+        method: "POST",
+        headers: mcpHeaders,
+        body: initialize,
+      });
+      expect(namedInQuery.status).toBe(401);
+      const forgedHeader = await fetch(mcpUrl, {
+        method: "POST",
+        headers: { ...mcpHeaders, "x-paseo-agent-caller": agentId! },
+        body: initialize,
+      });
+      expect(forgedHeader.status).toBe(401);
+
+      const injected = recorder.recordedLaunches.at(-1)?.mcpServers?.paseo;
+      const callerToken =
+        injected?.type === "http" ? injected.headers?.["x-paseo-agent-caller"] : undefined;
+      expect(typeof callerToken).toBe("string");
+
+      const withoutCaller = await topLevelClient.callTool({
+        name: "create_heartbeat",
+        args: { prompt: "say hello", cron: "*/5 * * * *" },
+      });
+      expect(withoutCaller.isError).toBe(true);
+
+      agentClient = await createMcpClient(mcpUrl, undefined, {
+        "x-paseo-agent-caller": callerToken!,
+      });
+      const withCaller = await agentClient.callTool({
+        name: "create_heartbeat",
+        args: { prompt: "say hello", cron: "*/5 * * * *" },
+      });
+      expect(withCaller.isError).not.toBe(true);
+    } finally {
+      if (agentId) {
+        await topLevelClient.callTool({ name: "kill_agent", args: { agentId } });
+      }
+      await agentClient?.close();
+      await topLevelClient.close();
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+      await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

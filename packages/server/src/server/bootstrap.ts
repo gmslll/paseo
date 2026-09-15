@@ -273,6 +273,11 @@ import {
   isAgentMcpRequestAuthorized,
   type DaemonAuthConfig,
 } from "./auth.js";
+import {
+  AGENT_MCP_CALLER_HEADER,
+  createAgentMcpCallerTokens,
+  resolveAgentMcpCaller,
+} from "./agent/mcp-caller-token.js";
 import { createWebUiMiddleware } from "./web-ui.js";
 import { WorkspaceAutoName } from "./workspace-auto-name.js";
 import { createGitMutationService } from "./session/git-mutation/git-mutation-service.js";
@@ -981,6 +986,9 @@ export async function createPaseoDaemon(
     // no plaintext available). Mirrors the /api/files/download capability-token
     // pattern.
     const agentMcpAuthToken = randomUUID();
+    // Per-Agent caller identity for the same endpoint (ADR-0043). The route trusts only these
+    // tokens, never a caller ID named by the request.
+    const agentMcpCallerTokens = createAgentMcpCallerTokens();
 
     const listenTarget = parseListenString(config.listen);
 
@@ -1374,6 +1382,7 @@ export async function createPaseoDaemon(
         workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
       },
       mcpAuthToken: agentMcpAuthToken,
+      mintMcpCallerToken: (agentId) => agentMcpCallerTokens.mint(agentId),
       resolvePaseoToolPolicy: (provider) =>
         resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
       logger,
@@ -2160,14 +2169,18 @@ export async function createPaseoDaemon(
             });
             return;
           }
-          const callerAgentIdRaw = req.query.callerAgentId;
-          let callerAgentId: string | undefined;
-          if (typeof callerAgentIdRaw === "string") {
-            callerAgentId = callerAgentIdRaw;
-          } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-            callerAgentId = callerAgentIdRaw[0];
+          const caller = resolveAgentMcpCaller({
+            tokens: agentMcpCallerTokens,
+            callerHeader: req.header(AGENT_MCP_CALLER_HEADER),
+            legacyCallerAgentId: req.query.callerAgentId,
+          });
+          if (caller.kind === "rejected") {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
           }
-          const { server, transport } = await createAgentMcpSession(callerAgentId);
+          const { server, transport } = await createAgentMcpSession(
+            caller.kind === "agent" ? caller.agentId : undefined,
+          );
           res.on("close", () => {
             void transport.close();
             void server.close();

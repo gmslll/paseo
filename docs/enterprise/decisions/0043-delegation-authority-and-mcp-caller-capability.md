@@ -6,17 +6,21 @@
 
 ## Problem
 
-The Agent MCP route reads the calling Agent from the `callerAgentId` query parameter
-(`packages/server/src/server/bootstrap.ts`). Any local process that reaches the route can claim to be
-any Agent and inherit its tool policy.
+The Agent MCP route `/mcp/agents` (`packages/server/src/server/bootstrap.ts`) reads the calling
+Agent from the `callerAgentId` query parameter. With a daemon password set, the route requires the
+per-run capability token, but every Agent receives that same token, so any Agent can name another
+Agent. Without a daemon password the route accepts any local request. Either way the caller
+inherits the named Agent's tool policy, parent relationship, and Workspace.
 
 ## Decision
 
-- The daemon mints a per-Agent capability token when it builds the Agent's MCP configuration. The
-  token is an HMAC-SHA256 over the Agent ID and daemon boot ID with a key held only in daemon
-  memory.
-- The MCP route accepts only that token and derives the caller Agent from it. A bare
-  `callerAgentId` is rejected. Tokens from an earlier boot are rejected.
+- The daemon mints a per-Agent caller token when it builds the Agent's MCP configuration:
+  `pmc1.<base64url Agent ID>.<base64url HMAC-SHA256>`, keyed by 32 random bytes generated for each
+  daemon run and held only in memory. Tokens from an earlier run do not verify.
+- The token travels in the `x-paseo-agent-caller` header, not the URL, so request debug logs never
+  contain it.
+- The route derives the caller Agent only from a verified token. A request naming `callerAgentId` in
+  the query is rejected with 401. A request with neither is a top-level caller, as before.
 - Delegation authority is the caller Agent's persisted Workspace owner, resolved through
   `OwnerRegistry` and frozen when the operation is accepted. Tool arguments never supply a Principal
   or Workspace authority.
