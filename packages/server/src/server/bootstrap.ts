@@ -165,6 +165,10 @@ import {
 } from "./workspace-registry.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { ScheduleService } from "./schedule/service.js";
+import { createAgentOrchestrationPort } from "./orchestration/agent-orchestration-port.js";
+import { OperationService, formatOperationCompletion } from "./orchestration/operation-service.js";
+import { OperationStore } from "./orchestration/operation-store.js";
+import { standaloneOrchestrationAuthority } from "./orchestration/orchestration-authority.js";
 import { DaemonConfigStore, type MutableDaemonConfig } from "./daemon-config-store.js";
 import { createOrchestrationSkills } from "./orchestration-skills/index.js";
 import { resolveConfigFromPersisted, type CliConfigOverrides } from "./config.js";
@@ -2013,6 +2017,28 @@ export async function createPaseoDaemon(
     });
     constructionCleanupStack.push(() => scheduleService.stop());
     await scheduleService.start();
+    // Durable delegation outbox (ADR-0042). Enterprise nodes keep in-memory finish notifications
+    // until delegations are authorized against Workspace Grants (ADR-0043).
+    const operationStore = enterpriseRuntime
+      ? null
+      : OperationStore.open({
+          path: path.join(capturedPaseoHome, "orchestration", "operations.sqlite3"),
+          formatCompletion: formatOperationCompletion,
+        });
+    const operationService = operationStore
+      ? new OperationService({
+          store: operationStore,
+          bootId: randomUUID(),
+          agents: createAgentOrchestrationPort({ agentManager, agentStorage, createAgent, logger }),
+          authority: standaloneOrchestrationAuthority,
+          logger: logger.child({ module: "orchestration" }),
+        })
+      : null;
+    if (operationStore && operationService) {
+      constructionCleanupStack.push(() => operationStore.close());
+      constructionCleanupStack.push(() => operationService.stop());
+      await operationService.start();
+    }
     requireConstructionAudit();
     agentManager.setAgentArchivedCallback(async (agentId) => {
       try {
@@ -2094,6 +2120,7 @@ export async function createPaseoDaemon(
           : undefined),
       paseoHome: capturedPaseoHome,
       worktreesRoot: config.worktreesRoot,
+      orchestration: operationService ?? undefined,
       callerAgentId: runtime.callerAgentId,
       enableVoiceTools: runtime.enableVoiceTools,
       voiceOnly: runtime.voiceOnly,
@@ -2268,6 +2295,9 @@ export async function createPaseoDaemon(
       } catch (error) {
         appendError(errors, error);
       }
+      // Stop watching delegated Agents before they close, so the next boot reports them as
+      // interrupted instead of closed.
+      const operationServiceStop = operationService?.stop();
       try {
         hubRelationshipShutdown = hubRelationships.stop();
       } catch (error) {
@@ -2285,10 +2315,12 @@ export async function createPaseoDaemon(
         await runCleanupStep(errors, () => scriptHealthMonitor.stop());
         await runCleanupStep(errors, () => scheduleService.stop());
         await runCleanupStep(errors, () => relayRuntime?.stop());
+        await runCleanupStep(errors, () => operationServiceStop);
         await runCleanupStep(errors, () => closeAllAgents(logger, agentManager));
         await runCleanupStep(errors, () => agentManager.flushForShutdown());
         await runCleanupStep(errors, () => detachAgentStoragePersistence());
         await runCleanupStep(errors, () => agentStorage.flush());
+        await runCleanupStep(errors, () => operationStore?.close());
         await runCleanupStep(errors, () => agentProviderRuntime.shutdown());
         await runCleanupStep(errors, () => terminalManager.killAll());
         await runCleanupStep(errors, () => speechService.stop());

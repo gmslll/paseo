@@ -78,6 +78,19 @@ Permission requests are notification checkpoints, not the end of that subscripti
 The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
 A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
 
+### Durable delegations
+
+On a standalone daemon, agent-scoped `create_agent` and background `send_agent_prompt`, plus `create_agents` and `send_agent_prompts`, are operations recorded in `$PASEO_HOME/orchestration/operations.sqlite3` before any Agent is created or prompted (ADR-0042). Notifications are delivered from that record, so a daemon restart does not lose them.
+
+- Retrying with the same `operationId` and arguments returns the recorded operation. Different arguments fail with `OPERATION_ID_CONFLICT`.
+- A fan-out operation sends one completion after every item settles. Permission checkpoints are still sent one per request.
+- Work that was running when the daemon stopped settles as `interrupted` on the next boot. A creation that never reached its Agent runs again under the same Agent ID, because `createAgent` replaces any existing state for an ID it is given.
+- Items still unsettled at the deadline (24 hours unless `deadlineSeconds` sets it) settle as `timed_out`. Their Agents keep running, and `cancel_operation` likewise stops tracking without stopping Agents or notifying.
+- Delegation chains stop at depth 32. A prompt from a person resets the chain for that Agent.
+- A delivery that may have landed before a crash is matched by its message ID or the `[paseo-delivery op:<operationId>:d:<n>]` marker in the requester timeline before it is sent again.
+
+Enterprise nodes and worktree placements still use the in-memory notification, which a restart loses.
+
 ## Provider-managed child agents
 
 Some providers can create their own child sessions inside one provider runtime. OMP's task tool reports these with `child_session` events; `AgentManager` imports the live provider handle, stamps `paseo.parent-agent-id`, and surfaces the result as a normal subagent in the parent's subagents track.

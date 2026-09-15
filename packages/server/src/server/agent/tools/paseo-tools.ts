@@ -94,6 +94,15 @@ import type {
 } from "./types.js";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
+import type { DelegatedCreateSpec } from "../../orchestration/agent-orchestration-port.js";
+import {
+  OPERATION_DEADLINE_MAX_SECONDS,
+  OPERATION_DEADLINE_MIN_SECONDS,
+  OPERATION_ID_PATTERN,
+  type DelegationItem,
+  type OperationService,
+} from "../../orchestration/operation-service.js";
+import type { OperationRecord } from "../../orchestration/operation-store.js";
 
 export interface PaseoToolHostDependencies {
   agentManager: AgentManager;
@@ -133,6 +142,8 @@ export interface PaseoToolHostDependencies {
   paseoToolPolicy?: ProviderPaseoToolsPolicy;
   paseoHome?: string;
   worktreesRoot?: string;
+  /** Durable delegation outbox (ADR-0042). Agent-scoped background delegations use it when set. */
+  orchestration?: OperationService;
   /**
    * ID of the agent that is using this tool catalog.
    * Used for cwd/mode inheritance when agents spawn child agents.
@@ -1016,8 +1027,31 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         "Existing workspace id. Agent-scoped calls default to the caller workspace; top-level calls create a new local workspace when omitted.",
       ),
   };
+  const delegationOperationFields = {
+    operationId: z
+      .string()
+      .regex(OPERATION_ID_PATTERN)
+      .optional()
+      .describe(
+        "Idempotency key. Retrying with the same operationId and arguments returns the original delegation instead of delegating again.",
+      ),
+    deadlineSeconds: z
+      .number()
+      .int()
+      .min(OPERATION_DEADLINE_MIN_SECONDS)
+      .max(OPERATION_DEADLINE_MAX_SECONDS)
+      .optional()
+      .describe(
+        "How long to wait for the delegated work before reporting it as timed out. Defaults to 24 hours.",
+      ),
+  };
+  const DelegationOperationArgsSchema = z.object(delegationOperationFields).passthrough();
+  const DELEGATION_GUIDANCE =
+    "You will get notified when the delegated work finishes, errors, or needs permission, including after a daemon restart. Do not poll for status; continue with other work until the notification arrives. get_operation shows its progress.";
+  const MAX_DELEGATION_ITEMS = 16;
   const agentToAgentInputSchema = {
     ...canonicalCreateAgentFields,
+    ...delegationOperationFields,
     notifyOnFinish: z
       .boolean()
       .optional()
@@ -1110,6 +1144,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   };
   const agentToAgentSendAgentPromptInputSchema = {
     ...commonSendAgentPromptInputSchema,
+    ...delegationOperationFields,
     background: z
       .boolean()
       .optional()
@@ -1421,10 +1456,15 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         lastMessage: z.string().nullable().optional(),
         permission: AgentPermissionRequestPayloadSchema.nullable().optional(),
         guidance: z.string().optional(),
+        operationId: z.string().optional(),
       },
     },
     async (args: unknown) => {
       const resolvedArgs = await resolveCreateAgentToolArgs(args);
+      const delegable = delegableCreate(resolvedArgs);
+      if (delegable) {
+        return delegateCreateAgent({ ...delegable, args });
+      }
       const { parsedArgs, worktree } = resolvedArgs;
       let requestedBackground: boolean;
       let notifyOnFinish: boolean;
@@ -1878,15 +1918,21 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         lastMessage: z.string().nullable().optional(),
         permission: AgentPermissionRequestPayloadSchema.nullable().optional(),
         guidance: z.string().optional(),
+        operationId: z.string().optional(),
       },
     },
-    async ({
-      agentId,
-      prompt,
-      sessionMode,
-      background = Boolean(callerAgentId),
-      notifyOnFinish = Boolean(callerAgentId),
-    }) => {
+    async (args) => {
+      const {
+        agentId,
+        prompt,
+        sessionMode,
+        background = Boolean(callerAgentId),
+        notifyOnFinish = Boolean(callerAgentId),
+      } = args;
+      const delegation = background && notifyOnFinish ? delegationContext() : null;
+      if (delegation) {
+        return delegatePrompt({ ...delegation, args, agentId, prompt, sessionMode });
+      }
       const shouldNotifyOnFinish = Boolean(callerAgentId && notifyOnFinish && background);
 
       await sendPromptToAgent({
@@ -1954,6 +2000,329 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       return response;
     },
   );
+
+  function delegationContext(): {
+    orchestration: OperationService;
+    requesterAgentId: string;
+  } | null {
+    return options.orchestration && callerAgentId
+      ? { orchestration: options.orchestration, requesterAgentId: callerAgentId }
+      : null;
+  }
+
+  // Worktree placements create their Workspace during creation, so they keep the in-memory
+  // notification path until the outbox can authorize a Workspace that does not exist yet.
+  function delegableCreate(resolvedArgs: ResolvedCreateAgentToolArgs) {
+    const delegation = delegationContext();
+    if (!delegation || resolvedArgs.kind !== "agent-scoped") return null;
+    if (!resolvedArgs.parsedArgs.notifyOnFinish || !resolvedArgs.workspaceId) return null;
+    if (resolvedArgs.worktree) return null;
+    return {
+      ...delegation,
+      parsedArgs: resolvedArgs.parsedArgs,
+      cwd: resolvedArgs.cwd,
+      workspaceId: resolvedArgs.workspaceId,
+    };
+  }
+
+  function buildDelegatedCreateSpec(input: {
+    parsedArgs: Pick<
+      AgentToAgentCreateAgentArgs,
+      "provider" | "title" | "initialPrompt" | "labels" | "settings"
+    >;
+    cwd: string | undefined;
+    workspaceId: string;
+  }): DelegatedCreateSpec {
+    const { parsedArgs } = input;
+    const settings = parsedArgs.settings;
+    const inherited = resolveInheritedProviderConfig(
+      resolveRequiredProviderModel(parsedArgs.provider).provider,
+    );
+    return {
+      provider: parsedArgs.provider,
+      title: parsedArgs.title,
+      initialPrompt: parsedArgs.initialPrompt,
+      workspaceId: input.workspaceId,
+      ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...(inherited?.providerOptions ? { providerOptions: inherited.providerOptions } : {}),
+      ...(settings?.modeId ? { modeId: settings.modeId } : {}),
+      ...(settings?.thinkingOptionId ? { thinkingOptionId: settings.thinkingOptionId } : {}),
+      ...(settings?.features ? { features: settings.features } : {}),
+      ...(parsedArgs.labels ? { labels: parsedArgs.labels } : {}),
+      ...(callerContext
+        ? {
+            callerContext: {
+              lockedCwd: callerContext.lockedCwd,
+              allowCustomCwd: callerContext.allowCustomCwd,
+              childAgentDefaultLabels: callerContext.childAgentDefaultLabels,
+            },
+          }
+        : {}),
+    };
+  }
+
+  function requireDispatchedItem(operation: OperationRecord) {
+    const item = operation.items[0];
+    if (!item) {
+      throw new Error(`Operation ${operation.operationId} has no items`);
+    }
+    if (item.outcome === "failed" || item.outcome === "authorization_revoked") {
+      throw new Error(item.errorMessage ?? `Delegation ${item.outcome}`);
+    }
+    return item;
+  }
+
+  async function delegateCreateAgent(input: {
+    orchestration: OperationService;
+    requesterAgentId: string;
+    args: unknown;
+    parsedArgs: AgentToAgentCreateAgentArgs | LegacyAgentToAgentCreateAgentArgs;
+    cwd: string | undefined;
+    workspaceId: string;
+  }): Promise<PaseoToolResult> {
+    const operation = DelegationOperationArgsSchema.parse(input.args);
+    const spec = buildDelegatedCreateSpec(input);
+    const accepted = await input.orchestration.accept({
+      requesterAgentId: input.requesterAgentId,
+      operationId: operation.operationId,
+      deadlineSeconds: operation.deadlineSeconds,
+      items: [{ kind: "create", title: spec.title, workspaceId: spec.workspaceId, spec }],
+    });
+    const dispatched = await input.orchestration.waitForDispatch(accepted.operation);
+    const item = requireDispatchedItem(dispatched);
+    const snapshot = agentManager.getAgent(item.targetAgentId);
+    return {
+      content: [],
+      structuredContent: ensureValidJson({
+        agentId: item.targetAgentId,
+        type: snapshot?.provider ?? resolveRequiredProviderModel(spec.provider).provider,
+        status: snapshot?.lifecycle ?? "closed",
+        cwd: snapshot?.cwd ?? spec.cwd ?? "",
+        ...(snapshot?.workspaceId ? { workspaceId: snapshot.workspaceId } : {}),
+        currentModeId: snapshot?.currentModeId ?? null,
+        availableModes: snapshot?.availableModes ?? [],
+        lastMessage: null,
+        permission: null,
+        operationId: dispatched.operationId,
+        guidance: DELEGATION_GUIDANCE,
+      }),
+    };
+  }
+
+  async function delegatePrompt(input: {
+    orchestration: OperationService;
+    requesterAgentId: string;
+    args: unknown;
+    agentId: string;
+    prompt: string;
+    sessionMode: string | undefined;
+  }): Promise<PaseoToolResult> {
+    const operation = DelegationOperationArgsSchema.parse(input.args);
+    const record = await agentStorage.get(input.agentId);
+    const accepted = await input.orchestration.accept({
+      requesterAgentId: input.requesterAgentId,
+      operationId: operation.operationId,
+      deadlineSeconds: operation.deadlineSeconds,
+      items: [
+        {
+          kind: "prompt",
+          title: record?.title ?? input.agentId,
+          agentId: input.agentId,
+          prompt: input.prompt,
+          ...(input.sessionMode ? { sessionMode: input.sessionMode } : {}),
+        },
+      ],
+    });
+    const dispatched = await input.orchestration.waitForDispatch(accepted.operation);
+    requireDispatchedItem(dispatched);
+    return {
+      content: [],
+      structuredContent: ensureValidJson({
+        success: true,
+        status: agentManager.getAgent(input.agentId)?.lifecycle ?? "idle",
+        lastMessage: null,
+        permission: null,
+        operationId: dispatched.operationId,
+        guidance: DELEGATION_GUIDANCE,
+      }),
+    };
+  }
+
+  function operationResult(operation: OperationRecord, guidance?: string): PaseoToolResult {
+    return {
+      content: [],
+      structuredContent: ensureValidJson({
+        operationId: operation.operationId,
+        kind: operation.kind,
+        status: operation.status,
+        errorCode: operation.errorCode,
+        deadlineAt: new Date(operation.deadlineAt).toISOString(),
+        items: operation.items.map((item) => ({
+          agentId: item.targetAgentId,
+          state: item.state,
+          outcome: item.outcome,
+          error: item.errorMessage,
+        })),
+        ...(guidance ? { guidance } : {}),
+      }),
+    };
+  }
+
+  function registerDelegationOperationTools(
+    orchestration: OperationService,
+    requesterAgentId: string,
+  ): void {
+    const operationSummaryOutputSchema = {
+      operationId: z.string(),
+      kind: z.string(),
+      status: z.string(),
+      errorCode: z.string().nullable(),
+      deadlineAt: z.string(),
+      items: z.array(
+        z.object({
+          agentId: z.string(),
+          state: z.string(),
+          outcome: z.string().nullable(),
+          error: z.string().nullable(),
+        }),
+      ),
+      guidance: z.string().optional(),
+    };
+    const createAgentsInputSchema = {
+      agents: z
+        .array(z.object(canonicalCreateAgentFields).strict())
+        .min(1)
+        .max(MAX_DELEGATION_ITEMS)
+        .describe("Subagents to create, each with its own provider/model and initial prompt."),
+      ...delegationOperationFields,
+    };
+    const sendAgentPromptsInputSchema = {
+      prompts: z
+        .array(
+          z
+            .object({
+              agentId: z.string(),
+              prompt: z.string(),
+              sessionMode: z
+                .string()
+                .optional()
+                .describe("Optional mode to set before running the prompt."),
+            })
+            .strict(),
+        )
+        .min(1)
+        .max(MAX_DELEGATION_ITEMS)
+        .describe("Prompts to send, at most one per Agent."),
+      ...delegationOperationFields,
+    };
+    const operationIdInputSchema = {
+      operationId: z
+        .string()
+        .describe("The operationId returned when the delegation was accepted."),
+    };
+
+    registerTool(
+      "create_agents",
+      {
+        title: "Create agents",
+        description:
+          "Create several subagents as one delegation. Returns their agent IDs immediately. You get one notification when all of them have finished, plus one for each permission request.",
+        inputSchema: createAgentsInputSchema,
+        outputSchema: operationSummaryOutputSchema,
+      },
+      async (input: unknown) => {
+        const parsed = z.object(createAgentsInputSchema).strict().parse(input);
+        const items: DelegationItem[] = [];
+        for (const agent of parsed.agents) {
+          const placement = await resolveCanonicalCreateAgentWorkspace(agent.workspaceId, {
+            prompt: agent.initialPrompt,
+          });
+          const spec = buildDelegatedCreateSpec({ parsedArgs: agent, ...placement });
+          items.push({ kind: "create", title: spec.title, workspaceId: spec.workspaceId, spec });
+        }
+        const accepted = await orchestration.accept({
+          requesterAgentId,
+          operationId: parsed.operationId,
+          deadlineSeconds: parsed.deadlineSeconds,
+          items,
+        });
+        return operationResult(accepted.operation, DELEGATION_GUIDANCE);
+      },
+    );
+
+    registerTool(
+      "send_agent_prompts",
+      {
+        title: "Send agent prompts",
+        description:
+          "Send prompts to several running agents as one delegation. Returns immediately. You get one notification when all of them have finished, plus one for each permission request.",
+        inputSchema: sendAgentPromptsInputSchema,
+        outputSchema: operationSummaryOutputSchema,
+      },
+      async (input: unknown) => {
+        const parsed = z.object(sendAgentPromptsInputSchema).strict().parse(input);
+        const agentIds = parsed.prompts.map((entry) => entry.agentId);
+        if (new Set(agentIds).size !== agentIds.length) {
+          throw new Error("Each agent can receive one prompt per delegation");
+        }
+        const items: DelegationItem[] = [];
+        for (const entry of parsed.prompts) {
+          const record = await agentStorage.get(entry.agentId);
+          items.push({
+            kind: "prompt",
+            title: record?.title ?? entry.agentId,
+            agentId: entry.agentId,
+            prompt: entry.prompt,
+            ...(entry.sessionMode ? { sessionMode: entry.sessionMode } : {}),
+          });
+        }
+        const accepted = await orchestration.accept({
+          requesterAgentId,
+          operationId: parsed.operationId,
+          deadlineSeconds: parsed.deadlineSeconds,
+          items,
+        });
+        return operationResult(accepted.operation, DELEGATION_GUIDANCE);
+      },
+    );
+
+    registerTool(
+      "get_operation",
+      {
+        title: "Get operation",
+        description: "Show the progress of a delegation you started.",
+        inputSchema: operationIdInputSchema,
+        outputSchema: operationSummaryOutputSchema,
+      },
+      async (input: unknown) => {
+        const { operationId } = z.object(operationIdInputSchema).parse(input);
+        const operation = orchestration.getOperation({ requesterAgentId, operationId });
+        if (!operation) {
+          throw new Error(`Operation ${operationId} not found`);
+        }
+        return operationResult(operation);
+      },
+    );
+
+    registerTool(
+      "cancel_operation",
+      {
+        title: "Cancel operation",
+        description:
+          "Stop tracking a delegation you started. No completion notification is sent. Its agents keep running; use cancel_agent to stop one.",
+        inputSchema: operationIdInputSchema,
+        outputSchema: operationSummaryOutputSchema,
+      },
+      async (input: unknown) => {
+        const { operationId } = z.object(operationIdInputSchema).parse(input);
+        return operationResult(orchestration.cancel({ requesterAgentId, operationId }));
+      },
+    );
+  }
+
+  if (options.orchestration && callerAgentId) {
+    registerDelegationOperationTools(options.orchestration, callerAgentId);
+  }
 
   registerTool(
     "get_agent_status",
