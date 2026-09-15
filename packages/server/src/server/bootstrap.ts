@@ -2522,6 +2522,7 @@ export async function createPaseoDaemon(
                   desktopManaged: config.desktopManaged === true,
                   managedRuntimes,
                   orchestration: operationService ?? undefined,
+                  localPlanes: () => localPlanes?.controlAvailable === true,
                   getRelayConfig: () =>
                     relayRuntime?.getConfig() ?? {
                       enabled: daemonConfigStore.get().relay?.enabled ?? relayEnabled,
@@ -2615,6 +2616,25 @@ export async function createPaseoDaemon(
                 localPlanes = await startLocalPlanes({
                   paseoHome: capturedPaseoHome,
                   logger: logger.child({ module: "local-planes" }),
+                  // The local token alone admits the owner only on a standalone daemon; an enterprise
+                  // daemon requires a PAT or Session Ticket on the control plane too.
+                  control: {
+                    authenticate: async (bearer) => {
+                      if (!enterpriseRuntime) return { kind: "allowed" };
+                      if (!bearer) return { kind: "denied" };
+                      productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit);
+                      const evidence = await enterpriseRuntime.admission.authenticateEvidence(
+                        bearer,
+                        { node: enterpriseRuntime.node, transport: "direct", peer: "local_ipc" },
+                      );
+                      productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit);
+                      return evidence ? { kind: "allowed", evidence } : { kind: "denied" };
+                    },
+                    attach: async (socket, evidence) => {
+                      if (!wsServer) throw new Error("WebSocket server is not ready");
+                      await wsServer.attachLocalPlaneSocket(socket, evidence);
+                    },
+                  },
                   sources: {
                     serverId,
                     version: daemonVersion,

@@ -1,9 +1,9 @@
-import { chmod, lstat, unlink } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Logger } from "pino";
 import { ProbeStateSchema, type ProbeState } from "@getpaseo/protocol/local-planes";
 
 import type { LocalPlaneSocketEndpoint } from "./plane-paths.js";
+import { closePlaneServer, listenOnPlaneEndpoint } from "./unix-socket-listener.js";
 
 // The probe plane answers health and state for local tooling (ADR-0038). Anyone who can reach the
 // socket can read it, so the state carries no Principal, Grant, or credential data.
@@ -55,51 +55,13 @@ async function handleProbeRequest(
   }
 }
 
-/** A socket file left by a crashed daemon is replaced; any other file at the path is an error. */
-async function removeStaleSocket(socketPath: string): Promise<void> {
-  try {
-    const existing = await lstat(socketPath);
-    if (!existing.isSocket()) {
-      throw new Error(`Refusing to replace ${socketPath}: it is not a socket`);
-    }
-    await unlink(socketPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-}
-
-function listen(server: Server, socketPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-}
-
-function closeServer(server: Server): Promise<void> {
-  server.closeAllConnections();
-  return new Promise((resolve) => {
-    server.close(() => resolve());
-  });
-}
-
 export async function startProbePlane(input: StartProbePlaneInput): Promise<ProbePlaneServer> {
   const server = createServer((request, response) => {
     void handleProbeRequest(request, response, input);
   });
-  const isUnix = input.endpoint.transport === "unix";
-  if (isUnix) await removeStaleSocket(input.endpoint.path);
-  await listen(server, input.endpoint.path);
-  if (isUnix) await chmod(input.endpoint.path, 0o600);
+  await listenOnPlaneEndpoint(server, input.endpoint);
   return {
     endpoint: input.endpoint,
-    async close() {
-      await closeServer(server);
-      if (isUnix) {
-        await unlink(input.endpoint.path).catch(() => undefined);
-      }
-    },
+    close: () => closePlaneServer(server, input.endpoint),
   };
 }

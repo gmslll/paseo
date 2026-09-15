@@ -50,6 +50,7 @@ The heart of Paseo. A Node.js process that:
 - Streams agent output in real time via a timeline model
 - Provides agent-to-agent tools through a transport-neutral tool catalog, with MCP as one adapter
 - Optionally connects outbound to a relay for remote access
+- Serves local planes under `$PASEO_HOME/run` for same-user tools: `probe.sock` for health and status, and `control.sock` for Sessions framed as `paseo-ndjson/1`, listed in `run/daemon.json` ([ADR-0038](enterprise/decisions/0038-local-transport-planes.md))
 - Optionally serves the browser web client from the same HTTP server (self-hosting guide: [public-docs/web-ui.md](../public-docs/web-ui.md))
 
 All paths are under `packages/server/src/`.
@@ -78,6 +79,7 @@ not retain non-Git directories.
 | `server/agent/providers/`       | Provider adapters (see "Agent providers" below)                                |
 | `server/orchestration-skills/`  | Bundled catalog, host selection, convergence, and skill-directory transactions |
 | `server/relay-transport.ts`     | Outbound relay connection with E2E encryption                                  |
+| `server/local-planes/`          | Probe and control plane sockets, local token, and `run/daemon.json` manifest   |
 | `server/schedule/`              | Cron-based scheduled agents                                                    |
 
 ### `packages/protocol` — Wire schemas and shared protocol types

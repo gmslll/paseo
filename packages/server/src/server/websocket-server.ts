@@ -1445,6 +1445,38 @@ export class VoiceAssistantWebSocketServer {
     );
   }
 
+  /**
+   * Attaches a local control plane connection (ADR-0038). A standalone daemon admits it as the owner,
+   * as it does a WebSocket that passed the daemon password; an enterprise daemon requires admission
+   * evidence from a PAT or Session Ticket.
+   */
+  public async attachLocalPlaneSocket(
+    ws: WebSocketLike,
+    authorizationEvidence?: EnterpriseAdmissionAuthenticationEvidence,
+  ): Promise<void> {
+    if (this.enterpriseRuntime) {
+      if (!authorizationEvidence) {
+        safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Enterprise admission required");
+        return;
+      }
+      await this.attachSocket(
+        ws,
+        undefined,
+        undefined,
+        false,
+        { kind: "enterprise", authorizationEvidence },
+        undefined,
+        authorizationEvidence,
+      );
+      return;
+    }
+    if (authorizationEvidence) {
+      safeCloseSocket(ws, WS_CLOSE_DAEMON_AUTH_FAILED, "Invalid enterprise admission");
+      return;
+    }
+    await this.attachSocket(ws);
+  }
+
   public async attachPluginSocket(
     pluginId: string,
     ws: WebSocketLike,
@@ -2721,6 +2753,8 @@ export class VoiceAssistantWebSocketServer {
         ...(this.daemonRuntimeConfig?.managedRuntimes ? { managedRuntimes: true } : {}),
         // COMPAT(orchestrationOutbox): added in v0.9.0, remove gate after 2027-03-16.
         ...(this.daemonRuntimeConfig?.orchestration ? { orchestrationOutbox: true } : {}),
+        // COMPAT(localPlanes): added in v0.9.0, remove gate after 2027-03-16.
+        ...(this.daemonRuntimeConfig?.localPlanes?.() ? { localPlanes: true } : {}),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
         ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.

@@ -79,6 +79,8 @@ export interface DaemonRuntimeConfig {
   desktopManaged?: boolean;
   managedRuntimes?: ManagedRuntimeControl;
   orchestration?: OrchestrationOperationControl;
+  /** Whether the local control plane is accepting Sessions (ADR-0038). */
+  localPlanes?: () => boolean;
   getRelayConfig(): {
     enabled: boolean;
     endpoint: string;

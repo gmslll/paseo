@@ -8,6 +8,7 @@ import { ProbeStateSchema } from "@getpaseo/protocol/local-planes";
 
 import { createPaseoDaemon } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { nextSessionLine, upgradeControlPlane } from "./control-plane-test-client.js";
 import { readDaemonManifest } from "./daemon-manifest.js";
 import { resolveLocalPlanePaths } from "./plane-paths.js";
 
@@ -27,6 +28,44 @@ function probeGet(
     outgoing.on("error", reject);
     outgoing.end();
   });
+}
+
+async function expectControlPlaneSession(socketPath: string, token: string): Promise<void> {
+  const refused = await upgradeControlPlane(socketPath, {
+    connection: "Upgrade",
+    upgrade: "paseo-ndjson/1",
+  });
+  expect(refused.status).toBe(401);
+
+  const upgrade = await upgradeControlPlane(socketPath, {
+    connection: "Upgrade",
+    upgrade: "paseo-ndjson/1",
+    "x-paseo-local-token": token,
+  });
+  expect(upgrade.status).toBe(101);
+  const socket = upgrade.socket!;
+  const serverInfo = nextSessionLine(
+    upgrade,
+    (line) => line.message?.payload?.status === "server_info",
+  );
+  socket.write(
+    `${JSON.stringify({ type: "hello", clientId: "control-plane-e2e", clientType: "cli", protocolVersion: 1 })}\n`,
+  );
+  const info = await serverInfo;
+  const features = info.message?.payload?.features as Record<string, unknown> | undefined;
+  expect(features?.localPlanes).toBe(true);
+
+  const agents = nextSessionLine(
+    upgrade,
+    (line) =>
+      line.message?.type === "fetch_agents_response" &&
+      line.message.payload?.requestId === "control-1",
+  );
+  socket.write(
+    `${JSON.stringify({ type: "session", message: { type: "fetch_agents_request", requestId: "control-1" } })}\n`,
+  );
+  expect((await agents).message?.payload).toMatchObject({ requestId: "control-1", entries: [] });
+  socket.destroy();
 }
 
 async function modeOf(filePath: string): Promise<number> {
@@ -66,10 +105,11 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
           probe: { transport: "unix", path: paths.endpoints.probe.path, protocolVersion: 1 },
         },
       });
-      expect(Object.keys(manifest?.planes ?? {})).toEqual(["probe"]);
+      expect(Object.keys(manifest?.planes ?? {}).toSorted()).toEqual(["control", "probe"]);
       expect(await modeOf(paths.runDirectory)).toBe(0o700);
       expect(await modeOf(paths.tokenPath)).toBe(0o600);
       expect(await modeOf(paths.endpoints.probe.path)).toBe(0o600);
+      expect(await modeOf(paths.endpoints.control.path)).toBe(0o600);
       const token = (await readFile(paths.tokenPath, "utf8")).trim();
 
       expect(await probeGet(paths.endpoints.probe.path, "/healthz")).toEqual({
@@ -86,10 +126,12 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
         relay: { enabled: false, connected: false },
         counts: { agents: 0, terminals: 0 },
         enterprise: null,
-        planes: { probe: { status: "listening" }, control: { status: "unavailable" } },
+        planes: { probe: { status: "listening" }, control: { status: "listening" } },
       });
       expect(state.websocket.listen).toMatch(/^127\.0\.0\.1:\d+$/);
       expect(stateResponse.body).not.toContain(token);
+
+      await expectControlPlaneSession(paths.endpoints.control.path, token);
 
       await daemon.stop();
       stopped = true;
@@ -97,6 +139,7 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
       expect(await readDaemonManifest(paths.manifestPath)).toBeNull();
       await expect(stat(paths.tokenPath)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(stat(paths.endpoints.probe.path)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(paths.endpoints.control.path)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       if (!stopped) await daemon.stop();
       await rm(root, { recursive: true, force: true });
