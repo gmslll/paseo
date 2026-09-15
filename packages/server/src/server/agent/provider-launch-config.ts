@@ -4,6 +4,7 @@ import {
   findExecutable,
 } from "../../executable-resolution/executable-resolution.js";
 import { createExternalProcessEnv, type ProcessEnvRecord } from "../paseo-env.js";
+import type { ManagedProviderBinary } from "../managed-runtimes/managed-provider-binary.js";
 export {
   AgentProviderRuntimeSettingsMapSchema,
   ProviderCommandSchema,
@@ -106,6 +107,55 @@ export async function resolveProviderLaunch({
     command: normalizedDefault.command,
     args,
     source: commandConfig?.mode === "append" ? "append" : "default",
+  };
+}
+
+export interface ManagedProviderLaunchInput {
+  commandConfig?: ProviderCommand;
+  defaultBinary: string | ProviderLaunchDefault;
+  managed?: ManagedProviderBinary;
+}
+
+export interface ManagedProviderLaunch {
+  launch: ResolvedProviderLaunch;
+  /** Pass to checkProviderLaunchAvailable so availability uses the same managed decision. */
+  defaultBinary: ProviderLaunchDefault;
+}
+
+/**
+ * Applies the company runtime policy (ADR-0039) before the usual launch resolution: a pinned and
+ * installed runtime wins, a pinned runtime that is missing blocks PATH lookup when the policy
+ * forbids fallback, and a replacing command override is ignored unless the policy allows it.
+ */
+export async function resolveManagedProviderLaunch(
+  input: ManagedProviderLaunchInput,
+): Promise<ManagedProviderLaunch> {
+  const baseDefault = normalizeLaunchDefault(input.defaultBinary);
+  const resolution = input.managed ? await input.managed.resolve() : { kind: "unmanaged" as const };
+  if (resolution.kind === "unmanaged") {
+    return {
+      launch: await resolveProviderLaunch({
+        commandConfig: input.commandConfig,
+        defaultBinary: baseDefault,
+      }),
+      defaultBinary: baseDefault,
+    };
+  }
+  const commandConfig =
+    input.commandConfig?.mode === "replace" && !resolution.allowCommandOverride
+      ? undefined
+      : input.commandConfig;
+  const defaultBinary: ProviderLaunchDefault = {
+    command: baseDefault.command,
+    resolvePath: async () => {
+      if (resolution.kind === "installed") return resolution.commandPath;
+      if (resolution.pathFallback === "forbid") return null;
+      return resolveDefaultLaunchPath(baseDefault);
+    },
+  };
+  return {
+    launch: await resolveProviderLaunch({ commandConfig, defaultBinary }),
+    defaultBinary,
   };
 }
 

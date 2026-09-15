@@ -149,6 +149,13 @@ import {
 } from "./agent/tools/paseo-tools.js";
 import type { PaseoToolRuntimeContext } from "./agent/tools/types.js";
 import { createAgentProviderRuntime } from "./agent/provider-runtime.js";
+import {
+  ManagedRuntimeManager,
+  createDirectoryArtifactSource,
+  loadLocalManagedRuntimePolicy,
+  staticManagedRuntimePolicySource,
+} from "./managed-runtimes/runtime-manager.js";
+import { managedRuntimePaths } from "./managed-runtimes/runtime-paths.js";
 import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js";
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
 import {
@@ -1335,6 +1342,18 @@ export async function createPaseoDaemon(
       workspaceGitService,
       logger,
     });
+    // Company-pinned Provider runtimes (ADR-0039). Without runtime-policy.json every Provider
+    // resolves exactly as before.
+    const runtimePaths = managedRuntimePaths(capturedPaseoHome);
+    const managedRuntimes = new ManagedRuntimeManager({
+      paths: runtimePaths,
+      policySource: staticManagedRuntimePolicySource(
+        await loadLocalManagedRuntimePolicy(runtimePaths.localPolicy),
+        "local_policy",
+      ),
+      artifactSource: createDirectoryArtifactSource(runtimePaths.artifacts),
+      logger: logger.child({ module: "managed-runtimes" }),
+    });
     const agentProviderRuntime = await createAgentProviderRuntime({
       paseoHome: capturedPaseoHome,
       logger,
@@ -1346,6 +1365,7 @@ export async function createPaseoDaemon(
         managedProcesses,
         isDev: config.isDev === true,
         extraClients: config.agentClients,
+        managedRuntimes,
       },
     });
     constructionCleanupStack.push(() => agentProviderRuntime.shutdown());

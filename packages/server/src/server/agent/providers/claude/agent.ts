@@ -132,10 +132,11 @@ import {
   checkProviderLaunchAvailable,
   createProviderEnv,
   createProviderEnvSpec,
-  resolveProviderLaunch,
+  resolveManagedProviderLaunch,
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
+import type { ManagedProviderBinary } from "../../../managed-runtimes/managed-provider-binary.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
@@ -404,6 +405,7 @@ interface ClaudeAgentClientOptions {
   queryFactory?: ClaudeQueryFactory;
   resolveBinary?: () => Promise<string>;
   resolveVersion?: (signal?: AbortSignal) => Promise<string>;
+  managedBinary?: ManagedProviderBinary;
   configDir?: string;
 }
 
@@ -1499,6 +1501,7 @@ export class ClaudeAgentClient implements AgentClient {
   private readonly queryFactory?: ClaudeQueryFactory;
   private readonly resolveBinary: () => Promise<string>;
   private readonly resolveVersion: (signal?: AbortSignal) => Promise<string>;
+  private readonly managedBinary?: ManagedProviderBinary;
   private readonly configDir?: string;
 
   constructor(options: ClaudeAgentClientOptions) {
@@ -1506,10 +1509,13 @@ export class ClaudeAgentClient implements AgentClient {
     this.logger = options.logger.child({ module: "agent", provider: "claude" });
     this.runtimeSettings = options.runtimeSettings;
     this.queryFactory = options.queryFactory;
-    this.resolveBinary = options.resolveBinary ?? (() => resolveClaudeBinary(this.runtimeSettings));
+    this.managedBinary = options.managedBinary;
+    this.resolveBinary =
+      options.resolveBinary ??
+      (() => resolveClaudeBinary(this.runtimeSettings, this.managedBinary));
     this.resolveVersion =
       options.resolveVersion ??
-      ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal));
+      ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal, this.managedBinary));
     this.configDir = options.configDir;
   }
 
@@ -1643,21 +1649,23 @@ export class ClaudeAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
-    const launch = await resolveProviderLaunch({
+    const { launch, defaultBinary } = await resolveManagedProviderLaunch({
       commandConfig: this.runtimeSettings?.command,
       defaultBinary: "claude",
+      managed: this.managedBinary,
     });
-    const availability = await checkProviderLaunchAvailable(launch);
+    const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
     return availability.available;
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
-      const launch = await resolveProviderLaunch({
+      const { launch, defaultBinary } = await resolveManagedProviderLaunch({
         commandConfig: this.runtimeSettings?.command,
         defaultBinary: "claude",
+        managed: this.managedBinary,
       });
-      const availability = await checkProviderLaunchAvailable(launch);
+      const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
       const auth = availability.available
         ? await resolveClaudeAuth(launch, availability, this.runtimeSettings)
         : null;
@@ -1693,12 +1701,16 @@ export class ClaudeAgentClient implements AgentClient {
   }
 }
 
-async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): Promise<string> {
-  const launch = await resolveProviderLaunch({
+async function resolveClaudeBinary(
+  runtimeSettings?: ProviderRuntimeSettings,
+  managed?: ManagedProviderBinary,
+): Promise<string> {
+  const { launch, defaultBinary } = await resolveManagedProviderLaunch({
     commandConfig: runtimeSettings?.command,
     defaultBinary: "claude",
+    managed,
   });
-  const availability = await checkProviderLaunchAvailable(launch);
+  const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
   if (availability.available) {
     return availability.resolvedPath ?? launch.command;
   }
@@ -1710,12 +1722,14 @@ async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): P
 export async function resolveClaudeCodeVersion(
   runtimeSettings?: ProviderRuntimeSettings,
   signal?: AbortSignal,
+  managed?: ManagedProviderBinary,
 ): Promise<string> {
-  const launch = await resolveProviderLaunch({
+  const { launch, defaultBinary } = await resolveManagedProviderLaunch({
     commandConfig: runtimeSettings?.command,
     defaultBinary: "claude",
+    managed,
   });
-  const availability = await checkProviderLaunchAvailable(launch);
+  const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
   if (!availability.available) {
     throw new Error("Claude binary not found while resolving Claude Code version");
   }
