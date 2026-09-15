@@ -39,6 +39,7 @@ interface RelayRuntimeOptions {
 
 export interface RelayRuntime {
   getConfig(): RelayRuntimeConfig;
+  isConnected(): boolean;
   setEnabled(enabled: boolean): void;
   stop(): Promise<void>;
 }
@@ -89,6 +90,7 @@ export function createRelayRuntime(options: RelayRuntimeOptions): RelayRuntime {
 
   return {
     getConfig: () => config,
+    isConnected: () => transport?.isConnected?.() ?? false,
     setEnabled,
     stop,
   };

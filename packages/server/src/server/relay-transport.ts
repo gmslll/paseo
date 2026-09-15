@@ -32,6 +32,8 @@ export interface RelayTransportOptions<TAuthentication = unknown> {
 
 export interface RelayTransportController {
   stop: () => Promise<void>;
+  /** True while the control socket is open and the relay has acknowledged it. */
+  isConnected?: () => boolean;
 }
 
 export interface RelaySocketLike {
@@ -136,9 +138,11 @@ export function startRelayTransport<TAuthentication = unknown>({
   let controlReadyTimeout: ReturnType<typeof setTimeout> | null = null;
   let controlLastSeenAt = 0;
   let controlConnectionSeq = 0;
+  let controlReady = false;
 
   const stop = async (): Promise<void> => {
     stopped = true;
+    controlReady = false;
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
       reconnectTimeout = null;
@@ -187,6 +191,7 @@ export function startRelayTransport<TAuthentication = unknown>({
       if (controlWs !== socket) return;
       if (controlConnected) return;
       controlConnected = true;
+      controlReady = true;
       reconnectAttempt = 0;
       if (controlReadyTimeout) {
         clearTimeout(controlReadyTimeout);
@@ -276,6 +281,7 @@ export function startRelayTransport<TAuthentication = unknown>({
         "relay_control_disconnected",
       );
       controlWs = null;
+      controlReady = false;
       if (controlKeepaliveInterval) {
         clearInterval(controlKeepaliveInterval);
         controlKeepaliveInterval = null;
@@ -421,7 +427,7 @@ export function startRelayTransport<TAuthentication = unknown>({
 
   connectControl();
 
-  return { stop };
+  return { stop, isConnected: () => controlReady };
 }
 
 async function attachEncryptedSocket<TAuthentication>(

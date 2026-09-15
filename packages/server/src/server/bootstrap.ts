@@ -168,6 +168,8 @@ import { ScheduleService } from "./schedule/service.js";
 import { createAgentOrchestrationPort } from "./orchestration/agent-orchestration-port.js";
 import { OperationService, formatOperationCompletion } from "./orchestration/operation-service.js";
 import { OperationStore } from "./orchestration/operation-store.js";
+import { startLocalPlanes, type LocalPlaneHost } from "./local-planes/local-plane-host.js";
+import { countTerminals, enterpriseProbeSummary } from "./local-planes/probe-sources.js";
 import { standaloneOrchestrationAuthority } from "./orchestration/orchestration-authority.js";
 import { createEnterpriseRuntimeOrchestrationAuthority } from "./orchestration/enterprise-orchestration-authority.js";
 import { DaemonConfigStore, type MutableDaemonConfig } from "./daemon-config-store.js";
@@ -982,6 +984,7 @@ export async function createPaseoDaemon(
       logger.warn({ err: error }, "Failed to reconcile managed helper process ledger");
     });
     let relayRuntime: RelayRuntime | null = null;
+    let localPlanes: LocalPlaneHost | null = null;
 
     const staticDir = config.staticDir;
     const downloadTokenTtlMs = config.downloadTokenTtlMs ?? 60000;
@@ -2319,6 +2322,8 @@ export async function createPaseoDaemon(
         appendError(errors, error);
       }
       shutdownRunPromise = Promise.resolve().then(async () => {
+        // Removing the manifest first stops local tools from finding a daemon that is going away.
+        await runCleanupStep(errors, () => localPlanes?.stop());
         await runCleanupStep(errors, () => pluginRuntime.stopAllPlugins());
         await runCleanupStep(errors, () => unsubscribePluginProviders());
         await runCleanupStep(errors, () => unsubscribeWorkspaceMutations());
@@ -2363,6 +2368,7 @@ export async function createPaseoDaemon(
     };
 
     const startImpl = async () => {
+      const daemonStartedAt = new Date().toISOString();
       const requireStartAudit = () => {
         if (enterpriseAudit) productionAuditCapabilityIssuer.requireCurrent(enterpriseAudit);
       };
@@ -2603,6 +2609,35 @@ export async function createPaseoDaemon(
                   relayRuntime?.setEnabled(value === true);
                 }),
               );
+              requireStartAudit();
+              // Local planes are additive (ADR-0038): without them the WebSocket path still works.
+              try {
+                localPlanes = await startLocalPlanes({
+                  paseoHome: capturedPaseoHome,
+                  logger: logger.child({ module: "local-planes" }),
+                  sources: {
+                    serverId,
+                    version: daemonVersion,
+                    startedAt: daemonStartedAt,
+                    desktopManaged: config.desktopManaged === true,
+                    websocketListen: () =>
+                      boundListenTarget ? formatListenTarget(boundListenTarget) : null,
+                    relay: () => ({
+                      enabled: relayRuntime?.getConfig().enabled ?? false,
+                      connected: relayRuntime?.isConnected() ?? false,
+                    }),
+                    counts: async () => ({
+                      sessions: wsServer?.listSessions().length ?? 0,
+                      agents: agentManager.listAgents().length,
+                      terminals: await countTerminals(terminalManager),
+                    }),
+                    managedRuntimes: () => managedRuntimes.status(),
+                    enterprise: () => enterpriseProbeSummary(config.enterpriseMultiUser),
+                  },
+                });
+              } catch (error) {
+                logger.error({ err: error }, "Local planes are unavailable");
+              }
               requireStartAudit();
             };
 
