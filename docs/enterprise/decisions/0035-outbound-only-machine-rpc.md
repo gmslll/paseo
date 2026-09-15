@@ -1,0 +1,44 @@
+# ADR-0035: Outbound-only machine RPC
+
+- Status: Accepted
+- Date: 2026-09-16
+- Decision owner: Enterprise integration owner (decided by the user on 2026-09-15)
+
+## Decision
+
+A collaborator can operate an Agent on a node without connecting to that node. The client appends a
+`MachineRpcEnvelope` request to `rpc:req:<nodeId>`. The plane checks membership and the per-method
+role, then attaches a plane-signed attestation. The node reads the stream over its outbound
+connection and answers on `rpc:res:<rpcId>`.
+
+The attestation is an Ed25519 signature by the existing plane ticket key over:
+`rpcId`, `method`, `nodeId`, `containerId`, requester `principalId`, `credentialId`, `grantVersion`,
+`clientId`, `sentAt`, and `expiresAt`.
+
+The node:
+
+1. verifies the signature and expiry (default 60 seconds);
+2. rejects a Grant version older than its current policy;
+3. deduplicates by `rpcId` in its local inbox;
+4. dispatches the payload through a headless enterprise Session for that Principal and client, so
+   authorization, outbound filtering, and audit match a direct connection.
+
+Only methods listed in the `machine_rpc` surface of the resource entry inventory are accepted:
+Agent create, send, steer, cancel, fork, permission response, file read and write, checkout status,
+and `machine.get_status`. `machine.restart` and `machine.upgrade` require the Workspace owner or a
+platform administrator and a receipt within 5 seconds.
+
+Clients obtain a plane session with `POST /v1/auth/password/plane-session` and a 5-minute stream
+token with `POST /v1/streams/token`. Direct node connection stays available and is no longer
+required for collaborators.
+
+## Amends
+
+- Master spec §5.1.4: direct node connection becomes optional for collaborative Workspaces.
+- Master spec §16 node channel paragraph.
+- ADR-0030 "Password login is available only for direct node connections".
+
+## Acceptance
+
+Tests cover forged, expired, replayed, and stale-Grant attestations; methods outside the allowlist;
+parity between machine RPC and direct Session denials; and restart receipt timing.

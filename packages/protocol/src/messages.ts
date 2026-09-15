@@ -1586,6 +1586,12 @@ const ToolCallTimelineItemPayloadSchema: z.ZodType<ToolCallTimelineItem, unknown
     ToolCallCanceledPayloadSchema,
   ]);
 
+// The authenticated author of a user message in a shared Agent (ADR-0034).
+export const AgentTimelineAuthorPayloadSchema = z.object({
+  principalId: PrincipalIdSchema,
+  displayName: z.string().optional(),
+});
+
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
 export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknown> = z.union([
@@ -1594,6 +1600,7 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknow
     text: z.string(),
     messageId: z.string().optional(),
     clientMessageId: z.string().optional(),
+    author: AgentTimelineAuthorPayloadSchema.optional(),
   }),
   z.object({
     type: z.literal("assistant_message"),
@@ -1734,6 +1741,13 @@ const AgentActiveTurnPayloadSchema = z.object({
   startedAt: z.string().nullable(),
 });
 
+// Queued turns from other collaborators carry no prompt text (ADR-0034).
+const AgentQueuedTurnPayloadSchema = z.object({
+  messageId: z.string(),
+  author: AgentTimelineAuthorPayloadSchema,
+  queuedAt: z.string(),
+});
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -1750,6 +1764,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   lastUserMessageAt: z.string().nullable(),
   status: AgentStatusSchema,
   activeTurn: AgentActiveTurnPayloadSchema.nullable().optional(),
+  queuedTurns: z.array(AgentQueuedTurnPayloadSchema).optional(),
   capabilities: AgentCapabilityFlagsSchema,
   currentModeId: z.string().nullable(),
   availableModes: z.array(AgentModeSchema),
@@ -2130,12 +2145,18 @@ const ImageAttachmentSchema = z.object({
 export const ActiveTurnBehaviorSchema = z.enum(["interrupt", "steer"]);
 export type ActiveTurnBehavior = z.infer<typeof ActiveTurnBehaviorSchema>;
 
+// A collaborator's preference when another Principal's turn is running. The daemon resolves the
+// effective behavior from the authenticated role (ADR-0034).
+export const SharedTurnPolicySchema = z.enum(["queue", "interrupt"]);
+export type SharedTurnPolicy = z.infer<typeof SharedTurnPolicySchema>;
+
 export const SendAgentMessageSchema = z.object({
   type: z.literal("send_agent_message"),
   agentId: z.string(),
   text: z.string(),
   messageId: z.string().optional(), // Client-provided ID for deduplication
   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
+  sharedTurnPolicy: SharedTurnPolicySchema.optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
 });
@@ -2292,6 +2313,7 @@ export const SendAgentMessageRequestSchema = z.object({
   text: z.string(),
   messageId: z.string().optional(), // Client-provided ID for deduplication
   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
+  sharedTurnPolicy: SharedTurnPolicySchema.optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
 });
@@ -5281,6 +5303,24 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(enterpriseBrowserPageIdentityInvalidationV1): added in v0.9.0, remove gate after 2027-03-09.
         // Keep absent until invalidation transport, bootstrap, W2 verification, publisher, and mismatch evidence are ready.
         enterpriseBrowserPageIdentityInvalidationV1: z.boolean().optional(),
+        // COMPAT(enterpriseCollaborationV1): added in v0.9.0, remove gate after 2027-03-09 once the supported client floor requires enterprise collaboration V1.
+        enterpriseCollaborationV1: z.boolean().optional(),
+        // COMPAT(localPlanes): added in v0.9.0, remove gate after 2027-03-16.
+        localPlanes: z.boolean().optional(),
+        // COMPAT(terminalPlane): added in v0.9.0, remove gate after 2027-03-16.
+        terminalPlane: z.boolean().optional(),
+        // COMPAT(dataPlane): added in v0.9.0, remove gate after 2027-03-16.
+        dataPlane: z.boolean().optional(),
+        // COMPAT(managedRuntimes): added in v0.9.0, remove gate after 2027-03-16.
+        managedRuntimes: z.boolean().optional(),
+        // COMPAT(orchestrationOutbox): added in v0.9.0, remove gate after 2027-03-16.
+        orchestrationOutbox: z.boolean().optional(),
+        // COMPAT(codeCollabTurnDiff): added in v0.9.0, remove gate after 2027-03-16.
+        codeCollabTurnDiff: z.boolean().optional(),
+        // COMPAT(taskBoard): added in v0.9.0, remove gate after 2027-03-16.
+        taskBoard: z.boolean().optional(),
+        // COMPAT(taskReview): added in v0.9.0, remove gate after 2027-03-16.
+        taskReview: z.boolean().optional(),
       })
       .optional(),
   })

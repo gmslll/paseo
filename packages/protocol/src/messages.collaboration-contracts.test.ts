@@ -1,0 +1,120 @@
+import { describe, expect, test } from "vitest";
+import { z } from "zod";
+
+import {
+  AgentSnapshotPayloadSchema,
+  AgentTimelineItemPayloadSchema,
+  ENTERPRISE_FEATURE_FLAGS,
+  SendAgentMessageRequestSchema,
+  ServerInfoStatusPayloadSchema,
+} from "./messages.js";
+
+const NEW_FEATURES = {
+  enterpriseCollaborationV1: true,
+  localPlanes: true,
+  terminalPlane: true,
+  dataPlane: true,
+  managedRuntimes: true,
+  orchestrationOutbox: true,
+  codeCollabTurnDiff: true,
+  taskBoard: true,
+  taskReview: true,
+};
+
+describe("collaboration and local runtime feature flags", () => {
+  test("a new daemon advertises each flag as an optional server_info feature", () => {
+    const parsed = ServerInfoStatusPayloadSchema.parse({
+      status: "server_info",
+      serverId: "server-1",
+      features: NEW_FEATURES,
+    });
+
+    expect(parsed.features).toMatchObject(NEW_FEATURES);
+  });
+
+  test("an old daemon without the flags still parses", () => {
+    const parsed = ServerInfoStatusPayloadSchema.parse({
+      status: "server_info",
+      serverId: "server-1",
+      features: {},
+    });
+
+    for (const flag of Object.keys(NEW_FEATURES)) {
+      expect(parsed.features?.[flag as keyof typeof NEW_FEATURES]).toBeUndefined();
+    }
+  });
+
+  test("the frozen enterprise V1 flag list does not grow (ADR-0008)", () => {
+    expect(ENTERPRISE_FEATURE_FLAGS).not.toContain("enterpriseCollaborationV1");
+    expect(ENTERPRISE_FEATURE_FLAGS).toHaveLength(13);
+  });
+});
+
+describe("shared turn attribution", () => {
+  const author = { principalId: "usr_0123456789abcdef", displayName: "Alice" };
+
+  test("user messages carry an optional author", () => {
+    expect(
+      AgentTimelineItemPayloadSchema.parse({ type: "user_message", text: "hi", author }),
+    ).toEqual({ type: "user_message", text: "hi", author });
+    expect(AgentTimelineItemPayloadSchema.parse({ type: "user_message", text: "hi" })).toEqual({
+      type: "user_message",
+      text: "hi",
+    });
+  });
+
+  test("an author must be an authenticated Principal ID", () => {
+    expect(
+      AgentTimelineItemPayloadSchema.safeParse({
+        type: "user_message",
+        text: "hi",
+        author: { principalId: "alice" },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("an old app parses a user message that carries an author", () => {
+    const LegacyUserMessageSchema = z.object({
+      type: z.literal("user_message"),
+      text: z.string(),
+      messageId: z.string().optional(),
+      clientMessageId: z.string().optional(),
+    });
+
+    expect(LegacyUserMessageSchema.parse({ type: "user_message", text: "hi", author })).toEqual({
+      type: "user_message",
+      text: "hi",
+    });
+  });
+
+  test("send requests accept an optional shared turn policy and old daemons ignore it", () => {
+    const request = {
+      type: "send_agent_message_request",
+      requestId: "request-1",
+      agentId: "agent-1",
+      text: "hi",
+      sharedTurnPolicy: "queue",
+    };
+    expect(SendAgentMessageRequestSchema.parse(request).sharedTurnPolicy).toBe("queue");
+    expect(
+      SendAgentMessageRequestSchema.safeParse({ ...request, sharedTurnPolicy: "later" }).success,
+    ).toBe(false);
+
+    const LegacySendSchema = z.object({
+      type: z.literal("send_agent_message_request"),
+      requestId: z.string(),
+      agentId: z.string(),
+      text: z.string(),
+    });
+    expect(LegacySendSchema.parse(request)).not.toHaveProperty("sharedTurnPolicy");
+  });
+
+  test("Agent snapshots expose queued turns as optional metadata without prompt text", () => {
+    const queuedTurns = AgentSnapshotPayloadSchema.shape.queuedTurns;
+    const queued = [{ messageId: "m1", author, queuedAt: "2026-09-16T00:00:00.000Z" }];
+
+    expect(queuedTurns.parse(undefined)).toBeUndefined();
+    expect(queuedTurns.parse(queued)).toEqual(queued);
+    expect(queuedTurns.parse([{ ...queued[0], text: "secret prompt" }])).toEqual(queued);
+  });
+});

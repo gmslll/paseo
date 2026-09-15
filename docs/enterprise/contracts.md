@@ -10,7 +10,7 @@ All additions to an existing wire shape are optional. Parse the wire shape first
 explicit normalizer or projection helper. Do not put transforms, catches, or preprocessors in a
 new enterprise wire schema. Tagged unions use a discriminator.
 
-The five `ENTERPRISE_FEATURE_FLAGS` fields must stay identical in the constant, wire schema,
+The `ENTERPRISE_FEATURE_FLAGS` fields must stay identical in the constant, wire schema,
 `server_info`, and normalizer. A missing field normalizes to `false`. The V1 vocabularies are
 closed by [ADR 0008](decisions/0008-enterprise-v1-enum-freeze.md).
 
@@ -131,6 +131,30 @@ binding applies.
 Enterprise events are `enterprise.identity.scope_refreshed`,
 `enterprise.identity.credential_revoked`, `enterprise.resource.waiting`, and
 `enterprise.resource.status`. Emit them only within the matching enterprise capability flow.
+
+## Collaboration, local planes, and runtimes
+
+These contracts live in `packages/protocol/src/enterprise-collaboration.ts`, `local-planes.ts`,
+`managed-runtimes.ts`, and `binary-frames/{length-prefix,data-plane}.ts`. Their flags are separate
+`server_info.features` fields and are not part of the frozen `ENTERPRISE_FEATURE_FLAGS` list.
+
+| Capability                                  | Contract                                                                                                                                                                                                                            |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enterpriseCollaborationV1`                 | CRDT streams, membership roles, shared turns, machine RPC, catalog, and plane audit: [0031](decisions/0031-collaborative-content-data-plane.md)–[0037](decisions/0037-data-plane-audit.md)                                          |
+| `localPlanes`, `terminalPlane`, `dataPlane` | Local sockets, attach tokens, and data frames: [ADR 0038](decisions/0038-local-transport-planes.md)                                                                                                                                 |
+| `managedRuntimes`                           | Runtime policy, artifacts, and install metadata: [ADR 0039](decisions/0039-managed-agent-runtimes.md)                                                                                                                               |
+| `orchestrationOutbox`                       | Durable delegation and caller capability: [ADR 0042](decisions/0042-durable-delegation-outbox.md), [ADR 0043](decisions/0043-delegation-authority-and-mcp-caller-capability.md)                                                     |
+| `codeCollabTurnDiff`                        | Per-turn diffs and content views: [ADR 0044](decisions/0044-per-turn-diff-store.md), [ADR 0045](decisions/0045-turn-diff-and-task-content-views.md)                                                                                 |
+| `taskBoard`, `taskReview`                   | Task board, grants, review policy, and pull request links: [ADR 0040](decisions/0040-team-task-board-scope.md), [0046](decisions/0046-task-documents-and-state-machine.md)–[0049](decisions/0049-pr-poller-state-and-task-links.md) |
+
+Membership never adds an `EnterpriseAction` or selector kind; roles project to Workspace-selector
+Grants through `WORKSPACE_MEMBER_ROLE_ACTIONS`. Segment write and read authority is the
+`COLLAB_SEGMENT_WRITERS` and `COLLAB_SEGMENT_READERS` tables; the plane enforces them and the node
+revalidates client-writable keys.
+
+Schemas that a node or client reads from a newer plane or daemon are plain objects that drop
+unknown fields. Requests the plane accepts from clients, stream token claims, and machine RPC
+attestations are strict. A client request cannot carry an attestation.
 
 ## Existing Workspace requests
 

@@ -35,6 +35,18 @@ describe("enterprise wire schema purity", () => {
     expect(browserCapabilities).not.toMatch(BANNED_WIRE_HELPER);
   });
 
+  test("collaboration, local plane, and managed runtime contracts use explicit normalization", async () => {
+    const sources = await Promise.all(
+      ["./enterprise-collaboration.ts", "./local-planes.ts", "./managed-runtimes.ts"].map((path) =>
+        readFile(new URL(path, import.meta.url), "utf8"),
+      ),
+    );
+
+    for (const source of sources) {
+      expect(source).not.toMatch(BANNED_WIRE_HELPER);
+    }
+  });
+
   test("removable enterprise gates carry the frozen compatibility deadline", async () => {
     const sources = await Promise.all([
       readFile(new URL("./messages.ts", import.meta.url), "utf8"),

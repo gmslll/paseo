@@ -1,6 +1,6 @@
 # Paseo 企业多人办公版主实施规约
 
-> 文档状态：可执行基线 v1.1（增加分布式 Paseo 管理演进约束）
+> 文档状态：可执行基线 v1.2（v1.1 增加分布式 Paseo 管理演进约束；v1.2 按 ADR-0031–0049 纳入协作数据面、成员共享、本地四平面、托管运行时与任务看板）
 > 编制日期：2026-09-09
 > 目标读者：技术负责人、总集成会话、各并行实现会话、测试与安全审计会话
 > Paseo 源码核对基线：`getpaseo/paseo`，commit `fdf3b4b`，`0.8.0-beta.1`
@@ -120,7 +120,7 @@ principalId（员工）
 
 以下项目不属于 v1，任何会话不得顺手实现：
 
-- 不开发面向员工的通用工作流编排器或排班系统。
+- 不开发面向员工的通用工作流编排器或排班系统。团队任务看板与审阅流程按 ADR-0040 纳入范围，但不自动给员工派活。
 - 不让员工直接管理 daemon、Hub、插件、全局 Provider 或访问控制。
 - 不把公司 Codex/Claude 登录凭据复制给员工客户端。
 - 不把业务账号密码、Cookie、刷新令牌写进 Agent prompt、聊天记录、审计正文或普通 JSON 配置。
@@ -289,9 +289,9 @@ P0 使用 `LocalIdentityResolver`、`LocalPlacementResolver`、`LocalLeaseCoordi
 3. 管理面签发短期、节点绑定的 Session Ticket；
 4. 客户端通过 Paseo Relay、VPN 或直连到目标 daemon；
 5. daemon 验证签名、`aud=nodeId`、Principal、Grant version、到期时间和吊销 epoch；
-6. 原始聊天和文件默认不经过中央控制面。
+6. 未启用协作的 Workspace，原始聊天和文件不经过中央控制面；启用协作的 Workspace 按 ADR-0031 经管理面同步会话与任务文档，文件仍留在节点。
 
-Session Ticket 不能跨节点复用。管理面只保存全局元数据和审计索引；Boss 打开正文时，由管理面签发一次性内容票据，再从目标节点按需读取并审计。
+Session Ticket 不能跨节点复用。未启用协作时，管理面只保存全局元数据和审计索引；Boss 打开正文时，由管理面签发一次性内容票据，再从目标节点按需读取并审计。协作成员可以不直连节点，通过管理面转发的机器 RPC 操作 Agent（ADR-0035）。
 
 如果未来必须使用 WebSocket 代理，也要保持相同 Ticket 和资源授权合同，不能因为流量经过网关就跳过 daemon 本地授权。
 
@@ -344,7 +344,8 @@ interface FencedLease extends ResourceLease {
 - 全局资源引用与 Placement；
 - 会话状态摘要和脱敏结果摘要；
 - 全局业务身份租约；
-- 审计索引和完整性锚点。
+- 审计索引和完整性锚点；
+- 协作 Workspace 的 CRDT 文档、附件 blob、成员关系与数据面审计（ADR-0031、ADR-0033、ADR-0037）。
 
 节点本地保存：
 
@@ -354,7 +355,7 @@ interface FencedLease extends ResourceLease {
 - 原生应用本地状态；
 - 详细本地审计 Journal。
 
-审计事件增加 `nodeId`、`nodeEventSeq` 和全局唯一 `eventId`。节点断网时有界缓存，恢复后幂等补传；管理面按 `eventId` 去重并检测 sequence gap。Boss 全局视图的摘要可以汇聚，正文不能默认批量复制到控制面。
+审计事件增加 `nodeId`、`nodeEventSeq` 和全局唯一 `eventId`。节点断网时有界缓存，恢复后幂等补传；管理面按 `eventId` 去重并检测 sequence gap。Boss 全局视图的摘要可以汇聚，正文不能默认批量复制到控制面；协作 Workspace 的文档由成员同步产生，Boss 读取仍需内容 Grant 与 required 审计。
 
 ### 5.1.8 故障语义
 
@@ -378,6 +379,7 @@ interface FencedLease extends ResourceLease {
 ### 5.1.10 分布式安全底线
 
 - 中央管理面被攻破不能直接获得所有节点的 Provider 明文凭据和 Browser Cookie。
+- 协作 Workspace 的正文存于管理面，管理面被攻破会暴露这些正文；此风险按 ADR-0031 接受，管理面数据卷必须加密。
 - 单个节点被攻破不能伪装成其他节点，也不能修改其他节点的 Placement/租约。
 - Boss 全局视图不批量预取原始聊天。
 - 节点之间不直接互信；所有跨节点指令由管理面签名、限定目标节点、资源、动作和到期时间。
@@ -580,7 +582,7 @@ createdByPrincipalId: z.string().optional(),
 - 新企业 Workspace 上述字段必须写入。
 - P0 的 `nodeId` 写当前本地节点；不得用常量散落在业务代码中，由 `NodeContext` 统一提供。
 - `ownerPrincipalId` 一经创建不可由普通员工修改。
-- 相同 `cwd` 不允许属于两个不同 Owner；这是 v1 的硬约束。
+- 相同 `cwd` 不允许属于两个不同 Owner；这是 v1 的硬约束。协作按 ADR-0033 在同一 Workspace 记录上增加 editor/viewer 成员，Owner 仍唯一。
 - 员工新建 Workspace 的 `cwd` 必须位于其 `assignedRoot` 内。
 - Project 列表只展示含有可访问 Workspace 的 Project；Project 操作同样受范围控制。
 
@@ -705,7 +707,7 @@ $PASEO_HOME/enterprise/workspaces/<organizationId>/<principalId>/<workspaceId>/
 
 ### 11.2 同 cwd 风险
 
-Paseo 部分 Directory-backed surface 和状态缓存按 `(serverId, cwd)` 建模。v1 不允许两个不同 Owner 使用相同 `cwd`。共享资料通过显式只读副本、受控 API 或独立共享资源 Grant 提供，不能让不同 Owner 注册同一个可写目录。
+Paseo 部分 Directory-backed surface 和状态缓存按 `(serverId, cwd)` 建模。v1 不允许两个不同 Owner 使用相同 `cwd`。共享资料通过显式只读副本、受控 API 或独立共享资源 Grant 提供，不能让不同 Owner 注册同一个可写目录。可写协作只能通过同一 Workspace 记录的成员 Grant 实现（ADR-0033），并发 turn 规则见 ADR-0034。
 
 ### 11.3 Codex/Claude 执行策略
 
@@ -721,6 +723,8 @@ codex:
 ```
 
 Claude 等 Provider 使用其原生等价限制，并设置 `failIfUnavailable: true`；沙箱不可用时不能自动退化到无限制模式。
+
+Provider 运行时版本由公司锁定：管理面下发锁定版本与制品，节点校验 SHA-256 后安装，策略可禁止回退到 PATH（ADR-0039）。
 
 员工角色默认禁止：
 
@@ -974,7 +978,7 @@ interface AuditEvent {
 
 ### 15.2 审计存储规则
 
-- 使用只追加 JSONL，每日轮转。
+- 节点本地审计使用只追加 JSONL，每日轮转；管理面数据面审计写入管理面 SQLite 哈希链（ADR-0037）。
 - 使用 hash chain 检测静默修改；每日首条关联上一日末尾 Hash。
 - 不记录 Prompt 正文、Cookie、Token、密码、完整客户数据或截图。
 - 审计服务失败时，高风险管理操作和 Boss 内容查看必须失败关闭；普通 Agent 状态事件可进入有界内存缓冲并报警。
@@ -1009,7 +1013,7 @@ enterprise.node.set_drain.request/response
 enterprise.placement.resolve_workspace.request/response
 ```
 
-节点 Enrollment、心跳、Capacity 和审计补传属于 daemon 与管理控制面的独立受认证通道，不复用普通员工 Session RPC。普通客户端只能调用有明确用户授权语义的 Node/Placement 查询，不能注册节点或伪造 Capacity。
+节点 Enrollment、心跳、Capacity 和审计补传属于 daemon 与管理控制面的独立受认证通道，不复用普通员工 Session RPC。普通客户端只能调用有明确用户授权语义的 Node/Placement 查询，不能注册节点或伪造 Capacity。协作机器 RPC 按 ADR-0035 经管理面签名声明转发，节点以对应 Principal 的无头 Session 执行，授权与直连一致。本地 control/data/terminal/probe 平面见 ADR-0038。
 
 建议 Feature Flags：
 
@@ -1251,6 +1255,19 @@ W7 可以要求其他工作流补可测试接口，但不得为了让测试通�
 - 完成多节点故障、版本漂移和脑裂测试。
 
 W8 不得在 P0/P1 核心授权完成前启动生产实现。W0 应先保留合同，但不要让分布式控制面拖延单机试点。
+
+### W9：协作、本地平面、托管运行时与任务看板（ADR-0031–0049）
+
+独占修改：
+
+- `packages/protocol/src/{enterprise-collaboration,local-planes,managed-runtimes}.ts` 与 `binary-frames/{length-prefix,data-plane}.ts`
+- `packages/enterprise-management/src/data-plane/**` 与运行时制品模块
+- `packages/server/src/server/{sqlite,transport,local-planes,managed-runtimes,orchestration,code-collab,tasks}/**`
+- `packages/server/src/server/enterprise/managed-node/collab/**`
+- `packages/client/src/collab/**`、`packages/app/src/{collab,code-collab,tasks}/**`
+- `docs/enterprise/decisions/` 中 0031–0049
+
+对 `websocket-server.ts`、`session.ts`、`bootstrap.ts`、`messages.ts` 等热点文件的修改，只限上述 ADR 点名的调用点，并保留现有授权、出站过滤与 Feature Gate。
 
 ---
 
