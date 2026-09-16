@@ -39,7 +39,7 @@ export interface ManagedNodeLifecycleOptions {
   readonly auditUploadIntervalMs?: number;
   readonly scheduler?: ManagedNodeLifecycleScheduler;
   readonly onError?: (
-    operation: "heartbeat" | "policy" | "audit" | "placements",
+    operation: "heartbeat" | "policy" | "audit" | "placements" | "collab",
     error: unknown,
   ) => void;
 }
@@ -57,6 +57,7 @@ export class ManagedNodeLifecycle {
   private readyPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
   private placementSource: ManagedPlacementSnapshotSource | null = null;
+  private collabPump: (() => Promise<void>) | null = null;
   private started = false;
   private closed = false;
 
@@ -119,6 +120,27 @@ export class ManagedNodeLifecycle {
     this.arm("placements", () => this.synchronizePlacements());
   }
 
+  /**
+   * Drives one collaboration exchange on the node's schedule (ADR-0032).
+   *
+   * Installed rather than constructed, like the placement source: the replicas need the Workspace
+   * registry and the Agent manager, which bootstrap builds after this lifecycle is already running.
+   * It shares the heartbeat's interval — the node is already talking to the plane that often, and a
+   * second cadence would be a second thing to tune.
+   */
+  async installCollabPump(pump: () => Promise<void>): Promise<void> {
+    if (typeof pump !== "function") throw new Error("collaboration pump is invalid");
+    await this.ready();
+    if (this.closed) throw new Error("managed node lifecycle is closed");
+    if (this.collabPump) throw new Error("collaboration pump is already installed");
+    this.collabPump = pump;
+    this.arm("collab", () => this.runCollabPump());
+  }
+
+  private async runCollabPump(): Promise<void> {
+    await this.collabPump?.();
+  }
+
   private async start(): Promise<void> {
     await this.options.refreshPolicy();
     await this.sendHeartbeat();
@@ -131,7 +153,7 @@ export class ManagedNodeLifecycle {
   }
 
   private arm(
-    operation: "heartbeat" | "policy" | "audit" | "placements",
+    operation: "heartbeat" | "policy" | "audit" | "placements" | "collab",
     operationTask: () => Promise<void>,
   ): void {
     const timer = this.scheduler.setInterval(
@@ -145,14 +167,16 @@ export class ManagedNodeLifecycle {
           () => undefined,
         );
       },
-      operation === "placements" ? this.intervals.heartbeat : this.intervals[operation],
+      operation === "placements" || operation === "collab"
+        ? this.intervals.heartbeat
+        : this.intervals[operation],
     );
     timer.unref?.();
     this.timers.push(timer);
   }
 
   private async runScheduledOperation(
-    operation: "heartbeat" | "policy" | "audit" | "placements",
+    operation: "heartbeat" | "policy" | "audit" | "placements" | "collab",
     operationTask: () => Promise<void>,
   ): Promise<void> {
     if (this.closed) return;
