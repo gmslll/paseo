@@ -1,7 +1,11 @@
 import { z } from "zod";
 
-import { ManagedPrincipalIdSchema } from "./enterprise-management.js";
-import { type EnterpriseAction, NodeIdSchema, OrganizationIdSchema } from "./messages.js";
+import {
+  type EnterpriseAction,
+  ManagedPrincipalIdSchema,
+  NodeIdSchema,
+  OrganizationIdSchema,
+} from "./messages.js";
 
 // Collaboration data plane contracts: ADR-0031 through ADR-0037, board containers from ADR-0046.
 

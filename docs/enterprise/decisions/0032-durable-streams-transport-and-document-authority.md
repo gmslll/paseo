@@ -97,6 +97,13 @@ A session document keeps rows grouped by timeline epoch. On daemon restart the n
 timeline store from the document epoch. It reconciles against Provider history by message identity;
 on mismatch it starts a new epoch and publishes a timeline replacement instead of editing old rows.
 
+`rpc:req:<nodeId>` is the one segment whose bytes the plane reads and rewrites; everywhere else it
+stores an append exactly as it arrived, without decoding it. It has to here: the node acts on a
+machine RPC only on the strength of a plane signature, and the member who appends the envelope
+cannot produce one, so the plane parses the envelope, applies the method allowlist and the role
+check of ADR-0035, and stores the attested envelope in place of the one it was handed. Added
+2026-09-17 by the integration owner.
+
 A node keeps one SQLite database per container at
 `$PASEO_HOME/enterprise/collab/<containerId>/repo.sqlite3`, in a 0700 directory because it holds the
 plaintext content ADR-0031 accepts only on an encrypted volume.

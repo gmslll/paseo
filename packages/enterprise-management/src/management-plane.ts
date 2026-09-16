@@ -85,11 +85,17 @@ import {
   type CollabSubscriptionCreated,
   type CollabSubscriptionEvent,
   type PresenceEntry,
+  MACHINE_RPC_DEFAULT_TTL_MS,
+  MachineRpcClientRequestSchema,
+  machineRpcMethodPolicy,
+  roleAllowsMachineRpcMethod,
+  type MachineRpcClientRequest,
   type WorkspaceMemberRole,
   type WorkspaceMembershipPolicy,
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { streamAccess, type StreamAccess } from "./data-plane/stream-access.js";
 import { collectSubscriptionEvents } from "./data-plane/subscription.js";
+import { signMachineRpcAttestation } from "./data-plane/rpc-attestation.js";
 import { signStreamToken, verifyStreamToken } from "./data-plane/stream-token.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
@@ -1865,8 +1871,9 @@ export class EnterpriseManagementPlane {
     input: StreamAppendInput,
   ): Promise<StreamAppendResult> {
     this.assertOpen();
-    this.assertStreamAccess(toStreamActor(actor), input.containerId, input.segment, "write");
-    const result = this.streams.append(input);
+    const caller = toStreamActor(actor);
+    this.assertStreamAccess(caller, input.containerId, input.segment, "write");
+    const result = this.streams.append(this.attestRpcRequest(caller, input));
     // Only a real append wakes readers. A duplicate or a refused write changes nothing to deliver.
     if (result.kind === "appended") {
       for (const listener of this.streamListeners) {
@@ -2236,6 +2243,72 @@ export class EnterpriseManagementPlane {
         .get(containerId, this.options.organizationId),
     );
     return row ? Number(row.collaboration_enabled) === 1 : false;
+  }
+
+  /**
+   * Attaches the plane's attestation to a machine RPC request, and leaves every other append
+   * exactly as it arrived (ADR-0035).
+   *
+   * This is the one segment whose bytes the plane rewrites. Everywhere else it stores what it was
+   * given without reading it; here it has to, because the node acts on an RPC only on the strength
+   * of a signature it can check, and a member appending the envelope cannot produce one.
+   *
+   * The requester's identity comes from the credential, never from the envelope. The client id does
+   * come from the envelope — the plane has no other source for it, and it names which of one
+   * person's devices asked rather than who they are, so a caller naming another device still only
+   * ever reaches their own.
+   */
+  private attestRpcRequest(actor: CollabStreamActor, input: StreamAppendInput): StreamAppendInput {
+    const segment = parseCollabSegment(input.segment);
+    if (!segment || segment.kind !== "rpc_request") return input;
+    // Only members write this segment, which assertStreamAccess has already enforced.
+    if (actor.kind !== "principal") throw new Error("stream authorization denied");
+
+    let envelope: MachineRpcClientRequest;
+    try {
+      envelope = MachineRpcClientRequestSchema.parse(
+        JSON.parse(Buffer.from(input.update).toString("utf8")),
+      );
+    } catch (error) {
+      throw new Error("invalid machine rpc envelope", { cause: error });
+    }
+    if (envelope.nodeId !== segment.nodeId || envelope.containerId !== input.containerId) {
+      throw new Error("machine rpc envelope does not match its segment");
+    }
+
+    const policy = machineRpcMethodPolicy(envelope.method);
+    // An unlisted method is refused here rather than at the node: the allowlist is the plane's to
+    // apply before it signs anything, and an attested request is one the node will act on.
+    if (!policy) throw new Error("machine rpc method not allowed");
+    const role = this.readCollabCollaborationEnabled(input.containerId)
+      ? this.readCollabRole(input.containerId, actor.principal.principalId)
+      : null;
+    if (!role || !roleAllowsMachineRpcMethod(role, policy)) {
+      throw new Error("machine rpc method authorization denied");
+    }
+
+    const issuedAtMs = this.clock.nowMs();
+    const attestation = signMachineRpcAttestation(
+      {
+        rpcId: envelope.rpcId,
+        method: envelope.method,
+        nodeId: envelope.nodeId,
+        containerId: envelope.containerId,
+        requester: {
+          principalId: actor.principal.principalId,
+          credentialId: actor.principal.credentialId,
+          grantVersion: actor.principal.grantVersion,
+          clientId: envelope.clientId,
+        },
+        sentAt: new Date(issuedAtMs).toISOString(),
+        expiresAt: new Date(issuedAtMs + MACHINE_RPC_DEFAULT_TTL_MS).toISOString(),
+      },
+      this.options.ticketPrivateKey,
+    );
+    return {
+      ...input,
+      update: new TextEncoder().encode(JSON.stringify({ ...envelope, attestation })),
+    };
   }
 
   private readCollabRole(containerId: string, principalId: string): WorkspaceMemberRole | null {

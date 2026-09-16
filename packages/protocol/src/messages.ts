@@ -181,6 +181,14 @@ const LEASE_ID_PATTERN = /^lea_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[
 export const OrganizationIdSchema = z.string().regex(ORGANIZATION_ID_PATTERN);
 export const HumanPrincipalIdSchema = z.string().regex(HUMAN_PRINCIPAL_ID_PATTERN);
 export const ServicePrincipalIdSchema = z.string().regex(SERVICE_PRINCIPAL_ID_PATTERN);
+/**
+ * Either kind of managed principal. It lives here with the two it unions rather than in
+ * enterprise-management, because enterprise-collaboration needs it too: defining it there made the
+ * two modules import each other, and whichever evaluated second left this undefined at the moment a
+ * schema built from it was constructed. zod only raises that when the schema is first used, so the
+ * cycle stayed hidden until an import order reached it.
+ */
+export const ManagedPrincipalIdSchema = z.union([HumanPrincipalIdSchema, ServicePrincipalIdSchema]);
 // Existing single-user direct admission permanently uses the literal "owner".
 export const PrincipalIdSchema = z.union([
   HumanPrincipalIdSchema,

@@ -4,16 +4,17 @@ import {
   EnterpriseActionSchema,
   FencedLeaseSchema,
   GlobalResourceRefSchema,
-  HumanPrincipalIdSchema,
+  ManagedPrincipalIdSchema,
   NodeIdSchema,
   OrganizationIdSchema,
   PrincipalIdSchema,
   ResourceGrantSchema,
-  ServicePrincipalIdSchema,
 } from "./messages.js";
 import { WorkspaceMembershipPolicySchema } from "./enterprise-collaboration.js";
 
-export const ManagedPrincipalIdSchema = z.union([HumanPrincipalIdSchema, ServicePrincipalIdSchema]);
+// Defined in messages.ts so that enterprise-collaboration can use it without importing this module,
+// which is what used to make the two of them a cycle. Re-exported because callers import it here.
+export { ManagedPrincipalIdSchema };
 
 export const ManagedNodeStatusSchema = z.enum([
   "registered",
