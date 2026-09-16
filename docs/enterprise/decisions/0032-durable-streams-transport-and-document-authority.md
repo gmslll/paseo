@@ -78,11 +78,24 @@ Segments:
 The node is the only writer of Agent-derived containers. Clients change Agents only through machine
 RPC. Existing `agent_stream` and `fetch_agent_timeline` stay authoritative for direct connections.
 
+Client-writable keys in `meta` are `title` and `pinnedAt`, and nothing else in the Workspace record
+(added 2026-09-17 by the integration owner; the writer table above named the category without ever
+listing it). Those are the two fields a client can already change on a direct connection, through
+`workspace.title.set` and `workspace.pin.set`, and both are gated on `workspace.write` — the action
+ADR-0033 gives an editor. Collaboration therefore widens where an editor may make those changes,
+never which changes an editor may make.
+
+Every other field is node-derived: identifiers, `cwd`, `kind`, `displayName`, the worktree and
+branch fields, timestamps, `untrustedSource`, the archive fields, and the ownership envelope with
+its `ownershipRevision`, which belongs to the transfer in ADR-0027 and would be privilege
+escalation to accept from a client. A change to one of those is refused, and the node publishes the
+value it holds so the replica that sent it converges back rather than silently disagreeing.
+
+## Node replica
+
 A session document keeps rows grouped by timeline epoch. On daemon restart the node seeds its
 timeline store from the document epoch. It reconciles against Provider history by message identity;
 on mismatch it starts a new epoch and publishes a timeline replacement instead of editing old rows.
-
-## Node replica
 
 A node keeps one SQLite database per container at
 `$PASEO_HOME/enterprise/collab/<containerId>/repo.sqlite3`, in a 0700 directory because it holds the
