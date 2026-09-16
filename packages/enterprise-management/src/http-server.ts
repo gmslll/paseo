@@ -25,6 +25,13 @@ import {
   type ManagementAuditInput,
 } from "./management-plane.js";
 import {
+  appendOutcome,
+  parseProducerHeaders,
+  parseStreamPath,
+  readOutcome,
+  readStreamBody,
+} from "./data-plane/stream-http.js";
+import {
   ManagedPlacementSnapshotSchema,
   NodeCapacitySchema,
   NodeHeartbeatSchema,
@@ -98,6 +105,8 @@ async function handleRequest(
 
   // Artifacts are larger than the JSON body limit, so the upload streams after authentication.
   if (await handleRuntimeArtifactUpload(plane, request, response, method, path)) return;
+  // Stream updates are binary, and the shared readBody would decode them as UTF-8.
+  if (await handleCollabStreamRequest(plane, request, response, method, path, url)) return;
   const body = method === "GET" || method === "HEAD" ? "" : await readBody(request);
   if (
     await handleUnauthenticatedPost(plane, request, response, method, path, body, passwordAttempts)
@@ -507,6 +516,91 @@ async function handleRuntimeArtifactUpload(
     body: request,
   });
   sendJson(response, 201, { artifact });
+  return true;
+}
+
+function sendStreamOutcome(
+  response: ServerResponse,
+  outcome: { status: number; headers: Record<string, string>; body: unknown },
+): void {
+  if (outcome.body === null) {
+    response.writeHead(outcome.status, outcome.headers);
+    response.end();
+    return;
+  }
+  const body = JSON.stringify(outcome.body);
+  response.writeHead(outcome.status, {
+    ...outcome.headers,
+    ...JSON_HEADERS,
+    "content-length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+async function handleCollabStreamRequest(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  url: URL,
+): Promise<boolean> {
+  if (!path.startsWith("/v1/ds/")) return false;
+  if (method !== "PUT" && method !== "POST" && method !== "GET" && method !== "HEAD") return false;
+  const target = parseStreamPath(path);
+  if (!target) {
+    sendJson(response, 400, {
+      error: { code: "invalid_request", message: "unknown container or segment" },
+    });
+    return true;
+  }
+  const actor = await authenticateUser(plane, request);
+
+  if (method === "GET" || method === "HEAD") {
+    const offset = url.searchParams.get("offset");
+    const outcome = readOutcome(
+      await plane.readCollabStream(actor, {
+        containerId: target.containerId,
+        segment: target.segment,
+        ...(offset ? { fromOffset: offset } : {}),
+      }),
+    );
+    if (method === "HEAD") {
+      response.writeHead(outcome.status, outcome.headers);
+      response.end();
+      return true;
+    }
+    sendStreamOutcome(response, outcome);
+    return true;
+  }
+
+  const producer = parseProducerHeaders(request.headers);
+  if (!producer) {
+    sendJson(response, 400, {
+      error: { code: "invalid_request", message: "missing or invalid producer headers" },
+    });
+    return true;
+  }
+  const update = await readStreamBody(request);
+  if (!update) {
+    sendJson(response, 413, {
+      error: { code: "append_too_large", message: "append exceeds the stream limit" },
+    });
+    return true;
+  }
+  sendStreamOutcome(
+    response,
+    appendOutcome(
+      await plane.appendCollabStream(actor, {
+        containerId: target.containerId,
+        segment: target.segment,
+        producerId: producer.producerId,
+        producerEpoch: producer.producerEpoch,
+        producerSeq: producer.producerSeq,
+        update: new Uint8Array(update),
+      }),
+    ),
+  );
   return true;
 }
 

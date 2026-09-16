@@ -54,6 +54,15 @@ import {
   type RuntimeArtifactRecord,
   type RuntimeArtifactUpload,
 } from "./runtime-distribution.js";
+import {
+  DATA_PLANE_SCHEMA,
+  createStreamStore,
+  type StreamAppendInput,
+  type StreamAppendResult,
+  type StreamReadInput,
+  type StreamReadResult,
+  type StreamStore,
+} from "./data-plane/stream-store.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
@@ -139,6 +148,7 @@ export class EnterpriseManagementPlane {
   private readonly database: SqliteDatabase;
   private readonly clock: Clock;
   private readonly runtimes: RuntimeDistributionStore;
+  private readonly streams: StreamStore;
   private closed = false;
 
   constructor(
@@ -174,6 +184,8 @@ export class EnterpriseManagementPlane {
           : path.join(path.dirname(options.databasePath), "runtime-artifacts")),
       nowIso: () => this.nowIso(),
     });
+    this.database.exec(DATA_PLANE_SCHEMA);
+    this.streams = createStreamStore({ database: this.database, clock: this.clock });
     this.database
       .prepare(
         "INSERT INTO organizations (organization_id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(organization_id) DO NOTHING",
@@ -1164,6 +1176,28 @@ export class EnterpriseManagementPlane {
     if (typeof key === "string") return key;
     if (Buffer.isBuffer(key)) return key.toString("utf8");
     return key.export({ type: "spki", format: "pem" }).toString();
+  }
+
+  // TODO(collab-membership): ADR-0032 grants stream writes by the segment writer matrix and
+  // ADR-0033 membership, not by platform administration. The members table does not exist yet, so
+  // these two gate on identity.manage; replace the assertion when membership lands rather than
+  // letting the placeholder settle into the permission model.
+  async appendCollabStream(
+    actor: AuthenticatedManagementPrincipal,
+    input: StreamAppendInput,
+  ): Promise<StreamAppendResult> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.streams.append(input);
+  }
+
+  async readCollabStream(
+    actor: AuthenticatedManagementPrincipal,
+    input: StreamReadInput,
+  ): Promise<StreamReadResult> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    return this.streams.read(input);
   }
 
   async uploadRuntimeArtifact(
