@@ -26,7 +26,24 @@ container and one segment and carries Loro updates or JSON log entries.
 - Limits: 1 MiB per append, 64 KiB per timeline row, and 8 MiB or 2,000 queued events per
   subscriber. Overflow sends `control` with `overflow` and closes the subscription.
 - The plane compacts a stream into a snapshot at 8 MiB or 5,000 updates. A reader below the lower
-  bound receives the snapshot first.
+  bound receives the snapshot first. Only the segments marked as documents below are compacted.
+
+Segment encodings (added 2026-09-16 by the integration owner). A stream carries either Loro updates
+or JSON log entries, and only a document can be compacted: replacing log entries with a snapshot
+would advance the lower bound past messages that cannot be reconstructed.
+
+| Segment                                        | Encoding      | Compacted | Basis                                                               |
+| ---------------------------------------------- | ------------- | --------- | ------------------------------------------------------------------- |
+| `meta`, `wf`                                   | Loro document | yes       | ADR-0031 names workspace-configuration documents                    |
+| `s:<agentId>`                                  | Loro document | yes       | ADR-0031 session documents; the epoch rows under Authority below    |
+| `mf:<nodeId>`                                  | Loro document | yes       | ADR-0031 names machine-state documents                              |
+| `ti`, `tk:<taskId>`, `tks:<taskId>`, `rp`      | Loro document | yes       | ADR-0046 gives each one's fields, all of them rewritten in place    |
+| `rpc:req:<nodeId>`, `rpc:res:<rpcId>`          | JSON log      | no        | ADR-0035 appends discrete envelopes; a response segment is one call |
+| `fi:<agentId>`, `ob:<nodeId>`, `pc:<resource>` | undefined     | no        | no ADR, master spec, plan, or protocol text says what they carry    |
+
+A segment this table does not mark as a document is never compacted, and that applies to any
+segment kind added later as well. Leaving a log uncompacted costs disk; compacting one loses
+history, so the default falls on the side that can be corrected.
 
 Segments:
 
