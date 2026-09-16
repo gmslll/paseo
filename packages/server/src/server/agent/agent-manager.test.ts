@@ -11212,3 +11212,54 @@ test("a queued send reports itself as queued rather than as a started turn", asy
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+async function waitFor(predicate: () => boolean, what: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+test("starts the waiting send once the turn it waited for ends", async () => {
+  const { manager, session, agentId, workdir } = await agentWithRunningTurnBy(ALICE);
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: BOB,
+    });
+    expect(manager.getAgent(agentId)!.queuedTurns).toHaveLength(1);
+
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+
+    // The queue is FIFO and drains on its own: Bob does not have to send again to be heard.
+    await waitFor(() => session.startPrompts.includes("second"), "the queued send to start");
+    await waitFor(
+      () => manager.getAgent(agentId)!.queuedTurns.length === 0,
+      "the queue entry to be cleared",
+    );
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("drops a queue entry it can no longer run rather than advertising it forever", async () => {
+  const { manager, session, agentId, workdir } = await agentWithRunningTurnBy(ALICE);
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: BOB,
+    });
+    expect(manager.getAgent(agentId)!.queuedTurns).toHaveLength(1);
+
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await waitFor(() => manager.getAgent(agentId)!.queuedTurns.length === 0, "the queue to drain");
+
+    // One entry in, one entry out. A send that ran must not stay listed as still waiting.
+    expect(manager.getAgent(agentId)!.queuedTurns).toEqual([]);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

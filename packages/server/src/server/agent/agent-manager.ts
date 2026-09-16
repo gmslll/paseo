@@ -2649,6 +2649,9 @@ export class AgentManager {
       nextLifecycle = "idle";
     }
     mutableAgent.lifecycle = nextLifecycle;
+    if (nextLifecycle === "idle") {
+      this.drainQueuedTurn(mutableAgent);
+    }
     const persistenceHandle =
       mutableAgent.session.describePersistence() ??
       (mutableAgent.runtimeInfo?.sessionId
@@ -2676,6 +2679,15 @@ export class AgentManager {
   }
 
   /**
+   * What each queued send is waiting to run, by agent and message id.
+   *
+   * Kept here rather than on the queue entry because `queuedTurns` is projected to every member of
+   * the Workspace, and ADR-0034 keeps the prompt text out of it. A structure that cannot carry the
+   * text is a better guarantee than remembering to strip it.
+   */
+  private readonly queuedPrompts = new Map<string, Map<string, AgentPromptInput>>();
+
+  /**
    * Whether this send waits behind the running turn instead of replacing it (ADR-0034).
    *
    * The turn belongs to the author of the user message that opened it. A different Principal
@@ -2685,6 +2697,7 @@ export class AgentManager {
    */
   private queueBehindRunningTurn(
     agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
     options: AgentRunOptions | undefined,
   ): boolean {
     const sender = options?.author;
@@ -2696,17 +2709,50 @@ export class AgentManager {
     if (!controller || controller.principalId === sender.principalId) return false;
     if (agent.enterpriseOwnership?.ownerPrincipalId === sender.principalId) return false;
 
-    agent.queuedTurns = [
-      ...agent.queuedTurns,
-      {
-        messageId: options?.clientMessageId ?? randomUUID(),
-        author: sender,
-        queuedAt: new Date(),
-      },
-    ];
+    const messageId = options?.clientMessageId ?? randomUUID();
+    agent.queuedTurns = [...agent.queuedTurns, { messageId, author: sender, queuedAt: new Date() }];
+    const pending = this.queuedPrompts.get(agent.id) ?? new Map<string, AgentPromptInput>();
+    pending.set(messageId, prompt);
+    this.queuedPrompts.set(agent.id, pending);
     this.touchUpdatedAt(agent);
     this.emitState(agent);
     return true;
+  }
+
+  /**
+   * Starts the oldest waiting send once the turn it was waiting for has ended (ADR-0034).
+   *
+   * Only when the Agent actually came to rest: a replacement already in flight keeps the lifecycle
+   * running, and starting a queued send into that would have two turns racing for the same Agent.
+   */
+  private drainQueuedTurn(agent: ActiveManagedAgent): void {
+    const next = agent.queuedTurns[0];
+    if (!next) return;
+    const pending = this.queuedPrompts.get(agent.id);
+    const prompt = pending?.get(next.messageId);
+    agent.queuedTurns = agent.queuedTurns.slice(1);
+    pending?.delete(next.messageId);
+    if (pending && pending.size === 0) this.queuedPrompts.delete(agent.id);
+    this.emitState(agent);
+    // The prompt is gone only if the Agent was reloaded while the send waited. Dropping the entry
+    // is right either way: the queue must not keep advertising a send that can no longer run.
+    if (prompt === undefined) return;
+    void (async () => {
+      try {
+        const run = this.streamAgent(agent.id, prompt, {
+          clientMessageId: next.messageId,
+          author: next.author,
+        });
+        for await (const _event of run) {
+          // Events reach subscribers through the manager; nothing to collect here.
+        }
+      } catch (error) {
+        this.logger.warn(
+          { agentId: agent.id, messageId: next.messageId, err: error },
+          "agent.manager.queued_turn_failed",
+        );
+      }
+    })();
   }
 
   /** Who opened the running turn, from the user message committed under its turn id. */
@@ -2754,7 +2800,7 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
-    if (this.queueBehindRunningTurn(agent, options)) {
+    if (this.queueBehindRunningTurn(agent, prompt, options)) {
       // Nothing to stream: the send is waiting, not running. An empty run would read to the caller
       // as a turn that started and produced nothing.
       return emptyAgentRunStream();
