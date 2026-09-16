@@ -310,13 +310,16 @@ describe("collaboration subscriptions over HTTP", () => {
     expect((await read(harness, harness.memberToken, id)).status).toBe(403);
   });
 
-  test("says the live half is not available yet instead of answering a one-shot body", async () => {
+  test("says long-poll is not available yet instead of answering a one-shot body", async () => {
     const harness = await start();
     await append(harness, "meta", 1, "one");
     const id = await openId(harness, harness.memberToken, { meta: FIRST });
 
-    const response = await read(harness, harness.memberToken, id, "?live=sse");
+    // sse streams now and is covered in subscription-sse.test.ts; long-poll is still its own slice.
+    const response = await read(harness, harness.memberToken, id, "?live=long-poll");
 
+    // 501 also proves the route is reached at all: /v1/ds/subscriptions shares the /v1/ds/ prefix
+    // with the single-stream route, which would have answered 400 for an unknown container.
     expect(response.status).toBe(501);
   });
 });

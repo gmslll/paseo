@@ -616,6 +616,11 @@ async function openCollabSubscription(
   return true;
 }
 
+// Long enough to be cheap, short enough that an idle stream keeps proving itself through whatever
+// sits in front of this server. Deliberately not the presence heartbeat: transport keepalive and
+// participant liveness are separate concerns that should not move together.
+const SSE_KEEPALIVE_MS = 30_000;
+
 async function readCollabSubscription(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
@@ -630,14 +635,6 @@ async function readCollabSubscription(
     });
     return true;
   }
-  if (url.searchParams.get("live")) {
-    // Answering a one-shot body would look like a working stream to a client that asked to be kept
-    // up to date.
-    sendJson(response, 501, {
-      error: { code: "not_implemented", message: "live subscriptions are not available yet" },
-    });
-    return true;
-  }
 
   // Not an authorization step: this only names the audience a stream token must have been minted
   // for. An unknown id and someone else's id are both refused below, identically.
@@ -648,15 +645,112 @@ async function readCollabSubscription(
     });
     return true;
   }
+  // Authentication happens before the response commits to a status, so a bad credential still gets
+  // a 401 rather than a 200 event stream whose first event is an error.
   let actor: AuthenticatedManagementPrincipal;
   try {
     actor = await authenticateStreamCaller(plane, request, containerId);
   } catch {
     return sendCredentialRefusal(response);
   }
+
+  const live = url.searchParams.get("live");
+  if (live === "sse") {
+    return streamCollabSubscription(plane, request, response, actor, subscriptionId, containerId);
+  }
+  if (live) {
+    // Long-poll is its own slice. Answering a one-shot body would look like a working stream to a
+    // client that asked to be kept up to date.
+    sendJson(response, 501, {
+      error: { code: "not_implemented", message: "live subscriptions are not available yet" },
+    });
+    return true;
+  }
   sendJson(response, 200, {
     events: await plane.readCollabSubscriptionById(actor, subscriptionId),
   });
+  return true;
+}
+
+async function streamCollabSubscription(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  actor: AuthenticatedManagementPrincipal,
+  subscriptionId: string,
+  containerId: string,
+): Promise<boolean> {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store",
+    connection: "keep-alive",
+    "x-content-type-options": "nosniff",
+  });
+  response.flushHeaders();
+  // This server configures no request or socket timeout, so nothing currently cuts a long-lived
+  // response. Say so here rather than depend on the default staying at zero.
+  response.setTimeout(0);
+
+  let closed = false;
+  let unsubscribe: (() => void) | null = null;
+  let keepalive: ReturnType<typeof setInterval> | null = null;
+  const finish = (): void => {
+    if (closed) return;
+    closed = true;
+    unsubscribe?.();
+    if (keepalive) clearInterval(keepalive);
+    response.end();
+  };
+
+  const send = (event: unknown): void => {
+    response.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  // An append resolves synchronously into a poll, but `await` still yields, so two appends in quick
+  // succession could otherwise have the later poll consume the newer events and the earlier poll
+  // deliver its older batch afterwards. Serialize instead, and collapse anything that arrives while
+  // a poll is in flight into a single follow-up.
+  let polling = false;
+  let pending = false;
+  const poll = async (): Promise<void> => {
+    if (closed) return;
+    if (polling) {
+      pending = true;
+      return;
+    }
+    polling = true;
+    try {
+      const events = await plane.readCollabSubscriptionById(actor, subscriptionId);
+      for (const event of events) send(event);
+      // ADR-0032: overflow closes the subscription, and the plane has already dropped it.
+      if (events.some((event) => event.type === "control" && event.overflow === true)) finish();
+    } catch {
+      // The headers went out long ago, so a refusal can no longer change the status. ADR-0032 gives
+      // it an event of its own precisely for this case.
+      send({ type: "revoked", containerId, reason: "stream authorization denied" });
+      finish();
+    } finally {
+      polling = false;
+    }
+    if (pending && !closed) {
+      pending = false;
+      await poll();
+    }
+  };
+
+  unsubscribe = plane.onCollabStreamAppend((changed) => {
+    // poll() is async, so a failure here would surface as an unhandled rejection rather than reach
+    // the notifier. Close the stream instead: a reader that cannot be polled is finished.
+    if (changed === containerId) void poll().catch(finish);
+  });
+  keepalive = setInterval(() => {
+    if (!closed) response.write(": keepalive\n\n");
+  }, SSE_KEEPALIVE_MS);
+  // A stray interval must never be the reason a process or a test run refuses to exit.
+  keepalive.unref?.();
+  request.on("close", finish);
+
+  await poll();
   return true;
 }
 

@@ -179,6 +179,7 @@ export class EnterpriseManagementPlane {
   private readonly runtimes: RuntimeDistributionStore;
   private readonly streams: StreamStore;
   private readonly subscriptions = new Map<string, CollabSubscriptionRecord>();
+  private readonly streamListeners = new Set<(containerId: string) => void>();
   private closed = false;
 
   constructor(
@@ -1480,7 +1481,32 @@ export class EnterpriseManagementPlane {
   ): Promise<StreamAppendResult> {
     this.assertOpen();
     this.assertStreamAccess(actor, input.containerId, input.segment, "write");
-    return this.streams.append(input);
+    const result = this.streams.append(input);
+    // Only a real append wakes readers. A duplicate or a refused write changes nothing to deliver.
+    if (result.kind === "appended") {
+      for (const listener of this.streamListeners) {
+        // One reader's failure must not fail the write that woke it, nor rob the other readers of
+        // their notification.
+        try {
+          listener(input.containerId);
+        } catch {
+          // The listener owns its own recovery; a live reader closes its stream.
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Notifies a listener whenever a container takes an append, so a live reader can poll instead of
+   * running its own timer. Returns the unsubscribe; a listener that throws would otherwise take
+   * down the append that woke it, so each call is isolated by the caller.
+   */
+  onCollabStreamAppend(listener: (containerId: string) => void): () => void {
+    this.streamListeners.add(listener);
+    return () => {
+      this.streamListeners.delete(listener);
+    };
   }
 
   async readCollabStream(
@@ -1721,6 +1747,7 @@ export class EnterpriseManagementPlane {
     if (this.closed) return;
     this.closed = true;
     this.subscriptions.clear();
+    this.streamListeners.clear();
     this.database.close();
   }
 
