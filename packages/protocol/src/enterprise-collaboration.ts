@@ -129,6 +129,32 @@ export const COLLAB_SEGMENT_READERS: Readonly<
   rpc_response: ["requester"],
 };
 
+/**
+ * Which segments hold a Loro document, and so are the only ones compaction may replace with a
+ * snapshot (ADR-0032). A log compacted this way would advance the lower bound past messages that
+ * cannot be reconstructed.
+ *
+ * A Record rather than a list, so adding a segment kind does not compile until someone classifies
+ * it. The ADR says the default is inherited by later kinds; this is what makes that true instead of
+ * merely written down. `false` is the answer when the content is undefined, which is why fi:, ob:
+ * and pc: are false today: no ADR, spec, plan, or protocol text says what they carry.
+ */
+export const COLLAB_SEGMENT_COMPACTED: Readonly<Record<CollabSegmentKind, boolean>> = {
+  meta: true,
+  workspace_kv: true,
+  session: true,
+  file_index: false,
+  machine_state: true,
+  orchestration: false,
+  preview_comments: false,
+  task_index: true,
+  task: true,
+  task_state: true,
+  review_policy: true,
+  rpc_request: false,
+  rpc_response: false,
+};
+
 const BOARD_SEGMENT_KINDS: ReadonlySet<CollabSegmentKind> = new Set([
   "task_index",
   "task",
