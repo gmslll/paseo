@@ -232,6 +232,10 @@ function toManagedAuditInput(event: AuditEvent): ManagedAuditInput {
       ...(event.workspaceId ? { workspaceId: event.workspaceId } : {}),
       ...(event.agentId ? { agentId: event.agentId } : {}),
     }),
+    // The chain travels with the events. Dropping these was why the plane held no chain of its own
+    // for node audit, even though the sink had computed one all along.
+    ...(event.previousHash ? { previousHash: event.previousHash } : {}),
+    ...(event.eventHash ? { eventHash: event.eventHash } : {}),
   };
 }
 

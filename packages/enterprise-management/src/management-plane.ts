@@ -221,6 +221,9 @@ export interface ManagementAuditInput {
   readonly resourceKind: string;
   readonly resourceId: string;
   readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
+  /** Absent from a node that predates the chain; see ManagedAuditInputSchema. */
+  readonly previousHash?: string;
+  readonly eventHash?: string;
 }
 
 export interface ManagementAuditRecord extends ManagementAuditInput {
@@ -363,7 +366,7 @@ export class EnterpriseManagementPlane {
     const nextSequence = lastSequence + 1;
     const eventId = createOpaqueId("evt_", 12);
     const occurredAt = this.nowIso();
-    const previousHash = this.planeAuditTailHash(lastSequence);
+    const previousHash = this.auditTailHash(PLANE_AUDIT_NODE_ID, lastSequence);
     const eventHash = planeAuditEventHash({
       eventId,
       organizationId: this.options.organizationId,
@@ -429,12 +432,13 @@ export class EnterpriseManagementPlane {
     }
   }
 
-  private planeAuditTailHash(lastSequence: number): string | null {
+  /** One reader for both chains, so the plane's own tail and a node's cannot drift apart. */
+  private auditTailHash(nodeId: string, lastSequence: number): string | null {
     if (lastSequence < 1) return null;
     const row = this.row(
       this.database
         .prepare("SELECT event_hash FROM audit_events WHERE node_id = ? AND node_event_seq = ?")
-        .get(PLANE_AUDIT_NODE_ID, lastSequence),
+        .get(nodeId, lastSequence),
     );
     const value = row?.event_hash;
     return value === null || value === undefined ? null : String(value);
@@ -1378,9 +1382,20 @@ export class EnterpriseManagementPlane {
           gaps.push({ expected, received: event.nodeEventSeq });
           break;
         }
+        // The plane cannot recompute a node's hash — what arrives is a flattened projection, not
+        // the AuditEvent the node hashed — so what it can check is the linkage: each event must
+        // name the hash of the one before it. A node that sends no hashes is left alone.
+        const expectedPrevious = this.auditTailHash(nodeId, event.nodeEventSeq - 1);
+        if (
+          event.eventHash !== undefined &&
+          expectedPrevious !== null &&
+          event.previousHash !== expectedPrevious
+        ) {
+          throw new Error("audit chain mismatch");
+        }
         const insert = this.database
           .prepare(
-            "INSERT OR IGNORE INTO audit_events (event_id, organization_id, node_id, node_event_seq, occurred_at, action, outcome, actor_principal_id, resource_kind, resource_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO audit_events (event_id, organization_id, node_id, node_event_seq, occurred_at, action, outcome, actor_principal_id, resource_kind, resource_id, metadata_json, previous_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           )
           .run(
             event.eventId,
@@ -1394,6 +1409,8 @@ export class EnterpriseManagementPlane {
             event.resourceKind,
             event.resourceId,
             JSON.stringify(event.metadata),
+            event.previousHash ?? null,
+            event.eventHash ?? null,
           );
         if (insert.changes !== 1) throw new Error("audit event identity conflict");
         accepted += 1;

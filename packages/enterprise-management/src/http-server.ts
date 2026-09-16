@@ -1219,6 +1219,9 @@ const auditInputSchema = z
     resourceKind: z.string().min(1),
     resourceId: z.string().min(1),
     metadata: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])),
+    // Strict, so these have to be named here or a node carrying its chain is refused at the door.
+    previousHash: z.string().min(1).optional(),
+    eventHash: z.string().min(1).optional(),
   })
   .strict() satisfies z.ZodType<ManagementAuditInput>;
 

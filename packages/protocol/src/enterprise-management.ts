@@ -177,6 +177,11 @@ export const ManagedAuditInputSchema = z
     resourceKind: z.string().min(1),
     resourceId: z.string().min(1),
     metadata: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])),
+    // Optional so a node that predates the chain still ingests. The plane stores them and checks
+    // that each event names the hash before it; it cannot recompute them, because what arrives here
+    // is a flattened projection of the node's AuditEvent, not the shape the node hashed.
+    previousHash: z.string().min(1).optional(),
+    eventHash: z.string().min(1).optional(),
   })
   .strict();
 
