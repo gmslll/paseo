@@ -50,7 +50,7 @@ The heart of Paseo. A Node.js process that:
 - Streams agent output in real time via a timeline model
 - Provides agent-to-agent tools through a transport-neutral tool catalog, with MCP as one adapter
 - Optionally connects outbound to a relay for remote access
-- Serves local planes under `$PASEO_HOME/run` for same-user tools: `probe.sock` for health and status, `control.sock` for Sessions framed as `paseo-ndjson/1` plus one-shot `POST /v1/rpc` calls, and `terminal.sock` for the terminal traffic of an already-admitted Session, listed in `run/daemon.json` ([ADR-0038](enterprise/decisions/0038-local-transport-planes.md))
+- Serves local planes under `$PASEO_HOME/run` for same-user tools: `probe.sock` for health and status, `control.sock` for Sessions framed as `paseo-ndjson/1` plus one-shot `POST /v1/rpc` calls, `terminal.sock` for the terminal traffic of an already-admitted Session, and `data.sock` for its document frames, listed in `run/daemon.json` ([ADR-0038](enterprise/decisions/0038-local-transport-planes.md))
 - Optionally serves the browser web client from the same HTTP server (self-hosting guide: [public-docs/web-ui.md](../public-docs/web-ui.md))
 
 All paths are under `packages/server/src/`.
@@ -65,22 +65,22 @@ not retain non-Git directories.
 
 **Key modules:**
 
-| Module                          | Responsibility                                                                                         |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `server/bootstrap.ts`           | Daemon initialization: HTTP server, WS server, agent manager, storage, relay                           |
-| `server/websocket-server.ts`    | WebSocket connection management, hello handshake, binary frame routing                                 |
-| `server/session.ts`             | Per-client session state, timeline subscriptions, terminal operations                                  |
-| `server/directory-sync/`        | Daemon-global latest-state sequences for projects, workspaces, and agents                              |
-| `server/workspace-labels/`      | Host-local label catalog, assignment mutations, and explicit subscriptions                             |
-| `server/agent/agent-manager.ts` | Agent lifecycle state machine, timeline tracking, subscriber management                                |
-| `server/agent/agent-storage.ts` | File-backed JSON persistence at `$PASEO_HOME/agents/`                                                  |
-| `server/agent/tools/`           | Transport-neutral catalog for workspaces, agents, permissions, and automation                          |
-| `server/agent/mcp-server.ts`    | Thin MCP adapter that registers the Paseo tool catalog with the MCP SDK                                |
-| `server/agent/providers/`       | Provider adapters (see "Agent providers" below)                                                        |
-| `server/orchestration-skills/`  | Bundled catalog, host selection, convergence, and skill-directory transactions                         |
-| `server/relay-transport.ts`     | Outbound relay connection with E2E encryption                                                          |
-| `server/local-planes/`          | Probe, control, and terminal plane sockets, attach tokens, local token, and `run/daemon.json` manifest |
-| `server/schedule/`              | Cron-based scheduled agents                                                                            |
+| Module                          | Responsibility                                                                                               |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `server/bootstrap.ts`           | Daemon initialization: HTTP server, WS server, agent manager, storage, relay                                 |
+| `server/websocket-server.ts`    | WebSocket connection management, hello handshake, binary frame routing                                       |
+| `server/session.ts`             | Per-client session state, timeline subscriptions, terminal operations                                        |
+| `server/directory-sync/`        | Daemon-global latest-state sequences for projects, workspaces, and agents                                    |
+| `server/workspace-labels/`      | Host-local label catalog, assignment mutations, and explicit subscriptions                                   |
+| `server/agent/agent-manager.ts` | Agent lifecycle state machine, timeline tracking, subscriber management                                      |
+| `server/agent/agent-storage.ts` | File-backed JSON persistence at `$PASEO_HOME/agents/`                                                        |
+| `server/agent/tools/`           | Transport-neutral catalog for workspaces, agents, permissions, and automation                                |
+| `server/agent/mcp-server.ts`    | Thin MCP adapter that registers the Paseo tool catalog with the MCP SDK                                      |
+| `server/agent/providers/`       | Provider adapters (see "Agent providers" below)                                                              |
+| `server/orchestration-skills/`  | Bundled catalog, host selection, convergence, and skill-directory transactions                               |
+| `server/relay-transport.ts`     | Outbound relay connection with E2E encryption                                                                |
+| `server/local-planes/`          | Probe, control, terminal, and data plane sockets, attach tokens, local token, and `run/daemon.json` manifest |
+| `server/schedule/`              | Cron-based scheduled agents                                                                                  |
 
 ### `packages/protocol` — Wire schemas and shared protocol types
 

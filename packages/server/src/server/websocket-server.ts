@@ -134,7 +134,7 @@ import {
 } from "@getpaseo/protocol/browser-automation/capabilities";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
-import type { TerminalPlaneAccess } from "./local-planes/terminal-plane-access.js";
+import type { LocalPlaneAccess } from "./local-planes/local-plane-access.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import {
   OWNER_PERMISSIONS,
@@ -782,8 +782,9 @@ interface SocketSessionOptions {
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
-  /** Terminal plane access, supplied only for transports that can reach the local socket. */
-  terminalPlane?: TerminalPlaneAccess;
+  /** Plane access, supplied only for transports that can reach the local sockets. */
+  terminalPlane?: LocalPlaneAccess;
+  dataPlane?: LocalPlaneAccess;
   enterprise?: SessionAdmission["enterprise"];
   grantVersionGuard?: EnterpriseAdmissionRuntime["grantVersionGuard"];
   sessionId?: string;
@@ -1973,7 +1974,8 @@ export class VoiceAssistantWebSocketServer {
     sessionAuthorization?: SessionAuthorization;
     enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
     enterpriseSessionBindingGeneration?: string;
-    terminalPlane?: TerminalPlaneAccess;
+    terminalPlane?: LocalPlaneAccess;
+    dataPlane?: LocalPlaneAccess;
     onEnterpriseWorkspaceRuntimeConstructionFailure?: (
       runtime: EnterpriseWorkspaceFilesRuntime,
     ) => void;
@@ -1991,6 +1993,7 @@ export class VoiceAssistantWebSocketServer {
       enterpriseAuthorizationRuntime,
       enterpriseSessionBindingGeneration,
       terminalPlane,
+      dataPlane,
       onEnterpriseWorkspaceRuntimeConstructionFailure,
     } = params;
     let connection: SessionConnection | null = null;
@@ -2015,6 +2018,7 @@ export class VoiceAssistantWebSocketServer {
         permissions: Object.freeze([...admission.permissions]),
         connectionLogger,
         ...(terminalPlane ? { terminalPlane } : {}),
+        ...(dataPlane ? { dataPlane } : {}),
         onMessage: (msg) => {
           if (!connection) {
             return;
@@ -2241,6 +2245,10 @@ export class VoiceAssistantWebSocketServer {
       daemonVersion: this.daemonVersion,
       daemonRuntimeConfig: this.daemonRuntimeConfig,
       ...(options.terminalPlane ? { terminalPlane: options.terminalPlane } : {}),
+      ...(options.dataPlane ? { dataPlane: options.dataPlane } : {}),
+      ...(this.daemonRuntimeConfig?.dataPlaneDocHandler
+        ? { dataPlaneDocHandler: this.daemonRuntimeConfig.dataPlaneDocHandler }
+        : {}),
       getWebSocketRuntimeMetrics: () => this.lastRuntimeMetricsSnapshot,
     });
   }
@@ -2551,6 +2559,9 @@ export class VoiceAssistantWebSocketServer {
         ...(pending.identity.transport === "direct" && this.daemonRuntimeConfig?.terminalPlane
           ? { terminalPlane: this.daemonRuntimeConfig.terminalPlane }
           : {}),
+        ...(pending.identity.transport === "direct" && this.daemonRuntimeConfig?.dataPlane
+          ? { dataPlane: this.daemonRuntimeConfig.dataPlane }
+          : {}),
         ...(sessionId ? { sessionId } : {}),
         ...(sessionAuthorization ? { sessionAuthorization } : {}),
         ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
@@ -2769,6 +2780,8 @@ export class VoiceAssistantWebSocketServer {
         ...(this.daemonRuntimeConfig?.localPlanes?.() ? { localPlanes: true } : {}),
         // COMPAT(terminalPlane): added in v0.9.0, remove gate after 2027-03-16.
         ...(this.daemonRuntimeConfig?.terminalPlane?.endpoint() ? { terminalPlane: true } : {}),
+        // COMPAT(dataPlane): added in v0.9.0, remove gate after 2027-03-16.
+        ...(this.daemonRuntimeConfig?.dataPlane?.endpoint() ? { dataPlane: true } : {}),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
         ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.

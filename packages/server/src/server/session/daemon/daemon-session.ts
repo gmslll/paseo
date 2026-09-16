@@ -1,6 +1,7 @@
 import type pino from "pino";
 import type { ManagedRuntimeControl } from "../../managed-runtimes/runtime-manager.js";
-import type { TerminalPlaneAccess } from "../../local-planes/terminal-plane-access.js";
+import type { LocalPlaneAccess } from "../../local-planes/local-plane-access.js";
+import type { DataPlaneDocHandler } from "../../local-planes/data-plane-access.js";
 import type { OrchestrationOperationControl } from "../../orchestration/operation-service.js";
 import { OperationStatusSchema } from "../../orchestration/operation-store.js";
 import { toOrchestrationOperationSummary } from "../../orchestration/operation-summary.js";
@@ -83,7 +84,10 @@ export interface DaemonRuntimeConfig {
   /** Whether the local control plane is accepting Sessions (ADR-0038). */
   localPlanes?: () => boolean;
   /** Attach tokens and the endpoint for the terminal plane, while it is listening (ADR-0038). */
-  terminalPlane?: TerminalPlaneAccess;
+  terminalPlane?: LocalPlaneAccess;
+  /** The same for the data plane, which listens only when a document handler is configured. */
+  dataPlane?: LocalPlaneAccess;
+  dataPlaneDocHandler?: DataPlaneDocHandler;
   getRelayConfig(): {
     enabled: boolean;
     endpoint: string;

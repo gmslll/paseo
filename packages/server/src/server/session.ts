@@ -69,10 +69,17 @@ import {
   type BinaryFrame,
 } from "@getpaseo/protocol/binary-frames/index";
 import type {
-  TerminalPlaneAccess,
   TerminalPlaneAttachment,
   TerminalPlaneChannel,
 } from "./local-planes/terminal-plane-access.js";
+import type { LocalPlaneAccess } from "./local-planes/local-plane-access.js";
+import type {
+  DataPlaneAttachment,
+  DataPlaneChannel,
+  DataPlaneDocHandler,
+} from "./local-planes/data-plane-access.js";
+import { LOCAL_PLANE_CONNECTION_LIMITS } from "@getpaseo/protocol/local-planes";
+import { encodeDataPlaneFrame } from "@getpaseo/protocol/binary-frames/data-plane";
 import type { ActiveFileDownloadStreamHandle } from "./enterprise/access/file-binary-outbound-authorizer.js";
 import {
   createEnterpriseAgentEventPreauthorization,
@@ -766,7 +773,11 @@ export interface SessionOptions {
   daemonVersion?: string;
   daemonRuntimeConfig?: DaemonRuntimeConfig;
   /** Terminal plane access, supplied only for transports that can reach the local socket. */
-  terminalPlane?: TerminalPlaneAccess;
+  terminalPlane?: LocalPlaneAccess;
+  /** Data plane access, on the same terms as the terminal plane. */
+  dataPlane?: LocalPlaneAccess;
+  /** Supplies the documents a data plane channel reads and writes. */
+  dataPlaneDocHandler?: DataPlaneDocHandler;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
 }
 
@@ -1096,9 +1107,12 @@ export class Session {
   private readonly serviceProxyPublicBaseUrl: string | null;
   private readonly resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | null;
   private readonly terminalController: TerminalSessionController;
-  private readonly terminalPlane: TerminalPlaneAccess | null;
+  private readonly terminalPlane: LocalPlaneAccess | null;
+  private readonly dataPlane: LocalPlaneAccess | null;
+  private readonly dataPlaneDocHandler: DataPlaneDocHandler | null;
   /** The attached terminal plane channel, while one is open (ADR-0038). */
   private terminalPlaneChannel: TerminalPlaneChannel | null = null;
+  private readonly dataPlaneChannels = new Set<DataPlaneChannel>();
   private inflightRequests = 0;
   private peakInflightRequests = 0;
   private readonly workspaceSetupSnapshots: Map<string, WorkspaceSetupSnapshot>;
@@ -1207,6 +1221,8 @@ export class Session {
       daemonVersion,
       daemonRuntimeConfig,
       terminalPlane,
+      dataPlane,
+      dataPlaneDocHandler,
       getWebSocketRuntimeMetrics,
     } = options;
     this.enterpriseDispatcher = enterpriseDispatcher ?? null;
@@ -1513,6 +1529,8 @@ export class Session {
     this.daemonConfigStore = daemonConfigStore;
     this.terminalManager = terminalManager;
     this.terminalPlane = terminalPlane ?? null;
+    this.dataPlane = dataPlane ?? null;
+    this.dataPlaneDocHandler = dataPlaneDocHandler ?? null;
     this.terminalController = new TerminalSessionController({
       terminalManager,
       emit: (msg) => this.emit(msg),
@@ -3960,8 +3978,9 @@ export class Session {
   private handleLocalPlaneAttachTokenRequest(
     msg: Extract<SessionInboundMessage, { type: "local_plane.attach_token.create.request" }>,
   ): Promise<void> {
-    const endpoint = msg.plane === "terminal" ? (this.terminalPlane?.endpoint() ?? null) : null;
-    if (!this.terminalPlane || !endpoint) {
+    const access = msg.plane === "terminal" ? this.terminalPlane : this.dataPlane;
+    const endpoint = access?.endpoint() ?? null;
+    if (!access || !endpoint) {
       this.onMessage({
         type: "rpc_error",
         payload: {
@@ -3973,7 +3992,7 @@ export class Session {
       });
       return Promise.resolve();
     }
-    const issued = this.terminalPlane.issue({
+    const issued = access.issue({
       sessionId: this.sessionId,
       plane: msg.plane,
       principalId: this.enterpriseContext?.principal.principalId ?? "owner",
@@ -4014,6 +4033,37 @@ export class Session {
       },
       detach: () => {
         if (this.terminalPlaneChannel === channel) this.terminalPlaneChannel = null;
+      },
+    };
+  }
+
+  /**
+   * Attaches a data plane channel (ADR-0038). The documents come from the handler this daemon was
+   * built with; without one the Session serves no data channel at all.
+   */
+  public attachDataChannel(channel: DataPlaneChannel): DataPlaneAttachment | null {
+    if (this.isCleanedUp || !this.authorization.allowsPermission("workspace.write")) return null;
+    if (!this.dataPlaneDocHandler) return null;
+    if (this.dataPlaneChannels.size >= LOCAL_PLANE_CONNECTION_LIMITS.dataChannelsPerSession) {
+      return null;
+    }
+    const documents = this.dataPlaneDocHandler.open({
+      sessionId: this.sessionId,
+      principalId: this.enterpriseContext?.principal.principalId ?? "owner",
+      grantVersion: this.enterpriseContext?.principal.grantVersion ?? "",
+      channel: {
+        send: (frame) => channel.send(encodeDataPlaneFrame(frame)),
+        bufferedAmount: () => channel.bufferedAmount(),
+        close: () => channel.close(),
+      },
+    });
+    if (!documents) return null;
+    this.dataPlaneChannels.add(channel);
+    return {
+      handleFrame: (frame) => documents.handleFrame(frame),
+      detach: () => {
+        this.dataPlaneChannels.delete(channel);
+        documents.detach();
       },
     };
   }
@@ -11136,9 +11186,13 @@ export class Session {
 
     try {
       this.terminalPlane?.revokeSession(this.sessionId);
+      this.dataPlane?.revokeSession(this.sessionId);
       const planeChannel = this.terminalPlaneChannel;
       this.terminalPlaneChannel = null;
       planeChannel?.close();
+      const dataChannels = [...this.dataPlaneChannels];
+      this.dataPlaneChannels.clear();
+      for (const channel of dataChannels) channel.close();
     } catch (error) {
       cleanupErrors.push(error);
     }

@@ -170,7 +170,8 @@ import { OperationService, formatOperationCompletion } from "./orchestration/ope
 import { OperationStore } from "./orchestration/operation-store.js";
 import { startLocalPlanes, type LocalPlaneHost } from "./local-planes/local-plane-host.js";
 import { createAttachTokenStore } from "./local-planes/attach-token-store.js";
-import type { TerminalPlaneAccess } from "./local-planes/terminal-plane-access.js";
+import type { LocalPlaneAccess } from "./local-planes/local-plane-access.js";
+import type { DataPlaneChannel, DataPlaneDocHandler } from "./local-planes/data-plane-access.js";
 import { countTerminals, enterpriseProbeSummary } from "./local-planes/probe-sources.js";
 import { standaloneOrchestrationAuthority } from "./orchestration/orchestration-authority.js";
 import { createEnterpriseRuntimeOrchestrationAuthority } from "./orchestration/enterprise-orchestration-authority.js";
@@ -547,6 +548,8 @@ export interface PaseoDaemonConfig {
     startupPersisted: PersistedConfig;
   };
   enterpriseMultiUser?: EnterpriseMultiUserConfig;
+  /** Supplies the documents the data plane serves. Without it the data plane stays down. */
+  dataPlaneDocHandler?: DataPlaneDocHandler;
 }
 
 export interface PaseoDaemon {
@@ -990,8 +993,13 @@ export async function createPaseoDaemon(
     // Attach tokens are per-daemon and name the Session they were issued for (ADR-0038). The
     // endpoint stays null until the terminal plane is listening, which keeps the feature ungated.
     const localPlaneAttachTokens = createAttachTokenStore();
-    const terminalPlaneAccess: TerminalPlaneAccess = {
+    const terminalPlaneAccess: LocalPlaneAccess = {
       endpoint: () => localPlanes?.terminalEndpoint ?? null,
+      issue: (claims) => localPlaneAttachTokens.issue(claims),
+      revokeSession: (sessionId) => localPlaneAttachTokens.revokeSession(sessionId),
+    };
+    const dataPlaneAccess: LocalPlaneAccess = {
+      endpoint: () => localPlanes?.dataEndpoint ?? null,
       issue: (claims) => localPlaneAttachTokens.issue(claims),
       revokeSession: (sessionId) => localPlaneAttachTokens.revokeSession(sessionId),
     };
@@ -2534,6 +2542,10 @@ export async function createPaseoDaemon(
                   orchestration: operationService ?? undefined,
                   localPlanes: () => localPlanes?.controlAvailable === true,
                   terminalPlane: terminalPlaneAccess,
+                  dataPlane: dataPlaneAccess,
+                  ...(config.dataPlaneDocHandler
+                    ? { dataPlaneDocHandler: config.dataPlaneDocHandler }
+                    : {}),
                   getRelayConfig: () =>
                     relayRuntime?.getConfig() ?? {
                       enabled: daemonConfigStore.get().relay?.enabled ?? relayEnabled,
@@ -2659,6 +2671,25 @@ export async function createPaseoDaemon(
                         .find((candidate) => candidate.getSessionId() === ticket.sessionId)
                         ?.attachTerminalChannel(channel) ?? null,
                   },
+                  // The data plane only listens once a handler can serve documents (ADR-0038).
+                  ...(config.dataPlaneDocHandler
+                    ? {
+                        data: {
+                          verify: (token: string) => {
+                            const claims = localPlaneAttachTokens.consume({
+                              token,
+                              plane: "data",
+                            });
+                            return claims ? { sessionId: claims.sessionId } : null;
+                          },
+                          attach: (ticket: { sessionId: string }, channel: DataPlaneChannel) =>
+                            wsServer
+                              ?.listSessions()
+                              .find((candidate) => candidate.getSessionId() === ticket.sessionId)
+                              ?.attachDataChannel(channel) ?? null,
+                        },
+                      }
+                    : {}),
                   sources: {
                     serverId,
                     version: daemonVersion,

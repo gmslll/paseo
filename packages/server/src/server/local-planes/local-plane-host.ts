@@ -1,6 +1,6 @@
 import type { Logger } from "pino";
 import type { DaemonManifest, ProbeState } from "@getpaseo/protocol/local-planes";
-import type { LocalPlaneAttachEndpoint } from "./terminal-plane-access.js";
+import type { LocalPlaneAttachEndpoint } from "./local-plane-access.js";
 
 import {
   startControlPlane,
@@ -15,6 +15,11 @@ import {
   type LocalPlanePaths,
 } from "./plane-paths.js";
 import { startProbePlane, type ProbePlaneServer } from "./probe-plane-server.js";
+import {
+  startDataPlane,
+  type DataPlaneAdmission,
+  type DataPlaneServer,
+} from "./data-plane-server.js";
 import {
   startTerminalPlane,
   type TerminalPlaneAdmission,
@@ -34,6 +39,8 @@ export interface LocalPlaneHost {
   readonly controlAvailable: boolean;
   /** Where terminal channels attach while the plane accepts them, else null. */
   readonly terminalEndpoint: LocalPlaneAttachEndpoint | null;
+  /** Where data channels attach while the plane accepts them, else null. */
+  readonly dataEndpoint: LocalPlaneAttachEndpoint | null;
   stop(): Promise<void>;
 }
 
@@ -44,6 +51,8 @@ export interface StartLocalPlanesInput {
   control?: ControlPlaneAdmission;
   /** Admission for terminal plane channels. Without it the terminal plane stays down. */
   terminal?: TerminalPlaneAdmission;
+  /** Admission for data plane channels. Without it the data plane stays down. */
+  data?: DataPlaneAdmission;
   logger: Logger;
   platform?: NodeJS.Platform;
 }
@@ -52,10 +61,11 @@ interface RunningPlanes {
   probe: ProbePlaneServer | null;
   control: ControlPlaneServer | null;
   terminal: TerminalPlaneServer | null;
+  data: DataPlaneServer | null;
 }
 
 function planeStatus(
-  server: ProbePlaneServer | ControlPlaneServer | TerminalPlaneServer | null,
+  server: ProbePlaneServer | ControlPlaneServer | TerminalPlaneServer | DataPlaneServer | null,
 ): ProbeState["planes"][string] {
   return server
     ? { status: "listening", path: server.endpoint.path }
@@ -73,10 +83,14 @@ function manifestPlanes(running: RunningPlanes): DaemonManifest["planes"] {
   if (running.terminal) {
     planes.terminal = { ...running.terminal.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
   }
+  if (running.data) {
+    planes.data = { ...running.data.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
+  }
   return planes;
 }
 
 async function closePlanes(running: RunningPlanes): Promise<void> {
+  await running.data?.close();
   await running.terminal?.close();
   await running.control?.close();
   await running.probe?.close();
@@ -89,7 +103,7 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
     await ensurePrivateDirectory(paths.socketDirectory);
   }
   const token = await issueLocalToken(paths.tokenPath);
-  const running: RunningPlanes = { probe: null, control: null, terminal: null };
+  const running: RunningPlanes = { probe: null, control: null, terminal: null, data: null };
   let lifecycle = "running";
   const collector = createProbeStateCollector({
     ...input.sources,
@@ -98,7 +112,7 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
       probe: planeStatus(running.probe),
       control: planeStatus(running.control),
       terminal: planeStatus(running.terminal),
-      data: planeStatus(null),
+      data: planeStatus(running.data),
     }),
   });
 
@@ -121,6 +135,14 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
         endpoint: paths.endpoints.terminal,
         token,
         admission: input.terminal,
+        logger: input.logger,
+      });
+    }
+    if (input.data) {
+      running.data = await startDataPlane({
+        endpoint: paths.endpoints.data,
+        token,
+        admission: input.data,
         logger: input.logger,
       });
     }
@@ -153,6 +175,10 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
     get terminalEndpoint() {
       if (!running.terminal || stopping !== null) return null;
       return { ...running.terminal.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
+    },
+    get dataEndpoint() {
+      if (!running.data || stopping !== null) return null;
+      return { ...running.data.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
     },
     stop() {
       stopping ??= (async () => {
