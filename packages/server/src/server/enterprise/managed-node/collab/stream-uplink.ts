@@ -17,7 +17,7 @@ import {
   type RequestJsonInput,
 } from "../node-request.js";
 import type { ManagedNodeRelationship } from "../relationship-store.js";
-import type { CollabRepoStore } from "./loro-repo-store.js";
+import type { CollabRepoStore, ProducerState } from "./loro-repo-store.js";
 
 /**
  * Carries one container's streams between the node's replica and the management plane (ADR-0032).
@@ -191,6 +191,18 @@ export class CollabStreamUplink {
       nextOffset: result.nextOffset,
       upToDate: result.upToDate,
     };
+  }
+
+  /**
+   * Opens this segment's producer epoch. Every local write requires one — the replica refuses an
+   * enqueue without it — and the epoch rises per call, so a queue that survived a restart cannot
+   * collide with what the plane already holds under the old one.
+   *
+   * Here rather than on the caller because the producer identity belongs to this uplink. A second
+   * copy of it elsewhere is a fencing bug that surfaces only as a refused append.
+   */
+  beginEpoch(segment: string): ProducerState {
+    return this.options.store.beginProducerEpoch(segment, this.producerId());
   }
 
   /** One producer identity per node per container, so the plane's fencing is per node. */

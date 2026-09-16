@@ -217,14 +217,27 @@ async function planeMessages(harness: Harness, segment: string): Promise<number>
 describe("uploading the replica's queue", () => {
   test("says idle when the node has produced nothing", async () => {
     const harness = await start();
-    harness.store.beginProducerEpoch("s:agent-1", `nod:${harness.nodeId}`);
+    harness.uplink.beginEpoch("s:agent-1");
 
     expect(await harness.uplink.flushSegment("s:agent-1")).toEqual({ kind: "idle" });
   });
 
+  test("opens the epoch under the node's own producer identity", async () => {
+    const harness = await start();
+
+    const first = harness.uplink.beginEpoch("s:agent-1");
+    const second = harness.uplink.beginEpoch("s:agent-1");
+
+    // The identity the plane fences on belongs to the uplink. A caller that spelled it out itself
+    // would be a second copy of the convention, and a divergence would surface only as a refused
+    // append.
+    expect(first.producerId).toBe(`nod:${harness.nodeId}`);
+    expect(second.epoch).toBeGreaterThan(first.epoch);
+  });
+
   test("sends what is queued and stops tracking it", async () => {
     const harness = await start();
-    harness.store.beginProducerEpoch("s:agent-1", `nod:${harness.nodeId}`);
+    harness.uplink.beginEpoch("s:agent-1");
     harness.store.enqueueLocalUpdate("s:agent-1", update("title", "one"));
     harness.store.enqueueLocalUpdate(
       "s:agent-1",
@@ -291,7 +304,7 @@ describe("uploading the replica's queue", () => {
 describe("pulling from the plane", () => {
   test("applies what arrived and resumes past it", async () => {
     const harness = await start();
-    harness.store.beginProducerEpoch("s:agent-1", `nod:${harness.nodeId}`);
+    harness.uplink.beginEpoch("s:agent-1");
     harness.store.enqueueLocalUpdate("s:agent-1", update("title", "one"));
     await harness.uplink.flushSegment("s:agent-1");
 
@@ -307,7 +320,7 @@ describe("pulling from the plane", () => {
 
   test("resumes from the stored cursor after a restart", async () => {
     const harness = await start();
-    harness.store.beginProducerEpoch("s:agent-1", `nod:${harness.nodeId}`);
+    harness.uplink.beginEpoch("s:agent-1");
     harness.store.enqueueLocalUpdate("s:agent-1", update("title", "one"));
     await harness.uplink.flushSegment("s:agent-1");
     await harness.uplink.pullSegment("s:agent-1");
