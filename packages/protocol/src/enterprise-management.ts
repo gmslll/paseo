@@ -11,6 +11,7 @@ import {
   ResourceGrantSchema,
   ServicePrincipalIdSchema,
 } from "./messages.js";
+import { WorkspaceMembershipPolicySchema } from "./enterprise-collaboration.js";
 
 export const ManagedPrincipalIdSchema = z.union([HumanPrincipalIdSchema, ServicePrincipalIdSchema]);
 
@@ -89,7 +90,15 @@ export const ManagedNodePolicyEntrySchema = z
   .strict();
 
 export const ManagedNodePolicyResponseSchema = z
-  .object({ principals: z.array(ManagedNodePolicyEntrySchema) })
+  .object({
+    principals: z.array(ManagedNodePolicyEntrySchema),
+    /**
+     * Sent only to nodes whose heartbeat declares collaborationV1 (ADR-0033). Optional, and the key
+     * is absent rather than empty for every other node: this object is strict, so an older node
+     * parsing a response that merely carries an empty array would reject it just the same.
+     */
+    workspaceMemberships: z.array(WorkspaceMembershipPolicySchema).optional(),
+  })
   .strict();
 
 export const ManagedNodeRequestAuthenticationSchema = z

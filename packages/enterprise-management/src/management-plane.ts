@@ -86,6 +86,7 @@ import {
   type CollabSubscriptionEvent,
   type PresenceEntry,
   type WorkspaceMemberRole,
+  type WorkspaceMembershipPolicy,
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { streamAccess } from "./data-plane/stream-access.js";
 import { collectSubscriptionEvents } from "./data-plane/subscription.js";
@@ -890,6 +891,62 @@ export class EnterpriseManagementPlane {
             updatedAt: String(row.updated_at),
           });
         }),
+    );
+  }
+
+  /**
+   * The collaborative Workspaces placed on one node, with their members (ADR-0033).
+   *
+   * Returns null — not an empty array — for a node that does not declare `collaborationV1`. The
+   * policy response is strict, so the caller has to leave the key out entirely for those nodes; an
+   * empty array would still be an unknown key to an older node and would still be rejected.
+   *
+   * Placement decides the list: a node learns about the Workspaces it hosts and no others, so one
+   * node's policy never discloses another's tenants.
+   *
+   * `membershipVersion` is derived from the members rather than stored. Nothing in the plane keeps
+   * such a counter today — a membership change rolls the Principal's grantVersion instead — so this
+   * gives a node something stable to compare without inventing a column that would then need to be
+   * kept correct on every write.
+   */
+  readNodeWorkspaceMemberships(nodeId: string): readonly WorkspaceMembershipPolicy[] | null {
+    this.assertOpen();
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) return null;
+
+    const rows = this.database
+      .prepare(
+        `SELECT w.workspace_uid, w.local_workspace_id, w.owner_principal_id
+         FROM collab_workspaces w
+         JOIN placements p
+           ON p.organization_id = w.organization_id
+          AND p.local_resource_id = w.local_workspace_id
+          AND p.resource_kind = 'workspace'
+         WHERE w.organization_id = ? AND p.node_id = ? AND w.collaboration_enabled = 1
+         ORDER BY w.workspace_uid`,
+      )
+      .all(this.options.organizationId, nodeId);
+
+    return Object.freeze(
+      rows.map((value) => {
+        const row = this.row(value)!;
+        const workspaceUid = String(row.workspace_uid);
+        const members = this.listCollabMembersUnchecked(workspaceUid);
+        return {
+          workspaceUid,
+          localWorkspaceId: String(row.local_workspace_id),
+          ownerPrincipalId: String(row.owner_principal_id),
+          membershipVersion: members.length,
+          // Not frozen: WorkspaceMembershipPolicy is inferred from a plain zod object, so its
+          // members array is mutable. Freezing it produced a readonly type the contract will not
+          // accept, and casting that away would have left the declared type saying something
+          // untrue. The outer list is still frozen.
+          members: members.map((member) => ({
+            principalId: member.principalId,
+            role: member.role,
+          })),
+        };
+      }),
     );
   }
 

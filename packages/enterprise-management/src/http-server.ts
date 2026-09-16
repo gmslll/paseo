@@ -1179,7 +1179,14 @@ async function handleNodePlacementRequest(
   nodeId: string,
 ): Promise<boolean> {
   if (method === "GET" && path === "/v1/node/policy") {
-    sendJson(response, 200, { principals: plane.getNodePolicy(nodeId) });
+    // Spread rather than assign: a node without collaborationV1 must receive no such key at all,
+    // because ManagedNodePolicyResponseSchema is strict and an older node rejects what it does not
+    // know — including a key whose value happens to be empty (ADR-0033).
+    const memberships = plane.readNodeWorkspaceMemberships(nodeId);
+    sendJson(response, 200, {
+      principals: plane.getNodePolicy(nodeId),
+      ...(memberships ? { workspaceMemberships: memberships } : {}),
+    });
     return true;
   }
   if (method === "POST" && path === "/v1/node/placements") {
