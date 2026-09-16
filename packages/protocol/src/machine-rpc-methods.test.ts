@@ -31,17 +31,22 @@ describe("the machine RPC method table", () => {
   });
 
   test("points each workspace method at the Session request it becomes", () => {
+    // The actions are the entry's own; a test in the daemon pins them to its entry mapping, which
+    // this package cannot import.
     expect(machineRpcMethodPolicy("agent.send")).toEqual({
       scope: "workspace",
       entry: "send_agent_message_request",
+      actions: ["workspace.write"],
     });
     expect(machineRpcMethodPolicy("agent.cancel")).toEqual({
       scope: "workspace",
       entry: "cancel_agent_request",
+      actions: ["workspace.write"],
     });
     expect(machineRpcMethodPolicy("checkout.status")).toEqual({
       scope: "workspace",
       entry: "checkout_status_request",
+      actions: ["workspace.content.read"],
     });
   });
 

@@ -49,6 +49,13 @@ that entry's enterprise actions already imply — `create_agent_request` and
 Deriving it this way means collaboration cannot widen what a role may do: the answer is the one a
 direct connection already gives.
 
+The actions are restated in the table rather than resolved from the daemon's entry mapping, because
+the plane cannot reach it: `packages/enterprise-management` depends on the protocol package and not
+on the daemon, while `inboundActionsForRequestType` lives in the daemon. This decision has the plane
+check the method before it attests, so the plane needs the answer in a package it can import. A
+daemon-side test pins every row of the table to that mapping, so the restatement cannot drift into a
+second answer — which is the only thing that makes duplicating it safe.
+
 Two corrections fell out of writing it down. Steering is not a method — it is the
 `activeTurnBehavior` of a send, so a table listing `agent.steer` would name something that does not
 exist. And the machine-scoped methods cannot be derived at all: `restart_server_request` carries the

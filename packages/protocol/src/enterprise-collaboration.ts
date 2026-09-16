@@ -75,23 +75,80 @@ export const COLLAB_REPO_FILE = "repo.sqlite3";
  * listed separately and answered explicitly for exactly that reason.
  */
 export type MachineRpcMethodPolicy =
-  | { readonly scope: "workspace"; readonly entry: string }
+  | {
+      readonly scope: "workspace";
+      readonly entry: string;
+      readonly actions: readonly EnterpriseAction[];
+    }
   | { readonly scope: "machine"; readonly requires: "member" | "owner" };
 
+/**
+ * `actions` is what the daemon's own entry mapping already resolves for that Session request. It is
+ * restated here because the management plane depends on this package and not on the daemon, so it
+ * cannot call that mapping — and ADR-0035 has the plane check the method before it attests. A test
+ * in the daemon pins every row to `inboundActionsForRequestType`, so the copy cannot drift into a
+ * second answer.
+ */
 export const MACHINE_RPC_METHODS: Readonly<Record<string, MachineRpcMethodPolicy>> = {
-  "agent.create": { scope: "workspace", entry: "create_agent_request" },
+  "agent.create": {
+    scope: "workspace",
+    entry: "create_agent_request",
+    actions: ["workspace.write"],
+  },
   // Steering is not its own method: it is the activeTurnBehavior of a send.
-  "agent.send": { scope: "workspace", entry: "send_agent_message_request" },
-  "agent.cancel": { scope: "workspace", entry: "cancel_agent_request" },
-  "agent.fork_context": { scope: "workspace", entry: "agent.fork_context.request" },
-  "agent.permission_response": { scope: "workspace", entry: "agent_permission_response" },
-  "file.read": { scope: "workspace", entry: "file_explorer_request" },
-  "file.write": { scope: "workspace", entry: "fs.file.write.request" },
-  "checkout.status": { scope: "workspace", entry: "checkout_status_request" },
+  "agent.send": {
+    scope: "workspace",
+    entry: "send_agent_message_request",
+    actions: ["workspace.write"],
+  },
+  "agent.cancel": {
+    scope: "workspace",
+    entry: "cancel_agent_request",
+    actions: ["workspace.write"],
+  },
+  "agent.fork_context": {
+    scope: "workspace",
+    entry: "agent.fork_context.request",
+    actions: ["workspace.content.read"],
+  },
+  "agent.permission_response": {
+    scope: "workspace",
+    entry: "agent_permission_response",
+    actions: ["workspace.write"],
+  },
+  "file.read": {
+    scope: "workspace",
+    entry: "file_explorer_request",
+    actions: ["workspace.content.read"],
+  },
+  "file.write": {
+    scope: "workspace",
+    entry: "fs.file.write.request",
+    actions: ["workspace.write"],
+  },
+  "checkout.status": {
+    scope: "workspace",
+    entry: "checkout_status_request",
+    actions: ["workspace.content.read"],
+  },
   "machine.get_status": { scope: "machine", requires: "member" },
   "machine.restart": { scope: "machine", requires: "owner" },
   "machine.upgrade": { scope: "machine", requires: "owner" },
 };
+
+/** Whether a member holding this role may call a workspace-scoped method. */
+export function roleAllowsMachineRpcMethod(
+  role: WorkspaceMemberRole,
+  policy: MachineRpcMethodPolicy,
+): boolean {
+  if (policy.scope === "machine") {
+    return policy.requires === "owner" ? role === "owner" : true;
+  }
+  // Every action the entry requires, not merely one of them. An empty list would pass vacuously,
+  // which is why the machine methods are never expressed this way.
+  const held = WORKSPACE_MEMBER_ROLE_ACTIONS[role];
+  return policy.actions.length > 0 && policy.actions.every((action) => held.includes(action));
+}
 
 export function machineRpcMethodPolicy(method: string): MachineRpcMethodPolicy | null {
   return Object.hasOwn(MACHINE_RPC_METHODS, method) ? MACHINE_RPC_METHODS[method]! : null;
