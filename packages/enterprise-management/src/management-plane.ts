@@ -84,6 +84,16 @@ import { collectSubscriptionEvents } from "./data-plane/subscription.js";
 import { signStreamToken, verifyStreamToken } from "./data-plane/stream-token.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
+/**
+ * The plane is not a node, but `audit_events.node_id` and `audit_node_state.node_id` are foreign
+ * keys into `nodes`, so plane-origin audit hangs off one reserved row (ADR-0037). The id is a
+ * well-formed node id that a generated one would collide with at 2^-64, and every place that
+ * enumerates or acts on nodes excludes it: it never heartbeats and is not a machine anyone can
+ * place work on.
+ */
+export const PLANE_AUDIT_NODE_ID = "nod_0000000000000000";
+const PLANE_AUDIT_SERVER_ID = "management-plane";
+
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
 const ENROLLMENT_TOKEN_PREFIX = "pso_enr_";
 const CREDENTIAL_ID_PATTERN = /^cred_[0-9a-f]{24}$/;
@@ -229,6 +239,89 @@ export class EnterpriseManagementPlane {
         "INSERT INTO organizations (organization_id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(organization_id) DO NOTHING",
       )
       .run(organizationId, options.organizationName, this.nowIso());
+    // Created here rather than at administrator bootstrap so that a plane can audit before anyone
+    // has bootstrapped. The endpoint is a reserved-TLD URL because ManagedNodeSchema requires a
+    // real one, and `disabled` is the closest the status enum comes to "not a machine": it keeps
+    // the row out of every `active`/`draining` path without claiming it was ever trusted and cut
+    // off, which `revoked` would.
+    const reservedAt = this.nowIso();
+    this.database
+      .prepare(
+        "INSERT INTO nodes (node_id, organization_id, paseo_server_id, public_key_pem, endpoint, boot_id, status, version, capabilities_json, capacity_json, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'disabled', ?, ?, ?, NULL, ?, ?) ON CONFLICT(node_id) DO NOTHING",
+      )
+      .run(
+        PLANE_AUDIT_NODE_ID,
+        organizationId,
+        PLANE_AUDIT_SERVER_ID,
+        `reserved-${PLANE_AUDIT_NODE_ID}`,
+        "https://management.invalid/",
+        "reserved",
+        "0",
+        "{}",
+        JSON.stringify({
+          cpuLogical: 1,
+          memoryTotalBytes: 0,
+          memoryAvailableBytes: 0,
+          activeAgents: 0,
+          activeBrowserProfiles: 0,
+        }),
+        reservedAt,
+        reservedAt,
+      );
+  }
+
+  /**
+   * Appends one plane-origin audit event inside the caller's transaction (ADR-0037).
+   *
+   * Deliberately not shared with ingestAuditEvents. That path is the node ingest: a batch, with gap
+   * and duplicate-identity semantics and a transaction of its own, and existing evidence rests on
+   * it. This is a single event that has to live or die with the change it records, which is what
+   * `required` durability means — the caller's transaction rolls back when this append fails, so
+   * the operation is denied rather than performed unrecorded.
+   *
+   * The insert is a plain INSERT, so a sequence collision raises instead of being ignored.
+   */
+  private appendPlaneAudit(input: {
+    readonly action: string;
+    readonly outcome: "allowed" | "denied" | "failed";
+    readonly actorPrincipalId: string;
+    readonly resourceKind: string;
+    readonly resourceId: string;
+    readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
+  }): void {
+    const lastSequence = Number(
+      this.row(
+        this.database
+          .prepare("SELECT last_sequence FROM audit_node_state WHERE node_id = ?")
+          .get(PLANE_AUDIT_NODE_ID),
+      )?.last_sequence ?? 0,
+    );
+    const nextSequence = lastSequence + 1;
+    const result = this.database
+      .prepare(
+        "INSERT INTO audit_events (event_id, organization_id, node_id, node_event_seq, occurred_at, action, outcome, actor_principal_id, resource_kind, resource_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        createOpaqueId("evt_", 12),
+        this.options.organizationId,
+        PLANE_AUDIT_NODE_ID,
+        nextSequence,
+        this.nowIso(),
+        input.action,
+        input.outcome,
+        input.actorPrincipalId,
+        input.resourceKind,
+        input.resourceId,
+        // ADR-0037: never prompt bodies, document bytes, file contents, tokens, or cookies. These
+        // are identifiers and roles only.
+        JSON.stringify(input.metadata),
+      );
+    if (result.changes !== 1) throw new Error("audit append failed");
+    this.database
+      .prepare(
+        "INSERT INTO audit_node_state (node_id, last_sequence) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET last_sequence = excluded.last_sequence",
+      )
+      .run(PLANE_AUDIT_NODE_ID, nextSequence);
   }
 
   async bootstrapAdministrator(input: {
@@ -596,6 +689,9 @@ export class EnterpriseManagementPlane {
     status: "active" | "draining" | "disabled" | "revoked",
   ): Promise<ManagedNode> {
     this.assertActor(actor, "identity.manage");
+    // The audit anchor is not a machine. Refused with the same words as a missing node, so the
+    // reserved row is not something an administrator can discover by probing ids.
+    if (nodeId === PLANE_AUDIT_NODE_ID) throw new Error("node unavailable");
     const result = this.database
       .prepare(
         "UPDATE nodes SET status = ?, last_seen_at = CASE WHEN ? = 'active' AND status IN ('offline', 'degraded') THEN NULL ELSE last_seen_at END, updated_at = ? WHERE node_id = ? AND organization_id = ?",
@@ -609,8 +705,10 @@ export class EnterpriseManagementPlane {
     this.assertActorAny(actor, ["identity.manage", "workspace.metadata.read"]);
     return Object.freeze(
       this.database
-        .prepare("SELECT node_id FROM nodes WHERE organization_id = ? ORDER BY created_at")
-        .all(this.options.organizationId)
+        .prepare(
+          "SELECT node_id FROM nodes WHERE organization_id = ? AND node_id != ? ORDER BY created_at",
+        )
+        .all(this.options.organizationId, PLANE_AUDIT_NODE_ID)
         .map((value) => this.requireNode(String(this.row(value)!.node_id))),
     );
   }
@@ -1088,6 +1186,12 @@ export class EnterpriseManagementPlane {
     readonly lastSequence: number;
     readonly gaps: readonly { readonly expected: number; readonly received: number }[];
   }> {
+    // The reserved id is well known, and this is the node-facing ingest. A node cannot reach the
+    // plane's own audit sequence: refused with the same words as a missing node, as everywhere else
+    // that names it. Signature verification would already stop it — the reserved row's key is a
+    // sentinel, not a real one — but the sequence is not something a node should be able to touch
+    // even in principle.
+    if (nodeId === PLANE_AUDIT_NODE_ID) throw new Error("node unavailable");
     this.requireNode(nodeId);
     let accepted = 0;
     let duplicates = 0;
@@ -1276,6 +1380,16 @@ export class EnterpriseManagementPlane {
         )
         .run(input.workspaceUid, member.principalId, input.role, now, now);
       this.reprojectMembership(member.principalId, input.workspaceUid, input.role, now);
+      // ADR-0037 makes a role change `required`: inside this transaction, so a failed append denies
+      // the change rather than leaving it unrecorded.
+      this.appendPlaneAudit({
+        action: "collab.member.set",
+        outcome: "allowed",
+        actorPrincipalId: actor.principalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { principalId: member.principalId, role: input.role },
+      });
     });
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
@@ -1296,6 +1410,14 @@ export class EnterpriseManagementPlane {
         .prepare("DELETE FROM collab_members WHERE workspace_uid = ? AND principal_id = ?")
         .run(input.workspaceUid, input.principalId);
       this.reprojectMembership(input.principalId, input.workspaceUid, null, now);
+      this.appendPlaneAudit({
+        action: "collab.member.remove",
+        outcome: "allowed",
+        actorPrincipalId: actor.principalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { principalId: input.principalId },
+      });
     });
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
@@ -1307,11 +1429,23 @@ export class EnterpriseManagementPlane {
     this.assertOpen();
     this.assertActor(actor, "identity.manage");
     this.requireCollabWorkspace(input.workspaceUid);
-    this.database
-      .prepare(
-        "UPDATE collab_workspaces SET collaboration_enabled = ?, updated_at = ? WHERE workspace_uid = ? AND organization_id = ?",
-      )
-      .run(input.enabled ? 1 : 0, this.nowIso(), input.workspaceUid, this.options.organizationId);
+    // Wrapped in a transaction it did not previously need, so the switch and its `required` audit
+    // commit together (ADR-0037).
+    transaction(this.database, () => {
+      this.database
+        .prepare(
+          "UPDATE collab_workspaces SET collaboration_enabled = ?, updated_at = ? WHERE workspace_uid = ? AND organization_id = ?",
+        )
+        .run(input.enabled ? 1 : 0, this.nowIso(), input.workspaceUid, this.options.organizationId);
+      this.appendPlaneAudit({
+        action: input.enabled ? "collab.workspace.enable" : "collab.workspace.disable",
+        outcome: "allowed",
+        actorPrincipalId: actor.principalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { enabled: input.enabled },
+      });
+    });
     return this.requireCollabWorkspace(input.workspaceUid);
   }
 
