@@ -310,16 +310,20 @@ describe("collaboration subscriptions over HTTP", () => {
     expect((await read(harness, harness.memberToken, id)).status).toBe(403);
   });
 
-  test("says long-poll is not available yet instead of answering a one-shot body", async () => {
+  test("refuses a live mode it does not have", async () => {
     const harness = await start();
     await append(harness, "meta", 1, "one");
     const id = await openId(harness, harness.memberToken, { meta: FIRST });
 
-    // sse streams now and is covered in subscription-sse.test.ts; long-poll is still its own slice.
-    const response = await read(harness, harness.memberToken, id, "?live=long-poll");
+    // sse and long-poll both work now, in subscription-sse.test.ts and
+    // subscription-long-poll.test.ts. Anything else is a request for a transport that does not
+    // exist, and answering the one-shot body would look like it did.
+    const response = await read(harness, harness.memberToken, id, "?live=websocket");
 
-    // 501 also proves the route is reached at all: /v1/ds/subscriptions shares the /v1/ds/ prefix
-    // with the single-stream route, which would have answered 400 for an unknown container.
-    expect(response.status).toBe(501);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    // The message is what distinguishes this from the single-stream route, which answers 400 for an
+    // unknown container and shares the /v1/ds/ prefix.
+    expect(body.error.message).toBe("unknown live mode");
   });
 });

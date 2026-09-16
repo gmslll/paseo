@@ -658,14 +658,84 @@ async function readCollabSubscription(
   if (live === "sse") {
     return streamCollabSubscription(plane, request, response, actor, subscriptionId, containerId);
   }
+  if (live === "long-poll") {
+    return longPollCollabSubscription(plane, request, response, actor, subscriptionId, containerId);
+  }
   if (live) {
-    // Long-poll is its own slice. Answering a one-shot body would look like a working stream to a
-    // client that asked to be kept up to date.
-    sendJson(response, 501, {
-      error: { code: "not_implemented", message: "live subscriptions are not available yet" },
+    sendJson(response, 400, {
+      error: { code: "invalid_request", message: "unknown live mode" },
     });
     return true;
   }
+  sendJson(response, 200, {
+    events: await plane.readCollabSubscriptionById(actor, subscriptionId),
+  });
+  return true;
+}
+
+// ADR-0032 names long-poll but not how long to hold. Twenty-five seconds sits under the thirty a
+// proxy or load balancer typically allows an idle response, so the hold ends on our terms with a
+// usable body rather than as somebody else's timeout.
+const LONG_POLL_TIMEOUT_MS = 25_000;
+
+/**
+ * Resolves on the first of three things: the container takes an append, the client hangs up, or the
+ * hold expires. Waking more than once is harmless — resolving a settled promise does nothing — so
+ * there is no flag to keep, and teardown lives in one place that runs however the wait ends.
+ */
+async function waitForContainerAppend(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  containerId: string,
+): Promise<void> {
+  let release: (() => void) | null = null;
+  const woken = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const wake = (): void => release?.();
+
+  const unsubscribe = plane.onCollabStreamAppend((changed) => {
+    if (changed === containerId) wake();
+  });
+  const timer = setTimeout(wake, LONG_POLL_TIMEOUT_MS);
+  // A stray timer must never be the reason a process or a test run refuses to exit.
+  timer.unref?.();
+  request.on("close", wake);
+
+  try {
+    await woken;
+  } finally {
+    unsubscribe();
+    clearTimeout(timer);
+    request.off("close", wake);
+  }
+}
+
+/**
+ * The multiplexed read for clients that cannot hold an event stream open (ADR-0032 gives native
+ * clients long-poll). Answers at once if anything is already waiting, otherwise holds until an
+ * append lands, the client leaves, or the hold expires.
+ */
+async function longPollCollabSubscription(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  actor: AuthenticatedManagementPrincipal,
+  subscriptionId: string,
+  containerId: string,
+): Promise<boolean> {
+  const waiting = await plane.readCollabSubscriptionById(actor, subscriptionId);
+  if (waiting.some((event) => event.type === "data")) {
+    sendJson(response, 200, { events: waiting });
+    return true;
+  }
+
+  await waitForContainerAppend(plane, request, containerId);
+
+  // The client may have hung up during the hold; writing to a gone response would only throw.
+  if (request.destroyed || response.writableEnded) return true;
+  // No headers have been sent yet, which is what lets a refusal here still be a status. The event
+  // stream had to invent a `revoked` event precisely because it no longer has that option.
   sendJson(response, 200, {
     events: await plane.readCollabSubscriptionById(actor, subscriptionId),
   });
