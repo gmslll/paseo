@@ -32,6 +32,8 @@ import {
   readStreamBody,
 } from "./data-plane/stream-http.js";
 import {
+  CollabContainerIdSchema,
+  CollabPresenceHeartbeatSchema,
   CollabSubscriptionIdSchema,
   CollabSubscriptionRequestSchema,
 } from "@getpaseo/protocol/enterprise-collaboration";
@@ -112,6 +114,9 @@ async function handleRequest(
   // Must precede the stream route: /v1/ds/subscriptions also starts with /v1/ds/, and the stream
   // path pattern needs two segments, so it would answer 400 rather than decline the route.
   if (await handleCollabSubscriptionRequest(plane, request, response, method, path, url)) return;
+  // Same collision: /v1/ds/<container>/presence parses as a segment named "presence", which is not
+  // one the contract names.
+  if (await handleCollabPresenceRequest(plane, request, response, method, path)) return;
   // Stream updates are binary, and the shared readBody would decode them as UTF-8.
   if (await handleCollabStreamRequest(plane, request, response, method, path, url)) return;
   const body = method === "GET" || method === "HEAD" ? "" : await readBody(request);
@@ -556,6 +561,52 @@ function sendStreamOutcome(
   response.end(body);
 }
 
+const STREAM_PATH_PREFIX = "/v1/ds/";
+const PRESENCE_PATH_SUFFIX = "/presence";
+
+/**
+ * A presence heartbeat (ADR-0032 emits presence to subscribers). It answers 204: the snapshot goes
+ * to the event streams watching this container, so the heartbeat itself has nothing to return.
+ */
+async function handleCollabPresenceRequest(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  method: string,
+  path: string,
+): Promise<boolean> {
+  if (method !== "POST") return false;
+  if (!path.startsWith(STREAM_PATH_PREFIX) || !path.endsWith(PRESENCE_PATH_SUFFIX)) return false;
+  const containerId = decodeURIComponent(
+    path.slice(STREAM_PATH_PREFIX.length, path.length - PRESENCE_PATH_SUFFIX.length),
+  );
+  // Declining rather than answering leaves anything else shaped like this to the stream route,
+  // which already has the vocabulary for an unknown container.
+  if (!CollabContainerIdSchema.safeParse(containerId).success) return false;
+
+  const parsed = CollabPresenceHeartbeatSchema.safeParse(parseJson(await readBody(request)));
+  if (!parsed.success) {
+    sendJson(response, 400, {
+      error: { code: "invalid_request", message: "invalid presence heartbeat" },
+    });
+    return true;
+  }
+  let actor: AuthenticatedManagementPrincipal;
+  try {
+    actor = await authenticateStreamCaller(plane, request, containerId);
+  } catch {
+    return sendCredentialRefusal(response);
+  }
+  await plane.recordCollabPresence(actor, {
+    containerId,
+    clientId: parsed.data.clientId,
+    focusAgentId: parsed.data.focusAgentId,
+  });
+  response.writeHead(204);
+  response.end();
+  return true;
+}
+
 const SUBSCRIPTION_PATH = "/v1/ds/subscriptions";
 
 // ADR-0032 splits this in two: POST opens a subscription, and GET reads it by id. Both sit ahead of
@@ -769,11 +820,13 @@ async function streamCollabSubscription(
 
   let closed = false;
   let unsubscribe: (() => void) | null = null;
+  let unsubscribePresence: (() => void) | null = null;
   let keepalive: ReturnType<typeof setInterval> | null = null;
   const finish = (): void => {
     if (closed) return;
     closed = true;
     unsubscribe?.();
+    unsubscribePresence?.();
     if (keepalive) clearInterval(keepalive);
     response.end();
   };
@@ -814,10 +867,20 @@ async function streamCollabSubscription(
     }
   };
 
+  // A full snapshot rather than a delta, which is what the event's `entries` field asks for and
+  // what lets a subscriber that just connected see who is already here.
+  const sendPresence = (): void => {
+    if (closed) return;
+    send({ type: "presence", containerId, entries: plane.readCollabPresence(containerId) });
+  };
+
   unsubscribe = plane.onCollabStreamAppend((changed) => {
     // poll() is async, so a failure here would surface as an unhandled rejection rather than reach
     // the notifier. Close the stream instead: a reader that cannot be polled is finished.
     if (changed === containerId) void poll().catch(finish);
+  });
+  unsubscribePresence = plane.onCollabPresenceChange((changed) => {
+    if (changed === containerId) sendPresence();
   });
   keepalive = setInterval(() => {
     if (!closed) response.write(": keepalive\n\n");
@@ -826,6 +889,9 @@ async function streamCollabSubscription(
   keepalive.unref?.();
   request.on("close", finish);
 
+  // Send the roster once up front: without this a subscriber sees nobody until someone happens to
+  // heartbeat, which for a quiet container could be the whole session.
+  sendPresence();
   await poll();
   return true;
 }

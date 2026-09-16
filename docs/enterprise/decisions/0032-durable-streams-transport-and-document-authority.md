@@ -17,6 +17,12 @@ container and one segment and carries Loro updates or JSON log entries.
 - Multiplexed subscribe: `POST /v1/ds/subscriptions` followed by `GET /v1/ds/subscriptions/<id>`
   with `live=sse` emits `data`, `control`, `presence`, and `revoked` events. Browsers need this
   because of the per-origin connection limit.
+- Presence: `POST /v1/ds/<containerId>/presence` takes one client's heartbeat, and the plane sends
+  that container's subscribers a `presence` event carrying the whole roster. The caller supplies
+  only its client id and current focus; the principal comes from the credential and the timestamp
+  from the plane, so a member can neither forge another's presence nor hold an entry past its TTL.
+  Heartbeats are every 30 seconds and an entry expires after 90. Presence is never an authorization
+  input. Added 2026-09-16 by the integration owner.
 - Limits: 1 MiB per append, 64 KiB per timeline row, and 8 MiB or 2,000 queued events per
   subscriber. Overflow sends `control` with `overflow` and closes the subscription.
 - The plane compacts a stream into a snapshot at 8 MiB or 5,000 updates. A reader below the lower
@@ -48,3 +54,10 @@ on mismatch it starts a new epoch and publishes a timeline replacement instead o
 
 Stream-store tests cover offsets, fencing results, TTL, closed streams, compaction lower bounds, and
 subscriber overflow. A restart test proves no duplicate rows after producer replay.
+
+Subscription tests cover multiplexed cursors, the all-or-nothing segment check, re-authorization on
+every read, and overflow closing the subscription. Live tests cover sse and long-poll on both
+routes, a hold that only its own segment releases, and revocation arriving as a status while the
+headers are still unsent and as a `revoked` event once they are gone. Presence tests cover the
+heartbeat, expiry on an injected clock, a non-member's refusal, a heartbeat that tries to name its
+own principal or timestamp, and the roster reaching subscribers both on connect and on change.

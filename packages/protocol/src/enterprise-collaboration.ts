@@ -347,6 +347,19 @@ export const PresenceEntrySchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
+/**
+ * What a client sends to say it is still here. Deliberately narrower than PresenceEntry: the
+ * principal comes from the credential and the timestamp from the plane's clock, because a caller
+ * that could name either would be able to forge another member's presence or backdate its own
+ * heartbeat past the TTL.
+ */
+export const CollabPresenceHeartbeatSchema = z
+  .object({
+    clientId: z.string().min(1),
+    focusAgentId: z.string().min(1).nullable(),
+  })
+  .strict();
+
 export const CollabSubscriptionRequestSchema = z
   .object({
     containerId: CollabContainerIdSchema,
@@ -401,5 +414,6 @@ export type MachineRpcClientRequest = z.infer<typeof MachineRpcClientRequestSche
 export type MachineRpcAttestedRequest = z.infer<typeof MachineRpcAttestedRequestSchema>;
 export type MachineRpcResult = z.infer<typeof MachineRpcResultSchema>;
 export type PresenceEntry = z.infer<typeof PresenceEntrySchema>;
+export type CollabPresenceHeartbeat = z.infer<typeof CollabPresenceHeartbeatSchema>;
 export type CollabSubscriptionEvent = z.infer<typeof CollabSubscriptionEventSchema>;
 export type CollabSubscriptionCreated = z.infer<typeof CollabSubscriptionCreatedSchema>;

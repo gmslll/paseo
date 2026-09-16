@@ -260,4 +260,34 @@ describe("collaboration subscriptions over SSE", () => {
     // ADR-0032: overflow closes the subscription, so the stream ends rather than idling.
     await waitFor(stream.ended, "the stream to close");
   });
+
+  test("sends the presence roster on connect and again when a heartbeat lands", async () => {
+    const harness = await start();
+    await append(harness, 1, "one");
+    const subscriptionId = await openSubscription(harness, { meta: FIRST });
+
+    const stream = await openEventStream(harness, subscriptionId);
+
+    // A subscriber that has just connected is told who is already here, rather than seeing nobody
+    // until somebody happens to heartbeat.
+    await waitFor(() => hasType(stream.events, "presence"), "the roster on connect");
+    const onConnect = stream.events.find((event) => event.type === "presence")!;
+    expect((onConnect.entries ?? []) as unknown[]).toHaveLength(0);
+
+    await fetch(`${harness.base}/v1/ds/${harness.workspaceUid}/presence`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.memberToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ clientId: "desktop-1", focusAgentId: null }),
+    });
+
+    await waitFor(() => countType(stream.events, "presence") === 2, "the roster after a heartbeat");
+    const latest = stream.events.findLast((event) => event.type === "presence")!;
+    const roster = (latest.entries ?? []) as Array<{ clientId?: string; principalId?: string }>;
+    expect(roster).toHaveLength(1);
+    expect(roster[0]?.clientId).toBe("desktop-1");
+    expect(roster[0]?.principalId).toBe(harness.memberPrincipalId);
+  });
 });

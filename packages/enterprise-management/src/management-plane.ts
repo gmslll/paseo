@@ -72,9 +72,11 @@ import {
 import {
   COLLAB_SUBSCRIPTION_TTL_MS,
   parseCollabSegment,
+  PRESENCE_TTL_MS,
   STREAM_TOKEN_TTL_MS,
   type CollabSubscriptionCreated,
   type CollabSubscriptionEvent,
+  type PresenceEntry,
   type WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { streamAccess } from "./data-plane/stream-access.js";
@@ -180,6 +182,10 @@ export class EnterpriseManagementPlane {
   private readonly streams: StreamStore;
   private readonly subscriptions = new Map<string, CollabSubscriptionRecord>();
   private readonly streamListeners = new Set<(containerId: string, segment: string) => void>();
+  // Container id to "<principalId>:<clientId>" to entry. Keyed by client as well as principal
+  // because one person on a laptop and a phone is two places, which is what clientId is for.
+  private readonly presence = new Map<string, Map<string, PresenceEntry>>();
+  private readonly presenceListeners = new Set<(containerId: string) => void>();
   private closed = false;
 
   constructor(
@@ -1509,6 +1515,87 @@ export class EnterpriseManagementPlane {
     };
   }
 
+  /**
+   * Records that one of a principal's clients is still here, for the presence events ADR-0032 sends
+   * to subscribers.
+   *
+   * The caller supplies only which client it is and what it is looking at. Who they are comes from
+   * the credential and when it happened from the plane's clock: a caller that could name the
+   * principal would be able to forge another member's presence, and one that could name the time
+   * could keep an entry alive past its TTL.
+   *
+   * Presence is never an authorization input. It says who is here, never what they may do.
+   */
+  async recordCollabPresence(
+    actor: AuthenticatedManagementPrincipal,
+    input: { containerId: string; clientId: string; focusAgentId: string | null },
+  ): Promise<void> {
+    this.assertOpen();
+    this.assertContainerMembership(actor, input.containerId);
+    const entries = this.presence.get(input.containerId) ?? new Map<string, PresenceEntry>();
+    entries.set(`${actor.principalId}:${input.clientId}`, {
+      kind: "principal",
+      principalId: actor.principalId,
+      displayName: actor.displayName,
+      clientId: input.clientId,
+      focusAgentId: input.focusAgentId,
+      heartbeatAt: this.nowIso(),
+    });
+    this.presence.set(input.containerId, entries);
+    for (const listener of this.presenceListeners) {
+      // One subscriber's failure must not fail the heartbeat that woke it.
+      try {
+        listener(input.containerId);
+      } catch {
+        // The listener owns its own recovery; a live reader closes its stream.
+      }
+    }
+  }
+
+  /** The entries still within their TTL. Everyone who can read the container sees the same list. */
+  readCollabPresence(containerId: string): PresenceEntry[] {
+    this.assertOpen();
+    this.sweepPresence(containerId);
+    return [...(this.presence.get(containerId)?.values() ?? [])];
+  }
+
+  onCollabPresenceChange(listener: (containerId: string) => void): () => void {
+    this.presenceListeners.add(listener);
+    return () => {
+      this.presenceListeners.delete(listener);
+    };
+  }
+
+  /** Lazy, like the subscription sweep: a timer would outlive a plane that a test never closes. */
+  private sweepPresence(containerId: string): void {
+    const entries = this.presence.get(containerId);
+    if (!entries) return;
+    const cutoff = this.clock.nowMs() - PRESENCE_TTL_MS;
+    for (const [key, entry] of entries) {
+      if (Date.parse(entry.heartbeatAt) <= cutoff) entries.delete(key);
+    }
+    if (entries.size === 0) this.presence.delete(containerId);
+  }
+
+  /**
+   * Presence is not a segment, so it cannot go through the segment matrix. Check membership itself
+   * rather than borrow some segment's answer and call it the same question. The refusal is worded
+   * like every other one here, so a non-member still cannot tell a container they are outside from
+   * one that does not exist.
+   */
+  private assertContainerMembership(
+    actor: AuthenticatedManagementPrincipal,
+    containerId: string,
+  ): void {
+    this.assertPrincipalCurrent(actor);
+    // ADR-0031: a Workspace without collaboration keeps its bodies off the plane entirely, so an
+    // unenabled container refuses every member exactly as a non-member is refused.
+    const role = this.readCollabCollaborationEnabled(containerId)
+      ? this.readCollabRole(containerId, actor.principalId)
+      : null;
+    if (!role) throw new Error("stream authorization denied");
+  }
+
   async readCollabStream(
     actor: AuthenticatedManagementPrincipal,
     input: StreamReadInput,
@@ -1748,6 +1835,8 @@ export class EnterpriseManagementPlane {
     this.closed = true;
     this.subscriptions.clear();
     this.streamListeners.clear();
+    this.presence.clear();
+    this.presenceListeners.clear();
     this.database.close();
   }
 
