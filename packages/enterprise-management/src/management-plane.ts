@@ -1,5 +1,13 @@
-import { createPublicKey, randomUUID, timingSafeEqual, type KeyObject } from "node:crypto";
+import {
+  createHash,
+  createPublicKey,
+  randomUUID,
+  timingSafeEqual,
+  type KeyObject,
+} from "node:crypto";
 import path from "node:path";
+
+import { canonicalAuditValue } from "@getpaseo/protocol/audit-canonical";
 
 import {
   FencedLeaseSchema,
@@ -93,6 +101,53 @@ import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.j
  */
 export const PLANE_AUDIT_NODE_ID = "nod_0000000000000000";
 const PLANE_AUDIT_SERVER_ID = "management-plane";
+
+/**
+ * What a plane-origin audit row hashes as. Every field comes from the stored row, which is what
+ * makes the chain verifiable after a restart from the table alone.
+ *
+ * `metadataJson` is the stored string rather than the parsed object on purpose: parsing and
+ * re-canonicalizing could reorder keys, and then a row would stop hashing to what was written.
+ * `previousHash` is null rather than undefined for the first event, because the canonical form
+ * drops undefined keys but serializes null — the two would hash differently.
+ */
+interface PlaneAuditHashInput {
+  readonly eventId: string;
+  readonly organizationId: string;
+  readonly nodeId: string;
+  readonly nodeEventSeq: number;
+  readonly occurredAt: string;
+  readonly action: string;
+  readonly outcome: string;
+  readonly actorPrincipalId: string;
+  readonly resourceKind: string;
+  readonly resourceId: string;
+  readonly metadataJson: string;
+  readonly previousHash: string | null;
+}
+
+function planeAuditEventHash(input: PlaneAuditHashInput): string {
+  return `sha256:${createHash("sha256").update(canonicalAuditValue(input)).digest("hex")}`;
+}
+
+/** The one mapping from a stored row to the hashed shape, so writing and verifying cannot drift. */
+function planeAuditHashInputFromRow(row: Readonly<Record<string, unknown>>): PlaneAuditHashInput {
+  const previous = row.previous_hash;
+  return {
+    eventId: String(row.event_id),
+    organizationId: String(row.organization_id),
+    nodeId: String(row.node_id),
+    nodeEventSeq: Number(row.node_event_seq),
+    occurredAt: String(row.occurred_at),
+    action: String(row.action),
+    outcome: String(row.outcome),
+    actorPrincipalId: String(row.actor_principal_id),
+    resourceKind: String(row.resource_kind),
+    resourceId: String(row.resource_id),
+    metadataJson: String(row.metadata_json),
+    previousHash: previous === null || previous === undefined ? null : String(previous),
+  };
+}
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
 const ENROLLMENT_TOKEN_PREFIX = "pso_enr_";
@@ -228,6 +283,7 @@ export class EnterpriseManagementPlane {
       "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;",
     );
     this.database.exec(SCHEMA);
+    this.ensureAuditHashColumns();
     this.database.exec(RUNTIME_DISTRIBUTION_SCHEMA);
     this.runtimes = new RuntimeDistributionStore({
       database: this.database,
@@ -305,24 +361,43 @@ export class EnterpriseManagementPlane {
       )?.last_sequence ?? 0,
     );
     const nextSequence = lastSequence + 1;
+    const eventId = createOpaqueId("evt_", 12);
+    const occurredAt = this.nowIso();
+    const previousHash = this.planeAuditTailHash(lastSequence);
+    const eventHash = planeAuditEventHash({
+      eventId,
+      organizationId: this.options.organizationId,
+      nodeId: PLANE_AUDIT_NODE_ID,
+      nodeEventSeq: nextSequence,
+      occurredAt,
+      action: input.action,
+      outcome: input.outcome,
+      actorPrincipalId: input.actorPrincipalId,
+      resourceKind: input.resourceKind,
+      resourceId: input.resourceId,
+      // ADR-0037: never prompt bodies, document bytes, file contents, tokens, or cookies. These
+      // are identifiers and roles only.
+      metadataJson: JSON.stringify(input.metadata),
+      previousHash,
+    });
     const result = this.database
       .prepare(
-        "INSERT INTO audit_events (event_id, organization_id, node_id, node_event_seq, occurred_at, action, outcome, actor_principal_id, resource_kind, resource_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_events (event_id, organization_id, node_id, node_event_seq, occurred_at, action, outcome, actor_principal_id, resource_kind, resource_id, metadata_json, previous_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
-        createOpaqueId("evt_", 12),
+        eventId,
         this.options.organizationId,
         PLANE_AUDIT_NODE_ID,
         nextSequence,
-        this.nowIso(),
+        occurredAt,
         input.action,
         input.outcome,
         input.actorPrincipalId,
         input.resourceKind,
         input.resourceId,
-        // ADR-0037: never prompt bodies, document bytes, file contents, tokens, or cookies. These
-        // are identifiers and roles only.
         JSON.stringify(input.metadata),
+        previousHash,
+        eventHash,
       );
     if (result.changes !== 1) throw new Error("audit append failed");
     this.database
@@ -330,6 +405,72 @@ export class EnterpriseManagementPlane {
         "INSERT INTO audit_node_state (node_id, last_sequence) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET last_sequence = excluded.last_sequence",
       )
       .run(PLANE_AUDIT_NODE_ID, nextSequence);
+  }
+
+  /**
+   * Adds the hash columns to a database that predates them. This package has no schema versioning,
+   * so the columns are inspected rather than added inside a try/catch: swallowing an exception here
+   * would also swallow a real failure. Both statements are additive, which is the only kind of
+   * change safe to make this way.
+   */
+  private ensureAuditHashColumns(): void {
+    const existing = new Set(
+      (
+        this.database.prepare("PRAGMA table_info(audit_events)").all() as Array<{
+          readonly name?: unknown;
+        }>
+      ).map((column) => String(column.name)),
+    );
+    if (!existing.has("previous_hash")) {
+      this.database.exec("ALTER TABLE audit_events ADD COLUMN previous_hash TEXT");
+    }
+    if (!existing.has("event_hash")) {
+      this.database.exec("ALTER TABLE audit_events ADD COLUMN event_hash TEXT");
+    }
+  }
+
+  private planeAuditTailHash(lastSequence: number): string | null {
+    if (lastSequence < 1) return null;
+    const row = this.row(
+      this.database
+        .prepare("SELECT event_hash FROM audit_events WHERE node_id = ? AND node_event_seq = ?")
+        .get(PLANE_AUDIT_NODE_ID, lastSequence),
+    );
+    const value = row?.event_hash;
+    return value === null || value === undefined ? null : String(value);
+  }
+
+  /**
+   * Walks the plane's own chain and reports the first sequence that does not hold (ADR-0037 asks
+   * that the chain verify after a restart). Non-throwing, so a caller can assert an intact chain
+   * and a tampered one the same way.
+   *
+   * Only plane-origin rows are checked. Node-ingested rows carry no hash yet.
+   */
+  verifyPlaneAuditChain(): {
+    readonly checked: number;
+    readonly brokenAtSequence: number | null;
+  } {
+    this.assertOpen();
+    const rows = this.database
+      .prepare("SELECT * FROM audit_events WHERE node_id = ? ORDER BY node_event_seq ASC")
+      .all(PLANE_AUDIT_NODE_ID);
+    let previousHash: string | null = null;
+    let checked = 0;
+    for (const value of rows) {
+      const row = this.row(value)!;
+      const input = planeAuditHashInputFromRow(row);
+      const stored = row.event_hash;
+      if (input.previousHash !== previousHash || stored === null || stored === undefined) {
+        return { checked, brokenAtSequence: input.nodeEventSeq };
+      }
+      if (planeAuditEventHash(input) !== String(stored)) {
+        return { checked, brokenAtSequence: input.nodeEventSeq };
+      }
+      previousHash = String(stored);
+      checked += 1;
+    }
+    return { checked, brokenAtSequence: null };
   }
 
   async bootstrapAdministrator(input: {
@@ -2497,6 +2638,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
   resource_kind TEXT NOT NULL,
   resource_id TEXT NOT NULL,
   metadata_json TEXT NOT NULL,
+  -- Nullable because node-ingested rows carry no hash yet; making them NOT NULL would break node
+  -- audit the moment this lands.
+  previous_hash TEXT,
+  event_hash TEXT,
   UNIQUE (node_id, node_event_seq)
 );
 CREATE TABLE IF NOT EXISTS audit_node_state (

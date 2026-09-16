@@ -221,4 +221,86 @@ describe("plane-origin audit", () => {
       expect(Object.keys(event.metadata).sort()).toEqual(["principalId", "role"]);
     }
   });
+
+  test("links each event to the one before it", async () => {
+    const harness = await start();
+    await harness.plane.setCollabMember(harness.admin, {
+      workspaceUid: harness.workspaceUid,
+      principalId: harness.memberPrincipalId,
+      role: "editor",
+    });
+    await harness.plane.setCollabCollaboration(harness.admin, {
+      workspaceUid: harness.workspaceUid,
+      enabled: true,
+    });
+
+    const raw = openSqliteDatabase(harness.databasePath);
+    const rows = raw
+      .prepare(
+        "SELECT node_event_seq, previous_hash, event_hash FROM audit_events WHERE node_id = ? ORDER BY node_event_seq ASC",
+      )
+      .all(PLANE_AUDIT_NODE_ID) as Array<{
+      node_event_seq: number;
+      previous_hash: string | null;
+      event_hash: string;
+    }>;
+    raw.close();
+
+    expect(rows).toHaveLength(2);
+    // The first event starts the chain, and each later one names the hash before it.
+    expect(rows[0]!.previous_hash).toBeNull();
+    expect(rows[0]!.event_hash.startsWith("sha256:")).toBe(true);
+    expect(rows[1]!.previous_hash).toBe(rows[0]!.event_hash);
+    expect(harness.plane.verifyPlaneAuditChain()).toEqual({ checked: 2, brokenAtSequence: null });
+  });
+
+  test("verifies after a restart, from the table alone", async () => {
+    const harness = await start();
+    await harness.plane.setCollabMember(harness.admin, {
+      workspaceUid: harness.workspaceUid,
+      principalId: harness.memberPrincipalId,
+      role: "editor",
+    });
+    harness.plane.close();
+
+    // ADR-0037's acceptance. Nothing carries over in memory: a fresh plane on the same file
+    // recomputes every hash from the stored rows.
+    const ticketKeys = generateKeyPairSync("ed25519");
+    const reopened = new EnterpriseManagementPlane({
+      databasePath: harness.databasePath,
+      organizationId: ORG,
+      organizationName: "Plane audit test",
+      issuer: "https://management.test:17443",
+      bootstrapSecret: "bootstrap-secret-for-plane-audit",
+      ticketPrivateKey: ticketKeys.privateKey,
+      ticketPublicKey: ticketKeys.publicKey,
+    });
+    cleanups.push(() => reopened.close());
+
+    expect(reopened.verifyPlaneAuditChain()).toEqual({ checked: 1, brokenAtSequence: null });
+  });
+
+  test("notices a row edited behind its back", async () => {
+    const harness = await start();
+    await harness.plane.setCollabMember(harness.admin, {
+      workspaceUid: harness.workspaceUid,
+      principalId: harness.memberPrincipalId,
+      role: "editor",
+    });
+    await harness.plane.setCollabCollaboration(harness.admin, {
+      workspaceUid: harness.workspaceUid,
+      enabled: true,
+    });
+    expect(harness.plane.verifyPlaneAuditChain().brokenAtSequence).toBeNull();
+
+    // Silent modification is the thing a chain exists to catch: rewrite the recorded outcome
+    // without touching the hash, exactly as an editor with database access would.
+    const raw = openSqliteDatabase(harness.databasePath);
+    raw
+      .prepare("UPDATE audit_events SET outcome = ? WHERE node_id = ? AND node_event_seq = ?")
+      .run("denied", PLANE_AUDIT_NODE_ID, 1);
+    raw.close();
+
+    expect(harness.plane.verifyPlaneAuditChain()).toEqual({ checked: 0, brokenAtSequence: 1 });
+  });
 });
