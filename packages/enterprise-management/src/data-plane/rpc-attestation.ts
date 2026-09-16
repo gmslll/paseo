@@ -1,20 +1,20 @@
 import { sign, verify, type KeyObject } from "node:crypto";
 
+import type { MachineRpcAttestationClaims } from "@getpaseo/protocol/enterprise-collaboration";
 import {
-  MachineRpcAttestationClaimsSchema,
-  type MachineRpcAttestationClaims,
-} from "@getpaseo/protocol/enterprise-collaboration";
+  decodeMachineRpcAttestationClaims,
+  encodeMachineRpcAttestationClaims,
+  formatMachineRpcAttestation,
+  machineRpcAttestationSigningInput,
+  parseMachineRpcAttestation,
+} from "@getpaseo/protocol/machine-rpc-attestation";
 
 // What the plane puts on a machine RPC so the node will act on it (ADR-0035). The node holds no
 // membership table and no Grant store, so the attestation is how it learns that the plane checked
 // both — and the signature is what stops a member from writing one itself.
 //
-// Third artifact signed with the plane's one ticket key, so it gets its own separator and prefix.
-// Without them a Session ticket or a stream token would verify here, and this one would verify
-// there: same key, same construction, different authority.
-
-const MACHINE_RPC_PREFIX = "pmr_v1";
-const MACHINE_RPC_DOMAIN = "paseo-machine-rpc-v1";
+// The encoding lives in the protocol package because the node verifies what the plane signs; only
+// the one crypto call is on this side.
 
 export type { MachineRpcAttestationClaims };
 
@@ -22,16 +22,13 @@ export function signMachineRpcAttestation(
   claims: MachineRpcAttestationClaims,
   privateKey: KeyObject | string | Buffer,
 ): string {
-  const payload = Buffer.from(
-    JSON.stringify(MachineRpcAttestationClaimsSchema.parse(structuredClone(claims))),
-    "utf8",
-  ).toString("base64url");
+  const payload = encodeMachineRpcAttestationClaims(claims);
   const signature = sign(
     null,
-    Buffer.from(`${MACHINE_RPC_DOMAIN}.${payload}`, "utf8"),
+    Buffer.from(machineRpcAttestationSigningInput(payload), "utf8"),
     privateKey,
   ).toString("base64url");
-  return `${MACHINE_RPC_PREFIX}.${payload}.${signature}`;
+  return formatMachineRpcAttestation(payload, signature);
 }
 
 export function verifyMachineRpcAttestation(
@@ -55,24 +52,19 @@ export function verifyMachineRpcAttestation(
     readonly currentGrantVersion: string;
   },
 ): MachineRpcAttestationClaims {
-  const parts = attestation.split(".");
-  if (parts.length !== 3 || parts[0] !== MACHINE_RPC_PREFIX) {
-    throw new Error("invalid machine rpc attestation");
-  }
-  const payload = parts[1]!;
+  const parts = parseMachineRpcAttestation(attestation);
+  if (!parts) throw new Error("invalid machine rpc attestation");
   const valid = verify(
     null,
-    Buffer.from(`${MACHINE_RPC_DOMAIN}.${payload}`, "utf8"),
+    Buffer.from(machineRpcAttestationSigningInput(parts.payload), "utf8"),
     publicKey,
-    Buffer.from(parts[2]!, "base64url"),
+    Buffer.from(parts.signature, "base64url"),
   );
   if (!valid) throw new Error("invalid machine rpc attestation signature");
 
   let claims: MachineRpcAttestationClaims;
   try {
-    claims = MachineRpcAttestationClaimsSchema.parse(
-      JSON.parse(Buffer.from(payload, "base64url").toString()),
-    );
+    claims = decodeMachineRpcAttestationClaims(parts.payload);
   } catch (error) {
     throw new Error("invalid machine rpc attestation claims", { cause: error });
   }
