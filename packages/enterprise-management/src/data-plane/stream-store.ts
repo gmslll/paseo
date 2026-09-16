@@ -1,4 +1,10 @@
-import { COLLAB_STREAM_LIMITS } from "@getpaseo/protocol/enterprise-collaboration";
+import { LoroDoc } from "loro-crdt";
+
+import {
+  COLLAB_SEGMENT_COMPACTED,
+  COLLAB_STREAM_LIMITS,
+  parseCollabSegment,
+} from "@getpaseo/protocol/enterprise-collaboration";
 
 import { type SqliteDatabase, transaction } from "../sqlite.js";
 
@@ -49,6 +55,14 @@ CREATE TABLE IF NOT EXISTS ds_producers (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (container_id, segment, producer_id)
 );
+CREATE TABLE IF NOT EXISTS ds_snapshots (
+  container_id TEXT NOT NULL,
+  segment TEXT NOT NULL,
+  upto_sequence INTEGER NOT NULL,
+  snapshot_bytes BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (container_id, segment)
+);
 `;
 
 export interface Clock {
@@ -92,6 +106,12 @@ export interface StreamReadResult {
   /** Everything below this has been compacted away; a reader under it needs the snapshot first. */
   lowerBoundOffset: string;
   upToDate: boolean;
+  /**
+   * Present only when the caller asked for an offset below the lower bound. It carries the state
+   * the discarded messages built, so the reader can start from it instead of from history it can
+   * no longer fetch (ADR-0032).
+   */
+  snapshot?: Uint8Array;
 }
 
 export interface StreamStore {
@@ -120,12 +140,53 @@ interface ProducerRow {
   last_seq: number;
 }
 
+/**
+ * Folds a segment's stored updates into one snapshot, or declines.
+ *
+ * Compaction is the only operation here that destroys history, so it refuses on anything it cannot
+ * confirm:
+ *
+ * - only segments ADR-0032 marks as documents, read from the contract's own map rather than a copy;
+ * - `pending` from importBatch means an update could not be applied for want of its causal
+ *   dependencies, and a snapshot taken then would silently omit it;
+ * - the snapshot is re-imported into a fresh document before anything is deleted, so "it restores"
+ *   is checked rather than assumed.
+ *
+ * `{ mode: "snapshot" }` and not `shallow-snapshot`, which keeps only history after a frontier.
+ */
+function buildSegmentSnapshot(segment: string, updates: Uint8Array[]): Uint8Array | null {
+  const parsed = parseCollabSegment(segment);
+  if (!parsed || !COLLAB_SEGMENT_COMPACTED[parsed.kind]) return null;
+
+  try {
+    const document = new LoroDoc();
+    if (document.importBatch(updates).pending !== null) return null;
+
+    const snapshot = document.export({ mode: "snapshot" });
+    const restored = new LoroDoc();
+    if (restored.importBatch([snapshot]).pending !== null) return null;
+    return snapshot;
+  } catch {
+    // A payload that is not a Loro update at all lands here — a corrupt row, or a segment whose
+    // writer sent something else. Compaction declines, because it must never be able to fail the
+    // append that triggered it. Refusing leaves the stream exactly as it was.
+    return null;
+  }
+}
+
 export function createStreamStore(options: {
   database: SqliteDatabase;
   clock?: Clock;
+  /**
+   * Defaults to the contract's thresholds. Configurable because 5,000 updates or 8 MiB is a lot of
+   * real CRDT traffic to generate before the behaviour can be observed at all.
+   */
+  compaction?: { updates?: number; bytes?: number };
 }): StreamStore {
   const { database } = options;
   const clock = options.clock ?? { nowMs: () => Date.now() };
+  const compactionUpdates = options.compaction?.updates ?? COLLAB_STREAM_LIMITS.compactionUpdates;
+  const compactionBytes = options.compaction?.bytes ?? COLLAB_STREAM_LIMITS.compactionBytes;
 
   const selectStream = database.prepare(
     "SELECT next_sequence, lower_bound_sequence, closed_at FROM ds_streams WHERE container_id = ? AND segment = ?",
@@ -158,12 +219,73 @@ export function createStreamStore(options: {
      WHERE container_id = ? AND segment = ? AND stream_offset >= ?
      ORDER BY sequence ASC LIMIT ?`,
   );
+  const measureRange = database.prepare(
+    `SELECT COUNT(*) AS count, SUM(LENGTH(update_bytes)) AS bytes FROM ds_messages
+     WHERE container_id = ? AND segment = ? AND sequence >= ? AND sequence <= ?`,
+  );
+  const selectRange = database.prepare(
+    `SELECT update_bytes FROM ds_messages
+     WHERE container_id = ? AND segment = ? AND sequence >= ? AND sequence <= ?
+     ORDER BY sequence ASC`,
+  );
+  const upsertSnapshot = database.prepare(
+    `INSERT INTO ds_snapshots (container_id, segment, upto_sequence, snapshot_bytes, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (container_id, segment)
+     DO UPDATE SET upto_sequence = excluded.upto_sequence,
+       snapshot_bytes = excluded.snapshot_bytes, created_at = excluded.created_at`,
+  );
+  const deleteRange = database.prepare(
+    "DELETE FROM ds_messages WHERE container_id = ? AND segment = ? AND sequence >= ? AND sequence <= ?",
+  );
+  const setLowerBound = database.prepare(
+    "UPDATE ds_streams SET lower_bound_sequence = ? WHERE container_id = ? AND segment = ?",
+  );
+  const selectSnapshot = database.prepare(
+    "SELECT snapshot_bytes FROM ds_snapshots WHERE container_id = ? AND segment = ?",
+  );
 
   function loadStream(containerId: string, segment: string, createdAt: string): StreamRow {
     const existing = selectStream.get(containerId, segment) as StreamRow | undefined;
     if (existing) return existing;
     insertStream.run(containerId, segment, createdAt);
     return { next_sequence: 1, lower_bound_sequence: 1, closed_at: null };
+  }
+
+  /**
+   * Folds everything from the lower bound through the just-appended sequence into a snapshot, when
+   * the segment has grown past either threshold. Runs inside the append transaction, so the
+   * snapshot, the deletion, and the new lower bound commit together or not at all.
+   *
+   * Every refusal leaves the stream exactly as it was. A stream that keeps its history costs disk
+   * and nothing else; one compacted on a snapshot that cannot be restored has lost it.
+   */
+  function compactIfDue(
+    containerId: string,
+    segment: string,
+    lowerBound: number,
+    throughSequence: number,
+    at: string,
+  ): void {
+    const totals = measureRange.get(containerId, segment, lowerBound, throughSequence) as
+      | { count?: number; bytes?: number | null }
+      | undefined;
+    const count = Number(totals?.count ?? 0);
+    const bytes = Number(totals?.bytes ?? 0);
+    if (count < compactionUpdates && bytes < compactionBytes) return;
+
+    const rows = selectRange.all(containerId, segment, lowerBound, throughSequence) as Array<{
+      update_bytes: unknown;
+    }>;
+    const snapshot = buildSegmentSnapshot(
+      segment,
+      rows.map((row) => toBytes(row.update_bytes)),
+    );
+    if (!snapshot) return;
+
+    upsertSnapshot.run(containerId, segment, throughSequence, snapshot, at);
+    deleteRange.run(containerId, segment, lowerBound, throughSequence);
+    setLowerBound.run(throughSequence + 1, containerId, segment);
   }
 
   return {
@@ -231,6 +353,7 @@ export function createStreamStore(options: {
           input.producerSeq,
           at,
         );
+        compactIfDue(input.containerId, input.segment, stream.lower_bound_sequence, sequence, at);
         return { kind: "appended", offset } as const;
       });
     },
@@ -251,11 +374,20 @@ export function createStreamStore(options: {
         update: toBytes(row.update_bytes),
       }));
       const last = messages.at(-1);
+      // A reader that asked for history the stream no longer holds gets the snapshot that replaced
+      // it. Asking from at or above the lower bound needs nothing extra, so nothing is sent.
+      const below =
+        input.fromOffset !== undefined && input.fromOffset < formatOffset(lowerBound)
+          ? (selectSnapshot.get(input.containerId, input.segment) as
+              | { snapshot_bytes: unknown }
+              | undefined)
+          : undefined;
       return {
         messages,
         nextOffset: formatOffset(nextSequence),
         lowerBoundOffset: formatOffset(lowerBound),
         upToDate: last === undefined || last.offset === formatOffset(nextSequence - 1),
+        ...(below ? { snapshot: toBytes(below.snapshot_bytes) } : {}),
       };
     },
   };
