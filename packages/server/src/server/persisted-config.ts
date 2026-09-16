@@ -56,6 +56,12 @@ export const EnterpriseMultiUserSchema = z.union([
       managementMode: z.literal("managed"),
       legacyRecords: z.literal("owner_only"),
       management: EnterpriseManagementConnectionSchema,
+      /**
+       * Collaboration puts Workspace content on the management plane (ADR-0031), so it stays off
+       * until an operator turns it on. Managed mode only: a standalone node has no plane to
+       * replicate to. Optional, so configuration written before this key still parses.
+       */
+      collaboration: z.object({ enabled: z.boolean() }).strict().optional(),
     })
     .strict(),
 ]);
@@ -67,7 +73,13 @@ export function normalizeEnterpriseMultiUser(
     value === undefined ? undefined : EnterpriseMultiUserSchema.parse(structuredClone(value));
   if (!parsed) return undefined;
   if (parsed.enabled && parsed.managementMode === "managed") {
-    return Object.freeze({ ...parsed, management: Object.freeze({ ...parsed.management }) });
+    return Object.freeze({
+      ...parsed,
+      management: Object.freeze({ ...parsed.management }),
+      ...(parsed.collaboration
+        ? { collaboration: Object.freeze({ ...parsed.collaboration }) }
+        : {}),
+    });
   }
   return Object.freeze({ ...parsed });
 }

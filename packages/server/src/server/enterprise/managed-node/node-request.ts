@@ -1,4 +1,5 @@
 import { createHash, sign, type KeyObject } from "node:crypto";
+import type { IncomingHttpHeaders } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Readable } from "node:stream";
 
@@ -200,6 +201,82 @@ export function requestStream(input: RequestStreamInput): Promise<Readable> {
     );
     request.once("timeout", () => request.destroy(new Error("management request timed out")));
     request.once("error", reject);
+    request.end();
+  });
+}
+
+export interface RequestBytesInput {
+  readonly baseUrl: string;
+  readonly method: "POST" | "PUT";
+  readonly path: string;
+  readonly body: Buffer;
+  readonly caCertificate: string | Buffer;
+  readonly timeoutMs: number;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+export interface RequestBytesResult {
+  readonly status: number;
+  readonly headers: IncomingHttpHeaders;
+  readonly body: unknown;
+}
+
+/**
+ * Sends bytes and returns the answer whatever its status, instead of throwing on a non-2xx like
+ * `requestJson` does.
+ *
+ * The data plane states its fencing outcomes as status codes — 204 for a replay it has already
+ * stored, 403 for a stale producer epoch, 409 for a sequence gap (ADR-0032). Those are answers the
+ * producer acts on, not failures: a stale epoch means re-read the current one, a gap means resend
+ * from where the plane is. Raising them as errors would make the uplink treat "already have it" the
+ * same as a broken connection.
+ *
+ * The body stays a Buffer because a Loro update does not survive being decoded as UTF-8.
+ */
+export function requestBytes(input: RequestBytesInput): Promise<RequestBytesResult> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(input.path, `${normalizeManagementOrigin(input.baseUrl)}/`);
+    const request = httpsRequest(
+      target,
+      {
+        method: input.method,
+        ca: input.caCertificate,
+        rejectUnauthorized: true,
+        timeout: input.timeoutMs,
+        headers: {
+          accept: "application/json",
+          "content-type": "application/octet-stream",
+          "content-length": String(input.body.byteLength),
+          ...input.headers,
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer | string) => {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > MAX_RESPONSE_BYTES) {
+            response.destroy(new Error("management response too large"));
+            return;
+          }
+          chunks.push(buffer);
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            headers: response.headers,
+            // 204 carries nothing, and an error body is JSON the caller may want to read.
+            body:
+              chunks.length === 0 ? null : safeJsonParse(Buffer.concat(chunks).toString("utf8")),
+          });
+        });
+      },
+    );
+    request.once("timeout", () => request.destroy(new Error("management request timed out")));
+    request.once("error", reject);
+    request.write(input.body);
     request.end();
   });
 }

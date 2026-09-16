@@ -154,12 +154,16 @@ describe("resuming from the plane", () => {
     remote.getMap("meta").set("owner", "someone");
     remote.commit();
 
-    const next = store.applyRemoteUpdates("meta", [
-      { offset: offset(1), update: remote.export({ mode: "update" }) },
-    ]);
+    const next = store.applyRemoteUpdates(
+      "meta",
+      [{ offset: offset(1), update: remote.export({ mode: "update" }) }],
+      offset(2),
+    );
 
-    expect(next).toBe(offset(1));
-    expect(store.remoteCursors()).toEqual({ meta: offset(1) });
+    // The cursor is the plane's next position, not the last offset applied. A read's fromOffset is
+    // inclusive, so resuming from offset(1) would fetch that same message on every poll.
+    expect(next).toBe(offset(2));
+    expect(store.remoteCursors()).toEqual({ meta: offset(2) });
     expect(store.document("meta").getMap("meta").get("owner")).toBe("someone");
   });
 
@@ -168,19 +172,23 @@ describe("resuming from the plane", () => {
     const remote = new LoroDoc();
     remote.getMap("meta").set("owner", "someone");
     remote.commit();
-    first.applyRemoteUpdates("meta", [
-      { offset: offset(7), update: remote.export({ mode: "update" }) },
-    ]);
+    first.applyRemoteUpdates(
+      "meta",
+      [{ offset: offset(7), update: remote.export({ mode: "update" }) }],
+      offset(8),
+    );
     first.close();
     open.pop();
 
-    expect(openStore().remoteCursors()).toEqual({ meta: offset(7) });
+    expect(openStore().remoteCursors()).toEqual({ meta: offset(8) });
   });
 
   test("leaves the cursor alone for an empty batch", () => {
     const store = openStore();
 
-    expect(store.applyRemoteUpdates("meta", [])).toBeNull();
+    // Nothing to apply leaves the cursor untouched rather than moving it to the plane's position:
+    // the node has not caught up, it simply had nothing waiting.
+    expect(store.applyRemoteUpdates("meta", [], offset(1))).toBeNull();
     expect(store.remoteCursors()).toEqual({});
   });
 
@@ -188,7 +196,7 @@ describe("resuming from the plane", () => {
     const store = openStore();
 
     expect(() =>
-      store.applyRemoteUpdates("meta", [{ offset: "12", update: new Uint8Array() }]),
+      store.applyRemoteUpdates("meta", [{ offset: "12", update: new Uint8Array() }], offset(1)),
     ).toThrow("Invalid stream offset");
   });
 
@@ -211,9 +219,11 @@ describe("resuming from the plane", () => {
 
     // Only the second update, so its dependency never arrived.
     expect(() =>
-      store.applyRemoteUpdates("meta", [
-        { offset: offset(2), update: remote.export({ mode: "update", from: base }) },
-      ]),
+      store.applyRemoteUpdates(
+        "meta",
+        [{ offset: offset(2), update: remote.export({ mode: "update", from: base }) }],
+        offset(3),
+      ),
     ).toThrow("missing dependencies");
     expect(store.remoteCursor("meta")).toBeNull();
   });

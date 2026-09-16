@@ -286,9 +286,17 @@ export class CollabRepoStore {
   /**
    * Applies a batch read from the plane and advances the cursor in one transaction. Batched because
    * the replica is re-exported once per call: per-update snapshots would cost O(document) each.
+   *
+   * `nextOffset` is the plane's own, not the last message's. A read's `fromOffset` is inclusive, so
+   * resuming from the last offset applied would fetch that message again on every poll.
    */
-  applyRemoteUpdates(segment: string, updates: readonly RemoteUpdate[]): string | null {
+  applyRemoteUpdates(
+    segment: string,
+    updates: readonly RemoteUpdate[],
+    nextOffset: string,
+  ): string | null {
     assertSegment(segment);
+    assertOffset(nextOffset);
     if (updates.length === 0) return this.remoteCursor(segment);
     for (const entry of updates) assertOffset(entry.offset);
     const at = this.now();
@@ -298,7 +306,6 @@ export class CollabRepoStore {
         updates.map((entry) => entry.update),
         at,
       );
-      const nextOffset = updates[updates.length - 1]!.offset;
       this.database
         .prepare(
           `INSERT INTO remote_cursors (segment, next_offset, updated_at) VALUES (?, ?, ?)
