@@ -3,7 +3,13 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import log from "electron-log/main";
-import { resolvePaseoHome, spawnProcess } from "@getpaseo/server";
+import {
+  getPidLockInfo,
+  readLiveDaemonManifest,
+  readLocalProbeState,
+  resolvePaseoHome,
+  spawnProcess,
+} from "@getpaseo/server";
 import {
   copyAttachmentFileToManagedStorage,
   deleteManagedAttachmentFile,
@@ -146,6 +152,8 @@ function summarizeDesktopDaemonStatus(status: DesktopDaemonStatus): Record<strin
   };
 }
 
+const DESKTOP_PROBE_TIMEOUT_MS = 1500;
+
 const DESKTOP_DAEMON_STOP_CLI_ARGS = [
   "daemon",
   "stop",
@@ -269,9 +277,38 @@ function resolveDesktopAppVersion(): string {
 // Daemon lifecycle
 // ---------------------------------------------------------------------------
 
+// The probe plane answers without spawning the CLI (ADR-0038). It classifies only the healthy
+// case; stale locks, unresponsive daemons, and shutdown stay with the CLI path, which already knows
+// how to tell those apart.
+async function resolveDesktopDaemonStatusFromPlanes(
+  home: string,
+): Promise<DesktopDaemonStatus | null> {
+  if (!readLiveDaemonManifest(home)?.planes.probe) return null;
+  const probe = await readLocalProbeState(home, DESKTOP_PROBE_TIMEOUT_MS);
+  if (!probe || probe.lifecycle !== "running") return null;
+  // Only the pid lock knows the host that took it; the probe carries no identity data.
+  const lock = await getPidLockInfo(home).catch(() => null);
+  return {
+    serverId: probe.serverId,
+    status: "running",
+    listen: probe.websocket.listen,
+    hostname: lock?.hostname ?? null,
+    pid: probe.pid,
+    home,
+    version: probe.version,
+    desktopManaged: probe.desktopManaged,
+    error: null,
+  };
+}
+
 export async function resolveDesktopDaemonStatus(): Promise<DesktopDaemonStatus> {
   const home = getPaseoHome();
 
+  const fromPlanes = await resolveDesktopDaemonStatusFromPlanes(home).catch(() => null);
+  if (fromPlanes) return fromPlanes;
+
+  // COMPAT(desktopDaemonStatusCli): the CLI subprocess still answers for daemons with no probe
+  // plane, and for every state the planes deliberately do not classify.
   try {
     const payload = (await runExternalCliJsonCommand(["daemon", "status", "--json"])) as Record<
       string,

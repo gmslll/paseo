@@ -52,7 +52,7 @@ describe.skipIf(process.platform === "win32")("CLI local control plane", () => {
       await client?.close();
 
       const state = await readLocalProbeState(paseoHome, 1_500);
-      expect(describeLocalPlanes(state)).toBe("control, probe");
+      expect(describeLocalPlanes(state)).toBe("control, probe, terminal");
 
       await writeFile(path.join(paseoHome, "run", "local-token"), "not-the-token\n");
       expect(await connect()).toBeNull();

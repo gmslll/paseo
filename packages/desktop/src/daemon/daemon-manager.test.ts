@@ -27,6 +27,9 @@ const mocks = vi.hoisted(() => ({
   logError: vi.fn(),
   appLogPath: "/tmp/paseo-desktop-daemon-manager-test-main.log",
   getElectronLogFile: vi.fn(),
+  readLiveDaemonManifest: vi.fn(),
+  readLocalProbeState: vi.fn(),
+  getPidLockInfo: vi.fn(),
 }));
 
 vi.mock("electron", () => ({
@@ -54,6 +57,9 @@ vi.mock("electron-log/main", () => ({
 vi.mock("@getpaseo/server", () => ({
   resolvePaseoHome: vi.fn(() => mocks.paseoHome),
   spawnProcess: mocks.spawnProcess,
+  readLiveDaemonManifest: mocks.readLiveDaemonManifest,
+  readLocalProbeState: mocks.readLocalProbeState,
+  getPidLockInfo: mocks.getPidLockInfo,
 }));
 
 vi.mock("../settings/desktop-settings-electron.js", () => ({
@@ -121,6 +127,13 @@ describe("daemon-manager commands", () => {
     mocks.logError.mockReset();
     mocks.getElectronLogFile.mockReset();
     mocks.getElectronLogFile.mockReturnValue({ path: mocks.appLogPath });
+    // No local planes by default, so these cases exercise the CLI path they were written for.
+    mocks.readLiveDaemonManifest.mockReset();
+    mocks.readLiveDaemonManifest.mockReturnValue(null);
+    mocks.readLocalProbeState.mockReset();
+    mocks.readLocalProbeState.mockResolvedValue(null);
+    mocks.getPidLockInfo.mockReset();
+    mocks.getPidLockInfo.mockResolvedValue(null);
     rmSync(mocks.paseoHome, { recursive: true, force: true });
     rmSync(mocks.appLogPath, { force: true });
   });
@@ -523,5 +536,63 @@ describe("daemon-manager commands", () => {
       platform: process.platform,
       currentVersion: "1.2.3",
     });
+  });
+
+  it("answers the daemon status from the probe plane without spawning the CLI", async () => {
+    mocks.readLiveDaemonManifest.mockReturnValue({
+      planes: { probe: { transport: "unix", path: "/tmp/probe.sock", protocolVersion: 1 } },
+    });
+    mocks.readLocalProbeState.mockResolvedValue({
+      lifecycle: "running",
+      pid: 4242,
+      serverId: "srv_probe",
+      version: "9.9.9",
+      desktopManaged: true,
+      websocket: { listen: "127.0.0.1:6767" },
+    });
+    mocks.getPidLockInfo.mockResolvedValue({ hostname: "build-host" });
+    const handlers = createDaemonCommandHandlers();
+
+    await expect(handlers.desktop_daemon_status()).resolves.toMatchObject({
+      status: "running",
+      pid: 4242,
+      serverId: "srv_probe",
+      version: "9.9.9",
+      listen: "127.0.0.1:6767",
+      hostname: "build-host",
+      desktopManaged: true,
+    });
+    expect(mocks.runExternalCliJsonCommand).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the CLI for a state the probe plane does not classify", async () => {
+    mocks.readLiveDaemonManifest.mockReturnValue({
+      planes: { probe: { transport: "unix", path: "/tmp/probe.sock", protocolVersion: 1 } },
+    });
+    mocks.readLocalProbeState.mockResolvedValue({
+      lifecycle: "stopping",
+      pid: 4242,
+      serverId: "srv_probe",
+      version: "9.9.9",
+      desktopManaged: true,
+      websocket: { listen: "127.0.0.1:6767" },
+    });
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "unresponsive",
+      connectedDaemon: "unreachable",
+      serverId: "srv_cli",
+      pid: 77,
+      daemonVersion: "8.8.8",
+      desktopManaged: true,
+      listen: "127.0.0.1:6767",
+    });
+    const handlers = createDaemonCommandHandlers();
+
+    await expect(handlers.desktop_daemon_status()).resolves.toMatchObject({
+      status: "errored",
+      serverId: "srv_cli",
+      pid: 77,
+    });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledWith(["daemon", "status", "--json"]);
   });
 });

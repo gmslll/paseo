@@ -71,6 +71,15 @@ export {
   type ProviderProfileModel,
 } from "./agent/provider-launch-config.js";
 export { findExecutable } from "../executable-resolution/executable-resolution.js";
+// Reading a running daemon's local planes from another process (ADR-0038): the CLI and the desktop
+// app share these instead of each learning the layout of `run/`.
+export {
+  describeLocalPlanes,
+  parseProbeState,
+  readLiveDaemonManifest,
+  readLocalProbeState,
+} from "./local-planes/local-plane-readers.js";
+export { getPidLockInfo, type PidLockInfo } from "./pid-lock.js";
 export { execCommand, spawnProcess } from "../utils/spawn.js";
 
 // Provider manifest (source of truth for provider definitions)

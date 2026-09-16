@@ -6,22 +6,22 @@ import type {
   DaemonTransport,
   DaemonTransportFactory,
 } from "@getpaseo/client/internal/daemon-client-transport-types";
+import { readLiveDaemonManifest } from "@getpaseo/server";
 import {
-  DaemonManifestSchema,
-  LOCAL_PLANE_MANIFEST_FILE,
   LOCAL_PLANE_RUN_DIRECTORY,
   LOCAL_PLANE_TOKEN_FILE,
   LOCAL_PLANE_TOKEN_HEADER,
   LOCAL_PLANE_UPGRADE_PROTOCOLS,
   CONTROL_PLANE_MAX_LINE_BYTES,
   NdjsonLineDecoder,
-  ProbeStateSchema,
   classifyControlPlaneLine,
   encodeControlPlaneBinaryLine,
   encodeControlPlaneCloseLine,
-  type DaemonManifest,
-  type ProbeState,
 } from "@getpaseo/protocol/local-planes";
+
+// The readers live in the server package so the desktop app shares them; the control plane
+// transport stays here because only a CLI-shaped caller needs the local token (ADR-0038).
+export { describeLocalPlanes, readLiveDaemonManifest, readLocalProbeState } from "@getpaseo/server";
 
 // Local control plane access for the CLI (ADR-0038). Only same-user tools can read run/local-token,
 // so a live manifest plus the token is enough to reach the daemon without its WebSocket listener.
@@ -32,28 +32,6 @@ export interface LocalControlPlane {
 }
 
 type Handler<T extends unknown[]> = (...args: T) => void;
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-export function readLiveDaemonManifest(paseoHome: string): DaemonManifest | null {
-  try {
-    const raw = readFileSync(
-      path.join(paseoHome, LOCAL_PLANE_RUN_DIRECTORY, LOCAL_PLANE_MANIFEST_FILE),
-      "utf8",
-    );
-    const parsed = DaemonManifestSchema.safeParse(JSON.parse(raw));
-    return parsed.success && isProcessAlive(parsed.data.pid) ? parsed.data : null;
-  } catch {
-    return null;
-  }
-}
 
 export function findLocalControlPlane(paseoHome: string): LocalControlPlane | null {
   const control = readLiveDaemonManifest(paseoHome)?.planes.control;
@@ -181,48 +159,4 @@ export function createControlPlaneTransportFactory(
     };
     return transport;
   };
-}
-
-function parseProbeState(status: number | undefined, body: string): ProbeState | null {
-  if (status !== 200) return null;
-  try {
-    const parsed = ProbeStateSchema.safeParse(JSON.parse(body));
-    return parsed.success ? parsed.data : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Reads the probe plane's state, or null when the daemon has no reachable probe plane. */
-export function readLocalProbeState(
-  paseoHome: string,
-  timeoutMs: number,
-): Promise<ProbeState | null> {
-  const probe = readLiveDaemonManifest(paseoHome)?.planes.probe;
-  if (probe?.transport !== "unix") return Promise.resolve(null);
-  return new Promise((resolve) => {
-    const outgoing = request(
-      { socketPath: probe.path, method: "GET", path: "/state" },
-      (response) => {
-        let body = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        response.on("end", () => resolve(parseProbeState(response.statusCode, body)));
-      },
-    );
-    outgoing.setTimeout(timeoutMs, () => outgoing.destroy());
-    outgoing.on("error", () => resolve(null));
-    outgoing.end();
-  });
-}
-
-export function describeLocalPlanes(state: ProbeState | null): string {
-  if (!state) return "unavailable";
-  const listening = Object.entries(state.planes)
-    .filter(([, plane]) => plane.status === "listening")
-    .map(([name]) => name)
-    .toSorted();
-  return listening.length > 0 ? listening.join(", ") : "none";
 }
