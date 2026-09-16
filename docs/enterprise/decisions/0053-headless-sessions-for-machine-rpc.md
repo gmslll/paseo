@@ -1,9 +1,10 @@
 # ADR-0053: What a machine RPC needs before a node can answer one
 
-- Status: DECISION_REQUIRED
+- Status: Accepted
 - Date: 2026-09-17
 - Raised by: Enterprise integration work on M6
-- Decision owner: Enterprise integration owner
+- Decision owner: Enterprise integration owner (decided by the user on 2026-09-17): option 1, a
+  headless factory on the WebSocket server.
 
 ## Context
 
@@ -27,11 +28,16 @@ Nothing implements that port, and the three things it needs are all outside this
 
 ## What the code says
 
-| What a headless Session needs | Where it is today                                                                                                                                                                                                                                                              |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Its collaborators             | `createSocketSession` (`websocket-server.ts:2113`) passes ~50 fields, most read off the server instance: `agentRequests`, `scheduleService`, `pluginRuntime`, `terminalManager`, `speech`, `voiceBridge`, `github`, `serviceProxy` and the rest. bootstrap holds none of them. |
-| Admission                     | `SessionAdmission`'s enterprise arm wants `{ principal, node, runtime, grantVersionGuard }`, and the release path wants the authorization handle admission issued.                                                                                                             |
-| Teardown                      | `Session` has no `close`, `dispose` or equivalent. A connection is torn down by the server: `admission.releaseSession(handle)`, `sessions.delete(ws)`, `runtime.cleanup("session-closed")` — all keyed on the `ws` a headless caller does not have.                            |
+| What a headless Session needs | Where it is today                                                                                                                                                                                                                                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Its collaborators             | `createSocketSession` (`websocket-server.ts:2113`) passes ~50 fields, most read off the server instance: `agentRequests`, `scheduleService`, `pluginRuntime`, `terminalManager`, `speech`, `voiceBridge`, `github`, `serviceProxy` and the rest. bootstrap holds none of them.                               |
+| Admission                     | `SessionAdmission`'s enterprise arm wants `{ principal, node, runtime, grantVersionGuard }`, and the release path wants the authorization handle admission issued.                                                                                                                                           |
+| Teardown                      | `Session.cleanup()` exists and is public, and is what every connection path awaits. What surrounds it does not: `releaseEnterpriseAuthorization(connection)` hands the admission handle back, and the `sessions` / `externalSessionsByKey` bookkeeping is keyed on the `ws` a headless caller does not have. |
+
+Corrected after this was first written: an earlier draft of this table said `Session` has no
+teardown at all. It has `cleanup()`. The part with no entry point is the admission handle around it,
+not the Session — and `bindSession` takes authentication evidence, which a machine RPC caller does
+not hold, so a headless Session runs without a handle and its close is `cleanup()` alone.
 
 One thing is already true: `createSocketSession` takes no socket. `SocketSessionOptions` is
 callbacks only, and `sockets` lives on the connection record rather than the Session. A Session
@@ -60,9 +66,14 @@ Which of these:
    replicas, the projectors and the attestation; the node answers no RPCs until then, and ADR-0035
    says so until it does.
 
-Option 1 is the smallest change that works. It is recorded rather than taken because the surface it
-adds is outside this workstream's files, and because option 2 is the same work done once instead of
-twice if the transport extraction is still wanted.
+Option 1 was taken. It is the smallest change that works, and the WebSocket server is the only
+holder of both the collaborators and the teardown sequence, so anywhere else would be a second copy
+of one or the other.
+
+What that obliges: the factory opens a Session with no transport and takes it apart the same way a
+closed connection does, and the headless Session stays out of the map keyed by socket so that
+`listSessions()` keeps meaning what it means today. If the transport extraction M1 planned is still
+wanted, this method is what moves into it — one caller rather than a new seam to unpick.
 
 ## Acceptance
 
