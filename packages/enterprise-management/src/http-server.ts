@@ -236,6 +236,31 @@ async function handleUnauthenticatedPost(
     });
     return true;
   }
+  if (path === "/v1/auth/password/plane-session") {
+    const input = z
+      .object({
+        username: z.string().trim().min(3).max(64),
+        password: z.string().min(12).max(128),
+      })
+      .strict()
+      .parse(parseJson(body));
+    // ADR-0030 sets the limit this enforces: five failed attempts per source address and normalized
+    // username in sixty seconds. Both password routes share the one ledger, so attempts against a
+    // username count together however they arrive.
+    const attemptKey = `${request.socket.remoteAddress ?? "unknown"}\n${input.username.toLowerCase()}`;
+    if (!passwordAttempts.allows(attemptKey)) throw new Error("invalid credential");
+    try {
+      const session = await plane.issuePlaneSessionWithPassword(input);
+      passwordAttempts.succeeded(attemptKey);
+      sendJson(response, 201, session);
+    } catch (error) {
+      if (error instanceof Error && error.message === "invalid credential") {
+        passwordAttempts.failed(attemptKey);
+      }
+      throw error;
+    }
+    return true;
+  }
   if (path === "/v1/auth/password/session") {
     const input = z
       .object({

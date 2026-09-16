@@ -101,6 +101,14 @@ const ENROLLMENT_ID_PATTERN = /^enr_[0-9a-f]{24}$/;
 const NODE_REQUEST_MAX_SKEW_MS = 60_000;
 const NODE_DUPLICATE_WINDOW_MS = 90_000;
 const MAX_SESSION_TICKET_TTL_MS = 5 * 60_000;
+/**
+ * A plane session has to outlive the five-minute stream tokens it is used to fetch, or a
+ * collaborator retypes their password every five minutes, and ADR-0035 gives no number. Twelve
+ * hours is a working day: long enough to be a session, short enough that a leaked one does not
+ * outlast it. Ending one early is ordinary credential revocation, which also rolls the Grant
+ * version and so invalidates the stream tokens already derived from it.
+ */
+const PLANE_SESSION_TTL_MS = 12 * 60 * 60_000;
 const USERNAME_PATTERN = /^[a-z0-9][a-z0-9._-]{2,63}$/;
 const INVALID_PASSWORD_HASH = "$2b$12$FKn7pcGA7X1tiWS5RHYSKed2ng6VB6U4Yo1CzAJGRF.eYHU9Fy4We";
 
@@ -2025,18 +2033,51 @@ export class EnterpriseManagementPlane {
     return this.requirePrincipal(principalId);
   }
 
+  /** `expiresAt` null keeps the personal-access-token behaviour: a credential that does not lapse. */
   private async issueCredentialUnchecked(
     principalId: string,
+    expiresAt: string | null = null,
   ): Promise<{ readonly token: string; readonly credentialId: string }> {
     const credentialId = createOpaqueId("cred_", 12);
     const token = createSecretToken(CREDENTIAL_TOKEN_PREFIX, credentialId);
     const digest = await digestSecret(token.secret);
     this.database
       .prepare(
-        "INSERT INTO credentials (credential_id, principal_id, secret_salt, secret_digest, created_at, expires_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
+        "INSERT INTO credentials (credential_id, principal_id, secret_salt, secret_digest, created_at, expires_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)",
       )
-      .run(credentialId, principalId, digest.salt, digest.digest, this.nowIso());
+      .run(credentialId, principalId, digest.salt, digest.digest, this.nowIso(), expiresAt);
     return Object.freeze({ token: token.token, credentialId });
+  }
+
+  /**
+   * Signs a human in against the plane itself (ADR-0035, which amends ADR-0030's "password login is
+   * available only for direct node connections").
+   *
+   * A session is an ordinary credential with an expiry, not a new token type with its own table and
+   * signing domain. `credentials` already carries expiry, revocation and a hashed secret, and
+   * authenticatePersonalAccessToken already honours all three, so a session reaches every
+   * authenticated route — POST /v1/streams/token among them — with no second code path to keep
+   * right. A third signed token would also need its own domain separator to avoid verifying as a
+   * Session ticket or a stream token.
+   *
+   * The lifetime is the plane's, not the caller's. The node ticket route lets a client name one
+   * because that ticket is handed to a node and capped at five minutes; a session a client could
+   * size itself would only ever be requested at the maximum.
+   */
+  async issuePlaneSessionWithPassword(input: {
+    readonly username: string;
+    readonly password: string;
+  }): Promise<{
+    readonly token: string;
+    readonly credentialId: string;
+    readonly expiresAt: string;
+  }> {
+    this.assertOpen();
+    const principal = await this.authenticatePassword(input.username, input.password);
+    if (!principal) throw new Error("invalid credential");
+    const expiresAt = new Date(this.clock.nowMs() + PLANE_SESSION_TTL_MS).toISOString();
+    const credential = await this.issueCredentialUnchecked(principal.principalId, expiresAt);
+    return Object.freeze({ ...credential, expiresAt });
   }
 
   private issueNodeSessionTicketForPrincipal(
