@@ -1,0 +1,67 @@
+# ADR-0052: What shared turn control needs before it can be built
+
+- Status: DECISION_REQUIRED
+- Date: 2026-09-17
+- Raised by: Enterprise integration work on M6
+
+## Context
+
+ADR-0034 is Accepted and says the author of a turn's user message controls that turn: a different
+editor who sends while a turn runs is queued, only the Workspace owner may interrupt another
+Principal's turn, permission requests are answered by the turn controller or the owner, and every
+user message carries `author` with the authenticated Principal ID.
+
+Implementing the daemon half of it turned up three things the decision assumes and the code does not
+have. Each was checked in the source rather than inferred:
+
+| What ADR-0034 needs                              | What exists today                                                                                                                     |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `author` on a user message                       | `AgentTimelineItemPayloadSchema` has `author` (protocol). The daemon's own `AgentTimelineItem` (`agent/agent-sdk-types.ts`) does not. |
+| The author stamped when the message is committed | Nothing in `packages/server/src/server/agent` ever writes `author`.                                                                   |
+| `queuedTurns` on the Agent snapshot              | The protocol field exists. Nothing in the daemon, client or app populates or reads it.                                                |
+
+The turn's controller is therefore not knowable at runtime. `ManagedAgent` tracks `activeTurnId` and
+`activeTurnStartedAt` and nothing else about who opened the turn, and `openActiveTurn` has no
+Principal in scope. The timeline row carries `turnId`, so the controller could be resolved by
+finding that turn's user message — except that no user message has ever been written with an author,
+so the lookup would always come back empty.
+
+## What is implementable without a decision
+
+The part that depends only on the caller: resolving the effective behaviour from the authenticated
+role rather than from the client's `sharedTurnPolicy` value. An owner may interrupt; anyone else
+queues. `SharedTurnPolicySchema` and the optional `sharedTurnPolicy` field on both send requests are
+already in the protocol, and `handleSendAgentMessageRequest` already has the enterprise principal in
+scope.
+
+What it cannot do is tell one Principal's turn from another's. Without the controller, "only the
+owner may interrupt **another Principal's** turn" collapses to "only the owner may interrupt", which
+also refuses an editor interrupting their own turn — a behaviour change for the single-user case,
+not just a missing collaboration feature.
+
+## The decision
+
+Which of these:
+
+1. **Thread the author through the agent core now.** Add `author` to the daemon's `AgentTimelineItem`,
+   stamp it where the user message is committed, populate `queuedTurns`, and implement ADR-0034 as
+   written. The change lands in `agent/agent-sdk-types.ts`, `agent/agent-manager.ts` and the agent
+   projections — the files the plan calls out as upstream-churn and merge-conflict risks, and outside
+   the enterprise workstream this work has stayed inside.
+
+2. **Ship the role-only half now and defer the rest.** Land the policy that resolves behaviour from
+   the role, treat an unknown controller conservatively (queue, never interrupt), and leave
+   ADR-0034's author, queue and controller rules to the milestone that owns the agent core. ADR-0034
+   would be amended to say which of its rules are in force.
+
+3. **Defer the whole thing.** M6 finishes without shared turn control, and ADR-0034 moves to a later
+   milestone in one piece.
+
+Option 2 is the one this work would take by default, because it is the largest piece that stays
+inside the boundary. It is recorded here rather than taken, because the choice changes what
+ADR-0034 means today and the master spec's §15.1 actor semantics depend on the author rule.
+
+## Acceptance
+
+Whichever option is taken, the tests ADR-0034 names stay the acceptance bar for the rules that are
+in force, and the rules that are not must say so in ADR-0034 rather than silently fail closed.
