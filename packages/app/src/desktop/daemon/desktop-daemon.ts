@@ -79,7 +79,7 @@ interface LocalTransportEventPayload {
   sessionId: string;
   kind: "open" | "message" | "close" | "error";
   text?: string | null;
-  binaryBase64?: string | null;
+  bytes?: Uint8Array | null;
   code?: number | null;
   reason?: string | null;
   error?: string | null;
@@ -95,6 +95,12 @@ function toStringOrNull(value: unknown): string | null {
 
 function toNumberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+// Electron's IPC uses structured clone, so frames arrive as bytes rather than base64.
+function toBytesOrNull(value: unknown): Uint8Array | null {
+  if (value instanceof Uint8Array) return value;
+  return value instanceof ArrayBuffer ? new Uint8Array(value) : null;
 }
 
 function parseDesktopDaemonState(value: unknown): DesktopDaemonState {
@@ -239,7 +245,7 @@ export async function listenToLocalTransportEvents(
       sessionId: toStringOrNull(payload.sessionId) ?? "",
       kind: (toStringOrNull(payload.kind) ?? "error") as LocalTransportEventPayload["kind"],
       text: toStringOrNull(payload.text),
-      binaryBase64: toStringOrNull(payload.binaryBase64),
+      bytes: toBytesOrNull(payload.bytes),
       code: toNumberOrNull(payload.code),
       reason: toStringOrNull(payload.reason),
       error: toStringOrNull(payload.error),
@@ -257,12 +263,12 @@ export async function openLocalTransportSession(
 export async function sendLocalTransportMessage(input: {
   sessionId: string;
   text?: string;
-  binaryBase64?: string;
+  bytes?: Uint8Array;
 }): Promise<void> {
   await invokeDesktopCommand("send_local_daemon_transport_message", {
     sessionId: input.sessionId,
     ...(input.text ? { text: input.text } : {}),
-    ...(input.binaryBase64 ? { binaryBase64: input.binaryBase64 } : {}),
+    ...(input.bytes ? { bytes: input.bytes } : {}),
   });
 }
 

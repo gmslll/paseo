@@ -12,24 +12,6 @@ import {
 
 const DESKTOP_TRANSPORT_SCHEME = "paseo+desktop:";
 
-function encodeBinaryToBase64(data: Uint8Array | ArrayBuffer): string {
-  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 1) {
-    binary += String.fromCharCode(bytes[index]);
-  }
-  return globalThis.btoa(binary);
-}
-
-function decodeBase64ToBytes(base64: string): Uint8Array {
-  const binary = globalThis.atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
 export function buildDesktopDaemonTransportUrl(target: DesktopDaemonTransportTarget): string {
   const url = new URL(`${DESKTOP_TRANSPORT_SCHEME}//${target.transportType}`);
   if (target.transportType === "ssh") {
@@ -140,8 +122,8 @@ export function createDesktopDaemonTransportFactory(
           emitMessage(payload.text, false);
           return;
         }
-        if (payload.binaryBase64) {
-          emitMessage(decodeBase64ToBytes(payload.binaryBase64), true);
+        if (payload.bytes) {
+          emitMessage(payload.bytes, true);
         }
         return;
       }
@@ -176,10 +158,8 @@ export function createDesktopDaemonTransportFactory(
           void rpc.sendMessage({ sessionId, text: data }).catch((error) => emitError(error));
           return;
         }
-        const binaryBase64 = encodeBinaryToBase64(
-          data instanceof ArrayBuffer ? data : new Uint8Array(data),
-        );
-        void rpc.sendMessage({ sessionId, binaryBase64 }).catch((error) => emitError(error));
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
+        void rpc.sendMessage({ sessionId, bytes }).catch((error) => emitError(error));
       },
       close: () => {
         if (disposed) {
