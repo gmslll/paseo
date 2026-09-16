@@ -32,6 +32,8 @@ import {
   createManagedLeaseCoordinator,
   ManagedNodeControlPlaneClient,
 } from "./management-client.js";
+import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
+import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
 import { ManagedPrincipalGrantSource } from "./principal-source.js";
 import { ManagedNodeRuntimeDistributionState } from "./runtime-policy-source.js";
 import { readManagedNodeRelationship } from "./relationship-store.js";
@@ -76,10 +78,8 @@ export async function createManagedEnterpriseRuntime(
       mode: "managed",
     }),
   );
-  const client = new ManagedNodeControlPlaneClient({
-    relationship,
-    caCertificate: readFileSync(caCertificatePath),
-  });
+  const caCertificate = readFileSync(caCertificatePath);
+  const client = new ManagedNodeControlPlaneClient({ relationship, caCertificate });
   const managedBootId = `boot_${randomBytes(16).toString("hex")}`;
   const browserProfiles = await prepareProductionBrowserProfileRegistry({
     paseoHome,
@@ -112,12 +112,35 @@ export async function createManagedEnterpriseRuntime(
       audit,
     );
     const runtimeDistribution = new ManagedNodeRuntimeDistributionState(client);
+    // Off unless an operator turned it on (ADR-0031): collaboration puts Workspace content on the
+    // management plane, so it is not something a node starts doing by being upgraded.
+    const collaboration =
+      input.config.collaboration?.enabled === true
+        ? (() => {
+            const catalog = new ManagedWorkspaceCatalog({
+              paseoHome,
+              nodeId: node.nodeId,
+              organizationId: input.config.organizationId,
+              source: client,
+            });
+            // The catalog the previous boot left, so a plane that is slow to answer does not read
+            // as a node that hosts nothing (§5.1.8).
+            catalog.load();
+            return {
+              catalog,
+              replicas: new CollabRuntime({ paseoHome, relationship, caCertificate, catalog }),
+            };
+          })()
+        : null;
     const lifecycle = new ManagedNodeLifecycle({
       client,
       audit,
       refreshPolicy: async () => {
         await principalSource.ready();
         await runtimeDistribution.refresh();
+        // Memberships arrive with the policy, so this is where the catalog learns what this node
+        // still hosts.
+        collaboration?.catalog.refresh();
       },
       heartbeat: async () => ({
         bootId: managedBootId,
@@ -208,12 +231,23 @@ export async function createManagedEnterpriseRuntime(
       identityDispatcherRegistration,
       leaseCoordinator: createManagedLeaseCoordinator(client),
       managedPlacementSource,
+      ...(collaboration
+        ? {
+            collaboration: Object.freeze({
+              install: async (dependencies: CollabRuntimeDependencies) => {
+                await collaboration.replicas.install(dependencies);
+                await lifecycle.installCollabPump(() => collaboration.replicas.pump());
+              },
+            }),
+          }
+        : {}),
       managedRuntimeDistribution: runtimeDistribution,
       nextSessionBindingGeneration: createSessionBindingGeneration,
       close() {
         closePromise ??= (async () => {
           admission.close();
           await lifecycle.close();
+          collaboration?.replicas.close();
           principalSource.close();
           await appSlots.close();
         })();

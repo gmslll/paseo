@@ -23,6 +23,7 @@ import type {
 import type { BrowserProfileRegistry } from "../browser/profile-registry.js";
 import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 import type { ManagedPlacementSnapshotSource } from "../managed-node/lifecycle.js";
+import type { CollabRuntimeDependencies } from "../managed-node/collab/collab-runtime.js";
 
 export interface EnterpriseAdmissionPort {
   readonly audit: ProductionAuditCapability;
@@ -69,6 +70,14 @@ export interface EnterpriseAdmissionRuntime {
   readonly leaseCoordinator?: LeaseCoordinator;
   readonly managedPlacementSource?: Readonly<{
     install(source: ManagedPlacementSnapshotSource): Promise<void>;
+  }>;
+  /**
+   * Present only when the node collaborates (ADR-0031). The replicas need the Workspace registry
+   * and the Agent manager, which bootstrap builds after this runtime, so they arrive here rather
+   * than through the factory.
+   */
+  readonly collaboration?: Readonly<{
+    install(dependencies: CollabRuntimeDependencies): Promise<void>;
   }>;
   readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;

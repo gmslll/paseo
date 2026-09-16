@@ -110,6 +110,21 @@ A feature flag is a promise to the client that the capability is there. Declarin
 collaboration stack is built but unwired would gate clients onto a path the daemon cannot serve.
 The declaration belongs with the runtime wiring that makes `collaboration.enabled` mean something.
 
+## Still open: nothing watches the node's scheduled work
+
+`ManagedNodeLifecycle` catches every scheduled operation and hands the error to an optional
+`onError`. No construction site passes one — not the managed runtime factory, not anywhere else —
+so a failed heartbeat, policy refresh, audit upload or placement sync is already swallowed in
+production today. The collaboration pump joins them on the same terms.
+
+Fixing it means giving the factory somewhere to report, and the factory has no logger. The seam it
+arrives through, `createEnterpriseAdmissionRuntime` in `bootstrap.ts`, takes `{ config, audit }`;
+widening it reaches `resolveEnterpriseRuntime`, `daemon-worker.ts`, the direct-daemon test helper
+and five test files that override the factory.
+
+Left as one deliberate change covering all five operations rather than threaded through here for
+the newest one, which would leave the four older ones silent and the seam widened anyway.
+
 ## Acceptance
 
 Whichever option is taken, the tests ADR-0034 names stay the acceptance bar for the rules that are

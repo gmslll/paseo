@@ -1571,6 +1571,14 @@ export async function createPaseoDaemon(
           }),
         );
       }
+      if (enterpriseRuntime.collaboration && workspaceRegistry) {
+        // The replicas project Agents and reconcile the Workspace record, so they need both of the
+        // registries this function has already built.
+        await enterpriseRuntime.collaboration.install({
+          workspaceRegistry,
+          agents: agentManager,
+        });
+      }
       const browserProfileContentProbe = capturedBrowserProfileContentReadSourceFactory({
         pageIdentity: browserBundle.pageIdentityVerifier,
       });
