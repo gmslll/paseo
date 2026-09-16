@@ -38,6 +38,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED,
         containerId: CONTAINER,
         organizationId: ORG,
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toEqual(claims());
   });
@@ -51,6 +53,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED,
         containerId: OTHER,
         organizationId: ORG,
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toThrow("stream token audience mismatch");
   });
@@ -64,6 +68,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED,
         containerId: CONTAINER,
         organizationId: "org_fedcba9876543210",
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toThrow("stream token audience mismatch");
     expect(() =>
@@ -71,6 +77,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED + STREAM_TOKEN_TTL_MS,
         containerId: CONTAINER,
         organizationId: ORG,
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toThrow("stream token expired");
   });
@@ -85,6 +93,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED,
         containerId: CONTAINER,
         organizationId: ORG,
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toThrow("invalid stream token signature");
 
@@ -95,6 +105,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED,
         containerId: OTHER,
         organizationId: ORG,
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toThrow("invalid stream token signature");
   });
@@ -110,6 +122,8 @@ describe("collaboration stream tokens", () => {
         nowMs: ISSUED,
         containerId: CONTAINER,
         organizationId: ORG,
+        currentGrantVersion: "grv_0123456789abcdef",
+        currentRevocationEpoch: 3,
       }),
     ).toThrow("invalid stream token");
 

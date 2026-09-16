@@ -133,6 +133,7 @@ async function handleRequest(
   if (await handlePrincipalRequest(context)) return;
   if (await handleManagementInventoryRequest(context)) return;
   if (await handleRuntimeDistributionRequest(context)) return;
+  if (await handleStreamTokenRequest(context)) return;
   if (await handleTicketRequest(context)) return;
   sendJson(response, 404, { error: { code: "not_found", message: "route not found" } });
 }
@@ -414,6 +415,17 @@ async function handleManagementInventoryRequest(
   return false;
 }
 
+async function handleStreamTokenRequest(context: AuthenticatedRouteContext): Promise<boolean> {
+  const { body, method, path, plane, response } = context;
+  if (method !== "POST" || path !== "/v1/streams/token") return false;
+  const input = z
+    .object({ clientId: z.string().min(1).max(160) })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 201, await plane.issueStreamToken(requireBearer(context.request), input));
+  return true;
+}
+
 async function handleTicketRequest(context: AuthenticatedRouteContext): Promise<boolean> {
   const { body, method, path, plane, request, response } = context;
   if (method !== "POST") return false;
@@ -554,7 +566,20 @@ async function handleCollabStreamRequest(
     });
     return true;
   }
-  const actor = await authenticateUser(plane, request);
+  // Only the credential step is caught here. A refusal from authorization must keep its own status,
+  // or a non-member would be answered differently from a bad token and the route would leak which
+  // Workspaces exist.
+  let actor: AuthenticatedManagementPrincipal;
+  try {
+    actor = await authenticateStreamCaller(plane, request, target.containerId);
+  } catch {
+    // Expired, revoked, wrong container, bad signature: all mean "this credential is not usable,
+    // get another one", which is 401 rather than a malformed request.
+    sendJson(response, 401, {
+      error: { code: "unauthorized", message: "invalid or expired credential" },
+    });
+    return true;
+  }
 
   if (method === "GET" || method === "HEAD") {
     const offset = url.searchParams.get("offset");
@@ -782,6 +807,22 @@ const auditInputSchema = z
     metadata: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])),
   })
   .strict() satisfies z.ZodType<ManagementAuditInput>;
+
+/**
+ * The stream routes take either a personal access token or a stream token. The stream token only
+ * identifies its holder; membership and the segment matrix still decide what that holder may do.
+ */
+async function authenticateStreamCaller(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  containerId: string,
+): Promise<AuthenticatedManagementPrincipal> {
+  const bearer = requireBearer(request);
+  if (bearer.startsWith("pst_v1.")) return plane.authenticateStreamToken(bearer, containerId);
+  const principal = await plane.authenticatePersonalAccessToken(bearer);
+  if (!principal) throw new Error("invalid credential");
+  return principal;
+}
 
 async function authenticateUser(
   plane: EnterpriseManagementPlane,

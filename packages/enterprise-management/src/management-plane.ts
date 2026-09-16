@@ -75,7 +75,7 @@ import {
   type WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { streamAccess } from "./data-plane/stream-access.js";
-import { signStreamToken } from "./data-plane/stream-token.js";
+import { signStreamToken, verifyStreamToken } from "./data-plane/stream-token.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
@@ -1329,6 +1329,53 @@ export class EnterpriseManagementPlane {
       ),
       expiresAt: new Date(expiresAtMs).toISOString(),
     });
+  }
+
+  /**
+   * Resolves a stream token into the Principal that holds it, refusing one whose authority has
+   * moved since it was minted. The comparison happens here rather than at the call site so a route
+   * cannot forget it: the token outlives a membership change by up to its full lifetime otherwise.
+   */
+  authenticateStreamToken(token: string, containerId: string): AuthenticatedManagementPrincipal {
+    this.assertOpen();
+    const probe = this.readStreamTokenPrincipal(token);
+    const claims = verifyStreamToken(token, this.options.ticketPublicKey, {
+      nowMs: this.clock.nowMs(),
+      containerId,
+      organizationId: this.options.organizationId,
+      currentGrantVersion: probe.grantVersion,
+      currentRevocationEpoch: probe.revocationEpoch,
+    });
+    const principal = this.readPrincipal(claims.principalId);
+    if (!principal || principal.status !== "active") throw new Error("invalid credential");
+    return Object.freeze({ ...principal, credentialId: claims.credentialId });
+  }
+
+  /**
+   * Reads the claimed holder's current authority so verification has something to compare against.
+   * The claims are not trusted yet, so an unknown holder yields values that cannot match a real
+   * token and the verifier refuses it like any other stale one.
+   */
+  private readStreamTokenPrincipal(token: string): {
+    grantVersion: string;
+    revocationEpoch: number;
+  } {
+    const payload = token.split(".")[1];
+    if (!payload) return { grantVersion: "", revocationEpoch: -1 };
+    try {
+      const claimed = JSON.parse(Buffer.from(payload, "base64url").toString()) as {
+        principalId?: unknown;
+      };
+      const principal =
+        typeof claimed.principalId === "string" ? this.readPrincipal(claimed.principalId) : null;
+      if (!principal) return { grantVersion: "", revocationEpoch: -1 };
+      return {
+        grantVersion: principal.grantVersion,
+        revocationEpoch: principal.revocationEpoch,
+      };
+    } catch {
+      return { grantVersion: "", revocationEpoch: -1 };
+    }
   }
 
   /** Enabled containers only: an unenabled Workspace keeps its bodies off the plane (ADR-0031). */

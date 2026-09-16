@@ -41,6 +41,15 @@ export function verifyStreamToken(
     readonly nowMs: number;
     readonly containerId: string;
     readonly organizationId: string;
+    /**
+     * The holder's authority as it stands right now. These are required, not optional: a token
+     * lives for five minutes, and a membership change rolls both values, so skipping the comparison
+     * would let a removed member keep reading and writing until the token expired. The Session
+     * ticket makes the same inputs optional and only its tests pass them; that is not a pattern to
+     * copy for a credential this short-lived and this widely presented.
+     */
+    readonly currentGrantVersion: string;
+    readonly currentRevocationEpoch: number;
   },
 ): StreamTokenClaims {
   const parts = token.split(".");
@@ -74,5 +83,11 @@ export function verifyStreamToken(
     throw new Error("stream token audience mismatch");
   }
   if (expected.nowMs >= Date.parse(claims.expiresAt)) throw new Error("stream token expired");
+  if (
+    claims.grantVersion !== expected.currentGrantVersion ||
+    claims.revocationEpoch !== expected.currentRevocationEpoch
+  ) {
+    throw new Error("stream token revoked");
+  }
   return claims;
 }

@@ -66,10 +66,15 @@ describe("issuing collaboration stream tokens", () => {
 
     const issued = await plane.issueStreamToken(member.token, { clientId: "desktop-1" });
 
+    const holder = (await plane.listPrincipals(admin)).find(
+      (entry) => entry.principalId === member.principalId,
+    )!;
     const claims = verifyStreamToken(issued.token, ticketKeys.publicKey, {
       nowMs: START,
       containerId: joined.workspaceUid,
       organizationId: ORG,
+      currentGrantVersion: holder.grantVersion,
+      currentRevocationEpoch: holder.revocationEpoch,
     });
     expect(claims.containerIds).toEqual([joined.workspaceUid]);
     expect(claims.principalId).toBe(member.principalId);
@@ -79,6 +84,8 @@ describe("issuing collaboration stream tokens", () => {
         nowMs: START,
         containerId: other.workspaceUid,
         organizationId: ORG,
+        currentGrantVersion: holder.grantVersion,
+        currentRevocationEpoch: holder.revocationEpoch,
       }),
     ).toThrow("stream token audience mismatch");
   });
@@ -129,14 +136,15 @@ describe("issuing collaboration stream tokens", () => {
     });
 
     const issued = await plane.issueStreamToken(owner.token, { clientId: "desktop-1" });
+    const principals = await plane.listPrincipals(admin);
+    const current = principals.find((entry) => entry.principalId === owner.principalId)!;
     const claims = verifyStreamToken(issued.token, ticketKeys.publicKey, {
       nowMs: START,
       containerId: workspace.workspaceUid,
       organizationId: ORG,
+      currentGrantVersion: current.grantVersion,
+      currentRevocationEpoch: current.revocationEpoch,
     });
-
-    const principals = await plane.listPrincipals(admin);
-    const current = principals.find((entry) => entry.principalId === owner.principalId)!;
     // A stream token pins the authority it was minted under, so a membership change invalidates it
     // through the same version the Session path already checks.
     expect(claims.grantVersion).toBe(current.grantVersion);
