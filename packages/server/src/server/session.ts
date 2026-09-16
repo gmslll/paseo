@@ -6538,11 +6538,33 @@ export class Session {
   /**
    * Handle agent permission response from user
    */
+  /**
+   * A tool permission belongs to the turn that raised it, so only that turn's controller or the
+   * Workspace owner answers it (ADR-0034). Answering another Principal's permission would let a
+   * collaborator approve a tool call they never asked for and cannot see the context of.
+   *
+   * A turn with no controller stays answerable by anyone: single-user daemons, turns the daemon
+   * opened itself, and turns that predate authorship all report none, and refusing those would take
+   * away behaviour that has always worked.
+   */
+  private mayAnswerPermissionFor(agentId: string): boolean {
+    if (!this.enterpriseContext) return true;
+    const controller = this.agentManager.turnControllerOf(agentId);
+    if (!controller) return true;
+    const responder = this.enterpriseContext.principal.principalId;
+    if (controller.principalId === responder) return true;
+    return this.agentManager.getAgent(agentId)?.enterpriseOwnership?.ownerPrincipalId === responder;
+  }
+
   private async handleAgentPermissionResponse(
     agentId: string,
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<void> {
+    if (!this.mayAnswerPermissionFor(agentId)) {
+      this.emitLegacyResourceDenied(requestId, "agent_permission_response");
+      return;
+    }
     try {
       await respondToAgentPermission({
         agentManager: this.agentManager,

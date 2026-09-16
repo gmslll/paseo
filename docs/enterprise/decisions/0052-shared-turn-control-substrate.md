@@ -63,6 +63,22 @@ Option 2 is the one this work would take by default, because it is the largest p
 inside the boundary. It is recorded here rather than taken, because the choice changes what
 ADR-0034 means today and the master spec's §15.1 actor semantics depend on the author rule.
 
+## Still open: the cross-author cancel audit
+
+ADR-0034 says cancelling another Principal's turn writes a `required` audit event. ADR-0037 owns
+audit durability and its `required` list is closed — content-Grant reads by a non-member, dispatching
+a turn through machine RPC, membership invite/accept/role change/removal, and collaboration
+enable/disable — with everything else `buffered`. A cross-author cancel is on neither list, so the
+two decisions disagree about what `required` covers.
+
+It is also not reachable yet: the daemon's Session holds no audit capability. The audit runtime is
+built in the managed runtime factory and never handed to Session, so writing an event from the
+cancel handler means plumbing it in, which is agent-core surface rather than this workstream's.
+
+Raised rather than resolved, because picking a durability level here would silently overrule
+whichever ADR is not chosen. The permission-response rule from ADR-0034 is implemented; the cancel
+audit is not, and ADR-0034 should say so until this is settled.
+
 ## Acceptance
 
 Whichever option is taken, the tests ADR-0034 names stay the acceptance bar for the rules that are
