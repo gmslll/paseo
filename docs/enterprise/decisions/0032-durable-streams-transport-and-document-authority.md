@@ -25,6 +25,12 @@ container and one segment and carries Loro updates or JSON log entries.
   input. Added 2026-09-16 by the integration owner.
 - Limits: 1 MiB per append, 64 KiB per timeline row, and 8 MiB or 2,000 queued events per
   subscriber. Overflow sends `control` with `overflow` and closes the subscription.
+- Quota: 600 appends per Principal per container per minute, answered with 429. Counted after
+  authentication so an unauthenticated flood cannot spend a member's allowance, and before the body
+  is read so a refused caller cannot stream a megabyte first. Reads are not counted: a read is
+  cheap, while an append writes a row and moves the stream toward compaction. The number is a
+  proposal added 2026-09-16 — nothing in these decisions or the master spec set one — chosen as far
+  above a person working and far below what would keep compaction permanently busy.
 - The plane compacts a stream into a snapshot at 8 MiB or 5,000 updates. A reader below the lower
   bound receives the snapshot first. Only the segments marked as documents below are compacted.
 

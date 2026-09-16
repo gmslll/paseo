@@ -55,6 +55,11 @@ const JSON_HEADERS = Object.freeze({
 
 export interface ManagementRequestHandlerOptions {
   readonly allowInsecureLoopback?: boolean;
+  /**
+   * Defaults to STREAM_APPENDS_PER_MINUTE. Configurable because the behaviour cannot otherwise be
+   * observed without six hundred round trips, and because a deployment may want its own ceiling.
+   */
+  readonly streamAppendsPerMinute?: number;
 }
 
 export function createManagementRequestHandler(
@@ -62,16 +67,23 @@ export function createManagementRequestHandler(
   options: ManagementRequestHandlerOptions = {},
 ): (request: IncomingMessage, response: ServerResponse) => void {
   const passwordAttempts = new PasswordAttemptLimiter();
+  // One per handler, not a module singleton: a shared one would carry state between servers and
+  // make tests depend on the order they ran in.
+  const streamQuota = new StreamAppendQuota(
+    options.streamAppendsPerMinute ?? STREAM_APPENDS_PER_MINUTE,
+  );
   return (request, response) => {
-    void handleRequest(plane, request, response, options, passwordAttempts).catch((error) => {
-      if (response.headersSent) {
-        response.destroy(error instanceof Error ? error : undefined);
-        return;
-      }
-      const message = error instanceof Error ? error.message : "request failed";
-      const status = classifyError(message);
-      sendJson(response, status, { error: { code: errorCode(status), message } });
-    });
+    void handleRequest(plane, request, response, options, passwordAttempts, streamQuota).catch(
+      (error) => {
+        if (response.headersSent) {
+          response.destroy(error instanceof Error ? error : undefined);
+          return;
+        }
+        const message = error instanceof Error ? error.message : "request failed";
+        const status = classifyError(message);
+        sendJson(response, status, { error: { code: errorCode(status), message } });
+      },
+    );
   };
 }
 
@@ -96,6 +108,7 @@ async function handleRequest(
   response: ServerResponse,
   options: ManagementRequestHandlerOptions,
   passwordAttempts: PasswordAttemptLimiter,
+  streamQuota: StreamAppendQuota,
 ): Promise<void> {
   enforceTls(request, options);
   applyPaseoAppCors(request, response);
@@ -118,7 +131,9 @@ async function handleRequest(
   // one the contract names.
   if (await handleCollabPresenceRequest(plane, request, response, method, path)) return;
   // Stream updates are binary, and the shared readBody would decode them as UTF-8.
-  if (await handleCollabStreamRequest(plane, request, response, method, path, url)) return;
+  if (await handleCollabStreamRequest(plane, request, response, method, path, url, streamQuota)) {
+    return;
+  }
   const body = method === "GET" || method === "HEAD" ? "" : await readBody(request);
   if (
     await handleUnauthenticatedPost(plane, request, response, method, path, body, passwordAttempts)
@@ -319,6 +334,50 @@ class PasswordAttemptLimiter {
 
   succeeded(key: string): void {
     this.attempts.delete(key);
+  }
+}
+
+/**
+ * How many appends one Principal may make to one container per minute.
+ *
+ * Neither the ADRs nor the master spec give a number — only the plan asks for a 429 alongside the
+ * 413 — so this is a proposal, recorded in ADR-0032 rather than left implicit here. Ten a second
+ * sustained is far above a person typing and far below what would keep the compaction threshold
+ * permanently busy.
+ *
+ * Appends only. Reads are cheap; an append writes a row and moves a stream toward compaction.
+ */
+const STREAM_APPENDS_PER_MINUTE = 600;
+
+/**
+ * Counts appends per key in a fixed window, with the same shape as the password ledger above: no
+ * timer, and a bounded number of keys so a flood of distinct containers cannot grow it without end.
+ */
+class StreamAppendQuota {
+  private readonly windows = new Map<string, { count: number; resetAt: number }>();
+
+  constructor(private readonly limit: number) {}
+
+  allows(key: string): boolean {
+    const now = Date.now();
+    const current = this.windows.get(key);
+    if (!current || current.resetAt <= now) {
+      this.windows.delete(key);
+      this.windows.set(key, { count: 1, resetAt: now + 60_000 });
+      this.evictOldest();
+      return true;
+    }
+    if (current.count >= this.limit) return false;
+    current.count += 1;
+    return true;
+  }
+
+  private evictOldest(): void {
+    while (this.windows.size > 4_096) {
+      const oldest = this.windows.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.windows.delete(oldest);
+    }
   }
 }
 
@@ -984,6 +1043,7 @@ async function handleCollabStreamRequest(
   method: string,
   path: string,
   url: URL,
+  streamQuota: StreamAppendQuota,
 ): Promise<boolean> {
   if (!path.startsWith("/v1/ds/")) return false;
   if (method !== "PUT" && method !== "POST" && method !== "GET" && method !== "HEAD") return false;
@@ -1013,6 +1073,14 @@ async function handleCollabStreamRequest(
     return readCollabStreamSegment(plane, request, response, actor, target, method, url);
   }
 
+  // Counted after authentication, so an unauthenticated flood cannot spend a member's allowance,
+  // and before the body is read, so a refused caller does not get to stream a megabyte first.
+  if (!streamQuota.allows(`${actor.principalId}\n${target.containerId}`)) {
+    sendJson(response, 429, {
+      error: { code: "too_many_requests", message: "append quota exceeded" },
+    });
+    return true;
+  }
   const producer = parseProducerHeaders(request.headers);
   if (!producer) {
     sendJson(response, 400, {
@@ -1325,6 +1393,7 @@ function errorCode(status: number): string {
   if (status === 403) return "forbidden";
   if (status === 404) return "not_found";
   if (status === 409) return "conflict";
+  if (status === 429) return "too_many_requests";
   return "invalid_request";
 }
 
