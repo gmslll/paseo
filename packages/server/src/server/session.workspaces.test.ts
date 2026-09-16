@@ -356,6 +356,7 @@ function makeManagedAgent(input: {
       attentionReason: null,
       attentionTimestamp: now,
     },
+    queuedTurns: [],
     foregroundTurnWaiters: new Set(),
     unsubscribeSession: null,
     session: null,

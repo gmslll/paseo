@@ -99,6 +99,7 @@ class InMemoryAgentManager {
       lastUsage: undefined,
       lastError: undefined,
       attention: { requiresAttention: false, attentionReason: null, attentionTimestamp: null },
+      queuedTurns: [],
       foregroundTurnWaiters: new Set(),
       finalizedForegroundTurnIds: new Set(),
       unsubscribeSession: null,

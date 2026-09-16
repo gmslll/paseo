@@ -133,6 +133,13 @@ export function toAgentPayload(
           startedAt: agent.activeTurnStartedAt?.toISOString() ?? null,
         }
       : null,
+    // ADR-0034 keeps the prompt text out of this: another collaborator may see that someone is
+    // waiting and who they are, never what they are about to say.
+    queuedTurns: agent.queuedTurns.map((queued) => ({
+      messageId: queued.messageId,
+      author: queued.author,
+      queuedAt: queued.queuedAt.toISOString(),
+    })),
     capabilities: cloneCapabilities(agent.capabilities),
     currentModeId: agent.currentModeId,
     availableModes: cloneAvailableModes(agent.availableModes),

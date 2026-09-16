@@ -77,6 +77,7 @@ function managedAgent(overrides: Partial<ManagedAgent> = {}): ManagedAgent {
     activeForegroundTurnId: null,
     activeTurnId: null,
     activeTurnStartedAt: null,
+    queuedTurns: [],
     foregroundTurnWaiters: new Set(),
     unsubscribeSession: null,
     timeline: [],

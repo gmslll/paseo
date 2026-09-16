@@ -386,6 +386,17 @@ interface HandleStreamEventOptions {
   fromHistory?: boolean;
 }
 
+/**
+ * One collaborator's send waiting behind another's turn (ADR-0034). The prompt itself is not kept
+ * here: the queue is visible to every member of the Workspace, and what someone is about to say is
+ * not theirs to read.
+ */
+export interface QueuedTurn {
+  messageId: string;
+  author: { principalId: string; displayName?: string };
+  queuedAt: Date;
+}
+
 interface ManagedAgentBase {
   id: string;
   provider: AgentProvider;
@@ -418,6 +429,12 @@ interface ManagedAgentBase {
   lastUserMessageAt: Date | null;
   activeTurnId: string | null;
   activeTurnStartedAt: Date | null;
+  /**
+   * Sends from other Principals waiting for the running turn to finish, oldest first (ADR-0034).
+   * Empty for a single-user daemon: a sender who controls the turn steers or interrupts it and
+   * never queues behind themselves.
+   */
+  queuedTurns: QueuedTurn[];
   lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
@@ -1911,6 +1928,7 @@ export class AgentManager {
         activeForegroundTurnId: null,
         activeTurnId: null,
         activeTurnStartedAt: null,
+        queuedTurns: [],
         foregroundTurnWaiters: new Set(),
         finalizedForegroundTurnIds: new Set(),
         unsubscribeSession: null,
@@ -3657,6 +3675,7 @@ export class AgentManager {
       activeForegroundTurnId: null,
       activeTurnId: null,
       activeTurnStartedAt: null,
+      queuedTurns: [],
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
       unsubscribeSession: null,
@@ -3712,6 +3731,7 @@ export class AgentManager {
       activeForegroundTurnId: null,
       activeTurnId: null,
       activeTurnStartedAt: null,
+      queuedTurns: [],
       pendingPermissions: new Map(),
       bufferedPermissionResolutions: new Map(),
       inFlightPermissionResponses: new Set(),
