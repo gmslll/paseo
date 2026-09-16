@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fileConstants, promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { canonicalAuditValue as stable } from "@getpaseo/protocol/audit-canonical";
 import {
   AuditAppendOptionsSchema,
   AuditEventInputSchema,
@@ -236,25 +237,8 @@ function throwCollected(errors: readonly unknown[], message: string): never {
   throw aggregateError(errors, message);
 }
 
-function compareCanonicalEntries(left: [string, unknown], right: [string, unknown]): number {
-  if (left[0] < right[0]) return -1;
-  if (left[0] > right[0]) return 1;
-  return 0;
-}
-
-function stable(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(compareCanonicalEntries)
-      .map(([key, entry]) => `${JSON.stringify(key)}:${stable(entry)}`)
-      .join(",")}}`;
-  }
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) throw new Error("unsupported canonical audit value");
-  return serialized;
-}
+// The canonical form moved to @getpaseo/protocol/audit-canonical so the management plane hashes
+// identically; it is imported above under the same name, so every call site here is unchanged.
 
 function parseTimestamp(value: unknown, source: string): string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(value)) {
