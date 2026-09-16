@@ -15,6 +15,14 @@ The attestation is an Ed25519 signature by the existing plane ticket key over:
 `rpcId`, `method`, `nodeId`, `containerId`, requester `principalId`, `credentialId`, `grantVersion`,
 `clientId`, `sentAt`, and `expiresAt`.
 
+It travels as `pmr_v1.<base64url claims>.<base64url signature>` — the same three-part token the
+Session ticket and the stream token use — rather than as a claims object beside a signature. The
+node must verify over exactly the bytes the plane signed, and re-serializing a parsed object to
+recover them would make the signature depend on key order and number formatting. Its domain
+separator, `paseo-machine-rpc-v1`, differs from the other two because all three are signed with the
+plane's one ticket key: without distinct separators a stream token would verify as an attestation.
+Added 2026-09-17 by the integration owner.
+
 The node:
 
 1. verifies the signature and expiry (default 60 seconds);

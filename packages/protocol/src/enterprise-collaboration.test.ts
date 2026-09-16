@@ -6,6 +6,7 @@ import {
   type CollabSegment,
   CollabContainerIdSchema,
   CollabSubscriptionEventSchema,
+  MachineRpcAttestationClaimsSchema,
   MachineRpcAttestedRequestSchema,
   MachineRpcClientRequestSchema,
   MachineRpcResultSchema,
@@ -188,22 +189,22 @@ describe("machine RPC envelopes", () => {
     expiresAt: AT,
     payload: { type: "send_agent_message_request", requestId: "r1", agentId: "a", text: "hi" },
   };
-  const attestation = {
-    claims: {
-      rpcId: RPC_ID,
-      method: "agent.send",
-      nodeId: NODE_ID,
-      containerId: WORKSPACE_UID,
-      requester: {
-        principalId: PRINCIPAL_ID,
-        credentialId: "cred-1",
-        grantVersion: "g1",
-        clientId: "client-1",
-      },
-      sentAt: AT,
-      expiresAt: AT,
+  // The wire carries the token, not the claims beside a signature: the node verifies over exactly
+  // the bytes the plane signed. The claims below are what that token's payload decodes to.
+  const attestation = "pmr_v1.eyJycGNJZCI6Im5vdC1wYXJzZWQtaGVyZSJ9.c2lnbmF0dXJl";
+  const attestationClaims = {
+    rpcId: RPC_ID,
+    method: "agent.send",
+    nodeId: NODE_ID,
+    containerId: WORKSPACE_UID,
+    requester: {
+      principalId: PRINCIPAL_ID,
+      credentialId: "cred-1",
+      grantVersion: "g1",
+      clientId: "client-1",
     },
-    signature: "c2lnbmF0dXJl",
+    sentAt: AT,
+    expiresAt: AT,
   };
 
   test("a client request cannot carry its own attestation", () => {
@@ -213,21 +214,33 @@ describe("machine RPC envelopes", () => {
     );
   });
 
-  test("the plane-attested request carries strict requester claims", () => {
+  test("the plane-attested request carries a pmr_v1 token", () => {
     expect(MachineRpcAttestedRequestSchema.parse({ ...request, attestation })).toEqual({
       ...request,
       attestation,
     });
+    // A token belonging to one of the other two artifacts signed with the same plane key is not an
+    // attestation, and neither is a claims object left where the token belongs.
+    for (const wrong of [
+      "pst_v1.eyJ9.c2ln",
+      "pmt_v1.eyJ9.c2ln",
+      "pmr_v1.eyJ9",
+      attestationClaims,
+    ]) {
+      expect(
+        MachineRpcAttestedRequestSchema.safeParse({ ...request, attestation: wrong }).success,
+      ).toBe(false);
+    }
+  });
+
+  test("attestation claims stay strict about the requester", () => {
+    expect(MachineRpcAttestationClaimsSchema.parse(attestationClaims)).toEqual(attestationClaims);
+    // The claims are what the token's payload decodes to, so an unknown requester field has to be
+    // refused there rather than at the wire schema, which now only sees a string.
     expect(
-      MachineRpcAttestedRequestSchema.safeParse({
-        ...request,
-        attestation: {
-          ...attestation,
-          claims: {
-            ...attestation.claims,
-            requester: { ...attestation.claims.requester, organizationId: ORGANIZATION_ID },
-          },
-        },
+      MachineRpcAttestationClaimsSchema.safeParse({
+        ...attestationClaims,
+        requester: { ...attestationClaims.requester, organizationId: ORGANIZATION_ID },
       }).success,
     ).toBe(false);
   });

@@ -334,13 +334,18 @@ export const MachineRpcClientRequestSchema = z
   })
   .strict();
 
+/**
+ * `pmr_v1.<base64url claims>.<base64url signature>`, the same three-part construction as the
+ * Session ticket and the stream token. A self-contained token rather than a claims object beside a
+ * signature: the node has to verify over exactly the bytes the plane signed, and re-serializing a
+ * parsed object to recover them makes the signature depend on key order and number formatting.
+ */
+export const MachineRpcAttestationSchema = z
+  .string()
+  .regex(/^pmr_v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
 export const MachineRpcAttestedRequestSchema = MachineRpcClientRequestSchema.extend({
-  attestation: z
-    .object({
-      claims: MachineRpcAttestationClaimsSchema,
-      signature: z.string().min(1),
-    })
-    .strict(),
+  attestation: MachineRpcAttestationSchema,
 }).strict();
 
 const MachineRpcResultShape = {
@@ -444,6 +449,8 @@ export type WorkspaceCatalog = z.infer<typeof WorkspaceCatalogSchema>;
 export type WorkspaceCatalogEntry = z.infer<typeof WorkspaceCatalogEntrySchema>;
 export type WorkspaceMembershipPolicy = z.infer<typeof WorkspaceMembershipPolicySchema>;
 export type StreamTokenClaims = z.infer<typeof StreamTokenClaimsSchema>;
+/** The token's payload. A contract in its own right now that the node decodes and checks it. */
+export type MachineRpcAttestationClaims = z.infer<typeof MachineRpcAttestationClaimsSchema>;
 export type MachineRpcClientRequest = z.infer<typeof MachineRpcClientRequestSchema>;
 export type MachineRpcAttestedRequest = z.infer<typeof MachineRpcAttestedRequestSchema>;
 export type MachineRpcResult = z.infer<typeof MachineRpcResultSchema>;
