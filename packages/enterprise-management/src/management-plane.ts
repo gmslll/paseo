@@ -69,7 +69,11 @@ import {
   type CollabMember,
   type CollabWorkspaceRecord,
 } from "./data-plane/membership.js";
-import type { WorkspaceMemberRole } from "@getpaseo/protocol/enterprise-collaboration";
+import {
+  parseCollabSegment,
+  type WorkspaceMemberRole,
+} from "@getpaseo/protocol/enterprise-collaboration";
+import { streamAccess } from "./data-plane/stream-access.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
@@ -1270,6 +1274,21 @@ export class EnterpriseManagementPlane {
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
+  async setCollabCollaboration(
+    actor: AuthenticatedManagementPrincipal,
+    input: { readonly workspaceUid: string; readonly enabled: boolean },
+  ): Promise<CollabWorkspaceRecord> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    this.requireCollabWorkspace(input.workspaceUid);
+    this.database
+      .prepare(
+        "UPDATE collab_workspaces SET collaboration_enabled = ?, updated_at = ? WHERE workspace_uid = ? AND organization_id = ?",
+      )
+      .run(input.enabled ? 1 : 0, this.nowIso(), input.workspaceUid, this.options.organizationId);
+    return this.requireCollabWorkspace(input.workspaceUid);
+  }
+
   async listCollabMembers(
     actor: AuthenticatedManagementPrincipal,
     workspaceUid: string,
@@ -1336,16 +1355,12 @@ export class EnterpriseManagementPlane {
       .run(JSON.stringify(grants), createOpaqueId("grv_", 16), now, principalId);
   }
 
-  // TODO(collab-membership): ADR-0032 grants stream writes by the segment writer matrix and
-  // ADR-0033 membership, not by platform administration. The members table does not exist yet, so
-  // these two gate on identity.manage; replace the assertion when membership lands rather than
-  // letting the placeholder settle into the permission model.
   async appendCollabStream(
     actor: AuthenticatedManagementPrincipal,
     input: StreamAppendInput,
   ): Promise<StreamAppendResult> {
     this.assertOpen();
-    this.assertActor(actor, "identity.manage");
+    this.assertStreamAccess(actor, input.containerId, input.segment, "write");
     return this.streams.append(input);
   }
 
@@ -1354,8 +1369,59 @@ export class EnterpriseManagementPlane {
     input: StreamReadInput,
   ): Promise<StreamReadResult> {
     this.assertOpen();
-    this.assertActor(actor, "identity.manage");
+    this.assertStreamAccess(actor, input.containerId, input.segment, "read");
     return this.streams.read(input);
+  }
+
+  /**
+   * Authorizes one stream operation by membership and the segment matrix (ADR-0032, ADR-0033).
+   *
+   * Every refusal raises the same error, so a caller cannot tell a Workspace they are not a member
+   * of from one that does not exist, or a closed segment from a mistyped one (master spec §22.1).
+   * Platform administration is not membership: identity.manage grants no stream access.
+   */
+  private assertStreamAccess(
+    actor: AuthenticatedManagementPrincipal,
+    containerId: string,
+    segment: string,
+    operation: "read" | "write",
+  ): void {
+    this.assertPrincipalCurrent(actor);
+    const parsed = parseCollabSegment(segment);
+    // ADR-0031: a Workspace without collaboration keeps its bodies off the plane entirely, so an
+    // unenabled container refuses every member exactly as a non-member is refused.
+    const role =
+      parsed && this.readCollabCollaborationEnabled(containerId)
+        ? this.readCollabRole(containerId, actor.principalId)
+        : null;
+    const access = parsed
+      ? streamAccess({ containerId, segment: parsed, role })
+      : { read: false, write: false };
+    if (!access[operation]) throw new Error("stream authorization denied");
+  }
+
+  private readCollabCollaborationEnabled(containerId: string): boolean {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT collaboration_enabled FROM collab_workspaces WHERE workspace_uid = ? AND organization_id = ?",
+        )
+        .get(containerId, this.options.organizationId),
+    );
+    return row ? Number(row.collaboration_enabled) === 1 : false;
+  }
+
+  private readCollabRole(containerId: string, principalId: string): WorkspaceMemberRole | null {
+    const row = this.row(
+      this.database
+        .prepare(
+          `SELECT m.role FROM collab_members m
+           JOIN collab_workspaces w ON w.workspace_uid = m.workspace_uid
+           WHERE m.workspace_uid = ? AND m.principal_id = ? AND w.organization_id = ?`,
+        )
+        .get(containerId, principalId, this.options.organizationId),
+    );
+    return row ? (String(row.role) as WorkspaceMemberRole) : null;
   }
 
   async uploadRuntimeArtifact(

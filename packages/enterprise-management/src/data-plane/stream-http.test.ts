@@ -8,12 +8,11 @@ import { createManagementRequestHandler } from "../http-server.js";
 import { EnterpriseManagementPlane } from "../management-plane.js";
 
 const ORG = "org_0123456789abcdef";
-const CONTAINER = "cws_0123456789abcdef";
-const STREAM = `/v1/ds/${CONTAINER}/meta`;
 
 interface Harness {
   base: string;
   token: string;
+  stream: string;
 }
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -57,14 +56,33 @@ async function start(): Promise<Harness> {
     bootstrapSecret: "bootstrap-secret-for-data-plane",
     displayName: "Admin",
   });
-  return { base: `http://127.0.0.1:${address.port}`, token: bootstrap.token };
+  const admin = (await plane.authenticatePersonalAccessToken(bootstrap.token))!;
+  const owner = await plane.createPrincipal(admin, {
+    displayName: "Owner",
+    principalType: "human",
+    role: "employee",
+  });
+  const credential = await plane.issuePersonalAccessToken(admin, owner.principalId);
+  const workspace = await plane.registerCollabWorkspace(admin, {
+    localWorkspaceId: "wks_stream_http",
+    ownerPrincipalId: owner.principalId,
+  });
+  await plane.setCollabCollaboration(admin, {
+    workspaceUid: workspace.workspaceUid,
+    enabled: true,
+  });
+  return {
+    base: `http://127.0.0.1:${address.port}`,
+    token: credential.token,
+    stream: `/v1/ds/${workspace.workspaceUid}/meta`,
+  };
 }
 
 function appendRequest(
   harness: Harness,
   input: { seq: number; epoch?: number; body?: Uint8Array; producerId?: string; path?: string },
 ): Promise<Response> {
-  return fetch(`${harness.base}${input.path ?? STREAM}`, {
+  return fetch(`${harness.base}${input.path ?? harness.stream}`, {
     method: "PUT",
     headers: {
       authorization: `Bearer ${harness.token}`,
@@ -113,7 +131,7 @@ describe("collaboration stream HTTP", () => {
     await appendRequest(harness, { seq: 1, body: new TextEncoder().encode("one") });
     await appendRequest(harness, { seq: 2, body: new TextEncoder().encode("two") });
 
-    const all = await fetch(`${harness.base}${STREAM}`, {
+    const all = await fetch(`${harness.base}${harness.stream}`, {
       headers: { authorization: `Bearer ${harness.token}` },
     });
     expect(all.status).toBe(200);
@@ -126,9 +144,12 @@ describe("collaboration stream HTTP", () => {
     expect(payload.messages.map((message) => atob(message.update))).toEqual(["one", "two"]);
     expect(payload.upToDate).toBe(true);
 
-    const tail = await fetch(`${harness.base}${STREAM}?offset=${payload.messages[1]!.offset}`, {
-      headers: { authorization: `Bearer ${harness.token}` },
-    });
+    const tail = await fetch(
+      `${harness.base}${harness.stream}?offset=${payload.messages[1]!.offset}`,
+      {
+        headers: { authorization: `Bearer ${harness.token}` },
+      },
+    );
     const tailPayload = (await tail.json()) as { messages: Array<{ update: string }> };
     expect(tailPayload.messages.map((message) => atob(message.update))).toEqual(["two"]);
   });
@@ -137,7 +158,7 @@ describe("collaboration stream HTTP", () => {
     const harness = await start();
     await appendRequest(harness, { seq: 1 });
 
-    const head = await fetch(`${harness.base}${STREAM}`, {
+    const head = await fetch(`${harness.base}${harness.stream}`, {
       method: "HEAD",
       headers: { authorization: `Bearer ${harness.token}` },
     });
@@ -150,7 +171,7 @@ describe("collaboration stream HTTP", () => {
   test("refuses an unauthenticated caller and an unparsable container", async () => {
     const harness = await start();
 
-    const anonymous = await fetch(`${harness.base}${STREAM}`, { method: "PUT", body: "x" });
+    const anonymous = await fetch(`${harness.base}${harness.stream}`, { method: "PUT", body: "x" });
     expect(anonymous.status).toBe(401);
 
     const badContainer = await appendRequest(harness, {
