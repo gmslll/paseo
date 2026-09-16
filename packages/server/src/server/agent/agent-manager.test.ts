@@ -11015,3 +11015,68 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
 });
+
+test("stamps the authenticated sender on the user message that opens a turn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-author-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await startAgentRun(manager, agent.id, "hello", logger, {
+      runOptions: {
+        clientMessageId: "authored-client",
+        author: { principalId: "usr_0123456789abcdef", displayName: "Ada" },
+      },
+    });
+
+    // ADR-0034: the author of a turn's first message is what makes them its controller, so it has
+    // to survive onto the committed row rather than stay with the caller.
+    expect(manager.getTimeline(agent.id)).toContainEqual(
+      expect.objectContaining({
+        type: "user_message",
+        clientMessageId: "authored-client",
+        author: { principalId: "usr_0123456789abcdef", displayName: "Ada" },
+      }),
+    );
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("leaves a user message unauthored when no Principal sent it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-unauthored-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await startAgentRun(manager, agent.id, "hello", logger, {
+      runOptions: { clientMessageId: "plain-client" },
+    });
+
+    // A single-user daemon has no Principal, and the prompts the daemon injects itself have no
+    // author either. The field stays absent rather than carrying a placeholder.
+    const item = manager
+      .getTimeline(agent.id)
+      .find((entry) => entry.type === "user_message" && entry.clientMessageId === "plain-client");
+    expect(item).toBeDefined();
+    expect(item && "author" in item).toBe(false);
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

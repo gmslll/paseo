@@ -241,6 +241,11 @@ export interface SendPromptToAgentParams {
   unarchive?: boolean;
   /** See {@link StartAgentRunOptions.clearPendingPermissions}. */
   clearPendingPermissions?: boolean;
+  /**
+   * The authenticated sender, when there is one (ADR-0034). It reaches the timeline through the run
+   * options, because the author of a turn's first message is what makes them its controller.
+   */
+  author?: { principalId: string; displayName?: string };
   logger: Logger;
 }
 
@@ -324,9 +329,17 @@ export async function sendPromptToAgent(
     await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
   }
 
-  const runOptions = params.messageId
-    ? { ...params.runOptions, clientMessageId: params.messageId }
-    : params.runOptions;
+  // The author folds in whether or not there is a client message id: an authored prompt without one
+  // would otherwise reach the timeline anonymous, and the author is what makes a sender the turn's
+  // controller (ADR-0034).
+  const runOptions =
+    params.messageId || params.author
+      ? {
+          ...params.runOptions,
+          ...(params.messageId ? { clientMessageId: params.messageId } : {}),
+          ...(params.author ? { author: params.author } : {}),
+        }
+      : params.runOptions;
 
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: true,

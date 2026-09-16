@@ -214,6 +214,13 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /**
+   * Who is sending, when an authenticated Principal is (ADR-0034). Carried here rather than derived
+   * later because the author of a turn's first message is its controller, and by the time the
+   * timeline row exists the caller is gone. AgentSteerOptions extends this, so a steer carries it
+   * too.
+   */
+  author?: { principalId: string; displayName?: string };
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {

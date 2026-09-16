@@ -2360,7 +2360,12 @@ export class AgentManager {
       return false;
     }
     if (options?.clientMessageId) {
-      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId);
+      this.recordSubmittedPrompt(
+        agent,
+        prompt,
+        options.clientMessageId,
+        options.author ? { author: options.author } : undefined,
+      );
       this.emitState(agent);
     }
     const dispatch = (event: AgentStreamEvent): void => {
@@ -2552,6 +2557,7 @@ export class AgentManager {
             stagedSubmittedPromptEcho?.item.type === "user_message"
               ? stagedSubmittedPromptEcho.item.messageId
               : undefined,
+          ...(options.author ? { author: options.author } : {}),
         });
       }
       for (const stagedEvent of pendingRun.stagedEvents.splice(0)) {
@@ -2712,7 +2718,13 @@ export class AgentManager {
         expectedTurnId,
       });
       if (admission.status === "accepted") {
-        await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
+        await this.recordAcceptedSteer(
+          agent,
+          prompt,
+          options?.clientMessageId,
+          expectedTurnId,
+          options?.author,
+        );
       }
       return admission;
     });
@@ -2742,7 +2754,13 @@ export class AgentManager {
             expectedTurnId,
           });
           if (admission.status === "accepted") {
-            await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
+            await this.recordAcceptedSteer(
+              agent,
+              prompt,
+              options?.clientMessageId,
+              expectedTurnId,
+              options?.author,
+            );
           }
           return admission;
         })
@@ -2847,6 +2865,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     clientMessageId: string | undefined,
     expectedTurnId: string,
+    author?: { principalId: string; displayName?: string },
   ): Promise<void> {
     if (!clientMessageId) {
       return;
@@ -2854,6 +2873,7 @@ export class AgentManager {
     this.recordSubmittedPrompt(agent, prompt, clientMessageId, {
       messageId: clientMessageId,
       turnId: expectedTurnId,
+      ...(author ? { author } : {}),
     });
     this.emitState(agent);
   }
@@ -4634,7 +4654,12 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
-    options?: { messageId?: string; providerMessageId?: string; turnId?: string },
+    options?: {
+      messageId?: string;
+      providerMessageId?: string;
+      turnId?: string;
+      author?: { principalId: string; displayName?: string };
+    },
   ): void {
     if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
       return;
@@ -4646,6 +4671,8 @@ export class AgentManager {
       text: submittedPromptText(prompt),
       clientMessageId,
       ...(options?.messageId ? { messageId: options.messageId } : {}),
+      // Absent for a single-user daemon and for prompts the daemon injects itself (ADR-0034).
+      ...(options?.author ? { author: options.author } : {}),
     };
     this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
   }
@@ -4663,6 +4690,8 @@ export class AgentManager {
         messageId: clientMessageId,
         ...(messageId ? { providerMessageId: messageId } : {}),
         ...(turnId ? { turnId } : {}),
+        // The echo carries whatever the submission recorded, so an author survives the round trip.
+        ...(item.author ? { author: item.author } : {}),
       });
       existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
     }

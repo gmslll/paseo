@@ -10026,6 +10026,10 @@ export class Session {
           messageId: msg.messageId,
           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
           clearPendingPermissions: true,
+          // Only an authenticated Principal has one; a single-user daemon sends without (ADR-0034).
+          ...(this.enterpriseContext
+            ? { author: { principalId: this.enterpriseContext.principal.principalId } }
+            : {}),
           logger: this.sessionLogger,
         });
         if (result.disposition === "turn_started") {
