@@ -1953,13 +1953,38 @@ export class EnterpriseManagementPlane {
     if (!role) throw new Error("stream authorization denied");
   }
 
+  /**
+   * A member reads on membership. Anyone else reads only on a content Grant, and only with a
+   * `required` audit event written first (ADR-0031, ADR-0037).
+   *
+   * The audit and the read share one transaction, which is what "before the first byte" means here:
+   * if the append fails, nothing is returned. A read performs no writes of its own, so wrapping it
+   * costs nothing and buys the all-or-nothing property the ADR asks for.
+   */
   async readCollabStream(
     actor: AuthenticatedManagementPrincipal,
     input: StreamReadInput,
   ): Promise<StreamReadResult> {
     this.assertOpen();
-    this.assertStreamAccess(actor, input.containerId, input.segment, "read");
-    return this.streams.read(input);
+    if (this.hasStreamAccess(actor, input.containerId, input.segment, "read")) {
+      return this.streams.read(input);
+    }
+    if (!this.allowsContentGrantRead(actor, input.containerId)) {
+      // Worded exactly as a member's refusal, so a Grant holder and a stranger cannot be told apart.
+      throw new Error("stream authorization denied");
+    }
+    return transaction(this.database, () => {
+      this.appendPlaneAudit({
+        action: "collab.content.read",
+        outcome: "allowed",
+        actorPrincipalId: actor.principalId,
+        resourceKind: "workspace",
+        resourceId: input.containerId,
+        // ADR-0037: identifiers only. The segment names what was opened, never what it held.
+        metadata: { segment: input.segment },
+      });
+      return this.streams.read(input);
+    });
   }
 
   /**
@@ -2064,12 +2089,17 @@ export class EnterpriseManagementPlane {
    * of from one that does not exist, or a closed segment from a mistyped one (master spec §22.1).
    * Platform administration is not membership: identity.manage grants no stream access.
    */
-  private assertStreamAccess(
+  /**
+   * Whether membership alone allows this operation. Non-throwing, because the Boss read path needs
+   * to ask the question without treating a refusal as an error — and catching the throw instead
+   * would have swallowed an expired or revoked Principal along with it.
+   */
+  private hasStreamAccess(
     actor: AuthenticatedManagementPrincipal,
     containerId: string,
     segment: string,
     operation: "read" | "write",
-  ): void {
+  ): boolean {
     this.assertPrincipalCurrent(actor);
     const parsed = parseCollabSegment(segment);
     // ADR-0031: a Workspace without collaboration keeps its bodies off the plane entirely, so an
@@ -2081,7 +2111,48 @@ export class EnterpriseManagementPlane {
     const access = parsed
       ? streamAccess({ containerId, segment: parsed, role })
       : { read: false, write: false };
-    if (!access[operation]) throw new Error("stream authorization denied");
+    return access[operation];
+  }
+
+  private assertStreamAccess(
+    actor: AuthenticatedManagementPrincipal,
+    containerId: string,
+    segment: string,
+    operation: "read" | "write",
+  ): void {
+    if (!this.hasStreamAccess(actor, containerId, segment, operation)) {
+      throw new Error("stream authorization denied");
+    }
+  }
+
+  /**
+   * Whether a non-member may read this container's bodies on a content Grant (ADR-0031). Reads
+   * only: a Grant of this kind never writes, so appendCollabStream stays members-only.
+   *
+   * Checked against the container uid, because that is what the plane's own membership projection
+   * writes into a workspace selector. A Grant an administrator wrote against the *local* workspace
+   * id will not match here — both identifier spaces occur in workspaceIds today, since
+   * resolveWorkspace checks the local one — and that inconsistency predates this path.
+   */
+  private allowsContentGrantRead(
+    actor: AuthenticatedManagementPrincipal,
+    containerId: string,
+  ): boolean {
+    if (!this.readCollabCollaborationEnabled(containerId)) return false;
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT owner_principal_id FROM collab_workspaces WHERE workspace_uid = ? AND organization_id = ?",
+        )
+        .get(containerId, this.options.organizationId),
+    );
+    if (!row) return false;
+    return this.allowsResource(
+      actor,
+      "workspace.content.read",
+      String(row.owner_principal_id),
+      containerId,
+    );
   }
 
   private readCollabCollaborationEnabled(containerId: string): boolean {
