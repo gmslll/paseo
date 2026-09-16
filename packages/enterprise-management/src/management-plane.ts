@@ -63,6 +63,13 @@ import {
   type StreamReadResult,
   type StreamStore,
 } from "./data-plane/stream-store.js";
+import {
+  MEMBERSHIP_SCHEMA,
+  projectMembershipGrants,
+  type CollabMember,
+  type CollabWorkspaceRecord,
+} from "./data-plane/membership.js";
+import type { WorkspaceMemberRole } from "@getpaseo/protocol/enterprise-collaboration";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
@@ -185,6 +192,7 @@ export class EnterpriseManagementPlane {
       nowIso: () => this.nowIso(),
     });
     this.database.exec(DATA_PLANE_SCHEMA);
+    this.database.exec(MEMBERSHIP_SCHEMA);
     this.streams = createStreamStore({ database: this.database, clock: this.clock });
     this.database
       .prepare(
@@ -1176,6 +1184,156 @@ export class EnterpriseManagementPlane {
     if (typeof key === "string") return key;
     if (Buffer.isBuffer(key)) return key.toString("utf8");
     return key.export({ type: "spki", format: "pem" }).toString();
+  }
+
+  async registerCollabWorkspace(
+    actor: AuthenticatedManagementPrincipal,
+    input: { readonly localWorkspaceId: string; readonly ownerPrincipalId: string },
+  ): Promise<CollabWorkspaceRecord> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    const owner = this.requirePrincipal(input.ownerPrincipalId);
+    const workspaceUid = createOpaqueId("cws_", 8);
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare(
+          "INSERT INTO collab_workspaces (workspace_uid, organization_id, local_workspace_id, owner_principal_id, collaboration_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?)",
+        )
+        .run(
+          workspaceUid,
+          this.options.organizationId,
+          input.localWorkspaceId,
+          owner.principalId,
+          now,
+          now,
+        );
+      // The owner is a member row too, so listing members needs no special case for it.
+      this.database
+        .prepare(
+          "INSERT INTO collab_members (workspace_uid, principal_id, role, created_at, updated_at) VALUES (?, ?, 'owner', ?, ?)",
+        )
+        .run(workspaceUid, owner.principalId, now, now);
+      this.reprojectMembership(owner.principalId, workspaceUid, "owner", now);
+    });
+    return this.requireCollabWorkspace(workspaceUid);
+  }
+
+  async setCollabMember(
+    actor: AuthenticatedManagementPrincipal,
+    input: {
+      readonly workspaceUid: string;
+      readonly principalId: string;
+      readonly role: WorkspaceMemberRole;
+    },
+  ): Promise<readonly CollabMember[]> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    const member = this.requirePrincipal(input.principalId);
+    // ADR-0033 keeps exactly one owner; promotion happens through ownership transfer, not here.
+    if (input.role === "owner" && member.principalId !== workspace.ownerPrincipalId) {
+      throw new Error("workspace already has an owner");
+    }
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare(
+          `INSERT INTO collab_members (workspace_uid, principal_id, role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (workspace_uid, principal_id)
+           DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+        )
+        .run(input.workspaceUid, member.principalId, input.role, now, now);
+      this.reprojectMembership(member.principalId, input.workspaceUid, input.role, now);
+    });
+    return this.listCollabMembersUnchecked(input.workspaceUid);
+  }
+
+  async removeCollabMember(
+    actor: AuthenticatedManagementPrincipal,
+    input: { readonly workspaceUid: string; readonly principalId: string },
+  ): Promise<readonly CollabMember[]> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.principalId === workspace.ownerPrincipalId) {
+      throw new Error("cannot remove the workspace owner");
+    }
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare("DELETE FROM collab_members WHERE workspace_uid = ? AND principal_id = ?")
+        .run(input.workspaceUid, input.principalId);
+      this.reprojectMembership(input.principalId, input.workspaceUid, null, now);
+    });
+    return this.listCollabMembersUnchecked(input.workspaceUid);
+  }
+
+  async listCollabMembers(
+    actor: AuthenticatedManagementPrincipal,
+    workspaceUid: string,
+  ): Promise<readonly CollabMember[]> {
+    this.assertOpen();
+    this.assertActor(actor, "identity.manage");
+    this.requireCollabWorkspace(workspaceUid);
+    return this.listCollabMembersUnchecked(workspaceUid);
+  }
+
+  private listCollabMembersUnchecked(workspaceUid: string): readonly CollabMember[] {
+    return Object.freeze(
+      this.database
+        .prepare(
+          "SELECT principal_id, role FROM collab_members WHERE workspace_uid = ? ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, created_at",
+        )
+        .all(workspaceUid)
+        .map((value) => {
+          const row = this.row(value)!;
+          return {
+            principalId: String(row.principal_id),
+            role: String(row.role) as WorkspaceMemberRole,
+          };
+        }),
+    );
+  }
+
+  private requireCollabWorkspace(workspaceUid: string): CollabWorkspaceRecord {
+    const row = this.row(
+      this.database
+        .prepare("SELECT * FROM collab_workspaces WHERE workspace_uid = ? AND organization_id = ?")
+        .get(workspaceUid, this.options.organizationId),
+    );
+    if (!row) throw new Error("collaborative workspace unavailable");
+    return {
+      workspaceUid: String(row.workspace_uid),
+      localWorkspaceId: String(row.local_workspace_id),
+      ownerPrincipalId: String(row.owner_principal_id),
+      collaborationEnabled: Number(row.collaboration_enabled) === 1,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  /**
+   * Rewrites the member's grants for one Workspace and rolls their Grant version, which is the
+   * existing Session invalidation path (ADR-0033). Every membership change rolls it, including a
+   * re-set to the same role: the contract is stated over changes, not over effective permissions.
+   */
+  private reprojectMembership(
+    principalId: string,
+    workspaceUid: string,
+    role: WorkspaceMemberRole | null,
+    now: string,
+  ): void {
+    const current = this.readPrincipal(principalId);
+    if (!current) throw new Error("principal unavailable");
+    const grants = projectMembershipGrants({ grants: current.grants, workspaceUid, role });
+    this.validateGrantOrganizations(grants);
+    this.database
+      .prepare(
+        "UPDATE principals SET grants_json = ?, grant_version = ?, revocation_epoch = revocation_epoch + 1, updated_at = ? WHERE principal_id = ?",
+      )
+      .run(JSON.stringify(grants), createOpaqueId("grv_", 16), now, principalId);
   }
 
   // TODO(collab-membership): ADR-0032 grants stream writes by the segment writer matrix and
