@@ -30,6 +30,47 @@ function probeGet(
   });
 }
 
+function postRpc(
+  socketPath: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      {
+        socketPath,
+        method: "POST",
+        path: "/v1/rpc",
+        headers: { "content-type": "application/json", ...headers },
+      },
+      (response) => {
+        let text = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: text }));
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end(body);
+  });
+}
+
+// One request through a real Session: same admission, same authorization, one correlated answer.
+async function expectOneShotRpc(socketPath: string, token: string): Promise<void> {
+  const call = JSON.stringify({ type: "fetch_agents_request", requestId: "rpc-e2e-1" });
+
+  expect((await postRpc(socketPath, {}, call)).status).toBe(401);
+
+  const answered = await postRpc(socketPath, { "x-paseo-local-token": token }, call);
+  expect(answered.status).toBe(200);
+  expect(JSON.parse(answered.body)).toMatchObject({
+    type: "fetch_agents_response",
+    payload: { requestId: "rpc-e2e-1", entries: [] },
+  });
+}
+
 async function expectControlPlaneSession(socketPath: string, token: string): Promise<void> {
   const refused = await upgradeControlPlane(socketPath, {
     connection: "Upgrade",
@@ -141,6 +182,7 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
       expect(stateResponse.body).not.toContain(token);
 
       await expectControlPlaneSession(paths.endpoints.control.path, token);
+      await expectOneShotRpc(paths.endpoints.control.path, token);
 
       await daemon.stop();
       stopped = true;

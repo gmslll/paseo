@@ -82,12 +82,65 @@ function echoAdmission(input: {
   };
 }
 
-async function start(admission: ControlPlaneAdmission): Promise<void> {
+function postRpc(
+  body: string,
+  headers: Record<string, string> = { "x-paseo-local-token": TOKEN },
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      {
+        socketPath,
+        method: "POST",
+        path: "/v1/rpc",
+        headers: { "content-type": "application/json", ...headers },
+      },
+      (response) => {
+        let text = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: text }));
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end(body);
+  });
+}
+
+// Answers whatever request arrives, the way a Session answers one RPC.
+function answeringAdmission(attached: WebSocketLike[]): ControlPlaneAdmission {
+  return {
+    authenticate: async () => ({ kind: "allowed" }),
+    attach: async (socket) => {
+      attached.push(socket);
+      socket.on("message", (raw) => {
+        const envelope = JSON.parse(String(raw)) as {
+          type?: string;
+          message?: { requestId?: string };
+        };
+        if (envelope.type !== "session" || !envelope.message?.requestId) return;
+        socket.send(
+          JSON.stringify({
+            type: "session",
+            message: {
+              type: "fetch_agents_response",
+              payload: { requestId: envelope.message.requestId, entries: [] },
+            },
+          }),
+        );
+      });
+    },
+  };
+}
+
+async function start(admission: ControlPlaneAdmission, rpcTimeoutMs?: number): Promise<void> {
   plane = await startControlPlane({
     endpoint: { transport: "unix", path: socketPath },
     token: TOKEN,
     admission,
     logger: createTestLogger(),
+    ...(rpcTimeoutMs === undefined ? {} : { rpcTimeoutMs }),
   });
 }
 
@@ -188,5 +241,52 @@ describe.skipIf(process.platform === "win32")("control plane server", () => {
     expect(await readLines(opened, 1)).toEqual([
       encodeControlPlaneCloseLine({ code: 1011, reason: "Session attach failed" }),
     ]);
+  });
+
+  test("runs one request through a Session and returns its correlated response", async () => {
+    const attached: WebSocketLike[] = [];
+    await start(answeringAdmission(attached));
+
+    const answered = await postRpc(
+      JSON.stringify({ type: "fetch_agents_request", requestId: "rpc-1" }),
+    );
+
+    expect(answered.status).toBe(200);
+    expect(JSON.parse(answered.body)).toEqual({
+      type: "fetch_agents_response",
+      payload: { requestId: "rpc-1", entries: [] },
+    });
+    expect(attached).toHaveLength(1);
+  });
+
+  test("refuses a one-shot RPC without the local token or with a body it cannot use", async () => {
+    await start(answeringAdmission([]));
+
+    const wrongToken = await postRpc(
+      JSON.stringify({ type: "fetch_agents_request", requestId: "rpc-2" }),
+      { "x-paseo-local-token": "guess" },
+    );
+
+    expect(wrongToken.status).toBe(401);
+    expect((await postRpc("not json")).status).toBe(400);
+    expect((await postRpc(JSON.stringify({ type: "not_a_request" }))).status).toBe(400);
+    // A request the answer cannot be correlated to belongs on a streaming Session.
+    expect((await postRpc(JSON.stringify({ type: "clear_agent_attention" }))).status).toBe(400);
+  });
+
+  test("answers 504 when the Session never correlates a response", async () => {
+    await start(
+      {
+        authenticate: async () => ({ kind: "allowed" }),
+        attach: async () => undefined,
+      },
+      50,
+    );
+
+    const answered = await postRpc(
+      JSON.stringify({ type: "fetch_agents_request", requestId: "rpc-3" }),
+    );
+
+    expect(answered.status).toBe(504);
   });
 });

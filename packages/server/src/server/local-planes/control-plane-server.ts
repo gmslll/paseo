@@ -1,15 +1,18 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import type { Logger } from "pino";
 import {
+  CONTROL_PLANE_MAX_LINE_BYTES,
   LOCAL_PLANE_TOKEN_HEADER,
   LOCAL_PLANE_UPGRADE_PROTOCOLS,
 } from "@getpaseo/protocol/local-planes";
+import { SessionInboundMessageSchema } from "@getpaseo/protocol/messages";
 
 import type { EnterpriseAdmissionAuthenticationEvidence } from "../enterprise/identity/admission-authorization.js";
 import type { WebSocketLike } from "../websocket-server.js";
 import { localTokenMatches } from "./local-token.js";
 import { NdjsonSocketAdapter } from "./ndjson-socket.js";
+import { runOneShotRpc } from "./one-shot-rpc-socket.js";
 import type { LocalPlaneSocketEndpoint } from "./plane-paths.js";
 import { closePlaneServer, listenOnPlaneEndpoint } from "./unix-socket-listener.js";
 
@@ -19,6 +22,8 @@ import { closePlaneServer, listenOnPlaneEndpoint } from "./unix-socket-listener.
 
 const CONTROL_PROTOCOL = LOCAL_PLANE_UPGRADE_PROTOCOLS.control;
 const SESSION_PATH = "/v1/session";
+const RPC_PATH = "/v1/rpc";
+const RPC_TIMEOUT_MS = 30_000;
 const CLOSE_INTERNAL_ERROR = 1011;
 
 export type ControlPlaneAuthentication =
@@ -44,6 +49,8 @@ export interface StartControlPlaneInput {
   token: string;
   admission: ControlPlaneAdmission;
   logger: Logger;
+  /** How long `POST /v1/rpc` waits for the correlated response. Defaults to 30s. */
+  rpcTimeoutMs?: number;
 }
 
 function headerValue(request: IncomingMessage, name: string): string | undefined {
@@ -60,7 +67,7 @@ function rejectUpgrade(socket: Socket, status: 400 | 401, statusText: string): v
   socket.end(`HTTP/1.1 ${status} ${statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }
 
-async function authenticateUpgrade(
+async function authenticateRequest(
   request: IncomingMessage,
   input: StartControlPlaneInput,
 ): Promise<ControlPlaneAuthentication> {
@@ -92,7 +99,7 @@ async function handleUpgrade(input: {
     rejectUpgrade(socket, 400, "Bad Request");
     return;
   }
-  const authentication = await authenticateUpgrade(request, plane);
+  const authentication = await authenticateRequest(request, plane);
   if (authentication.kind === "denied" || socket.destroyed) {
     rejectUpgrade(socket, 401, "Unauthorized");
     return;
@@ -111,12 +118,102 @@ async function handleUpgrade(input: {
   }
 }
 
+function sendJson(response: ServerResponse, status: number, body: unknown): void {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+/** Reads the request body, or null when it is larger than one control plane line. */
+function readBody(request: IncomingMessage): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    request.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      bytes += chunk.byteLength;
+      if (bytes > CONTROL_PLANE_MAX_LINE_BYTES) {
+        settled = true;
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    request.on("error", reject);
+  });
+}
+
+// One request, one Session, one correlated response (ADR-0038). The caller must name a requestId so
+// the answer can be matched; a message without one belongs on a streaming Session.
+async function handleRpc(input: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  plane: StartControlPlaneInput;
+}): Promise<void> {
+  const { request, response, plane } = input;
+  if (request.method !== "POST") {
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+  const authentication = await authenticateRequest(request, plane);
+  if (authentication.kind === "denied") {
+    sendJson(response, 401, { error: "unauthorized" });
+    return;
+  }
+  const body = await readBody(request);
+  if (body === null) {
+    sendJson(response, 413, { error: "request_too_large" });
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    sendJson(response, 400, { error: "invalid_json" });
+    return;
+  }
+  const message = SessionInboundMessageSchema.safeParse(parsed);
+  if (!message.success) {
+    sendJson(response, 400, { error: "invalid_message" });
+    return;
+  }
+  const requestId = (message.data as { requestId?: unknown }).requestId;
+  if (typeof requestId !== "string" || requestId.length === 0) {
+    sendJson(response, 400, { error: "request_id_required" });
+    return;
+  }
+  try {
+    const outcome = await runOneShotRpc({
+      message: { ...message.data, requestId } as typeof message.data & { requestId: string },
+      attach: (socket) => plane.admission.attach(socket, authentication.evidence),
+      timeoutMs: plane.rpcTimeoutMs ?? RPC_TIMEOUT_MS,
+    });
+    if (outcome.kind === "timeout") {
+      sendJson(response, 504, { error: "rpc_timeout" });
+      return;
+    }
+    sendJson(response, 200, outcome.message);
+  } catch (error) {
+    plane.logger.warn({ err: error }, "Control plane one-shot RPC failed");
+    sendJson(response, 500, { error: "rpc_failed" });
+  }
+}
+
 export async function startControlPlane(
   input: StartControlPlaneInput,
 ): Promise<ControlPlaneServer> {
   const upgraded = new Set<Socket>();
   const server = createServer((request, response) => {
     const { pathname } = new URL(request.url ?? "/", "http://control.local");
+    if (pathname === RPC_PATH) {
+      void handleRpc({ request, response, plane: input });
+      return;
+    }
     const upgradeRequired = pathname === SESSION_PATH;
     response.writeHead(upgradeRequired ? 426 : 404, {
       "content-type": "application/json",
