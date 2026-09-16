@@ -1,6 +1,7 @@
 import { LoroDoc } from "loro-crdt";
 
 import {
+  COLLAB_SEGMENT_COMPACTED,
   StreamOffsetSchema,
   parseCollabSegment,
 } from "@getpaseo/protocol/enterprise-collaboration";
@@ -373,6 +374,12 @@ export class CollabRepoStore {
   }
 
   private applyToDocument(segment: string, updates: readonly Uint8Array[], at: number): void {
+    // Only the segments ADR-0032 marks as documents hold a replica. A log segment's bytes are the
+    // entry — `rpc:req` and `rpc:res` carry JSON envelopes — and importing those into a LoroDoc
+    // fails on the magic bytes. The same matrix the plane compacts by answers it here, so the two
+    // sides cannot disagree about which segments are documents.
+    const parsed = parseCollabSegment(segment);
+    if (!parsed || !COLLAB_SEGMENT_COMPACTED[parsed.kind]) return;
     const document = this.document(segment);
     const status = document.importBatch(updates as Uint8Array[]);
     if (status.pending !== null) {
