@@ -23,6 +23,15 @@ container and one segment and carries Loro updates or JSON log entries.
   from the plane, so a member can neither forge another's presence nor hold an entry past its TTL.
   Heartbeats are every 30 seconds and an entry expires after 90. Presence is never an authorization
   input. Added 2026-09-16 by the integration owner.
+- Callers (added 2026-09-17 by the integration owner). A client presents a stream token or a
+  personal access token and answers to membership. A node presents the request signature it already
+  uses for `/v1/node/*`, holds no credential of its own, and answers to placement: it reaches
+  exactly the Workspaces its policy named and no others. Subscriptions and presence stay
+  client-only — both are keyed by a principal, and a node resumes from its own cursors on the
+  single-stream route — so a node calling either is refused rather than admitted without a
+  principal id. Because the node signature covers the body, a node's append is read before its
+  signature can be checked; for those calls the rule below that a refused caller never streams a
+  megabyte first holds only up to the append limit, which is what bounds the read.
 - Limits: 1 MiB per append, 64 KiB per timeline row, and 8 MiB or 2,000 queued events per
   subscriber. Overflow sends `control` with `overflow` and closes the subscription.
 - Quota: 600 appends per Principal per container per minute, answered with 429. Counted after
@@ -116,3 +125,8 @@ Node replica tests cover the producer epoch rising across a restart, unsent work
 epoch without a sequence gap, the outbound queue and the replica both surviving a restart, cursors
 resuming rather than replaying, a batch whose dependencies are missing leaving the cursor untouched,
 and a container id that cannot escape the collab root.
+
+Node caller tests cover a node writing its segments over HTTP with nothing but its signature, an
+append whose bytes are not the bytes it signed, a reused nonce, a node that does not host the
+Workspace, the segments that answer to membership, the presence route refusing a node, and a client
+with a bearer token still appending as before.

@@ -19,6 +19,13 @@ function access(input: {
   return streamAccess({ containerId: input.containerId, segment, role: input.role });
 }
 
+/** A node arrives with no role at all: its authority is placement, checked before it gets here. */
+function nodeAccess(input: { containerId: string; segment: string }) {
+  const segment = parseCollabSegment(input.segment);
+  if (!segment) throw new Error(`unparsable segment ${input.segment}`);
+  return streamAccess({ containerId: input.containerId, segment, role: null, caller: "node" });
+}
+
 describe("collaboration stream access", () => {
   test("lets editors write the client-writable segments and refuses viewers", () => {
     for (const segment of ["meta", "wf", "pc:preview-1"]) {
@@ -76,6 +83,41 @@ describe("collaboration stream access", () => {
         write: false,
       });
     }
+  });
+
+  test("opens the node-owned segments to a node and keeps the client-writable ones shut", () => {
+    // ADR-0032 makes the node the only writer of the Agent-derived segments. Placement is what
+    // gives it that authority, so it writes them holding no membership at all.
+    for (const segment of [`s:agent-1`, `fi:agent-1`, `mf:${NODE}`, `ob:${NODE}`]) {
+      expect(nodeAccess({ containerId: WORKSPACE, segment }).write).toBe(true);
+    }
+    // `meta` names both node and editor, so a node writes its derived keys there too.
+    expect(nodeAccess({ containerId: WORKSPACE, segment: "meta" }).write).toBe(true);
+    // A node is not a member, so the segments that answer to membership stay closed to it.
+    expect(nodeAccess({ containerId: WORKSPACE, segment: "pc:preview-1" }).write).toBe(false);
+    expect(nodeAccess({ containerId: WORKSPACE, segment: `rpc:req:${NODE}` }).write).toBe(false);
+  });
+
+  test("lets a node take RPC requests and answer them, and read back neither", () => {
+    // The node reads the request segment it is addressed on and writes the response segment.
+    expect(nodeAccess({ containerId: WORKSPACE, segment: `rpc:req:${NODE}` }).read).toBe(true);
+    expect(nodeAccess({ containerId: WORKSPACE, segment: `rpc:res:${RPC}` }).write).toBe(true);
+    // Only the requesting Principal reads a response back; the node that wrote it does not.
+    expect(nodeAccess({ containerId: WORKSPACE, segment: `rpc:res:${RPC}` }).read).toBe(false);
+  });
+
+  test("keeps board containers shut to a node as well", () => {
+    // Every board segment belongs to the plane or to editors, so placement opens none of them.
+    for (const segment of ["ti", "rp", `tks:${TASK}`, `tk:${TASK}`]) {
+      expect(nodeAccess({ containerId: BOARD, segment })).toEqual({ read: false, write: false });
+    }
+  });
+
+  test("treats a caller that does not identify itself as a client, never as a node", () => {
+    // The default decides what an un-migrated call site gets, so it has to be the closed one.
+    expect(access({ containerId: WORKSPACE, segment: "s:agent-1", role: "owner" }).write).toBe(
+      false,
+    );
   });
 
   test("refuses a segment that belongs to the other container kind", () => {

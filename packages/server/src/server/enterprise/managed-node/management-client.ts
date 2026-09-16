@@ -472,7 +472,9 @@ function signNodeRequest(
     readonly path: string;
     readonly timestampMs: number;
     readonly nonce: string;
-    readonly body: string;
+    // Buffer as well as string: a data-plane append carries Loro update bytes, which do not survive
+    // being decoded as UTF-8 to be signed.
+    readonly body: string | Buffer;
   },
 ): string {
   const digest = createHash("sha256").update(input.body).digest("base64url");

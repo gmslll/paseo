@@ -88,7 +88,7 @@ import {
   type WorkspaceMemberRole,
   type WorkspaceMembershipPolicy,
 } from "@getpaseo/protocol/enterprise-collaboration";
-import { streamAccess } from "./data-plane/stream-access.js";
+import { streamAccess, type StreamAccess } from "./data-plane/stream-access.js";
 import { collectSubscriptionEvents } from "./data-plane/subscription.js";
 import { signStreamToken, verifyStreamToken } from "./data-plane/stream-token.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
@@ -101,6 +101,28 @@ import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.j
  * place work on.
  */
 export const PLANE_AUDIT_NODE_ID = "nod_0000000000000000";
+
+/**
+ * Who is asking for a stream. A client arrives with a credential and answers to membership; a node
+ * arrives with its request signature and answers to placement (ADR-0032). They are different
+ * authorities over the same routes, so the segment matrix is asked which one it is rather than
+ * given a principal that a node does not have.
+ */
+export type CollabStreamActor =
+  | { readonly kind: "principal"; readonly principal: AuthenticatedManagementPrincipal }
+  | { readonly kind: "node"; readonly node: ManagedNode };
+
+/**
+ * What the stream entry points accept. A bare Principal is taken as a client, so the many call
+ * sites that had one before nodes existed keep reading as they did. Only the boundary is loose:
+ * everything past `toStreamActor` is the explicit union, so no authorization decision is ever made
+ * from an actor whose kind was left to be inferred.
+ */
+export type CollabStreamCallerLike = CollabStreamActor | AuthenticatedManagementPrincipal;
+
+function toStreamActor(actor: CollabStreamCallerLike): CollabStreamActor {
+  return "kind" in actor ? actor : { kind: "principal", principal: actor };
+}
 const PLANE_AUDIT_SERVER_ID = "management-plane";
 
 /**
@@ -1839,11 +1861,11 @@ export class EnterpriseManagementPlane {
   }
 
   async appendCollabStream(
-    actor: AuthenticatedManagementPrincipal,
+    actor: CollabStreamCallerLike,
     input: StreamAppendInput,
   ): Promise<StreamAppendResult> {
     this.assertOpen();
-    this.assertStreamAccess(actor, input.containerId, input.segment, "write");
+    this.assertStreamAccess(toStreamActor(actor), input.containerId, input.segment, "write");
     const result = this.streams.append(input);
     // Only a real append wakes readers. A duplicate or a refused write changes nothing to deliver.
     if (result.kind === "appended") {
@@ -1962,14 +1984,18 @@ export class EnterpriseManagementPlane {
    * costs nothing and buys the all-or-nothing property the ADR asks for.
    */
   async readCollabStream(
-    actor: AuthenticatedManagementPrincipal,
+    actor: CollabStreamCallerLike,
     input: StreamReadInput,
   ): Promise<StreamReadResult> {
     this.assertOpen();
-    if (this.hasStreamAccess(actor, input.containerId, input.segment, "read")) {
+    const caller = toStreamActor(actor);
+    if (this.hasStreamAccess(caller, input.containerId, input.segment, "read")) {
       return this.streams.read(input);
     }
-    if (!this.allowsContentGrantRead(actor, input.containerId)) {
+    // Content Grants belong to Principals. A node holds none, so a refused node is simply refused
+    // rather than falling through to a path that would audit it as a Grant holder.
+    if (caller.kind === "node") throw new Error("stream authorization denied");
+    if (!this.allowsContentGrantRead(caller.principal, input.containerId)) {
       // Worded exactly as a member's refusal, so a Grant holder and a stranger cannot be told apart.
       throw new Error("stream authorization denied");
     }
@@ -1977,7 +2003,7 @@ export class EnterpriseManagementPlane {
       this.appendPlaneAudit({
         action: "collab.content.read",
         outcome: "allowed",
-        actorPrincipalId: actor.principalId,
+        actorPrincipalId: caller.principal.principalId,
         resourceKind: "workspace",
         resourceId: input.containerId,
         // ADR-0037: identifiers only. The segment names what was opened, never what it held.
@@ -2006,7 +2032,9 @@ export class EnterpriseManagementPlane {
     const segments = Object.keys(input.cursors);
     if (segments.length === 0) throw new Error("subscription names no segments");
     for (const segment of segments) {
-      this.assertStreamAccess(actor, input.containerId, segment, "read");
+      // Subscriptions stay client-only: they are stored against a principalId, and a node resumes
+      // from its own cursors on the single-stream route instead.
+      this.assertStreamAccess(toStreamActor(actor), input.containerId, segment, "read");
     }
     this.sweepSubscriptions();
     const subscriptionId = createOpaqueId("sub_", 8);
@@ -2043,7 +2071,7 @@ export class EnterpriseManagementPlane {
       throw new Error("stream authorization denied");
     }
     for (const segment of Object.keys(record.cursors)) {
-      this.assertStreamAccess(actor, record.containerId, segment, "read");
+      this.assertStreamAccess(toStreamActor(actor), record.containerId, segment, "read");
     }
     const events = collectSubscriptionEvents({
       store: this.streams,
@@ -2095,18 +2123,21 @@ export class EnterpriseManagementPlane {
    * would have swallowed an expired or revoked Principal along with it.
    */
   private hasStreamAccess(
-    actor: AuthenticatedManagementPrincipal,
+    actor: CollabStreamActor,
     containerId: string,
     segment: string,
     operation: "read" | "write",
   ): boolean {
-    this.assertPrincipalCurrent(actor);
+    if (actor.kind === "node") {
+      return this.hasNodeStreamAccess(actor.node, containerId, segment)[operation];
+    }
+    this.assertPrincipalCurrent(actor.principal);
     const parsed = parseCollabSegment(segment);
     // ADR-0031: a Workspace without collaboration keeps its bodies off the plane entirely, so an
     // unenabled container refuses every member exactly as a non-member is refused.
     const role =
       parsed && this.readCollabCollaborationEnabled(containerId)
-        ? this.readCollabRole(containerId, actor.principalId)
+        ? this.readCollabRole(containerId, actor.principal.principalId)
         : null;
     const access = parsed
       ? streamAccess({ containerId, segment: parsed, role })
@@ -2114,8 +2145,49 @@ export class EnterpriseManagementPlane {
     return access[operation];
   }
 
+  /**
+   * A node's authority over a container is placement, not membership (ADR-0032). Re-checked on
+   * every call rather than only at the signature step, so a node that is disabled or whose
+   * Workspace moves away loses access to an open stream immediately.
+   */
+  private hasNodeStreamAccess(
+    node: ManagedNode,
+    containerId: string,
+    segment: string,
+  ): StreamAccess {
+    const current = this.readNode(node.nodeId);
+    if (!current || ["disabled", "revoked"].includes(current.status)) {
+      return { read: false, write: false };
+    }
+    const parsed = parseCollabSegment(segment);
+    if (!parsed || !this.isContainerPlacedOnNode(containerId, node.nodeId)) {
+      return { read: false, write: false };
+    }
+    return streamAccess({ containerId, segment: parsed, role: null, caller: "node" });
+  }
+
+  /**
+   * Whether this container is a collaborating Workspace hosted by this node. Same join the node
+   * policy uses, so a node reaches exactly the Workspaces its policy already told it about.
+   */
+  private isContainerPlacedOnNode(containerId: string, nodeId: string): boolean {
+    return (
+      this.database
+        .prepare(
+          `SELECT 1 FROM collab_workspaces w
+           JOIN placements p
+             ON p.organization_id = w.organization_id
+            AND p.local_resource_id = w.local_workspace_id
+            AND p.resource_kind = 'workspace'
+           WHERE w.organization_id = ? AND w.workspace_uid = ? AND p.node_id = ?
+             AND w.collaboration_enabled = 1`,
+        )
+        .get(this.options.organizationId, containerId, nodeId) !== undefined
+    );
+  }
+
   private assertStreamAccess(
-    actor: AuthenticatedManagementPrincipal,
+    actor: CollabStreamActor,
     containerId: string,
     segment: string,
     operation: "read" | "write",
@@ -2253,7 +2325,9 @@ export class EnterpriseManagementPlane {
 
   authenticateSignedNodeRequest(
     authentication: NodeRequestAuthentication,
-    input: { readonly method: string; readonly path: string; readonly body: string },
+    // Buffer as well as string: a data-plane append is a Loro update, and decoding it as UTF-8 to
+    // sign it would not round-trip. The digest underneath already takes either.
+    input: { readonly method: string; readonly path: string; readonly body: string | Buffer },
   ): ManagedNode {
     return this.authenticateNodeRequest(authentication, input);
   }
@@ -2270,7 +2344,7 @@ export class EnterpriseManagementPlane {
 
   private authenticateNodeRequest(
     authentication: NodeRequestAuthentication,
-    input: { readonly method: string; readonly path: string; readonly body: string },
+    input: { readonly method: string; readonly path: string; readonly body: string | Buffer },
   ): ManagedNode {
     this.assertOpen();
     const node = this.requireNode(authentication.nodeId);

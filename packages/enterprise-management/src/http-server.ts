@@ -21,6 +21,7 @@ import { z } from "zod";
 import {
   EnterpriseManagementPlane,
   type AuthenticatedManagementPrincipal,
+  type CollabStreamActor,
   type EnrollmentRequest,
   type ManagementAuditInput,
 } from "./management-plane.js";
@@ -677,7 +678,7 @@ async function handleCollabPresenceRequest(
   }
   let actor: AuthenticatedManagementPrincipal;
   try {
-    actor = await authenticateStreamCaller(plane, request, containerId);
+    actor = await authenticateStreamPrincipal(plane, request, containerId);
   } catch {
     return sendCredentialRefusal(response);
   }
@@ -736,7 +737,7 @@ async function openCollabSubscription(
   // `live` describes the follow-up read, not this call: opening a subscription is always immediate.
   let actor: AuthenticatedManagementPrincipal;
   try {
-    actor = await authenticateStreamCaller(plane, request, parsed.data.containerId);
+    actor = await authenticateStreamPrincipal(plane, request, parsed.data.containerId);
   } catch {
     return sendCredentialRefusal(response);
   }
@@ -784,7 +785,7 @@ async function readCollabSubscription(
   // a 401 rather than a 200 event stream whose first event is an error.
   let actor: AuthenticatedManagementPrincipal;
   try {
-    actor = await authenticateStreamCaller(plane, request, containerId);
+    actor = await authenticateStreamPrincipal(plane, request, containerId);
   } catch {
     return sendCredentialRefusal(response);
   }
@@ -989,7 +990,7 @@ async function readCollabStreamSegment(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
   response: ServerResponse,
-  actor: AuthenticatedManagementPrincipal,
+  actor: CollabStreamActor,
   target: { containerId: string; segment: string },
   method: string,
   url: URL,
@@ -1054,12 +1055,32 @@ async function handleCollabStreamRequest(
     });
     return true;
   }
+  // A node signs the body, so its append has to be read before the signature can be checked. This
+  // gives up, for node calls only, the property the quota comment below relies on: that a refused
+  // caller never streams a megabyte first. readStreamBody stops at the contract's append limit, so
+  // what an unauthenticated caller can spend this way is bounded by that limit rather than open.
+  const nodeSignsBody = isNodeStreamCall(request) && method !== "GET" && method !== "HEAD";
+  let update: Buffer | null = null;
+  if (nodeSignsBody) {
+    update = await readStreamBody(request);
+    if (!update) {
+      sendJson(response, 413, {
+        error: { code: "append_too_large", message: "append exceeds the stream limit" },
+      });
+      return true;
+    }
+  }
+
   // Only the credential step is caught here. A refusal from authorization must keep its own status,
   // or a non-member would be answered differently from a bad token and the route would leak which
   // Workspaces exist.
-  let actor: AuthenticatedManagementPrincipal;
+  let actor: CollabStreamActor;
   try {
-    actor = await authenticateStreamCaller(plane, request, target.containerId);
+    actor = await authenticateStreamCaller(plane, request, target.containerId, {
+      method,
+      path,
+      body: update ?? "",
+    });
   } catch {
     // Expired, revoked, wrong container, bad signature: all mean "this credential is not usable,
     // get another one", which is 401 rather than a malformed request.
@@ -1075,7 +1096,7 @@ async function handleCollabStreamRequest(
 
   // Counted after authentication, so an unauthenticated flood cannot spend a member's allowance,
   // and before the body is read, so a refused caller does not get to stream a megabyte first.
-  if (!streamQuota.allows(`${actor.principalId}\n${target.containerId}`)) {
+  if (!streamQuota.allows(`${streamQuotaSubject(actor)}\n${target.containerId}`)) {
     sendJson(response, 429, {
       error: { code: "too_many_requests", message: "append quota exceeded" },
     });
@@ -1088,7 +1109,8 @@ async function handleCollabStreamRequest(
     });
     return true;
   }
-  const update = await readStreamBody(request);
+  // Already read above when the caller is a node, because its signature covers these bytes.
+  update ??= await readStreamBody(request);
   if (!update) {
     sendJson(response, 413, {
       error: { code: "append_too_large", message: "append exceeds the stream limit" },
@@ -1304,7 +1326,63 @@ const auditInputSchema = z
  * The stream routes take either a personal access token or a stream token. The stream token only
  * identifies its holder; membership and the segment matrix still decide what that holder may do.
  */
+/** A node presents the signature headers it uses everywhere else rather than a credential. */
+function isNodeStreamCall(request: IncomingMessage): boolean {
+  return request.headers["x-paseo-node-id"] !== undefined;
+}
+
+/**
+ * Who the append quota is spent by. A node has no principal, and charging its appends to the
+ * Workspace owner would let one node's traffic exhaust a person's allowance.
+ */
+function streamQuotaSubject(actor: CollabStreamActor): string {
+  return actor.kind === "node" ? `node:${actor.node.nodeId}` : actor.principal.principalId;
+}
+
+/**
+ * Who is calling a stream route (ADR-0032). A node authenticates with its request signature, the
+ * same one it uses for `/v1/node/*`, so it needs no credential of its own and answers to placement
+ * rather than membership. Everyone else presents a stream token or a personal access token.
+ *
+ * The node signature covers the body, so an append hands in the bytes it is about to write.
+ */
 async function authenticateStreamCaller(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  containerId: string,
+  signed: { readonly method: string; readonly path: string; readonly body: string | Buffer },
+): Promise<CollabStreamActor> {
+  if (isNodeStreamCall(request)) {
+    const authentication = NodeRequestAuthenticationSchema.parse({
+      nodeId: request.headers["x-paseo-node-id"],
+      timestampMs: Number(request.headers["x-paseo-node-timestamp"]),
+      nonce: request.headers["x-paseo-node-nonce"],
+      signature: request.headers["x-paseo-node-signature"],
+    });
+    return { kind: "node", node: plane.authenticateSignedNodeRequest(authentication, signed) };
+  }
+  return {
+    kind: "principal",
+    principal: await authenticateBearerCaller(plane, request, containerId),
+  };
+}
+
+/**
+ * The routes that answer only to people: a subscription is stored against a principalId, and
+ * presence says who is here. A node is refused outright rather than allowed through as a caller
+ * with no principal id — an absent id compares equal to another absent one, which would turn an
+ * ownership check into a pass.
+ */
+async function authenticateStreamPrincipal(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  containerId: string,
+): Promise<AuthenticatedManagementPrincipal> {
+  if (isNodeStreamCall(request)) throw new Error("invalid credential");
+  return authenticateBearerCaller(plane, request, containerId);
+}
+
+async function authenticateBearerCaller(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
   containerId: string,
