@@ -15,12 +15,13 @@ import { ensurePrivateDirectory } from "../../../private-files.js";
 
 export interface CollabPaths {
   readonly root: string;
+  /** The Workspaces this node hosts, kept across restarts so an unreachable plane is survivable. */
+  readonly catalog: string;
 }
 
 export function collabPaths(paseoHome: string): CollabPaths {
-  return Object.freeze({
-    root: path.join(paseoHome, ENTERPRISE_DIRECTORY, COLLAB_DIRECTORY),
-  });
+  const root = path.join(paseoHome, ENTERPRISE_DIRECTORY, COLLAB_DIRECTORY);
+  return Object.freeze({ root, catalog: path.join(root, "catalog.json") });
 }
 
 /**

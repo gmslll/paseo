@@ -22,6 +22,7 @@ import {
   type ManagedPlacement,
   type ManagedPlacementRegistration,
 } from "@getpaseo/protocol/enterprise-management";
+import type { WorkspaceMembershipPolicy } from "@getpaseo/protocol/enterprise-collaboration";
 import {
   type ManagedRuntimePolicy,
   ManagedRuntimeNodePolicyResponseSchema,
@@ -72,6 +73,7 @@ export class ManagedNodeControlPlaneClient {
   private readonly requestTimeoutMs: number;
   private readonly clock: { readonly nowMs: () => number };
   private policy = new Map<string, ManagedNodePolicyEntry>();
+  private workspaceMemberships: readonly WorkspaceMembershipPolicy[] | null = null;
   private policyUpdatedAtMs = -Infinity;
 
   constructor(options: ManagedNodeClientOptions) {
@@ -117,8 +119,19 @@ export class ManagedNodeControlPlaneClient {
       next.set(entry.principalId, Object.freeze({ ...entry }));
     }
     this.policy = next;
+    // Sent only to nodes that declare collaborationV1, and absent rather than empty for the rest
+    // (ADR-0033), so null and [] mean different things: not a collaborating node, versus one that
+    // hosts no collaborating Workspaces.
+    this.workspaceMemberships = result.workspaceMemberships
+      ? Object.freeze(result.workspaceMemberships.map((entry) => Object.freeze({ ...entry })))
+      : null;
     this.policyUpdatedAtMs = this.clock.nowMs();
     return Object.freeze([...next.values()]);
+  }
+
+  /** The Workspaces the plane says this node hosts, as of the last policy refresh. */
+  currentWorkspaceMemberships(): readonly WorkspaceMembershipPolicy[] | null {
+    return this.workspaceMemberships;
   }
 
   currentPolicy(principalId: string): ManagedNodePolicyEntry | null {
