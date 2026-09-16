@@ -682,11 +682,14 @@ const LONG_POLL_TIMEOUT_MS = 25_000;
  * Resolves on the first of three things: the container takes an append, the client hangs up, or the
  * hold expires. Waking more than once is harmless — resolving a settled promise does nothing — so
  * there is no flag to keep, and teardown lives in one place that runs however the wait ends.
+ *
+ * Pass a segment to wait on just that one; a multiplexed reader omits it and takes the container.
  */
 async function waitForContainerAppend(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
   containerId: string,
+  segment?: string,
 ): Promise<void> {
   let release: (() => void) | null = null;
   const woken = new Promise<void>((resolve) => {
@@ -694,8 +697,11 @@ async function waitForContainerAppend(
   });
   const wake = (): void => release?.();
 
-  const unsubscribe = plane.onCollabStreamAppend((changed) => {
-    if (changed === containerId) wake();
+  const unsubscribe = plane.onCollabStreamAppend((changed, changedSegment) => {
+    if (changed !== containerId) return;
+    // Waking a single-stream reader for a sibling segment would answer its poll with nothing new.
+    if (segment !== undefined && changedSegment !== segment) return;
+    wake();
   });
   const timer = setTimeout(wake, LONG_POLL_TIMEOUT_MS);
   // A stray timer must never be the reason a process or a test run refuses to exit.
@@ -824,6 +830,62 @@ async function streamCollabSubscription(
   return true;
 }
 
+/**
+ * The read half of the single-stream route, split from the append half: one function doing path
+ * parsing, authentication, live reads, and producer-header appends is over the complexity limit,
+ * and the multiplexed route already separates opening from reading the same way.
+ */
+async function readCollabStreamSegment(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  actor: AuthenticatedManagementPrincipal,
+  target: { containerId: string; segment: string },
+  method: string,
+  url: URL,
+): Promise<boolean> {
+  const offset = url.searchParams.get("offset");
+  // A HEAD asks for the headers as they stand; holding one open would answer a different question.
+  const live = method === "GET" ? url.searchParams.get("live") : null;
+  if (live === "sse") {
+    // ADR-0032 names live=sse for single-stream reads but never says how a single stream frames its
+    // events — the multiplexed route is the one with a stated event contract. Say plainly that it
+    // is missing rather than invent a framing, and rather than ignore the parameter and let a
+    // one-shot body pass for a live one.
+    sendJson(response, 501, {
+      error: { code: "not_implemented", message: "single-stream sse is not available yet" },
+    });
+    return true;
+  }
+  if (live !== null && live !== "long-poll") {
+    sendJson(response, 400, { error: { code: "invalid_request", message: "unknown live mode" } });
+    return true;
+  }
+
+  const read = () =>
+    plane.readCollabStream(actor, {
+      containerId: target.containerId,
+      segment: target.segment,
+      ...(offset ? { fromOffset: offset } : {}),
+    });
+  let result = await read();
+  if (live === "long-poll" && result.messages.length === 0) {
+    await waitForContainerAppend(plane, request, target.containerId, target.segment);
+    // The client may have hung up during the hold; writing to a gone response would only throw.
+    if (request.destroyed || response.writableEnded) return true;
+    result = await read();
+  }
+
+  const outcome = readOutcome(result);
+  if (method === "HEAD") {
+    response.writeHead(outcome.status, outcome.headers);
+    response.end();
+    return true;
+  }
+  sendStreamOutcome(response, outcome);
+  return true;
+}
+
 async function handleCollabStreamRequest(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
@@ -857,21 +919,7 @@ async function handleCollabStreamRequest(
   }
 
   if (method === "GET" || method === "HEAD") {
-    const offset = url.searchParams.get("offset");
-    const outcome = readOutcome(
-      await plane.readCollabStream(actor, {
-        containerId: target.containerId,
-        segment: target.segment,
-        ...(offset ? { fromOffset: offset } : {}),
-      }),
-    );
-    if (method === "HEAD") {
-      response.writeHead(outcome.status, outcome.headers);
-      response.end();
-      return true;
-    }
-    sendStreamOutcome(response, outcome);
-    return true;
+    return readCollabStreamSegment(plane, request, response, actor, target, method, url);
   }
 
   const producer = parseProducerHeaders(request.headers);

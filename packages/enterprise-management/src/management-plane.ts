@@ -179,7 +179,7 @@ export class EnterpriseManagementPlane {
   private readonly runtimes: RuntimeDistributionStore;
   private readonly streams: StreamStore;
   private readonly subscriptions = new Map<string, CollabSubscriptionRecord>();
-  private readonly streamListeners = new Set<(containerId: string) => void>();
+  private readonly streamListeners = new Set<(containerId: string, segment: string) => void>();
   private closed = false;
 
   constructor(
@@ -1488,7 +1488,7 @@ export class EnterpriseManagementPlane {
         // One reader's failure must not fail the write that woke it, nor rob the other readers of
         // their notification.
         try {
-          listener(input.containerId);
+          listener(input.containerId, input.segment);
         } catch {
           // The listener owns its own recovery; a live reader closes its stream.
         }
@@ -1498,11 +1498,11 @@ export class EnterpriseManagementPlane {
   }
 
   /**
-   * Notifies a listener whenever a container takes an append, so a live reader can poll instead of
-   * running its own timer. Returns the unsubscribe; a listener that throws would otherwise take
-   * down the append that woke it, so each call is isolated by the caller.
+   * Notifies a listener whenever a container takes an append, naming the segment so a reader
+   * waiting on one of them is not woken by its siblings. Returns the unsubscribe. A listener that
+   * throws would otherwise take down the append that woke it, so the plane isolates each call.
    */
-  onCollabStreamAppend(listener: (containerId: string) => void): () => void {
+  onCollabStreamAppend(listener: (containerId: string, segment: string) => void): () => void {
     this.streamListeners.add(listener);
     return () => {
       this.streamListeners.delete(listener);
