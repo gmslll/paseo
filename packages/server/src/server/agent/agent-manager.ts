@@ -386,6 +386,11 @@ interface HandleStreamEventOptions {
   fromHistory?: boolean;
 }
 
+/** A run that produces nothing, for a send that was queued rather than started (ADR-0034). */
+async function* emptyAgentRunStream(): AsyncGenerator<AgentStreamEvent> {
+  // Intentionally yields nothing.
+}
+
 /**
  * One collaborator's send waiting behind another's turn (ADR-0034). The prompt itself is not kept
  * here: the queue is visible to every member of the Workspace, and what someone is about to say is
@@ -2670,6 +2675,52 @@ export class AgentManager {
     }
   }
 
+  /**
+   * Whether this send waits behind the running turn instead of replacing it (ADR-0034).
+   *
+   * The turn belongs to the author of the user message that opened it. A different Principal
+   * queues; the Workspace owner does not, and neither does the controller sending again. A send
+   * with no author is a single-user daemon or a prompt the daemon injected, and those keep today's
+   * behaviour exactly — this returns false and the caller replaces as it always has.
+   */
+  private queueBehindRunningTurn(
+    agent: ActiveManagedAgent,
+    options: AgentRunOptions | undefined,
+  ): boolean {
+    const sender = options?.author;
+    if (!sender) return false;
+    const controller = this.activeTurnAuthor(agent);
+    // Unknown controller means the running turn predates authorship or came from the daemon. Left
+    // to replace rather than queued: refusing on a turn nobody is recorded as owning would block
+    // sends that have always been allowed.
+    if (!controller || controller.principalId === sender.principalId) return false;
+    if (agent.enterpriseOwnership?.ownerPrincipalId === sender.principalId) return false;
+
+    agent.queuedTurns = [
+      ...agent.queuedTurns,
+      {
+        messageId: options?.clientMessageId ?? randomUUID(),
+        author: sender,
+        queuedAt: new Date(),
+      },
+    ];
+    this.touchUpdatedAt(agent);
+    this.emitState(agent);
+    return true;
+  }
+
+  /** Who opened the running turn, from the user message committed under its turn id. */
+  private activeTurnAuthor(
+    agent: ActiveManagedAgent,
+  ): { principalId: string; displayName?: string } | null {
+    const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    if (!turnId || !this.timelineStore.has(agent.id)) return null;
+    const row = this.timelineStore
+      .getRows(agent.id)
+      .find((candidate) => candidate.turnId === turnId && candidate.item.type === "user_message");
+    return row?.item.type === "user_message" ? (row.item.author ?? null) : null;
+  }
+
   private openActiveTurn(agent: ActiveManagedAgent, turnId: string, startedAt: Date): void {
     agent.activeTurnId = turnId;
     agent.activeTurnStartedAt = startedAt;
@@ -2703,6 +2754,11 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
+    if (this.queueBehindRunningTurn(agent, options)) {
+      // Nothing to stream: the send is waiting, not running. An empty run would read to the caller
+      // as a turn that started and produced nothing.
+      return emptyAgentRunStream();
+    }
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);

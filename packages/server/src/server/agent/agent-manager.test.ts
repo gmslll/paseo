@@ -11080,3 +11080,135 @@ test("leaves a user message unauthored when no Principal sent it", async () => {
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+const ALICE = { principalId: "usr_00000000000000a1", displayName: "Alice" };
+const BOB = { principalId: "usr_00000000000000b2", displayName: "Bob" };
+
+/** An agent whose turn is open, opened by `author`, so a second send meets a running turn. */
+async function agentWithRunningTurnBy(
+  author: { principalId: string; displayName?: string } | undefined,
+  ownership?: { ownerPrincipalId: string },
+): Promise<{
+  manager: AgentManager;
+  session: SteeringTestSession;
+  agentId: string;
+  workdir: string;
+}> {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queue-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent(
+    { provider: "codex", cwd: workdir },
+    undefined,
+    ownership
+      ? {
+          workspaceId: "workspace-queue",
+          enterpriseOwnership: {
+            workspaceId: "workspace-queue",
+            organizationId: "org_0123456789abcdef",
+            nodeId: "nod_0123456789abcdef",
+            ownerPrincipalId: ownership.ownerPrincipalId,
+            createdByPrincipalId: ownership.ownerPrincipalId,
+          },
+        }
+      : { workspaceId: undefined },
+  );
+  const run = manager.streamAgent(agent.id, "first", {
+    clientMessageId: "first-client",
+    ...(author ? { author } : {}),
+  });
+  void (async () => {
+    for await (const _event of run) {
+    }
+  })();
+  await manager.waitForAgentRunStart(agent.id);
+  return { manager, session, agentId: agent.id, workdir };
+}
+
+test("a send from another Principal waits behind the running turn", async () => {
+  const { manager, session, agentId, workdir } = await agentWithRunningTurnBy(ALICE);
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: BOB,
+    });
+
+    // ADR-0034: the author of the turn's user message controls it, so Bob queues rather than
+    // cancelling Alice's work.
+    const queued = manager.getAgent(agentId)!.queuedTurns;
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ messageId: "second-client", author: BOB });
+    expect(session.interruptCount).toBe(0);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("the Principal controlling the turn replaces it instead of queueing behind themselves", async () => {
+  const { manager, agentId, workdir } = await agentWithRunningTurnBy(ALICE);
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: ALICE,
+    });
+
+    expect(manager.getAgent(agentId)!.queuedTurns).toHaveLength(0);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("the Workspace owner interrupts another Principal's turn rather than queueing", async () => {
+  const { manager, agentId, workdir } = await agentWithRunningTurnBy(ALICE, {
+    ownerPrincipalId: BOB.principalId,
+  });
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: BOB,
+    });
+
+    // Only the owner may interrupt someone else's turn; everyone else queues.
+    expect(manager.getAgent(agentId)!.queuedTurns).toHaveLength(0);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an unauthored send keeps replacing exactly as it did before collaboration", async () => {
+  const { manager, agentId, workdir } = await agentWithRunningTurnBy(undefined);
+  try {
+    await manager.replaceAgentRun(agentId, "second", { clientMessageId: "second-client" });
+
+    // A single-user daemon has no Principal, and the prompts the daemon injects itself have no
+    // author. Queueing either would be a behaviour change outside collaboration.
+    expect(manager.getAgent(agentId)!.queuedTurns).toHaveLength(0);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a queued send reports itself as queued rather than as a started turn", async () => {
+  const { manager, agentId, workdir } = await agentWithRunningTurnBy(ALICE);
+  try {
+    const result = await startAgentRun(manager, agentId, "second", logger, {
+      replaceRunning: true,
+      runOptions: { clientMessageId: "second-client", author: BOB },
+    });
+
+    // Reporting turn_started would leave the caller waiting for a run that will not happen.
+    expect(result.disposition).toBe("queued");
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

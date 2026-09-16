@@ -35,7 +35,7 @@ export interface StartAgentRunOptions {
   clearPendingPermissions?: boolean;
 }
 
-export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
+export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started" | "queued";
 
 async function steerOrReplaceActiveRun(
   agentManager: AgentRunController,
@@ -74,12 +74,19 @@ async function startOrReplaceRun(
 ): Promise<{
   iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
   replaced: boolean;
+  queued: boolean;
 }> {
   const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+  // A send from someone who does not control the running turn waits instead of replacing it
+  // (ADR-0034). The manager decides that, and it shows up as a longer queue on the Agent — the run
+  // it hands back is empty, which on its own would be indistinguishable from a turn that started
+  // and said nothing.
+  const queuedBefore = agentManager.getAgent(agentId)?.queuedTurns.length ?? 0;
   const iterator = replaced
     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
     : agentManager.streamAgent(agentId, prompt, options?.runOptions);
-  return { iterator, replaced };
+  const queued = (agentManager.getAgent(agentId)?.queuedTurns.length ?? 0) > queuedBefore;
+  return { iterator, replaced, queued };
 }
 
 async function drainAgentRunIterator(
@@ -140,9 +147,14 @@ async function startAgentRunInner(
   if (steered?.disposition === "steered") {
     return steered;
   }
-  const { iterator, replaced } = steered
-    ? { iterator: steered.iterator, replaced: true }
+  const { iterator, replaced, queued } = steered
+    ? { iterator: steered.iterator, replaced: true, queued: false }
     : await startOrReplaceRun(agentManager, agentId, prompt, options);
+  if (queued) {
+    // Nothing to drain and nothing started. Saying "turn_started" here would have the caller wait
+    // for a run that is not going to happen.
+    return { disposition: "queued" };
+  }
   logger.trace(
     {
       agentId,
