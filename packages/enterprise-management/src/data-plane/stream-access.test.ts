@@ -67,6 +67,17 @@ describe("collaboration stream access", () => {
     expect(stranger.write).toBe(false);
   });
 
+  test("closes board containers until board membership exists", () => {
+    // tk: is a board segment on a board container, so the kinds match and only the missing board
+    // membership model keeps it shut. A Workspace role must never be read as a board role.
+    for (const role of ["owner", "editor", "viewer"] as const) {
+      expect(access({ containerId: BOARD, segment: `tk:${TASK}`, role })).toEqual({
+        read: false,
+        write: false,
+      });
+    }
+  });
+
   test("refuses a segment that belongs to the other container kind", () => {
     // A board segment on a Workspace container, and a Workspace segment on a board.
     expect(access({ containerId: WORKSPACE, segment: `tk:${TASK}`, role: "owner" })).toEqual({

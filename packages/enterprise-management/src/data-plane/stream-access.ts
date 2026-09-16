@@ -32,6 +32,11 @@ export function streamAccess(input: {
   // A board segment on a Workspace container is not a permission question, it is a malformed
   // target; answering it like any other refusal keeps the two indistinguishable.
   if (!containerKind || containerKind !== collabSegmentContainerKind(input.segment)) return CLOSED;
+  // Board containers answer to board membership (ADR-0046), which does not exist yet. The caller's
+  // role here is Workspace membership and says nothing about a board, so boards stay closed
+  // explicitly. Without this they would merely happen to be closed because no board row exists,
+  // and would open silently the moment boards are stored.
+  if (containerKind === "board") return CLOSED;
   if (!input.role) return CLOSED;
 
   const writers = COLLAB_SEGMENT_WRITERS[input.segment.kind];
