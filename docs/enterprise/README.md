@@ -60,4 +60,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0047: Task grants field](decisions/0047-task-grants-field.md)
 - [ADR 0048: Review policy](decisions/0048-review-policy.md)
 - [ADR 0049: Pull request poller state and task links](decisions/0049-pr-poller-state-and-task-links.md)
-- [ADR 0050: Local plane break-glass admission](decisions/0050-local-plane-break-glass-admission.md) — DECISION_REQUIRED
+- [ADR 0050: Local plane break-glass admission](decisions/0050-local-plane-break-glass-admission.md)

@@ -27,11 +27,11 @@ paths stay unchanged for every existing client.
   the local socket is issued one, so relay and Hub Sessions are not. Closing or invalidating the
   Session closes its channels. The terminal plane carries terminal requests only; every other RPC
   stays on the Session's own channel, where its response is authorized.
-- In enterprise mode the local token alone is admitted only as break-glass Owner when explicitly
-  enabled, and always writes a high-priority audit event. This clause is **not implemented** and
-  awaits [ADR-0050](0050-local-plane-break-glass-admission.md): the local token alone is currently
-  never sufficient. Break-glass over the planes works today by presenting the daemon password, which
-  the existing authenticator already admits over a local connection and audits at high priority.
+- In enterprise mode the local token alone admits no one; a PAT, Session Ticket, or the daemon
+  password is always required. Break-glass is the password path, which the existing
+  authenticator admits over a local connection and audits at high priority with required
+  durability. An earlier form of this clause allowed token-only break-glass when explicitly
+  enabled; it was withdrawn by [ADR-0050](0050-local-plane-break-glass-admission.md).
 - The data frame is `[u8 opcode 0x20–0x2F][u16 BE docId length][docId UTF-8][payload]`. Over an
   existing WebSocket the same bytes travel as a binary frame when the daemon advertises `dataPlane`
   and the client declares the matching capability.
