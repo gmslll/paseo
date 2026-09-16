@@ -37,10 +37,26 @@ memory so that a crash does not reopen the replay window, and the expiry stored 
 rather than a local default, so a replay can never outlive the window the plane signed. Added
 2026-09-17 by the integration owner.
 
-Only methods listed in the `machine_rpc` surface of the resource entry inventory are accepted:
-Agent create, send, steer, cancel, fork, permission response, file read and write, checkout status,
-and `machine.get_status`. `machine.restart` and `machine.upgrade` require the Workspace owner or a
-platform administrator and a receipt within 5 seconds.
+The accepted methods, and the role each one answers to, are `MACHINE_RPC_METHODS` in the protocol
+(added 2026-09-17 by the integration owner; this decision named the list in prose and never wrote
+it down). Both sides read the same table: the plane before it attests, the node before it
+dispatches.
+
+A workspace-scoped method names the Session inbound request it becomes, and its role is whatever
+that entry's enterprise actions already imply — `create_agent_request` and
+`send_agent_message_request` carry `workspace.write`, so an editor may drive an Agent, while
+`file_explorer_request` and `checkout_status_request` carry `workspace.read`, so a viewer may look.
+Deriving it this way means collaboration cannot widen what a role may do: the answer is the one a
+direct connection already gives.
+
+Two corrections fell out of writing it down. Steering is not a method — it is the
+`activeTurnBehavior` of a send, so a table listing `agent.steer` would name something that does not
+exist. And the machine-scoped methods cannot be derived at all: `restart_server_request` carries the
+daemon's `daemon.manage` permission, which maps to no enterprise action, so the derivation returns
+an empty action list — and an empty list is satisfied by every role, viewer included. Deriving them
+would fail open on the one case this decision most wanted closed, so `machine.restart` and
+`machine.upgrade` are answered explicitly as owner-only, and `machine.get_status` as member.
+`machine.restart` and `machine.upgrade` still require a receipt within 5 seconds.
 
 Clients obtain a plane session with `POST /v1/auth/password/plane-session` and a 5-minute stream
 token with `POST /v1/streams/token`. Direct node connection stays available and is no longer

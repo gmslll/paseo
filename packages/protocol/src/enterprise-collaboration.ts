@@ -61,6 +61,42 @@ export const ENTERPRISE_DIRECTORY = "enterprise";
 export const COLLAB_DIRECTORY = "collab";
 export const COLLAB_REPO_FILE = "repo.sqlite3";
 
+/**
+ * What a machine RPC method is allowed to be (ADR-0035). Both the plane and the node consult this:
+ * the plane before it attests a request, the node before it dispatches one.
+ *
+ * A workspace-scoped method names the Session inbound request it becomes, and its role follows from
+ * that entry's existing enterprise actions — the same answer a direct connection would give, so
+ * collaboration cannot widen what a role may do.
+ *
+ * A machine-scoped method has no Session entry. Those carry the daemon's `daemon.manage`
+ * permission, which maps to no enterprise action at all, so deriving a role for them yields an
+ * empty action list — and an empty list is satisfied by every role, viewer included. They are
+ * listed separately and answered explicitly for exactly that reason.
+ */
+export type MachineRpcMethodPolicy =
+  | { readonly scope: "workspace"; readonly entry: string }
+  | { readonly scope: "machine"; readonly requires: "member" | "owner" };
+
+export const MACHINE_RPC_METHODS: Readonly<Record<string, MachineRpcMethodPolicy>> = {
+  "agent.create": { scope: "workspace", entry: "create_agent_request" },
+  // Steering is not its own method: it is the activeTurnBehavior of a send.
+  "agent.send": { scope: "workspace", entry: "send_agent_message_request" },
+  "agent.cancel": { scope: "workspace", entry: "cancel_agent_request" },
+  "agent.fork_context": { scope: "workspace", entry: "agent.fork_context.request" },
+  "agent.permission_response": { scope: "workspace", entry: "agent_permission_response" },
+  "file.read": { scope: "workspace", entry: "file_explorer_request" },
+  "file.write": { scope: "workspace", entry: "fs.file.write.request" },
+  "checkout.status": { scope: "workspace", entry: "checkout_status_request" },
+  "machine.get_status": { scope: "machine", requires: "member" },
+  "machine.restart": { scope: "machine", requires: "owner" },
+  "machine.upgrade": { scope: "machine", requires: "owner" },
+};
+
+export function machineRpcMethodPolicy(method: string): MachineRpcMethodPolicy | null {
+  return Object.hasOwn(MACHINE_RPC_METHODS, method) ? MACHINE_RPC_METHODS[method]! : null;
+}
+
 export const WORKSPACE_MEMBER_ROLES = ["owner", "editor", "viewer"] as const;
 export const WorkspaceMemberRoleSchema = z.enum(WORKSPACE_MEMBER_ROLES);
 export type WorkspaceMemberRole = z.infer<typeof WorkspaceMemberRoleSchema>;
