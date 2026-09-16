@@ -13,7 +13,9 @@ const MACHINE_RPC_ID_PATTERN =
 const STREAM_OFFSET_PATTERN = /^\d{20}$/;
 const SEGMENT_RESOURCE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const MACHINE_RPC_METHOD_PATTERN = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)+$/;
+const COLLAB_SUBSCRIPTION_ID_PATTERN = /^sub_[0-9a-f]{16}$/;
 
+export const CollabSubscriptionIdSchema = z.string().regex(COLLAB_SUBSCRIPTION_ID_PATTERN);
 export const CollabWorkspaceUidSchema = z.string().regex(COLLAB_WORKSPACE_UID_PATTERN);
 export const TaskBoardIdSchema = z.string().regex(TASK_BOARD_ID_PATTERN);
 export const TaskIdSchema = z.string().regex(TASK_ID_PATTERN);
@@ -43,6 +45,11 @@ export const COLLAB_STREAM_LIMITS = {
 export const PRESENCE_HEARTBEAT_INTERVAL_MS = 30_000;
 export const PRESENCE_TTL_MS = 90_000;
 export const STREAM_TOKEN_TTL_MS = 5 * 60_000;
+/**
+ * A subscription is dropped after this long without a read. It holds only cursors, so a client that
+ * loses one re-subscribes with the offsets it already has and misses nothing.
+ */
+export const COLLAB_SUBSCRIPTION_TTL_MS = 5 * 60_000;
 export const MACHINE_RPC_DEFAULT_TTL_MS = 60_000;
 export const MACHINE_RPC_LIFECYCLE_RECEIPT_MS = 5_000;
 
@@ -348,6 +355,14 @@ export const CollabSubscriptionRequestSchema = z
   })
   .strict();
 
+// Not strict: this is a response, and an older client must keep parsing it after the plane starts
+// sending a new field.
+export const CollabSubscriptionCreatedSchema = z.object({
+  subscriptionId: CollabSubscriptionIdSchema,
+  containerId: CollabContainerIdSchema,
+  expiresAt: TimestampSchema,
+});
+
 export const CollabSubscriptionEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("data"),
@@ -387,3 +402,4 @@ export type MachineRpcAttestedRequest = z.infer<typeof MachineRpcAttestedRequest
 export type MachineRpcResult = z.infer<typeof MachineRpcResultSchema>;
 export type PresenceEntry = z.infer<typeof PresenceEntrySchema>;
 export type CollabSubscriptionEvent = z.infer<typeof CollabSubscriptionEventSchema>;
+export type CollabSubscriptionCreated = z.infer<typeof CollabSubscriptionCreatedSchema>;

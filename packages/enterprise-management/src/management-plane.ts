@@ -70,8 +70,10 @@ import {
   type CollabWorkspaceRecord,
 } from "./data-plane/membership.js";
 import {
+  COLLAB_SUBSCRIPTION_TTL_MS,
   parseCollabSegment,
   STREAM_TOKEN_TTL_MS,
+  type CollabSubscriptionCreated,
   type CollabSubscriptionEvent,
   type WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
@@ -159,11 +161,24 @@ export interface ManagementCredentialSummary {
   readonly revokedAt: string | null;
 }
 
+/**
+ * A live subscription, held in memory rather than in a table: it is connection state, and a client
+ * that loses it re-subscribes with the cursors it already holds. The plan's table list names no
+ * subscriptions table for the same reason.
+ */
+interface CollabSubscriptionRecord {
+  readonly containerId: string;
+  readonly principalId: string;
+  readonly cursors: Record<string, string>;
+  expiresAtMs: number;
+}
+
 export class EnterpriseManagementPlane {
   private readonly database: SqliteDatabase;
   private readonly clock: Clock;
   private readonly runtimes: RuntimeDistributionStore;
   private readonly streams: StreamStore;
+  private readonly subscriptions = new Map<string, CollabSubscriptionRecord>();
   private closed = false;
 
   constructor(
@@ -1478,30 +1493,98 @@ export class EnterpriseManagementPlane {
   }
 
   /**
-   * Reads one poll of a multiplexed subscription (ADR-0032).
+   * Opens a multiplexed subscription (ADR-0032), which the caller then reads by id.
    *
-   * Every segment is authorized before any is read, and one refusal fails the whole subscription.
-   * Returning just the segments the caller may read would tell them which of the rest they were
-   * refused, and would leave them believing they are subscribed to a segment that never delivers.
+   * Every segment is authorized before the subscription exists, and one refusal fails the whole
+   * thing. Accepting just the segments the caller may read would tell them which of the rest they
+   * were refused, and would leave them believing they are subscribed to a segment that never
+   * delivers.
    *
-   * A subscription naming no segments is refused rather than answered with an empty list: no
-   * segments would mean no authorization check ran at all.
+   * A subscription naming no segments is refused rather than accepted empty: no segments would mean
+   * no authorization check ran at all.
    */
-  async readCollabSubscription(
+  async createCollabSubscription(
     actor: AuthenticatedManagementPrincipal,
     input: { containerId: string; cursors: Readonly<Record<string, string>> },
-  ): Promise<CollabSubscriptionEvent[]> {
+  ): Promise<CollabSubscriptionCreated> {
     this.assertOpen();
     const segments = Object.keys(input.cursors);
     if (segments.length === 0) throw new Error("subscription names no segments");
     for (const segment of segments) {
       this.assertStreamAccess(actor, input.containerId, segment, "read");
     }
-    return collectSubscriptionEvents({
-      store: this.streams,
+    this.sweepSubscriptions();
+    const subscriptionId = createOpaqueId("sub_", 8);
+    const expiresAtMs = this.clock.nowMs() + COLLAB_SUBSCRIPTION_TTL_MS;
+    this.subscriptions.set(subscriptionId, {
       containerId: input.containerId,
-      cursors: input.cursors,
+      principalId: actor.principalId,
+      cursors: { ...input.cursors },
+      expiresAtMs,
     });
+    return {
+      subscriptionId,
+      containerId: input.containerId,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    };
+  }
+
+  /**
+   * Reads one poll of an open subscription and advances its cursors.
+   *
+   * Authorization runs again on every read rather than only at creation: membership can be revoked
+   * while a subscription is open, and the stored cursors must not outlive the grant that justified
+   * them. An unknown, expired, or someone else's id all raise the same refusal, so an id cannot be
+   * used to learn that a subscription exists.
+   */
+  async readCollabSubscriptionById(
+    actor: AuthenticatedManagementPrincipal,
+    subscriptionId: string,
+  ): Promise<CollabSubscriptionEvent[]> {
+    this.assertOpen();
+    this.sweepSubscriptions();
+    const record = this.subscriptions.get(subscriptionId);
+    if (!record || record.principalId !== actor.principalId) {
+      throw new Error("stream authorization denied");
+    }
+    for (const segment of Object.keys(record.cursors)) {
+      this.assertStreamAccess(actor, record.containerId, segment, "read");
+    }
+    const events = collectSubscriptionEvents({
+      store: this.streams,
+      containerId: record.containerId,
+      cursors: record.cursors,
+    });
+    let overflowed = false;
+    for (const event of events) {
+      if (event.type !== "control") continue;
+      record.cursors[event.segment] = event.nextOffset;
+      if (event.overflow === true) overflowed = true;
+    }
+    // ADR-0032: overflow closes the subscription. The cursors were advanced first, so the control
+    // event the caller just received tells them where to resume when they open a new one.
+    if (overflowed) this.subscriptions.delete(subscriptionId);
+    else record.expiresAtMs = this.clock.nowMs() + COLLAB_SUBSCRIPTION_TTL_MS;
+    return events;
+  }
+
+  /**
+   * The container an open subscription belongs to, for picking the audience a stream token must
+   * have been minted for. This is not an authorization step and answers before any credential is
+   * checked: the caller still has to get past readCollabSubscriptionById.
+   */
+  readCollabSubscriptionContainer(subscriptionId: string): string | null {
+    this.assertOpen();
+    this.sweepSubscriptions();
+    return this.subscriptions.get(subscriptionId)?.containerId ?? null;
+  }
+
+  /** Expiry is lazy: a timer would outlive the tests that create a plane and never close it. */
+  private sweepSubscriptions(): void {
+    const now = this.clock.nowMs();
+    for (const [id, record] of this.subscriptions) {
+      if (record.expiresAtMs <= now) this.subscriptions.delete(id);
+    }
   }
 
   /**
@@ -1637,6 +1720,7 @@ export class EnterpriseManagementPlane {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.subscriptions.clear();
     this.database.close();
   }
 

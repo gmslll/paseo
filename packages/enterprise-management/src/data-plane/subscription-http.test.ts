@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 
 import { afterEach, describe, expect, test } from "vitest";
 
+import { COLLAB_STREAM_LIMITS } from "@getpaseo/protocol/enterprise-collaboration";
 import { createManagementRequestHandler } from "../http-server.js";
 import {
   EnterpriseManagementPlane,
@@ -21,6 +22,7 @@ interface Harness {
   admin: AuthenticatedManagementPrincipal;
   member: AuthenticatedManagementPrincipal;
   memberToken: string;
+  ownerToken: string;
   containerId: string;
 }
 
@@ -67,7 +69,7 @@ async function start(): Promise<Harness> {
     displayName: "Admin",
   });
   const admin = (await plane.authenticatePersonalAccessToken(bootstrap.token))!;
-  const owner = await plane.createPrincipal(admin, {
+  const ownerPrincipal = await plane.createPrincipal(admin, {
     displayName: "Owner",
     principalType: "human",
     role: "employee",
@@ -77,10 +79,11 @@ async function start(): Promise<Harness> {
     principalType: "human",
     role: "employee",
   });
+  const ownerCredential = await plane.issuePersonalAccessToken(admin, ownerPrincipal.principalId);
   const credential = await plane.issuePersonalAccessToken(admin, memberPrincipal.principalId);
   const workspace = await plane.registerCollabWorkspace(admin, {
     localWorkspaceId: "wks_subscription_http",
-    ownerPrincipalId: owner.principalId,
+    ownerPrincipalId: ownerPrincipal.principalId,
   });
   await plane.setCollabMember(admin, {
     workspaceUid: workspace.workspaceUid,
@@ -99,16 +102,30 @@ async function start(): Promise<Harness> {
     admin,
     member,
     memberToken: credential.token,
+    ownerToken: ownerCredential.token,
     containerId: workspace.workspaceUid,
   };
 }
 
-function subscribe(harness: Harness, bearer: string, body: unknown): Promise<Response> {
+function open(harness: Harness, bearer: string, body: unknown): Promise<Response> {
   return fetch(`${harness.base}/v1/ds/subscriptions`, {
     method: "POST",
     headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+function read(harness: Harness, bearer: string, id: string, query = ""): Promise<Response> {
+  return fetch(`${harness.base}/v1/ds/subscriptions/${id}${query}`, {
+    headers: { authorization: `Bearer ${bearer}` },
+  });
+}
+
+async function openId(harness: Harness, bearer: string, cursors: Record<string, string>) {
+  const response = await open(harness, bearer, { containerId: harness.containerId, cursors });
+  expect(response.status).toBe(201);
+  const { subscriptionId } = (await response.json()) as { subscriptionId: string };
+  return subscriptionId;
 }
 
 async function append(harness: Harness, segment: string, seq: number, text: string): Promise<void> {
@@ -123,30 +140,59 @@ async function append(harness: Harness, segment: string, seq: number, text: stri
   if (result.kind !== "appended") throw new Error(`append failed: ${result.kind}`);
 }
 
-interface SubscriptionBody {
+interface EventsBody {
   events: Array<Record<string, unknown>>;
 }
 
+async function eventsOf(response: Response): Promise<Array<Record<string, unknown>>> {
+  expect(response.status).toBe(200);
+  return ((await response.json()) as EventsBody).events;
+}
+
 describe("collaboration subscriptions over HTTP", () => {
-  test("answers every named segment with its data and a control", async () => {
+  test("opens a subscription and reads every named segment by its id", async () => {
     const harness = await start();
     await append(harness, "meta", 1, "one");
     await append(harness, "meta", 2, "two");
     await append(harness, "wf", 1, "three");
 
-    const response = await subscribe(harness, harness.memberToken, {
+    const opened = await open(harness, harness.memberToken, {
       containerId: harness.containerId,
       cursors: { meta: FIRST, wf: FIRST },
     });
+    expect(opened.status).toBe(201);
+    const created = (await opened.json()) as { subscriptionId: string; expiresAt: string };
+    expect(created.subscriptionId).toMatch(/^sub_[0-9a-f]{16}$/);
+    expect(Date.parse(created.expiresAt)).toBeGreaterThan(Date.now());
 
-    expect(response.status).toBe(200);
-    const { events } = (await response.json()) as SubscriptionBody;
+    const events = await eventsOf(await read(harness, harness.memberToken, created.subscriptionId));
     const data = events.filter((event) => event.type === "data");
     expect(data.map((event) => event.segment)).toEqual(["meta", "meta", "wf"]);
     expect(Buffer.from(String(data[0]!.update), "base64").toString()).toBe("one");
     const control = events.filter((event) => event.type === "control");
     expect(control.map((event) => event.segment)).toEqual(["meta", "wf"]);
-    expect(control.every((event) => event.upToDate === true)).toBe(true);
+  });
+
+  test("advances its cursors, so a second read returns only what arrived since", async () => {
+    const harness = await start();
+    await append(harness, "meta", 1, "one");
+    const id = await openId(harness, harness.memberToken, { meta: FIRST });
+
+    expect(
+      (await eventsOf(await read(harness, harness.memberToken, id))).filter(
+        (event) => event.type === "data",
+      ),
+    ).toHaveLength(1);
+
+    const second = await eventsOf(await read(harness, harness.memberToken, id));
+    expect(second.filter((event) => event.type === "data")).toHaveLength(0);
+    expect(second.every((event) => event.upToDate === true)).toBe(true);
+
+    await append(harness, "meta", 2, "two");
+    const third = await eventsOf(await read(harness, harness.memberToken, id));
+    const data = third.filter((event) => event.type === "data");
+    expect(data).toHaveLength(1);
+    expect(Buffer.from(String(data[0]!.update), "base64").toString()).toBe("two");
   });
 
   test("accepts a stream token, not only a personal access token", async () => {
@@ -162,23 +208,19 @@ describe("collaboration subscriptions over HTTP", () => {
     });
     const { token } = (await minted.json()) as { token: string };
 
-    const response = await subscribe(harness, token, {
-      containerId: harness.containerId,
-      cursors: { meta: FIRST },
-    });
-
-    expect(response.status).toBe(200);
-    const { events } = (await response.json()) as SubscriptionBody;
-    expect(events.filter((event) => event.type === "data")).toHaveLength(1);
+    const id = await openId(harness, token, { meta: FIRST });
+    expect(
+      (await eventsOf(await read(harness, token, id))).filter((event) => event.type === "data"),
+    ).toHaveLength(1);
   });
 
-  test("refuses the whole subscription when one named segment is closed to the caller", async () => {
+  test("refuses to open when one named segment is closed to the caller", async () => {
     const harness = await start();
     await append(harness, "meta", 1, "one");
 
     // rpc:req is readable by the node alone (ADR-0032 segment matrix), so an editor is refused it
     // even though the same subscription's meta cursor is perfectly legitimate.
-    const mixed = await subscribe(harness, harness.memberToken, {
+    const mixed = await open(harness, harness.memberToken, {
       containerId: harness.containerId,
       cursors: { meta: FIRST, [`rpc:req:${NODE}`]: FIRST },
     });
@@ -186,11 +228,11 @@ describe("collaboration subscriptions over HTTP", () => {
 
     // The same request without the closed segment succeeds, which is what makes the refusal above
     // attributable to the matrix rather than to anything incidental about the request.
-    const allowed = await subscribe(harness, harness.memberToken, {
+    const allowed = await open(harness, harness.memberToken, {
       containerId: harness.containerId,
       cursors: { meta: FIRST },
     });
-    expect(allowed.status).toBe(200);
+    expect(allowed.status).toBe(201);
   });
 
   test("refuses a caller who is not a member of the container", async () => {
@@ -205,7 +247,7 @@ describe("collaboration subscriptions over HTTP", () => {
       stranger.principalId,
     );
 
-    const response = await subscribe(harness, credential.token, {
+    const response = await open(harness, credential.token, {
       containerId: harness.containerId,
       cursors: { meta: FIRST },
     });
@@ -213,40 +255,68 @@ describe("collaboration subscriptions over HTTP", () => {
     expect(response.status).toBe(403);
   });
 
+  test("refuses one member the subscription another member opened", async () => {
+    const harness = await start();
+    await append(harness, "meta", 1, "one");
+    // The owner is a member in good standing, so the refusal is about whose subscription it is
+    // rather than about access to the container.
+    const ownersId = await openId(harness, harness.ownerToken, { meta: FIRST });
+
+    expect((await read(harness, harness.memberToken, ownersId)).status).toBe(403);
+    expect((await read(harness, harness.ownerToken, ownersId)).status).toBe(200);
+  });
+
+  test("refuses an unknown id exactly as it refuses someone else's", async () => {
+    const harness = await start();
+    expect((await read(harness, harness.memberToken, "sub_00000000000000ff")).status).toBe(403);
+  });
+
   test("refuses a subscription that names no segments", async () => {
     const harness = await start();
 
     // An empty cursor set would run no authorization check at all, so it is refused rather than
-    // answered with an empty event list.
-    const response = await subscribe(harness, harness.memberToken, {
+    // accepted as a subscription to nothing.
+    const response = await open(harness, harness.memberToken, {
       containerId: harness.containerId,
       cursors: {},
     });
-
     expect(response.status).toBe(400);
 
     // Pinned at the plane too. The route would answer 400 either way — from the schema or from the
     // guard — so only this says the guard itself exists, and it holds for a caller that reaches the
     // plane directly rather than over HTTP.
     await expect(
-      harness.plane.readCollabSubscription(harness.member, {
+      harness.plane.createCollabSubscription(harness.member, {
         containerId: harness.containerId,
         cursors: {},
       }),
     ).rejects.toThrow("subscription names no segments");
   });
 
+  test("closes the subscription when a read overflows", async () => {
+    const harness = await start();
+    for (let seq = 1; seq <= COLLAB_STREAM_LIMITS.maxSubscriberQueueEvents + 1; seq += 1) {
+      await append(harness, "meta", seq, "x");
+    }
+    const id = await openId(harness, harness.memberToken, { meta: FIRST });
+
+    const events = await eventsOf(await read(harness, harness.memberToken, id));
+    const last = events.at(-1);
+    expect(last?.type).toBe("control");
+    expect(last?.overflow).toBe(true);
+
+    // ADR-0032: overflow closes the subscription. The client resumes by opening a new one from the
+    // offset the control event just handed it.
+    expect((await read(harness, harness.memberToken, id)).status).toBe(403);
+  });
+
   test("says the live half is not available yet instead of answering a one-shot body", async () => {
     const harness = await start();
+    await append(harness, "meta", 1, "one");
+    const id = await openId(harness, harness.memberToken, { meta: FIRST });
 
-    const response = await subscribe(harness, harness.memberToken, {
-      containerId: harness.containerId,
-      cursors: { meta: FIRST },
-      live: "sse",
-    });
+    const response = await read(harness, harness.memberToken, id, "?live=sse");
 
-    // 501 also proves the route is reached at all: /v1/ds/subscriptions shares the /v1/ds/ prefix
-    // with the single-stream route, which would have answered 400 for an unknown container.
     expect(response.status).toBe(501);
   });
 });

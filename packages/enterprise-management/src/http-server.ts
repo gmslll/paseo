@@ -31,7 +31,10 @@ import {
   readOutcome,
   readStreamBody,
 } from "./data-plane/stream-http.js";
-import { CollabSubscriptionRequestSchema } from "@getpaseo/protocol/enterprise-collaboration";
+import {
+  CollabSubscriptionIdSchema,
+  CollabSubscriptionRequestSchema,
+} from "@getpaseo/protocol/enterprise-collaboration";
 import {
   ManagedPlacementSnapshotSchema,
   NodeCapacitySchema,
@@ -108,7 +111,7 @@ async function handleRequest(
   if (await handleRuntimeArtifactUpload(plane, request, response, method, path)) return;
   // Must precede the stream route: /v1/ds/subscriptions also starts with /v1/ds/, and the stream
   // path pattern needs two segments, so it would answer 400 rather than decline the route.
-  if (await handleCollabSubscriptionRequest(plane, request, response, method, path)) return;
+  if (await handleCollabSubscriptionRequest(plane, request, response, method, path, url)) return;
   // Stream updates are binary, and the shared readBody would decode them as UTF-8.
   if (await handleCollabStreamRequest(plane, request, response, method, path, url)) return;
   const body = method === "GET" || method === "HEAD" ? "" : await readBody(request);
@@ -553,14 +556,41 @@ function sendStreamOutcome(
   response.end(body);
 }
 
+const SUBSCRIPTION_PATH = "/v1/ds/subscriptions";
+
+// ADR-0032 splits this in two: POST opens a subscription, and GET reads it by id. Both sit ahead of
+// the single-stream route, which would otherwise claim these paths and answer 400.
 async function handleCollabSubscriptionRequest(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
   response: ServerResponse,
   method: string,
   path: string,
+  url: URL,
 ): Promise<boolean> {
-  if (method !== "POST" || path !== "/v1/ds/subscriptions") return false;
+  if (method === "POST" && path === SUBSCRIPTION_PATH) {
+    return openCollabSubscription(plane, request, response);
+  }
+  if (method === "GET" && path.startsWith(`${SUBSCRIPTION_PATH}/`)) {
+    return readCollabSubscription(plane, request, response, path, url);
+  }
+  return false;
+}
+
+function sendCredentialRefusal(response: ServerResponse): true {
+  // Only the credential step is answered here, for the same reason as the stream route: an
+  // authorization refusal must keep its own status or the route leaks which Workspaces exist.
+  sendJson(response, 401, {
+    error: { code: "unauthorized", message: "invalid or expired credential" },
+  });
+  return true;
+}
+
+async function openCollabSubscription(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<boolean> {
   const parsed = CollabSubscriptionRequestSchema.safeParse(parseJson(await readBody(request)));
   if (!parsed.success) {
     sendJson(response, 400, {
@@ -568,32 +598,64 @@ async function handleCollabSubscriptionRequest(
     });
     return true;
   }
-  if (parsed.data.live) {
-    // The live half is its own slice. Answering a one-shot body would look like a working stream
-    // to a client that asked to be kept up to date.
+  // `live` describes the follow-up read, not this call: opening a subscription is always immediate.
+  let actor: AuthenticatedManagementPrincipal;
+  try {
+    actor = await authenticateStreamCaller(plane, request, parsed.data.containerId);
+  } catch {
+    return sendCredentialRefusal(response);
+  }
+  sendJson(
+    response,
+    201,
+    await plane.createCollabSubscription(actor, {
+      containerId: parsed.data.containerId,
+      cursors: parsed.data.cursors,
+    }),
+  );
+  return true;
+}
+
+async function readCollabSubscription(
+  plane: EnterpriseManagementPlane,
+  request: IncomingMessage,
+  response: ServerResponse,
+  path: string,
+  url: URL,
+): Promise<boolean> {
+  const subscriptionId = decodeURIComponent(path.slice(SUBSCRIPTION_PATH.length + 1));
+  if (!CollabSubscriptionIdSchema.safeParse(subscriptionId).success) {
+    sendJson(response, 400, {
+      error: { code: "invalid_request", message: "invalid subscription id" },
+    });
+    return true;
+  }
+  if (url.searchParams.get("live")) {
+    // Answering a one-shot body would look like a working stream to a client that asked to be kept
+    // up to date.
     sendJson(response, 501, {
       error: { code: "not_implemented", message: "live subscriptions are not available yet" },
     });
     return true;
   }
 
-  // Only the credential step is caught, for the same reason as the stream route: an authorization
-  // refusal must keep its own status or the route leaks which Workspaces exist.
-  let actor: AuthenticatedManagementPrincipal;
-  try {
-    actor = await authenticateStreamCaller(plane, request, parsed.data.containerId);
-  } catch {
-    sendJson(response, 401, {
-      error: { code: "unauthorized", message: "invalid or expired credential" },
+  // Not an authorization step: this only names the audience a stream token must have been minted
+  // for. An unknown id and someone else's id are both refused below, identically.
+  const containerId = plane.readCollabSubscriptionContainer(subscriptionId);
+  if (!containerId) {
+    sendJson(response, 403, {
+      error: { code: "forbidden", message: "stream authorization denied" },
     });
     return true;
   }
-
+  let actor: AuthenticatedManagementPrincipal;
+  try {
+    actor = await authenticateStreamCaller(plane, request, containerId);
+  } catch {
+    return sendCredentialRefusal(response);
+  }
   sendJson(response, 200, {
-    events: await plane.readCollabSubscription(actor, {
-      containerId: parsed.data.containerId,
-      cursors: parsed.data.cursors,
-    }),
+    events: await plane.readCollabSubscriptionById(actor, subscriptionId),
   });
   return true;
 }
