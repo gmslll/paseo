@@ -62,9 +62,7 @@ export class CollabRuntime {
     if (this.closed) throw new Error("collaboration runtime is closed");
     if (this.dependencies) throw new Error("collaboration runtime is already installed");
     this.dependencies = dependencies;
-    for (const entry of this.options.catalog.activeWorkspaces()) {
-      await this.openContainer(entry.workspaceUid, entry.localWorkspaceId);
-    }
+    await this.openCatalogedContainers();
     // Every Agent event, not one Agent's: this is what notices an Agent the node did not have when
     // the container opened.
     this.unsubscribe = dependencies.agents.subscribe((event) => this.onAgentEvent(event));
@@ -75,6 +73,11 @@ export class CollabRuntime {
    * meta projector settle the Workspace record against what arrived.
    */
   async pump(): Promise<void> {
+    if (this.closed || !this.dependencies) return;
+    // The catalog is re-read every cycle rather than only at install: it is empty on a first boot
+    // until the policy refresh builds it, and a Workspace shared later arrives the same way. A
+    // container opened once at install would miss both.
+    await this.openCatalogedContainers();
     for (const container of this.containers.values()) {
       // Re-checked each turn: close() can land between two containers, and the stores it closed
       // must not be flushed against.
@@ -98,6 +101,18 @@ export class CollabRuntime {
       container.store.close();
     }
     this.containers.clear();
+  }
+
+  private async openCatalogedContainers(): Promise<void> {
+    for (const entry of this.options.catalog.activeWorkspaces()) {
+      if (this.closed) return;
+      if (this.containers.has(entry.workspaceUid)) continue;
+      try {
+        await this.openContainer(entry.workspaceUid, entry.localWorkspaceId);
+      } catch (error) {
+        this.options.onError?.(entry.workspaceUid, error);
+      }
+    }
   }
 
   private async pumpContainer(container: CollabContainer): Promise<void> {

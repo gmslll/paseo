@@ -281,6 +281,22 @@ describe("collaborating on behalf of a node", () => {
     expect(pathsSent()).toContain(`/v1/ds/${OTHER_CONTAINER}/wf`);
   });
 
+  test("picks up a Workspace shared after it was installed", async () => {
+    // The catalog is empty on a first boot until the policy refresh builds it, so install cannot be
+    // the only time it is read.
+    const entries: WorkspaceCatalogEntry[] = [];
+    const collab = runtime(entries);
+    await collab.install({ workspaceRegistry: registry(), agents: agents() });
+    await collab.pump();
+    expect(pathsSent()).toEqual([]);
+
+    entries.push(catalogEntry(CONTAINER, WORKSPACE_ID));
+    await collab.pump();
+
+    expect(pathsSent()).toContain(`/v1/ds/${CONTAINER}/wf`);
+    expect(failures).toEqual([]);
+  });
+
   test("stops projecting once closed", async () => {
     const collab = runtime([catalogEntry(CONTAINER, WORKSPACE_ID)]);
     await collab.install({ workspaceRegistry: registry(), agents: agents() });
