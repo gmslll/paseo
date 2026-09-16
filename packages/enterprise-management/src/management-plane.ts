@@ -71,9 +71,11 @@ import {
 } from "./data-plane/membership.js";
 import {
   parseCollabSegment,
+  STREAM_TOKEN_TTL_MS,
   type WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { streamAccess } from "./data-plane/stream-access.js";
+import { signStreamToken } from "./data-plane/stream-token.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
 const CREDENTIAL_TOKEN_PREFIX = "pso_m_";
@@ -1287,6 +1289,59 @@ export class EnterpriseManagementPlane {
       )
       .run(input.enabled ? 1 : 0, this.nowIso(), input.workspaceUid, this.options.organizationId);
     return this.requireCollabWorkspace(input.workspaceUid);
+  }
+
+  /**
+   * Mints a short-lived token for the collaborative Workspaces this caller currently belongs to
+   * (ADR-0032). The container list comes from membership, never from the caller: a client that
+   * could name its own containers would hold a token for Workspaces it was never added to.
+   */
+  async issueStreamToken(
+    token: string,
+    input: { readonly clientId: string },
+  ): Promise<{ readonly token: string; readonly expiresAt: string }> {
+    this.assertOpen();
+    const principal = await this.authenticatePersonalAccessToken(token);
+    if (!principal) throw new Error("invalid credential");
+    if (input.clientId.length === 0 || input.clientId.length > 160) {
+      throw new Error("invalid client ID");
+    }
+    const containerIds = this.listCollabContainersForPrincipal(principal.principalId);
+    // The claims require at least one container, and a token naming none would authorize nothing.
+    if (containerIds.length === 0) throw new Error("no collaborative workspaces");
+    const issuedAtMs = this.clock.nowMs();
+    const expiresAtMs = issuedAtMs + STREAM_TOKEN_TTL_MS;
+    return Object.freeze({
+      token: signStreamToken(
+        {
+          tokenId: createOpaqueId("stk_", 16),
+          organizationId: principal.organizationId,
+          principalId: principal.principalId,
+          credentialId: principal.credentialId,
+          clientId: input.clientId,
+          grantVersion: principal.grantVersion,
+          revocationEpoch: principal.revocationEpoch,
+          containerIds,
+          issuedAt: new Date(issuedAtMs).toISOString(),
+          expiresAt: new Date(expiresAtMs).toISOString(),
+        },
+        this.options.ticketPrivateKey,
+      ),
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    });
+  }
+
+  /** Enabled containers only: an unenabled Workspace keeps its bodies off the plane (ADR-0031). */
+  private listCollabContainersForPrincipal(principalId: string): string[] {
+    return this.database
+      .prepare(
+        `SELECT m.workspace_uid FROM collab_members m
+         JOIN collab_workspaces w ON w.workspace_uid = m.workspace_uid
+         WHERE m.principal_id = ? AND w.organization_id = ? AND w.collaboration_enabled = 1
+         ORDER BY m.workspace_uid`,
+      )
+      .all(principalId, this.options.organizationId)
+      .map((value) => String(this.row(value)!.workspace_uid));
   }
 
   async listCollabMembers(
