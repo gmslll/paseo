@@ -72,9 +72,11 @@ import {
 import {
   parseCollabSegment,
   STREAM_TOKEN_TTL_MS,
+  type CollabSubscriptionEvent,
   type WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { streamAccess } from "./data-plane/stream-access.js";
+import { collectSubscriptionEvents } from "./data-plane/subscription.js";
 import { signStreamToken, verifyStreamToken } from "./data-plane/stream-token.js";
 import { openSqliteDatabase, transaction, type SqliteDatabase } from "./sqlite.js";
 
@@ -1473,6 +1475,33 @@ export class EnterpriseManagementPlane {
     this.assertOpen();
     this.assertStreamAccess(actor, input.containerId, input.segment, "read");
     return this.streams.read(input);
+  }
+
+  /**
+   * Reads one poll of a multiplexed subscription (ADR-0032).
+   *
+   * Every segment is authorized before any is read, and one refusal fails the whole subscription.
+   * Returning just the segments the caller may read would tell them which of the rest they were
+   * refused, and would leave them believing they are subscribed to a segment that never delivers.
+   *
+   * A subscription naming no segments is refused rather than answered with an empty list: no
+   * segments would mean no authorization check ran at all.
+   */
+  async readCollabSubscription(
+    actor: AuthenticatedManagementPrincipal,
+    input: { containerId: string; cursors: Readonly<Record<string, string>> },
+  ): Promise<CollabSubscriptionEvent[]> {
+    this.assertOpen();
+    const segments = Object.keys(input.cursors);
+    if (segments.length === 0) throw new Error("subscription names no segments");
+    for (const segment of segments) {
+      this.assertStreamAccess(actor, input.containerId, segment, "read");
+    }
+    return collectSubscriptionEvents({
+      store: this.streams,
+      containerId: input.containerId,
+      cursors: input.cursors,
+    });
   }
 
   /**
