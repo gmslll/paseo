@@ -73,6 +73,33 @@ A session document keeps rows grouped by timeline epoch. On daemon restart the n
 timeline store from the document epoch. It reconciles against Provider history by message identity;
 on mismatch it starts a new epoch and publishes a timeline replacement instead of editing old rows.
 
+## Node replica
+
+A node keeps one SQLite database per container at
+`$PASEO_HOME/enterprise/collab/<containerId>/repo.sqlite3`, in a 0700 directory because it holds the
+plaintext content ADR-0031 accepts only on an encrypted volume.
+
+Columns added 2026-09-17 by the integration owner. The plan named `producer_state`, `rpc_inbox`, and
+`remote_cursors` without defining them and otherwise said only that the tables match Lody's, so this
+schema is a proposal derived from the decisions above rather than a ported one.
+
+| Table             | Holds                                                    | Keyed by              |
+| ----------------- | -------------------------------------------------------- | --------------------- |
+| `documents`       | the replica's Loro snapshot per segment                  | segment               |
+| `pending_updates` | local updates produced but not yet accepted by the plane | segment, producer seq |
+| `producer_state`  | producer id, epoch, and last sequence for fencing        | segment               |
+| `remote_cursors`  | the next offset to read, for resuming after a restart    | segment               |
+| `rpc_inbox`       | machine RPC ids already handled (ADR-0035)               | rpc id                |
+
+Two different numbers are called an epoch. `producer_state.epoch` is the producer epoch of the
+fencing rules above: it rises once per boot, so an append still in flight from a previous boot
+carries the older one and is refused with 403 instead of interleaving. The timeline epoch that
+groups rows inside a session document is unrelated, lives in the document, and is not stored here.
+
+Raising the producer epoch re-stamps the updates still queued under the old one and renumbers them
+from 1. Dropping them would lose work that survived the crash; leaving their old sequences would
+open the new epoch on a gap, which the fencing rules answer with 409.
+
 ## Acceptance
 
 Stream-store tests cover offsets, fencing results, TTL, closed streams, compaction lower bounds, and
@@ -84,3 +111,8 @@ routes, a hold that only its own segment releases, and revocation arriving as a 
 headers are still unsent and as a `revoked` event once they are gone. Presence tests cover the
 heartbeat, expiry on an injected clock, a non-member's refusal, a heartbeat that tries to name its
 own principal or timestamp, and the roster reaching subscribers both on connect and on change.
+
+Node replica tests cover the producer epoch rising across a restart, unsent work carried into a new
+epoch without a sequence gap, the outbound queue and the replica both surviving a restart, cursors
+resuming rather than replaying, a batch whose dependencies are missing leaving the cursor untouched,
+and a container id that cannot escape the collab root.

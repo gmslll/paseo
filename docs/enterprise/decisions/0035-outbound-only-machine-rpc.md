@@ -23,6 +23,12 @@ The node:
 4. dispatches the payload through a headless enterprise Session for that Principal and client, so
    authorization, outbound filtering, and audit match a direct connection.
 
+The inbox of step 3 is the `rpc_inbox` table of the node replica (ADR-0032), keyed by `rpc_id` and
+carrying the method, the arrival time, and an expiry it is swept by. It is on disk rather than in
+memory so that a crash does not reopen the replay window, and the expiry stored is the attestation's
+rather than a local default, so a replay can never outlive the window the plane signed. Added
+2026-09-17 by the integration owner.
+
 Only methods listed in the `machine_rpc` surface of the resource entry inventory are accepted:
 Agent create, send, steer, cancel, fork, permission response, file read and write, checkout status,
 and `machine.get_status`. `machine.restart` and `machine.upgrade` require the Workspace owner or a
@@ -41,4 +47,6 @@ required for collaborators.
 ## Acceptance
 
 Tests cover forged, expired, replayed, and stale-Grant attestations; methods outside the allowlist;
-parity between machine RPC and direct Session denials; and restart receipt timing.
+parity between machine RPC and direct Session denials; and restart receipt timing. Inbox tests prove
+the replay refusal survives a restart and that a sweep removes only entries past their signed
+expiry.

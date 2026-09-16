@@ -53,6 +53,14 @@ export const COLLAB_SUBSCRIPTION_TTL_MS = 5 * 60_000;
 export const MACHINE_RPC_DEFAULT_TTL_MS = 60_000;
 export const MACHINE_RPC_LIFECYCLE_RECEIPT_MS = 5_000;
 
+/**
+ * Where a node keeps its replica: `$PASEO_HOME/<enterprise>/<collab>/<containerId>/<repo file>`.
+ * Segments rather than a joined path, because the node joins them with the platform separator.
+ */
+export const ENTERPRISE_DIRECTORY = "enterprise";
+export const COLLAB_DIRECTORY = "collab";
+export const COLLAB_REPO_FILE = "repo.sqlite3";
+
 export const WORKSPACE_MEMBER_ROLES = ["owner", "editor", "viewer"] as const;
 export const WorkspaceMemberRoleSchema = z.enum(WORKSPACE_MEMBER_ROLES);
 export type WorkspaceMemberRole = z.infer<typeof WorkspaceMemberRoleSchema>;
