@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 import type { DaemonManifest, ProbeState } from "@getpaseo/protocol/local-planes";
+import type { LocalPlaneAttachEndpoint } from "./terminal-plane-access.js";
 
 import {
   startControlPlane,
@@ -14,6 +15,11 @@ import {
   type LocalPlanePaths,
 } from "./plane-paths.js";
 import { startProbePlane, type ProbePlaneServer } from "./probe-plane-server.js";
+import {
+  startTerminalPlane,
+  type TerminalPlaneAdmission,
+  type TerminalPlaneServer,
+} from "./terminal-plane-server.js";
 import { createProbeStateCollector, type ProbeStateSources } from "./probe-state.js";
 
 // Starts the local planes after the daemon's other listeners are ready and writes run/daemon.json
@@ -26,6 +32,8 @@ export interface LocalPlaneHost {
   readonly token: string;
   /** True while the control plane accepts Sessions. */
   readonly controlAvailable: boolean;
+  /** Where terminal channels attach while the plane accepts them, else null. */
+  readonly terminalEndpoint: LocalPlaneAttachEndpoint | null;
   stop(): Promise<void>;
 }
 
@@ -34,6 +42,8 @@ export interface StartLocalPlanesInput {
   sources: Omit<ProbeStateSources, "planes" | "lifecycle">;
   /** Admission for control plane Sessions. Without it only the probe plane starts. */
   control?: ControlPlaneAdmission;
+  /** Admission for terminal plane channels. Without it the terminal plane stays down. */
+  terminal?: TerminalPlaneAdmission;
   logger: Logger;
   platform?: NodeJS.Platform;
 }
@@ -41,10 +51,11 @@ export interface StartLocalPlanesInput {
 interface RunningPlanes {
   probe: ProbePlaneServer | null;
   control: ControlPlaneServer | null;
+  terminal: TerminalPlaneServer | null;
 }
 
 function planeStatus(
-  server: ProbePlaneServer | ControlPlaneServer | null,
+  server: ProbePlaneServer | ControlPlaneServer | TerminalPlaneServer | null,
 ): ProbeState["planes"][string] {
   return server
     ? { status: "listening", path: server.endpoint.path }
@@ -59,10 +70,14 @@ function manifestPlanes(running: RunningPlanes): DaemonManifest["planes"] {
   if (running.control) {
     planes.control = { ...running.control.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
   }
+  if (running.terminal) {
+    planes.terminal = { ...running.terminal.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
+  }
   return planes;
 }
 
 async function closePlanes(running: RunningPlanes): Promise<void> {
+  await running.terminal?.close();
   await running.control?.close();
   await running.probe?.close();
 }
@@ -74,7 +89,7 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
     await ensurePrivateDirectory(paths.socketDirectory);
   }
   const token = await issueLocalToken(paths.tokenPath);
-  const running: RunningPlanes = { probe: null, control: null };
+  const running: RunningPlanes = { probe: null, control: null, terminal: null };
   let lifecycle = "running";
   const collector = createProbeStateCollector({
     ...input.sources,
@@ -82,7 +97,7 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
     planes: () => ({
       probe: planeStatus(running.probe),
       control: planeStatus(running.control),
-      terminal: planeStatus(null),
+      terminal: planeStatus(running.terminal),
       data: planeStatus(null),
     }),
   });
@@ -98,6 +113,14 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
         endpoint: paths.endpoints.control,
         token,
         admission: input.control,
+        logger: input.logger,
+      });
+    }
+    if (input.terminal) {
+      running.terminal = await startTerminalPlane({
+        endpoint: paths.endpoints.terminal,
+        token,
+        admission: input.terminal,
         logger: input.logger,
       });
     }
@@ -126,6 +149,10 @@ export async function startLocalPlanes(input: StartLocalPlanesInput): Promise<Lo
     token,
     get controlAvailable() {
       return running.control !== null && stopping === null;
+    },
+    get terminalEndpoint() {
+      if (!running.terminal || stopping !== null) return null;
+      return { ...running.terminal.endpoint, protocolVersion: PLANE_PROTOCOL_VERSION };
     },
     stop() {
       stopping ??= (async () => {

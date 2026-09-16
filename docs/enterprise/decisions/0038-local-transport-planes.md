@@ -22,9 +22,11 @@ paths stay unchanged for every existing client.
 - `run/daemon.json` is written after every listener is ready and lists each plane path and protocol
   version. `paseo.pid` remains the lock file.
 - Terminal and data connections are secondary channels of an admitted Session. The Session issues a
-  60-second, one-use attach token bound to Session, Principal, Grant version, and plane. Sessions
-  that arrived through the relay cannot issue one. Closing or invalidating the Session closes its
-  channels.
+  60-second, one-use attach token bound to Session, Principal, Grant version, and plane, through
+  `local_plane.attach_token.create.request`/`.response`. Only a Session whose transport can reach
+  the local socket is issued one, so relay and Hub Sessions are not. Closing or invalidating the
+  Session closes its channels. The terminal plane carries terminal requests only; every other RPC
+  stays on the Session's own channel, where its response is authorized.
 - In enterprise mode the local token alone is admitted only as break-glass Owner when explicitly
   enabled, and always writes a high-priority audit event.
 - The data frame is `[u8 opcode 0x20–0x2F][u16 BE docId length][docId UTF-8][payload]`. Over an

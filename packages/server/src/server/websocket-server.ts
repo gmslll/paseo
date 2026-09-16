@@ -134,6 +134,7 @@ import {
 } from "@getpaseo/protocol/browser-automation/capabilities";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
+import type { TerminalPlaneAccess } from "./local-planes/terminal-plane-access.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import {
   OWNER_PERMISSIONS,
@@ -781,6 +782,8 @@ interface SocketSessionOptions {
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
+  /** Terminal plane access, supplied only for transports that can reach the local socket. */
+  terminalPlane?: TerminalPlaneAccess;
   enterprise?: SessionAdmission["enterprise"];
   grantVersionGuard?: EnterpriseAdmissionRuntime["grantVersionGuard"];
   sessionId?: string;
@@ -1970,6 +1973,7 @@ export class VoiceAssistantWebSocketServer {
     sessionAuthorization?: SessionAuthorization;
     enterpriseAuthorizationRuntime?: ProductionAuthorizationRuntime;
     enterpriseSessionBindingGeneration?: string;
+    terminalPlane?: TerminalPlaneAccess;
     onEnterpriseWorkspaceRuntimeConstructionFailure?: (
       runtime: EnterpriseWorkspaceFilesRuntime,
     ) => void;
@@ -1986,6 +1990,7 @@ export class VoiceAssistantWebSocketServer {
       sessionAuthorization,
       enterpriseAuthorizationRuntime,
       enterpriseSessionBindingGeneration,
+      terminalPlane,
       onEnterpriseWorkspaceRuntimeConstructionFailure,
     } = params;
     let connection: SessionConnection | null = null;
@@ -2009,6 +2014,7 @@ export class VoiceAssistantWebSocketServer {
         clientCapabilities,
         permissions: Object.freeze([...admission.permissions]),
         connectionLogger,
+        ...(terminalPlane ? { terminalPlane } : {}),
         onMessage: (msg) => {
           if (!connection) {
             return;
@@ -2234,6 +2240,7 @@ export class VoiceAssistantWebSocketServer {
       serverId: this.serverId,
       daemonVersion: this.daemonVersion,
       daemonRuntimeConfig: this.daemonRuntimeConfig,
+      ...(options.terminalPlane ? { terminalPlane: options.terminalPlane } : {}),
       getWebSocketRuntimeMetrics: () => this.lastRuntimeMetricsSnapshot,
     });
   }
@@ -2539,6 +2546,11 @@ export class VoiceAssistantWebSocketServer {
         lifecycle: pluginId ? { kind: "ephemeral-plugin", pluginId } : { kind: "reconnectable" },
         admission: activeAdmission,
         ...(enterpriseAuthorizationHandle ? { enterpriseAuthorizationHandle } : {}),
+        // Only a client that can reach the local socket may hold an attach token (ADR-0038), so a
+        // relay or Hub Session never gets one.
+        ...(pending.identity.transport === "direct" && this.daemonRuntimeConfig?.terminalPlane
+          ? { terminalPlane: this.daemonRuntimeConfig.terminalPlane }
+          : {}),
         ...(sessionId ? { sessionId } : {}),
         ...(sessionAuthorization ? { sessionAuthorization } : {}),
         ...(enterpriseAuthorizationRuntime ? { enterpriseAuthorizationRuntime } : {}),
@@ -2755,6 +2767,8 @@ export class VoiceAssistantWebSocketServer {
         ...(this.daemonRuntimeConfig?.orchestration ? { orchestrationOutbox: true } : {}),
         // COMPAT(localPlanes): added in v0.9.0, remove gate after 2027-03-16.
         ...(this.daemonRuntimeConfig?.localPlanes?.() ? { localPlanes: true } : {}),
+        // COMPAT(terminalPlane): added in v0.9.0, remove gate after 2027-03-16.
+        ...(this.daemonRuntimeConfig?.terminalPlane?.endpoint() ? { terminalPlane: true } : {}),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
         ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.

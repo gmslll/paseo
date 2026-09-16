@@ -226,6 +226,7 @@ export const REVIEWED_INBOUND_ENTRIES = [
   "list_provider_models_request",
   "list_provider_modes_request",
   "list_terminals_request",
+  "local_plane.attach_token.create.request",
   "loop/inspect",
   "loop/list",
   "loop/logs",

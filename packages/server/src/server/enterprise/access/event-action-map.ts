@@ -98,6 +98,8 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "orchestration.operation.get.request": ["workspace.metadata.read"],
   "orchestration.operation.list.request": ["workspace.metadata.read"],
   create_terminal_request: ["terminal.use"],
+  // An attach token only reopens the terminal stream the Session may already use.
+  "local_plane.attach_token.create.request": ["terminal.use"],
   "enterprise.access.list_grants.request": ["identity.manage"],
   "enterprise.access.update_grants.request": ["identity.manage"],
   "enterprise.audit.list_events.request": ["audit.read"],
@@ -517,6 +519,13 @@ export const OUTBOUND_AUTHORITY_RECEIPT_POLICIES = Object.freeze([
     "hub.management.daemon.permissions.update.request",
   ),
   authorityReceiptPolicy("list_available_providers_response", "list_available_providers_request"),
+  // An attach token names only the Session that asked for it, so the receipt from that request is
+  // its whole authority; it carries no Workspace or Agent data (ADR-0038).
+  authorityReceiptPolicy(
+    "local_plane.attach_token.create.response",
+    "local_plane.attach_token.create.request",
+    ["terminal.use"],
+  ),
   authorityReceiptPolicy("plugin.catalog.get.response", "plugin.catalog.get.request"),
   authorityReceiptPolicy("plugin.directory.inspect.response", "plugin.directory.inspect.request"),
   authorityReceiptPolicy("plugin.directory.install.response", "plugin.directory.install.request"),

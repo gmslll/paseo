@@ -36,7 +36,10 @@ import {
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
 } from "./messages.js";
-import { SessionOutboundMessageSchema } from "@getpaseo/protocol/messages";
+import {
+  SessionInboundMessageSchema,
+  SessionOutboundMessageSchema,
+} from "@getpaseo/protocol/messages";
 import {
   ENTERPRISE_UNAVAILABLE_ERROR,
   dispatchEnterpriseRequest,
@@ -60,10 +63,16 @@ import type {
 import { TerminalSessionController } from "../terminal/terminal-session-controller.js";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import {
+  decodeBinaryFrame,
   decodeFileTransferFrame,
   FileTransferOpcode,
   type BinaryFrame,
 } from "@getpaseo/protocol/binary-frames/index";
+import type {
+  TerminalPlaneAccess,
+  TerminalPlaneAttachment,
+  TerminalPlaneChannel,
+} from "./local-planes/terminal-plane-access.js";
 import type { ActiveFileDownloadStreamHandle } from "./enterprise/access/file-binary-outbound-authorizer.js";
 import {
   createEnterpriseAgentEventPreauthorization,
@@ -756,8 +765,24 @@ export interface SessionOptions {
   serverId?: string;
   daemonVersion?: string;
   daemonRuntimeConfig?: DaemonRuntimeConfig;
+  /** Terminal plane access, supplied only for transports that can reach the local socket. */
+  terminalPlane?: TerminalPlaneAccess;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
 }
+
+// The terminal plane carries only these requests; every other RPC stays on the Session's own
+// channel, where its response is authorized against the request that asked for it (ADR-0038).
+const TERMINAL_PLANE_REQUEST_TYPES: ReadonlySet<SessionInboundMessage["type"]> = new Set([
+  "capture_terminal_request",
+  "create_terminal_request",
+  "kill_terminal_request",
+  "list_terminals_request",
+  "subscribe_terminal_request",
+  "subscribe_terminals_request",
+  "terminal.rename.request",
+  "unsubscribe_terminal_request",
+  "unsubscribe_terminals_request",
+]);
 
 export type SessionLifecycleIntent =
   | {
@@ -1071,6 +1096,9 @@ export class Session {
   private readonly serviceProxyPublicBaseUrl: string | null;
   private readonly resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | null;
   private readonly terminalController: TerminalSessionController;
+  private readonly terminalPlane: TerminalPlaneAccess | null;
+  /** The attached terminal plane channel, while one is open (ADR-0038). */
+  private terminalPlaneChannel: TerminalPlaneChannel | null = null;
   private inflightRequests = 0;
   private peakInflightRequests = 0;
   private readonly workspaceSetupSnapshots: Map<string, WorkspaceSetupSnapshot>;
@@ -1178,6 +1206,7 @@ export class Session {
       serverId,
       daemonVersion,
       daemonRuntimeConfig,
+      terminalPlane,
       getWebSocketRuntimeMetrics,
     } = options;
     this.enterpriseDispatcher = enterpriseDispatcher ?? null;
@@ -1483,17 +1512,19 @@ export class Session {
       : null;
     this.daemonConfigStore = daemonConfigStore;
     this.terminalManager = terminalManager;
+    this.terminalPlane = terminalPlane ?? null;
     this.terminalController = new TerminalSessionController({
       terminalManager,
       emit: (msg) => this.emit(msg),
       emitBinary: (frame) => this.emitBinary(frame),
-      hasBinaryChannel: () => this.onBinaryMessage !== null,
+      hasBinaryChannel: () => this.onBinaryMessage !== null || this.terminalPlaneChannel !== null,
       isPathWithinRoot: (rootPath, candidatePath) => this.isPathWithinRoot(rootPath, candidatePath),
       sessionLogger: this.sessionLogger,
       listTerminalWorkspaceRefs: () => this.listActiveWorkspaceRefs(),
       clientSupportsWrapReflow: () =>
         this.clientCapabilities.has(CLIENT_CAPS.terminalReflowableSnapshot),
-      getClientBufferedAmount: () => this.getTransportBufferedAmount(),
+      getClientBufferedAmount: () =>
+        this.terminalPlaneChannel?.bufferedAmount() ?? this.getTransportBufferedAmount(),
     });
     this.agentUpdates = createAgentUpdatesService({
       emit: (message, scope) => this.emitAgentUpdatePublication(message, scope),
@@ -3916,9 +3947,91 @@ export class Session {
       case "orchestration.operation.get.request":
       case "orchestration.operation.cancel.request":
         return this.handleOrchestrationOperationRequest(msg);
+      case "local_plane.attach_token.create.request":
+        return this.handleLocalPlaneAttachTokenRequest(msg);
       default:
         return undefined;
     }
+  }
+
+  // An attach token names this Session, its Principal, and its Grant version, so a plane channel
+  // can never outlive or widen the Session that asked for it (ADR-0038). The response is authorized
+  // by the receipt minted from this request; the error carries no context, like other denials.
+  private handleLocalPlaneAttachTokenRequest(
+    msg: Extract<SessionInboundMessage, { type: "local_plane.attach_token.create.request" }>,
+  ): Promise<void> {
+    const endpoint = msg.plane === "terminal" ? (this.terminalPlane?.endpoint() ?? null) : null;
+    if (!this.terminalPlane || !endpoint) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: `The ${msg.plane} plane is unavailable on this daemon`,
+          code: "unavailable",
+        },
+      });
+      return Promise.resolve();
+    }
+    const issued = this.terminalPlane.issue({
+      sessionId: this.sessionId,
+      plane: msg.plane,
+      principalId: this.enterpriseContext?.principal.principalId ?? "owner",
+      grantVersion: this.enterpriseContext?.principal.grantVersion ?? "",
+    });
+    this.emit({
+      type: "local_plane.attach_token.create.response",
+      payload: {
+        requestId: msg.requestId,
+        plane: msg.plane,
+        token: issued.token,
+        expiresAt: new Date(issued.expiresAt).toISOString(),
+        endpoint,
+      },
+    });
+    return Promise.resolve();
+  }
+
+  /**
+   * Attaches a terminal plane channel (ADR-0038). Terminal output follows the channel until it
+   * detaches, and inbound frames take the same authorization path the WebSocket takes.
+   */
+  public attachTerminalChannel(channel: TerminalPlaneChannel): TerminalPlaneAttachment | null {
+    if (this.isCleanedUp || !this.authorization.allowsPermission("workspace.write")) return null;
+    const previous = this.terminalPlaneChannel;
+    this.terminalPlaneChannel = channel;
+    previous?.close();
+    return {
+      handleTerminalFrame: (frame) => {
+        const decoded = decodeBinaryFrame(frame);
+        if (decoded?.kind !== "terminal") return;
+        void this.handleBinaryFrame(decoded).catch((error) => {
+          this.sessionLogger.warn({ err: error }, "Terminal plane frame failed");
+        });
+      },
+      handleJsonMessage: (text) => {
+        void this.handleTerminalPlaneJson(text);
+      },
+      detach: () => {
+        if (this.terminalPlaneChannel === channel) this.terminalPlaneChannel = null;
+      },
+    };
+  }
+
+  private async handleTerminalPlaneJson(text: string): Promise<void> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      this.sessionLogger.warn({}, "Terminal plane JSON was unreadable");
+      return;
+    }
+    const message = SessionInboundMessageSchema.safeParse(parsed);
+    if (!message.success || !TERMINAL_PLANE_REQUEST_TYPES.has(message.data.type)) {
+      this.sessionLogger.warn({}, "Terminal plane message refused");
+      return;
+    }
+    await this.handleMessage(message.data);
   }
 
   // An enterprise Session answers for one requester Agent the Principal can see, and emits the
@@ -10605,6 +10718,17 @@ export class Session {
   }
 
   private emitBinary(frame: Uint8Array): void {
+    // Terminal output follows the plane channel while one is attached, so the Session's own
+    // transport carries only its JSON (ADR-0038).
+    const planeChannel = this.terminalPlaneChannel;
+    if (planeChannel) {
+      try {
+        planeChannel.send(frame);
+      } catch (error) {
+        this.sessionLogger.error({ err: error }, "Failed to emit terminal plane frame");
+      }
+      return;
+    }
     if (!this.onBinaryMessage) {
       return;
     }
@@ -11006,6 +11130,15 @@ export class Session {
 
     try {
       await this.voiceSession.cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+
+    try {
+      this.terminalPlane?.revokeSession(this.sessionId);
+      const planeChannel = this.terminalPlaneChannel;
+      this.terminalPlaneChannel = null;
+      planeChannel?.close();
     } catch (error) {
       cleanupErrors.push(error);
     }

@@ -169,6 +169,8 @@ import { createAgentOrchestrationPort } from "./orchestration/agent-orchestratio
 import { OperationService, formatOperationCompletion } from "./orchestration/operation-service.js";
 import { OperationStore } from "./orchestration/operation-store.js";
 import { startLocalPlanes, type LocalPlaneHost } from "./local-planes/local-plane-host.js";
+import { createAttachTokenStore } from "./local-planes/attach-token-store.js";
+import type { TerminalPlaneAccess } from "./local-planes/terminal-plane-access.js";
 import { countTerminals, enterpriseProbeSummary } from "./local-planes/probe-sources.js";
 import { standaloneOrchestrationAuthority } from "./orchestration/orchestration-authority.js";
 import { createEnterpriseRuntimeOrchestrationAuthority } from "./orchestration/enterprise-orchestration-authority.js";
@@ -985,6 +987,14 @@ export async function createPaseoDaemon(
     });
     let relayRuntime: RelayRuntime | null = null;
     let localPlanes: LocalPlaneHost | null = null;
+    // Attach tokens are per-daemon and name the Session they were issued for (ADR-0038). The
+    // endpoint stays null until the terminal plane is listening, which keeps the feature ungated.
+    const localPlaneAttachTokens = createAttachTokenStore();
+    const terminalPlaneAccess: TerminalPlaneAccess = {
+      endpoint: () => localPlanes?.terminalEndpoint ?? null,
+      issue: (claims) => localPlaneAttachTokens.issue(claims),
+      revokeSession: (sessionId) => localPlaneAttachTokens.revokeSession(sessionId),
+    };
 
     const staticDir = config.staticDir;
     const downloadTokenTtlMs = config.downloadTokenTtlMs ?? 60000;
@@ -2523,6 +2533,7 @@ export async function createPaseoDaemon(
                   managedRuntimes,
                   orchestration: operationService ?? undefined,
                   localPlanes: () => localPlanes?.controlAvailable === true,
+                  terminalPlane: terminalPlaneAccess,
                   getRelayConfig: () =>
                     relayRuntime?.getConfig() ?? {
                       enabled: daemonConfigStore.get().relay?.enabled ?? relayEnabled,
@@ -2634,6 +2645,19 @@ export async function createPaseoDaemon(
                       if (!wsServer) throw new Error("WebSocket server is not ready");
                       await wsServer.attachLocalPlaneSocket(socket, evidence);
                     },
+                  },
+                  // A channel joins the Session its one-use token was issued for; once that Session
+                  // is gone the token buys nothing (ADR-0038).
+                  terminal: {
+                    verify: (token) => {
+                      const claims = localPlaneAttachTokens.consume({ token, plane: "terminal" });
+                      return claims ? { sessionId: claims.sessionId } : null;
+                    },
+                    attach: (ticket, channel) =>
+                      wsServer
+                        ?.listSessions()
+                        .find((candidate) => candidate.getSessionId() === ticket.sessionId)
+                        ?.attachTerminalChannel(channel) ?? null,
                   },
                   sources: {
                     serverId,

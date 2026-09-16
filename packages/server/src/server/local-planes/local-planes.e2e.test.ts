@@ -105,11 +105,16 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
           probe: { transport: "unix", path: paths.endpoints.probe.path, protocolVersion: 1 },
         },
       });
-      expect(Object.keys(manifest?.planes ?? {}).toSorted()).toEqual(["control", "probe"]);
+      expect(Object.keys(manifest?.planes ?? {}).toSorted()).toEqual([
+        "control",
+        "probe",
+        "terminal",
+      ]);
       expect(await modeOf(paths.runDirectory)).toBe(0o700);
       expect(await modeOf(paths.tokenPath)).toBe(0o600);
       expect(await modeOf(paths.endpoints.probe.path)).toBe(0o600);
       expect(await modeOf(paths.endpoints.control.path)).toBe(0o600);
+      expect(await modeOf(paths.endpoints.terminal.path)).toBe(0o600);
       const token = (await readFile(paths.tokenPath, "utf8")).trim();
 
       expect(await probeGet(paths.endpoints.probe.path, "/healthz")).toEqual({
@@ -126,7 +131,11 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
         relay: { enabled: false, connected: false },
         counts: { agents: 0, terminals: 0 },
         enterprise: null,
-        planes: { probe: { status: "listening" }, control: { status: "listening" } },
+        planes: {
+          probe: { status: "listening" },
+          control: { status: "listening" },
+          terminal: { status: "listening" },
+        },
       });
       expect(state.websocket.listen).toMatch(/^127\.0\.0\.1:\d+$/);
       expect(stateResponse.body).not.toContain(token);
@@ -140,6 +149,7 @@ describe.skipIf(process.platform === "win32")("local planes end-to-end", () => {
       await expect(stat(paths.tokenPath)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(stat(paths.endpoints.probe.path)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(stat(paths.endpoints.control.path)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(paths.endpoints.terminal.path)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       if (!stopped) await daemon.stop();
       await rm(root, { recursive: true, force: true });

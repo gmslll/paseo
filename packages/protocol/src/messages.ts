@@ -2355,6 +2355,14 @@ export const DaemonRuntimeInstallRequestSchema = z.object({
 });
 
 // Durable delegation operations (ADR-0042). Gated by server_info.features.orchestrationOutbox.
+// Terminal and data plane attach tokens (ADR-0038). The endpoint fields mirror
+// LocalPlaneEndpointSchema; they are inlined because local-planes.ts already imports this module.
+export const LocalPlaneAttachTokenCreateRequestSchema = z.object({
+  type: z.literal("local_plane.attach_token.create.request"),
+  requestId: z.string(),
+  plane: z.enum(["terminal", "data"]),
+});
+
 export const OrchestrationOperationListRequestSchema = z.object({
   type: z.literal("orchestration.operation.list.request"),
   requestId: z.string(),
@@ -4823,6 +4831,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   OrchestrationOperationListRequestSchema,
   OrchestrationOperationGetRequestSchema,
   OrchestrationOperationCancelRequestSchema,
+  LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
@@ -6553,6 +6562,21 @@ export const DaemonRuntimeInstallResponseSchema = z.object({
 
 // Metadata only: prompts and Agent responses stay out of operation summaries. Kind, status, state,
 // and outcome are open strings so an older client parses values a newer daemon adds.
+export const LocalPlaneAttachTokenCreateResponseSchema = z.object({
+  type: z.literal("local_plane.attach_token.create.response"),
+  payload: z.object({
+    requestId: z.string(),
+    plane: z.enum(["terminal", "data"]),
+    token: z.string().min(1),
+    expiresAt: z.string().min(1),
+    endpoint: z.object({
+      transport: z.enum(["unix", "pipe"]),
+      path: z.string().min(1),
+      protocolVersion: z.number().int().positive(),
+    }),
+  }),
+});
+
 export const OrchestrationOperationItemSchema = z.object({
   itemIndex: z.number().int().nonnegative(),
   agentId: z.string(),
@@ -8426,6 +8450,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   OrchestrationOperationListResponseSchema,
   OrchestrationOperationGetResponseSchema,
   OrchestrationOperationCancelResponseSchema,
+  LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
   HubManagementDaemonDisconnectResponseSchema,
