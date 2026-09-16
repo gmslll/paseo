@@ -253,6 +253,26 @@ export class CollabRepoStore {
     });
   }
 
+  /**
+   * Changes this segment's replica and queues exactly the delta the change produced.
+   *
+   * Prefer this over exporting an update by hand and passing it to `enqueueLocalUpdate`: the
+   * version has to be read before the mutation and handed back to `export`, and a caller that
+   * forgets sends a whole snapshot as if it were an increment.
+   */
+  applyLocalChange(segment: string, mutate: (document: LoroDoc) => void): PendingUpdate | null {
+    assertSegment(segment);
+    const document = this.document(segment);
+    const from = document.version();
+    mutate(document);
+    document.commit();
+    const update = document.export({ mode: "update", from });
+    // A mutation that changed nothing still commits; queuing an empty update would spend a producer
+    // sequence and a round trip on it.
+    if (update.byteLength === 0) return null;
+    return this.enqueueLocalUpdate(segment, update);
+  }
+
   listPendingUpdates(segment?: string, limit = 256): PendingUpdate[] {
     const rows = (
       segment === undefined
