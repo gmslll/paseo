@@ -5,6 +5,7 @@ import type {
   AgentPromptInput,
   AgentRunOptions,
 } from "./agent-sdk-types.js";
+import { isQueuedAgentRun } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
@@ -77,16 +78,12 @@ async function startOrReplaceRun(
   queued: boolean;
 }> {
   const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
-  // A send from someone who does not control the running turn waits instead of replacing it
-  // (ADR-0034). The manager decides that, and it shows up as a longer queue on the Agent — the run
-  // it hands back is empty, which on its own would be indistinguishable from a turn that started
-  // and said nothing.
-  const queuedBefore = agentManager.getAgent(agentId)?.queuedTurns.length ?? 0;
   const iterator = replaced
     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
     : agentManager.streamAgent(agentId, prompt, options?.runOptions);
-  const queued = (agentManager.getAgent(agentId)?.queuedTurns.length ?? 0) > queuedBefore;
-  return { iterator, replaced, queued };
+  // A send from someone who does not control the running turn waits instead of replacing it
+  // (ADR-0034). The manager marks the empty run it hands back for that.
+  return { iterator, replaced, queued: isQueuedAgentRun(iterator) };
 }
 
 async function drainAgentRunIterator(

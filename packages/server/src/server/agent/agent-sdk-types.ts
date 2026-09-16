@@ -496,6 +496,24 @@ export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | und
   return "turnId" in event ? event.turnId : undefined;
 }
 
+/**
+ * A send that was queued rather than started hands back a run that produces nothing (ADR-0034).
+ * The fact travels on the stream itself: an empty run is otherwise indistinguishable from a turn
+ * that started and said nothing, and reading it back off the Agent would mean trusting two
+ * snapshots taken around the call.
+ */
+const QUEUED_AGENT_RUN: unique symbol = Symbol.for("paseo.agent.queued-run");
+
+export function markQueuedAgentRun(
+  stream: AsyncGenerator<AgentStreamEvent>,
+): AsyncGenerator<AgentStreamEvent> {
+  return Object.assign(stream, { [QUEUED_AGENT_RUN]: true });
+}
+
+export function isQueuedAgentRun(stream: AsyncGenerator<AgentStreamEvent>): boolean {
+  return (stream as { [QUEUED_AGENT_RUN]?: boolean })[QUEUED_AGENT_RUN] === true;
+}
+
 export type AgentPermissionRequestKind = "tool" | "plan" | "question" | "mode" | "other";
 
 export type AgentPermissionUpdate = AgentMetadata;

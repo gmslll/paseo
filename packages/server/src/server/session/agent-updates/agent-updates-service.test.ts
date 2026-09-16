@@ -236,6 +236,7 @@ function buildHarness(options?: {
         },
         activeTurnId: null,
         activeTurnStartedAt: null,
+        queuedTurns: [],
       } as unknown as ManagedAgent;
     },
     stored(id: string): StoredAgentRecord {

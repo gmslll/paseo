@@ -56,6 +56,7 @@ import {
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
+import { markQueuedAgentRun } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import {
   storedAgentOwnership,
@@ -387,8 +388,8 @@ interface HandleStreamEventOptions {
 }
 
 /** A run that produces nothing, for a send that was queued rather than started (ADR-0034). */
-async function* emptyAgentRunStream(): AsyncGenerator<AgentStreamEvent> {
-  // Intentionally yields nothing.
+function emptyAgentRunStream(): AsyncGenerator<AgentStreamEvent> {
+  return markQueuedAgentRun((async function* () {})());
 }
 
 /**
@@ -2753,6 +2754,20 @@ export class AgentManager {
         );
       }
     })();
+  }
+
+  /**
+   * Who controls this Agent's running turn, or null when nothing is running and when the turn was
+   * opened without an author (ADR-0034). Callers that gate on it must treat null as "not known to
+   * be someone else's" rather than as a refusal: turns opened before authorship, and by the daemon
+   * itself, have no controller and were always answerable by anyone.
+   */
+  turnControllerOf(agentId: string): { principalId: string; displayName?: string } | null {
+    const agent = this.agents.get(agentId);
+    // Same narrowing requireSessionAgent uses, without its throw: an unknown or closed Agent has no
+    // controller, and a question about one is not an error.
+    if (!agent || agent.session === null) return null;
+    return this.activeTurnAuthor(agent);
   }
 
   /** Who opened the running turn, from the user message committed under its turn id. */
