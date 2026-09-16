@@ -5,6 +5,7 @@ import {
   ManagedPrincipalIdSchema,
   NodeIdSchema,
   OrganizationIdSchema,
+  type SharedTurnPolicy,
 } from "./messages.js";
 
 // Collaboration data plane contracts: ADR-0031 through ADR-0037, board containers from ADR-0046.
@@ -156,6 +157,37 @@ export function roleAllowsMachineRpcMethod(
 
 export function machineRpcMethodPolicy(method: string): MachineRpcMethodPolicy | null {
   return Object.hasOwn(MACHINE_RPC_METHODS, method) ? MACHINE_RPC_METHODS[method]! : null;
+}
+
+/** Whether a send waits behind the running turn or replaces it (ADR-0034). */
+export type SharedTurnDisposition = "proceed" | "queue";
+
+export interface SharedTurnRequest {
+  /** The authenticated sender, or null for a single-user daemon or a daemon-injected prompt. */
+  readonly senderPrincipalId: string | null;
+  /** Whose message opened the running turn, or null when nobody is recorded as owning it. */
+  readonly controllerPrincipalId: string | null;
+  /** The Workspace owner, when the Agent records one. */
+  readonly ownerPrincipalId: string | null;
+  /** What the client asked for. Never decides this on its own. */
+  readonly requested?: SharedTurnPolicy;
+}
+
+/**
+ * The daemon resolves the effective behaviour from the authenticated Principal, never from the
+ * client value alone (ADR-0034). The stated policy can only ask for less than the sender's standing
+ * already allows: a different Principal queues whatever they ask for, and the Workspace owner may
+ * interrupt but may also choose to wait.
+ */
+export function resolveSharedTurnDisposition(request: SharedTurnRequest): SharedTurnDisposition {
+  const { senderPrincipalId, controllerPrincipalId, ownerPrincipalId, requested } = request;
+  // No authenticated sender, and a turn nobody is recorded as owning, both keep today's behaviour:
+  // refusing either would take away sends that have always been allowed.
+  if (!senderPrincipalId || !controllerPrincipalId) return "proceed";
+  // The same Principal keeps today's interrupt and steer behaviour.
+  if (senderPrincipalId === controllerPrincipalId) return "proceed";
+  if (senderPrincipalId === ownerPrincipalId) return requested === "queue" ? "queue" : "proceed";
+  return "queue";
 }
 
 export const WORKSPACE_MEMBER_ROLES = ["owner", "editor", "viewer"] as const;

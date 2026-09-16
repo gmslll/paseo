@@ -10052,6 +10052,7 @@ export class Session {
           ...(this.enterpriseContext
             ? { author: { principalId: this.enterpriseContext.principal.principalId } }
             : {}),
+          ...(msg.sharedTurnPolicy ? { sharedTurnPolicy: msg.sharedTurnPolicy } : {}),
           logger: this.sessionLogger,
         });
         if (result.disposition === "turn_started") {

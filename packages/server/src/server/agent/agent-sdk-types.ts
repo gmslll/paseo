@@ -5,7 +5,7 @@ import type {
   ProviderOptions,
   ToolPolicy,
 } from "@getpaseo/protocol/agent-types";
-import type { AgentAttachment } from "@getpaseo/protocol/messages";
+import type { AgentAttachment, SharedTurnPolicy } from "@getpaseo/protocol/messages";
 import type { PaseoToolCatalog } from "./tools/types.js";
 
 export type { AgentProviderNotice, AgentTaskItem };
@@ -221,6 +221,11 @@ export interface AgentRunOptions {
    * too.
    */
   author?: { principalId: string; displayName?: string };
+  /**
+   * What the sender asked for when a turn is already running (ADR-0034). Advisory: the manager
+   * resolves the effective behaviour from the Principal, and this can only ask for less.
+   */
+  sharedTurnPolicy?: SharedTurnPolicy;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {

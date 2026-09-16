@@ -11183,6 +11183,47 @@ test("the Workspace owner interrupts another Principal's turn rather than queuei
   }
 });
 
+test("the owner may ask to wait instead of interrupting", async () => {
+  const { manager, agentId, workdir } = await agentWithRunningTurnBy(ALICE, {
+    ownerPrincipalId: BOB.principalId,
+  });
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: BOB,
+      sharedTurnPolicy: "queue",
+    });
+
+    // The stated policy may ask for less than the sender's standing allows, so an owner who says
+    // "queue" waits rather than cancelling the turn they are entitled to interrupt.
+    const queued = manager.getAgent(agentId)!.queuedTurns;
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ messageId: "second-client", author: BOB });
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a stated policy cannot buy an interrupt the sender does not have", async () => {
+  const { manager, session, agentId, workdir } = await agentWithRunningTurnBy(ALICE);
+  try {
+    await manager.replaceAgentRun(agentId, "second", {
+      clientMessageId: "second-client",
+      author: BOB,
+      sharedTurnPolicy: "interrupt",
+    });
+
+    // ADR-0034 resolves the effective behaviour from the authenticated Principal, never from the
+    // client value alone. Asking to interrupt does not make Bob the owner.
+    expect(manager.getAgent(agentId)!.queuedTurns).toHaveLength(1);
+    expect(session.interruptCount).toBe(0);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("an unauthored send keeps replacing exactly as it did before collaboration", async () => {
   const { manager, agentId, workdir } = await agentWithRunningTurnBy(undefined);
   try {

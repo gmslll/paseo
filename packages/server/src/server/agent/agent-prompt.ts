@@ -12,7 +12,7 @@ import { ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { watchAgentCompletion, type AgentCompletionReason } from "./agent-completion-watch.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
-import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
+import type { ActiveTurnBehavior, SharedTurnPolicy } from "@getpaseo/protocol/messages";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
 
@@ -255,6 +255,8 @@ export interface SendPromptToAgentParams {
    * options, because the author of a turn's first message is what makes them its controller.
    */
   author?: { principalId: string; displayName?: string };
+  /** What the sender asked for when a turn is already running (ADR-0034). Advisory. */
+  sharedTurnPolicy?: SharedTurnPolicy;
   logger: Logger;
 }
 
@@ -342,11 +344,12 @@ export async function sendPromptToAgent(
   // would otherwise reach the timeline anonymous, and the author is what makes a sender the turn's
   // controller (ADR-0034).
   const runOptions =
-    params.messageId || params.author
+    params.messageId || params.author || params.sharedTurnPolicy
       ? {
           ...params.runOptions,
           ...(params.messageId ? { clientMessageId: params.messageId } : {}),
           ...(params.author ? { author: params.author } : {}),
+          ...(params.sharedTurnPolicy ? { sharedTurnPolicy: params.sharedTurnPolicy } : {}),
         }
       : params.runOptions;
 

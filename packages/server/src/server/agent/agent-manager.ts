@@ -57,6 +57,7 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import { markQueuedAgentRun } from "./agent-sdk-types.js";
+import { resolveSharedTurnDisposition } from "@getpaseo/protocol/enterprise-collaboration";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import {
   storedAgentOwnership,
@@ -2704,11 +2705,13 @@ export class AgentManager {
     const sender = options?.author;
     if (!sender) return false;
     const controller = this.activeTurnAuthor(agent);
-    // Unknown controller means the running turn predates authorship or came from the daemon. Left
-    // to replace rather than queued: refusing on a turn nobody is recorded as owning would block
-    // sends that have always been allowed.
-    if (!controller || controller.principalId === sender.principalId) return false;
-    if (agent.enterpriseOwnership?.ownerPrincipalId === sender.principalId) return false;
+    const disposition = resolveSharedTurnDisposition({
+      senderPrincipalId: sender.principalId,
+      controllerPrincipalId: controller?.principalId ?? null,
+      ownerPrincipalId: agent.enterpriseOwnership?.ownerPrincipalId ?? null,
+      requested: options?.sharedTurnPolicy,
+    });
+    if (disposition === "proceed") return false;
 
     const messageId = options?.clientMessageId ?? randomUUID();
     agent.queuedTurns = [...agent.queuedTurns, { messageId, author: sender, queuedAt: new Date() }];

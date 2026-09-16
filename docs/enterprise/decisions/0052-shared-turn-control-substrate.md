@@ -79,6 +79,37 @@ Raised rather than resolved, because picking a durability level here would silen
 whichever ADR is not chosen. The permission-response rule from ADR-0034 is implemented; the cancel
 audit is not, and ADR-0034 should say so until this is settled.
 
+## Where the resolver lives
+
+The plan puts the shared turn policy in `packages/server/src/server/enterprise/access/shared-turn-policy.ts`,
+which assumed the decision would be taken in the Session. It is taken in `AgentManager`, because the
+manager is what holds the running turn and what machine RPC and the Agent tools reach too, not only
+a client Session.
+
+`packages/server/src/server/agent/agent-manager.ts` imports nothing from `enterprise/` or
+`authorization/`: the agent core is deliberately free of that layering, and the plan calls those
+files out as upstream-churn and merge-conflict risks. Having the core reach into the enterprise
+workstream to ask a policy question would invert that.
+
+So `resolveSharedTurnDisposition` sits in `packages/protocol/src/enterprise-collaboration.ts`,
+beside `roleAllowsMachineRpcMethod`, which is the same shape of decision for the same reason: a pure
+function over contract types that both sides already depend on.
+
+The distinction it needs is the sender against the turn's controller and the Workspace owner, not
+the member's role. Whether a viewer may send at all is a `workspace.write` question, answered before
+this one and elsewhere.
+
+## The feature is not declared yet
+
+The plan has this work declare `enterpriseCollaborationV1` and `enterpriseDistributedNodeV1`. It
+does not. Both flags exist in the protocol and only the protocol's own tests ever set them; no
+daemon code declares either, and nothing reads the `collaboration.enabled` key that
+`persisted-config.ts` already parses.
+
+A feature flag is a promise to the client that the capability is there. Declaring it while the
+collaboration stack is built but unwired would gate clients onto a path the daemon cannot serve.
+The declaration belongs with the runtime wiring that makes `collaboration.enabled` mean something.
+
 ## Acceptance
 
 Whichever option is taken, the tests ADR-0034 names stay the acceptance bar for the rules that are

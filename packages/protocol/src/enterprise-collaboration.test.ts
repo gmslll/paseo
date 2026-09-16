@@ -17,6 +17,7 @@ import {
   collabSegmentContainerKind,
   formatCollabSegment,
   parseCollabSegment,
+  resolveSharedTurnDisposition,
 } from "./enterprise-collaboration.js";
 import { EnterpriseActionSchema } from "./messages.js";
 
@@ -329,5 +330,74 @@ describe("stream tokens and subscriptions", () => {
     expect(CollabSubscriptionEventSchema.safeParse({ ...events[0], offset: "42" }).success).toBe(
       false,
     );
+  });
+});
+
+describe("resolving who waits behind a running turn", () => {
+  const ALICE = "usr_00000000000000a1";
+  const BOB = "usr_00000000000000b2";
+  const OWNER = "usr_00000000000000c3";
+
+  test("a different Principal queues even when the client asks to interrupt", () => {
+    expect(
+      resolveSharedTurnDisposition({
+        senderPrincipalId: BOB,
+        controllerPrincipalId: ALICE,
+        ownerPrincipalId: OWNER,
+        requested: "interrupt",
+      }),
+    ).toBe("queue");
+  });
+
+  test("the controller sending again keeps today's behaviour", () => {
+    expect(
+      resolveSharedTurnDisposition({
+        senderPrincipalId: ALICE,
+        controllerPrincipalId: ALICE,
+        ownerPrincipalId: OWNER,
+      }),
+    ).toBe("proceed");
+  });
+
+  test("the Workspace owner may interrupt another Principal's turn", () => {
+    expect(
+      resolveSharedTurnDisposition({
+        senderPrincipalId: OWNER,
+        controllerPrincipalId: ALICE,
+        ownerPrincipalId: OWNER,
+      }),
+    ).toBe("proceed");
+  });
+
+  test("the owner may ask to wait instead", () => {
+    expect(
+      resolveSharedTurnDisposition({
+        senderPrincipalId: OWNER,
+        controllerPrincipalId: ALICE,
+        ownerPrincipalId: OWNER,
+        requested: "queue",
+      }),
+    ).toBe("queue");
+  });
+
+  test("a turn nobody is recorded as owning stays replaceable", () => {
+    expect(
+      resolveSharedTurnDisposition({
+        senderPrincipalId: BOB,
+        controllerPrincipalId: null,
+        ownerPrincipalId: OWNER,
+        requested: "interrupt",
+      }),
+    ).toBe("proceed");
+  });
+
+  test("an unauthenticated send keeps today's behaviour", () => {
+    expect(
+      resolveSharedTurnDisposition({
+        senderPrincipalId: null,
+        controllerPrincipalId: ALICE,
+        ownerPrincipalId: OWNER,
+      }),
+    ).toBe("proceed");
   });
 });
