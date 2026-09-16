@@ -1,8 +1,10 @@
 # ADR-0052: What shared turn control needs before it can be built
 
-- Status: DECISION_REQUIRED
+- Status: Accepted
 - Date: 2026-09-17
 - Raised by: Enterprise integration work on M6
+- Decision owner: Enterprise integration owner (decided by the user on 2026-09-17): option 1, thread
+  the author through the agent core now and implement ADR-0034 as written.
 
 ## Context
 

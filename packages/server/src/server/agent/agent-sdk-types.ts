@@ -402,7 +402,18 @@ export interface PluginTimelineItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      /**
+       * Who sent it, when the daemon knows (ADR-0034). Absent for a single-user daemon and for
+       * prompts the daemon injects itself, present for an authenticated Principal — which is what
+       * makes the author of a turn's first message its controller.
+       */
+      author?: { principalId: string; displayName?: string };
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
