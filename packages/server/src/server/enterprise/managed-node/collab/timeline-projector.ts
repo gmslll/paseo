@@ -1,3 +1,4 @@
+import { isTurnTerminalStreamEvent } from "../../../agent/agent-sdk-types.js";
 import type { AgentStreamEvent } from "@getpaseo/protocol/agent-types";
 import { formatCollabSegment } from "@getpaseo/protocol/enterprise-collaboration";
 
@@ -169,11 +170,7 @@ export class TimelineProjector {
       return;
     }
     // A turn ending makes the text final whichever way it ended.
-    if (
-      stream.type === "turn_completed" ||
-      stream.type === "turn_failed" ||
-      stream.type === "turn_canceled"
-    ) {
+    if (isTurnTerminalStreamEvent(stream)) {
       this.commitPending();
     }
   }

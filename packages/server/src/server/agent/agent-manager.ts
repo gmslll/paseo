@@ -56,7 +56,7 @@ import {
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
-import { markQueuedAgentRun } from "./agent-sdk-types.js";
+import { isTurnTerminalStreamEvent, markQueuedAgentRun } from "./agent-sdk-types.js";
 import { resolveSharedTurnDisposition } from "@getpaseo/protocol/enterprise-collaboration";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import {
@@ -596,14 +596,6 @@ const AgentIdSchema = z.guid();
 
 function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
-}
-
-function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
-  return (
-    event.type === "turn_completed" ||
-    event.type === "turn_failed" ||
-    event.type === "turn_canceled"
-  );
 }
 
 function abortMessage(reason: unknown, fallbackMessage: string): string {
@@ -2616,7 +2608,7 @@ export class AgentManager {
           turnId,
         };
         yield acceptedTurnStartedEvent;
-        for await (const event of turnStream.events(isTurnTerminalEvent)) {
+        for await (const event of turnStream.events(isTurnTerminalStreamEvent)) {
           yield event;
         }
       } finally {
@@ -3993,7 +3985,7 @@ export class AgentManager {
     }
 
     this.runs.notifyWaiters(matchingWaiters, event, {
-      terminal: isTurnTerminalEvent(event),
+      terminal: isTurnTerminalStreamEvent(event),
     });
     this.logger.trace(
       {
@@ -4002,7 +3994,7 @@ export class AgentManager {
         sessionId: agent.persistence?.sessionId ?? undefined,
         turnId,
         notifiedWaiterCount: matchingWaiters.length,
-        terminal: isTurnTerminalEvent(event),
+        terminal: isTurnTerminalStreamEvent(event),
         event,
       },
       "agent.manager.notify_waiters",
@@ -4281,7 +4273,7 @@ export class AgentManager {
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
       eventTurnId &&
-      isTurnTerminalEvent(event) &&
+      isTurnTerminalStreamEvent(event) &&
       this.runs.hasFinalizedTurn(agent, eventTurnId)
     ) {
       return false;
@@ -4298,7 +4290,7 @@ export class AgentManager {
     }
 
     let terminalDisposition: ActiveTurnTerminalDisposition = "untracked";
-    if (isTurnTerminalEvent(event)) {
+    if (isTurnTerminalStreamEvent(event)) {
       terminalDisposition = this.applyActiveTurnTerminal(
         agent,
         eventTurnId,
@@ -4322,7 +4314,7 @@ export class AgentManager {
     }
 
     if (!options?.fromHistory) {
-      if (isTurnTerminalEvent(event)) {
+      if (isTurnTerminalStreamEvent(event)) {
         this.runs.settleTerminalRun(agent.id, eventTurnId);
         if (isForegroundEvent) {
           this.finalizeForegroundTurn(agent, eventTurnId);

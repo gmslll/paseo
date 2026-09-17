@@ -502,6 +502,21 @@ export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | und
 }
 
 /**
+ * Whether this event ends a turn, however it ended.
+ *
+ * Here rather than beside one caller because three already ask it: the manager decides a run is
+ * over, the session projector makes streamed text final, and the plugin lifecycle reports the turn.
+ * A rule spelled out separately in each is a rule that can drift in one of them.
+ */
+export function isTurnTerminalStreamEvent(event: AgentStreamEvent): boolean {
+  return (
+    event.type === "turn_completed" ||
+    event.type === "turn_failed" ||
+    event.type === "turn_canceled"
+  );
+}
+
+/**
  * A send that was queued rather than started hands back a run that produces nothing (ADR-0034).
  * The fact travels on the stream itself: an empty run is otherwise indistinguishable from a turn
  * that started and said nothing, and reading it back off the Agent would mean trusting two
