@@ -147,5 +147,15 @@ describe("collab views", () => {
       description: "You no longer have access to this workspace.",
     });
     expect(projectRevokeBanner({ revoked: false, reason: null, copy })).toBeNull();
+    expect(
+      projectRevokeBanner({
+        revoked: true,
+        reason: "remote_missing",
+        copy,
+      }),
+    ).toEqual({
+      title: "Access removed",
+      description: "This workspace is no longer available.",
+    });
   });
 });

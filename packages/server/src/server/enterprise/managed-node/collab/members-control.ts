@@ -1,4 +1,5 @@
 import type {
+  WorkspaceCatalogEntry,
   WorkspaceMember,
   WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
@@ -6,10 +7,31 @@ import type { ManagedWorkspaceCatalog } from "./workspace-catalog.js";
 
 export const COLLAB_MEMBERS_UNAVAILABLE = "Workspace sharing is unavailable on this daemon";
 
+function resolveMemberRevoke(
+  entry: WorkspaceCatalogEntry,
+  viewerPrincipalId: string | null,
+): { revoked: boolean; reason: string | null } {
+  const isOwner = viewerPrincipalId === entry.ownerPrincipalId;
+  const isMember =
+    viewerPrincipalId !== null &&
+    entry.members.some((member) => member.principalId === viewerPrincipalId);
+  if (entry.state === "revoked") {
+    return { revoked: true, reason: "membership_removed" };
+  }
+  if (entry.state === "remote_missing" && !isOwner) {
+    return { revoked: true, reason: "remote_missing" };
+  }
+  if (viewerPrincipalId && viewerPrincipalId !== "owner" && !isOwner && !isMember) {
+    return { revoked: true, reason: "membership_removed" };
+  }
+  return { revoked: false, reason: null };
+}
+
 export interface CollabMembersSnapshot {
   readonly workspaceUid: string | null;
   readonly viewerRole: WorkspaceMemberRole | null;
   readonly revoked: boolean;
+  readonly revokeReason: string | null;
   readonly members: readonly WorkspaceMember[];
 }
 
@@ -55,14 +77,22 @@ export function createCollabMembersControl(input: {
     list(workspaceId, viewerPrincipalId) {
       const entry = lookup(workspaceId);
       if (!entry) {
-        return { workspaceUid: null, viewerRole: null, revoked: false, members: [] };
+        return {
+          workspaceUid: null,
+          viewerRole: null,
+          revoked: false,
+          revokeReason: null,
+          members: [],
+        };
       }
       const viewerRole =
         entry.members.find((member) => member.principalId === viewerPrincipalId)?.role ?? null;
+      const revoke = resolveMemberRevoke(entry, viewerPrincipalId);
       return {
         workspaceUid: entry.workspaceUid,
         viewerRole,
-        revoked: entry.state === "revoked",
+        revoked: revoke.revoked,
+        revokeReason: revoke.reason,
         members: entry.members,
       };
     },

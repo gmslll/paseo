@@ -39,6 +39,7 @@ describe("collab members control", () => {
       workspaceUid: WORKSPACE_UID,
       viewerRole: "owner",
       revoked: false,
+      revokeReason: null,
       members: [
         { principalId: OWNER, role: "owner" },
         { principalId: EDITOR, role: "editor" },
@@ -55,7 +56,49 @@ describe("collab members control", () => {
       workspaceUid: null,
       viewerRole: null,
       revoked: false,
+      revokeReason: null,
       members: [],
+    });
+  });
+
+  test("a Principal no longer in the members list is revoked", () => {
+    const snapshot = catalog();
+    const workspace = snapshot.workspaces[0]!;
+    const control = createCollabMembersControl({
+      catalog: {
+        current: () => ({
+          ...snapshot,
+          workspaces: [{ ...workspace, members: [{ principalId: OWNER, role: "owner" }] }],
+        }),
+      },
+    });
+
+    expect(control.list("ws-1", EDITOR)).toMatchObject({
+      revoked: true,
+      revokeReason: "membership_removed",
+      viewerRole: null,
+    });
+  });
+
+  test("a member on a remote_missing Workspace is revoked, the owner is not", () => {
+    const snapshot = catalog();
+    const workspace = snapshot.workspaces[0]!;
+    const control = createCollabMembersControl({
+      catalog: {
+        current: () => ({
+          ...snapshot,
+          workspaces: [{ ...workspace, state: "remote_missing" }],
+        }),
+      },
+    });
+
+    expect(control.list("ws-1", EDITOR)).toMatchObject({
+      revoked: true,
+      revokeReason: "remote_missing",
+    });
+    expect(control.list("ws-1", OWNER)).toMatchObject({
+      revoked: false,
+      revokeReason: null,
     });
   });
 });

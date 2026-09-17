@@ -6776,6 +6776,7 @@ export const CollabMembersListResponseSchema = z.object({
     workspaceUid: z.string().nullable(),
     viewerRole: z.enum(["owner", "editor", "viewer"]).nullable(),
     revoked: z.boolean(),
+    revokeReason: z.string().nullable().optional(),
     members: z.array(CollabWireMemberSchema),
   }),
 });

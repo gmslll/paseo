@@ -33,6 +33,7 @@ export async function handleCollabMembersRequest(
           workspaceUid: snapshot.workspaceUid,
           viewerRole: snapshot.viewerRole,
           revoked: snapshot.revoked,
+          revokeReason: snapshot.revokeReason,
           members: [...snapshot.members],
         },
       };
