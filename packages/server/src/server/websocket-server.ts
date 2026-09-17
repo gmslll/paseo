@@ -18,6 +18,7 @@ import type { CheckoutDiffManager, CheckoutDiffMetrics } from "./checkout-diff-m
 import type { DaemonConfigStore, MutableDaemonConfig } from "./daemon-config-store.js";
 import {
   type ServerInfoStatusPayload,
+  type SessionInboundMessage,
   type SessionOutboundMessage,
   type WorkspaceSetupSnapshot,
   type WSHelloMessage,
@@ -1502,6 +1503,58 @@ export class VoiceAssistantWebSocketServer {
       throw error;
     }
     return { closed };
+  }
+
+  /**
+   * A Session with no transport, for a request that reached this node through the management plane
+   * rather than a socket (ADR-0035, ADR-0053).
+   *
+   * Here because this server is the only holder of the collaborators a Session needs and of the
+   * teardown that follows it. Two things differ from an admitted connection, both deliberate:
+   *
+   * - No admission handle. `bindSession` takes branded evidence that only `authenticateEvidence`
+   *   produces, and the plane already authenticated this caller, so there is nothing to bind and
+   *   nothing to release. The Principal's own grants still gate every request through
+   *   `resourceAuthorization` and the grant-version guard.
+   * - It joins neither session map. `listSessions()` is what broadcasts and project updates fan
+   *   out over, and a machine RPC is answering one caller, not subscribing on their behalf.
+   */
+  public openHeadlessSession(input: {
+    readonly principal: PrincipalContext;
+    readonly clientId: string;
+    readonly onMessage: (message: SessionOutboundMessage) => void;
+  }): {
+    handleMessage(message: SessionInboundMessage): Promise<void>;
+    close(): void;
+  } | null {
+    const runtime = this.enterpriseRuntime;
+    if (!runtime) return null;
+    const session = this.createSocketSession({
+      clientId: input.clientId,
+      appVersion: null,
+      clientCapabilities: null,
+      // The same derivation an admitted enterprise connection gets, so a machine RPC can never do
+      // more than the same Principal could over a socket.
+      permissions: deriveEnterpriseSessionPermissions(input.principal),
+      connectionLogger: this.logger.child({ module: "machine-rpc", clientId: input.clientId }),
+      onMessage: input.onMessage,
+      enterprise: {
+        principal: input.principal,
+        node: runtime.node,
+        runtime,
+        grantVersionGuard: runtime.grantVersionGuard,
+      },
+    });
+    return {
+      handleMessage: (message) => session.handleMessage(message),
+      close: () => {
+        void session
+          .cleanup()
+          .catch((error) =>
+            this.logger.warn({ err: error }, "Failed to clean up headless session"),
+          );
+      },
+    };
   }
 
   public updatePrincipalPermissions(
