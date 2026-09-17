@@ -24,6 +24,7 @@ import type { BrowserProfileRegistry } from "../browser/profile-registry.js";
 import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 import type { ManagedPlacementSnapshotSource } from "../managed-node/lifecycle.js";
 import type { CollabRuntimeDependencies } from "../managed-node/collab/collab-runtime.js";
+import type { HeadlessSessionFactory } from "../managed-node/collab/machine-rpc-server.js";
 
 export interface EnterpriseAdmissionPort {
   readonly audit: ProductionAuditCapability;
@@ -78,6 +79,11 @@ export interface EnterpriseAdmissionRuntime {
    */
   readonly collaboration?: Readonly<{
     install(dependencies: CollabRuntimeDependencies): Promise<void>;
+    /**
+     * Separate from `install` because the factory belongs to the WebSocket server, which bootstrap
+     * builds long after the replicas (ADR-0053).
+     */
+    attachSessions(sessions: HeadlessSessionFactory): void;
   }>;
   readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;

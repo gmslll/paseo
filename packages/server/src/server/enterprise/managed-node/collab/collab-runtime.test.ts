@@ -11,6 +11,7 @@ import type { AgentPermissionRequest, AgentSession } from "../../../agent/agent-
 import type { PersistedWorkspaceRecord } from "../../../workspace-registry.js";
 import { generateManagedNodeKeyPair, type ManagedNodeRelationship } from "../relationship-store.js";
 import { CollabRuntime, type CollabRuntimeOptions } from "./collab-runtime.js";
+import type { HeadlessSessionFactory } from "./machine-rpc-server.js";
 import type { MetaWorkspaceStore } from "./meta-projector.js";
 import type { StreamUplinkTransport } from "./stream-uplink.js";
 import type { AgentSubscription } from "./timeline-projector.js";
@@ -207,11 +208,23 @@ function runtime(entries: readonly WorkspaceCatalogEntry[]): CollabRuntime {
     } as unknown as ManagedNodeRelationship,
     caCertificate: "ca",
     catalog: { activeWorkspaces: () => entries },
+    organizationId: "org_0123456789abcdef",
+    ticketPublicKeyPem: "unused-until-an-attestation-arrives",
+    // No RPC reaches these tests: sessions are never attached, so the machine RPC server is null
+    // and nothing resolves a Principal.
+    principals: { resolvePrincipal: async () => null },
     transport: transport(),
   };
   const created = new CollabRuntime(options);
   runtimes.push(created);
   return created;
+}
+
+/** Enough to make an RPC answerable; what a Session does with the message is its own test. */
+function sessions(): HeadlessSessionFactory {
+  return {
+    open: () => ({ handleMessage: async () => {}, close: () => {} }),
+  };
 }
 
 function pathsSent(): string[] {
@@ -244,6 +257,24 @@ describe("collaborating on behalf of a node", () => {
     expect(read.some((entry) => entry.includes(encodeURIComponent(`rpc:req:${NODE_ID}`)))).toBe(
       false,
     );
+  });
+
+  test("pulls the RPC log once it can answer one", async () => {
+    const collab = runtime([catalogEntry(CONTAINER, WORKSPACE_ID)]);
+    await collab.install({ workspaceRegistry: registry(), agents: agents() });
+    await collab.pump();
+    const rpcPath = encodeURIComponent(`rpc:req:${NODE_ID}`);
+    expect(read.some((entry) => entry.includes(rpcPath))).toBe(false);
+
+    collab.attachSessions(sessions());
+    await collab.pump();
+
+    // Reading it is what makes a request answerable, and attaching the factory is what makes
+    // reading it safe: before this there was nothing to answer with, and the bytes do not survive
+    // the read (ADR-0032). Whether a signed envelope then dispatches is the machine RPC server's
+    // own test; this covers the branch that decides to read at all.
+    expect(read.some((entry) => entry.includes(rpcPath))).toBe(true);
+    expect(failures).toEqual([]);
   });
 
   test("projects an Agent that belongs to a collaborating Workspace", async () => {

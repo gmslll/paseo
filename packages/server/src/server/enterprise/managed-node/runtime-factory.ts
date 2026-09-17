@@ -33,6 +33,7 @@ import {
   ManagedNodeControlPlaneClient,
 } from "./management-client.js";
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
+import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
 import { ManagedPrincipalGrantSource } from "./principal-source.js";
 import { ManagedNodeRuntimeDistributionState } from "./runtime-policy-source.js";
@@ -128,7 +129,15 @@ export async function createManagedEnterpriseRuntime(
             catalog.load();
             return {
               catalog,
-              replicas: new CollabRuntime({ paseoHome, relationship, caCertificate, catalog }),
+              replicas: new CollabRuntime({
+                paseoHome,
+                relationship,
+                caCertificate,
+                catalog,
+                organizationId: input.config.organizationId,
+                ticketPublicKeyPem: relationship.ticketPublicKeyPem,
+                principals: principalSource,
+              }),
             };
           })()
         : null;
@@ -237,6 +246,9 @@ export async function createManagedEnterpriseRuntime(
               install: async (dependencies: CollabRuntimeDependencies) => {
                 await collaboration.replicas.install(dependencies);
                 await lifecycle.installCollabPump(() => collaboration.replicas.pump());
+              },
+              attachSessions: (sessions: HeadlessSessionFactory) => {
+                collaboration.replicas.attachSessions(sessions);
               },
             }),
           }

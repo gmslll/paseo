@@ -2583,6 +2583,19 @@ export async function createPaseoDaemon(
                 dependencies.rpcDiagnosticObserver,
               );
               requireStartAudit();
+              if (enterpriseRuntime?.collaboration) {
+                // Only this server can open a Session without a socket (ADR-0053), and it does not
+                // exist until here — which is why this is a second injection rather than part of
+                // collaboration.install above.
+                const host = wsServer;
+                enterpriseRuntime.collaboration.attachSessions({
+                  open: (request) => {
+                    const session = host.openHeadlessSession(request);
+                    if (!session) throw new Error("headless session unavailable");
+                    return session;
+                  },
+                });
+              }
               pluginRuntime.bindPaseoSessionHost(wsServer);
               requireStartAudit();
               await pluginRuntime.start();

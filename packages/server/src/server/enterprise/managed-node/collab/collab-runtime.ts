@@ -6,6 +6,11 @@ import type { AgentManagerEvent } from "../../../agent/agent-manager.js";
 import type { ManagedNodeRelationship } from "../relationship-store.js";
 import { collabPaths, ensureCollabRepoPath, type CollabPaths } from "./collab-paths.js";
 import { CollabRepoStore } from "./loro-repo-store.js";
+import {
+  MachineRpcServer,
+  type HeadlessSessionFactory,
+  type MachineRpcPrincipalSource,
+} from "./machine-rpc-server.js";
 import { MetaProjector, type MetaWorkspaceStore } from "./meta-projector.js";
 import { CollabStreamUplink, type StreamUplinkTransport } from "./stream-uplink.js";
 import { TimelineProjector, type AgentSubscription } from "./timeline-projector.js";
@@ -27,6 +32,11 @@ export interface CollabRuntimeOptions {
   readonly catalog: Pick<ManagedWorkspaceCatalog, "activeWorkspaces">;
   /** Reported rather than thrown: one container's failure must not stop the others. */
   readonly onError?: (containerId: string, error: unknown) => void;
+  readonly organizationId: string;
+  /** The plane's ticket key, which is what an attestation is checked against (ADR-0035). */
+  readonly ticketPublicKeyPem: string;
+  /** Resolves the Principal an attested request names, for the Session that answers it. */
+  readonly principals: MachineRpcPrincipalSource;
   readonly now?: () => number;
   /** Handed to every uplink. Left unset, each dials the plane over HTTPS as it does in production. */
   readonly transport?: StreamUplinkTransport;
@@ -44,12 +54,14 @@ interface CollabContainer {
   readonly uplink: CollabStreamUplink;
   readonly meta: MetaProjector;
   readonly timelines: Map<string, TimelineProjector>;
+  readonly rpc: MachineRpcServer | null;
 }
 
 export class CollabRuntime {
   private readonly paths: CollabPaths;
   private readonly containers = new Map<string, CollabContainer>();
   private dependencies: CollabRuntimeDependencies | null = null;
+  private sessions: HeadlessSessionFactory | null = null;
   private unsubscribe: (() => void) | null = null;
   private closed = false;
 
@@ -66,6 +78,22 @@ export class CollabRuntime {
     // Every Agent event, not one Agent's: this is what notices an Agent the node did not have when
     // the container opened.
     this.unsubscribe = dependencies.agents.subscribe((event) => this.onAgentEvent(event));
+  }
+
+  /**
+   * Lets the node answer machine RPCs (ADR-0035, ADR-0053).
+   *
+   * Separate from `install` because the factory belongs to the WebSocket server, which bootstrap
+   * builds long after the replicas. Until this lands the RPC log is not even read: consuming a
+   * request with nothing to answer it would drop it past its cursor.
+   */
+  attachSessions(sessions: HeadlessSessionFactory): void {
+    if (this.closed) throw new Error("collaboration runtime is closed");
+    if (this.sessions) throw new Error("collaboration sessions are already attached");
+    this.sessions = sessions;
+    for (const [containerId, container] of this.containers) {
+      this.containers.set(containerId, { ...container, rpc: this.createRpcServer(container) });
+    }
   }
 
   /**
@@ -123,6 +151,15 @@ export class CollabRuntime {
 
     for (const segment of this.pullSet(container)) await container.uplink.pullSegment(segment);
 
+    // Read only with something to answer with: a log segment's bytes exist nowhere after the read.
+    const rpc = container.rpc;
+    if (rpc) {
+      const requests = await container.uplink.pullSegment(
+        formatCollabSegment({ kind: "rpc_request", nodeId: this.options.relationship.node.nodeId }),
+      );
+      for (const request of requests.messages) await rpc.handle(request);
+    }
+
     await container.meta.reconcile();
     container.store.sweepRpcInbox();
   }
@@ -130,10 +167,9 @@ export class CollabRuntime {
   /** What this node reads: the shared Workspace documents, the RPCs addressed to it, and whatever
    * it already holds a cursor for. */
   private pullSet(container: CollabContainer): readonly string[] {
-    // `rpc:req:<nodeId>` is deliberately absent until a consumer exists. Reading it advances the
-    // cursor past envelopes the replica does not keep — a log segment's bytes are the entry, and
-    // only documents are stored (ADR-0032) — so pulling it without something to answer with would
-    // consume machine RPCs and drop them. It returns with the machine RPC server (ADR-0053).
+    // `rpc:req:<nodeId>` is not here: it is pulled in `pumpContainer`, and only when a session
+    // factory is attached, because reading it advances the cursor past envelopes the replica does
+    // not keep (ADR-0032).
     const segments = new Set<string>([
       formatCollabSegment({ kind: "meta" }),
       formatCollabSegment({ kind: "workspace_kv" }),
@@ -172,13 +208,38 @@ export class CollabRuntime {
     const record = await dependencies.workspaceRegistry.get(workspaceId);
     if (record) meta.publish(record);
 
-    this.containers.set(containerId, {
+    const container: CollabContainer = {
       containerId,
       workspaceId,
       store,
       uplink,
       meta,
       timelines: new Map(),
+      rpc: null,
+    };
+    this.containers.set(containerId, { ...container, rpc: this.createRpcServer(container) });
+  }
+
+  /** Null until sessions are attached, which is what makes an RPC answerable. */
+  private createRpcServer(container: CollabContainer): MachineRpcServer | null {
+    const sessions = this.sessions;
+    if (!sessions) return null;
+    return new MachineRpcServer({
+      store: container.store,
+      containerId: container.containerId,
+      nodeId: this.options.relationship.node.nodeId,
+      organizationId: this.options.organizationId,
+      ticketPublicKeyPem: this.options.ticketPublicKeyPem,
+      principals: this.options.principals,
+      sessions,
+      // The role the plane recorded for this container, which is the second of the two checks
+      // ADR-0035 wants: the plane applies one before signing, the node applies its own.
+      roleOf: (principalId) =>
+        this.options.catalog
+          .activeWorkspaces()
+          .find((entry) => entry.workspaceUid === container.containerId)
+          ?.members.find((member) => member.principalId === principalId)?.role ?? null,
+      ...(this.options.now ? { now: this.options.now } : {}),
     });
   }
 
