@@ -28,6 +28,21 @@ events only.
 Feature flag: `codeCollabTurnDiff`. RPCs: `code_collab.turn_diff.list_turns`,
 `code_collab.turn_diff.get_files`, and `code_collab.all_changes.get_diff`.
 
+## The Workspace directory is named by hash
+
+This decision writes the store to `$PASEO_HOME/code-collab/<workspaceId>/diff-store.sqlite3`. The
+implementation puts it under `sha256(workspaceId)` instead.
+
+`generateWorkspaceId` produces `wks_<hex>`, but the persisted schema types the field as a bare
+string and ids such as `/tmp/repo` and `""` are in use, so the id reaching `path.join` is not
+guaranteed to be one segment. Validating a shape the type does not promise would refuse Workspaces
+the rest of the daemon serves; joining the id as written would let one escape the root. Hashing
+gives every id exactly one safe segment, which is what the daemon already does wherever a name has
+to reach the filesystem.
+
+The mapping is not lost: a Workspace's store is found by hashing its id again. Nothing outside this
+module needs to read the directory by name.
+
 ## Acceptance
 
 Tests use a real temporary git repository and cover capture of only touched files, chunk dedupe,
