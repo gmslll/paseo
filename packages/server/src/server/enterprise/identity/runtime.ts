@@ -24,6 +24,7 @@ import type { BrowserProfileRegistry } from "../browser/profile-registry.js";
 import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 import type { ManagedPlacementSnapshotSource } from "../managed-node/lifecycle.js";
 import type { CollabRuntimeDependencies } from "../managed-node/collab/collab-runtime.js";
+import type { CollabMembersControl } from "../managed-node/collab/members-control.js";
 import type { HeadlessSessionFactory } from "../managed-node/collab/machine-rpc-server.js";
 
 export interface EnterpriseAdmissionPort {
@@ -84,6 +85,7 @@ export interface EnterpriseAdmissionRuntime {
      * builds long after the replicas (ADR-0053).
      */
     attachSessions(sessions: HeadlessSessionFactory): void;
+    members?: CollabMembersControl;
   }>;
   readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;

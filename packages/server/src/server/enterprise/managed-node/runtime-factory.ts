@@ -33,6 +33,7 @@ import {
   ManagedNodeControlPlaneClient,
 } from "./management-client.js";
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
+import { createCollabMembersControl } from "./collab/members-control.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
 import { ManagedPrincipalGrantSource } from "./principal-source.js";
@@ -250,6 +251,23 @@ export async function createManagedEnterpriseRuntime(
               attachSessions: (sessions: HeadlessSessionFactory) => {
                 collaboration.replicas.attachSessions(sessions);
               },
+              members: createCollabMembersControl({
+                catalog: collaboration.catalog,
+                mutator: {
+                  async setMember(change) {
+                    const members = await client.applyOwnedCollabMemberChange(change);
+                    await client.refreshPolicy();
+                    collaboration.catalog.refresh();
+                    return members;
+                  },
+                  async removeMember(change) {
+                    const members = await client.applyOwnedCollabMemberChange(change);
+                    await client.refreshPolicy();
+                    collaboration.catalog.refresh();
+                    return members;
+                  },
+                },
+              }),
             }),
           }
         : {}),

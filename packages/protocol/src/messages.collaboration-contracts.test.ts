@@ -4,6 +4,8 @@ import { z } from "zod";
 import {
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
+  CollabMembersListRequestSchema,
+  CollabMembersListResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
   SendAgentMessageRequestSchema,
   ServerInfoStatusPayloadSchema,
@@ -47,6 +49,29 @@ describe("collaboration and local runtime feature flags", () => {
   test("the frozen enterprise V1 flag list does not grow (ADR-0008)", () => {
     expect(ENTERPRISE_FEATURE_FLAGS).not.toContain("enterpriseCollaborationV1");
     expect(ENTERPRISE_FEATURE_FLAGS).toHaveLength(13);
+  });
+});
+
+describe("collab member RPCs", () => {
+  test("list members is optional on an old client and required fields parse", () => {
+    const request = CollabMembersListRequestSchema.parse({
+      type: "collab.members.list.request",
+      requestId: "r1",
+      workspaceId: "ws-1",
+    });
+    expect(request.workspaceId).toBe("ws-1");
+    const response = CollabMembersListResponseSchema.parse({
+      type: "collab.members.list.response",
+      payload: {
+        requestId: "r1",
+        workspaceId: "ws-1",
+        workspaceUid: "cws_0123456789abcdef",
+        viewerRole: "owner",
+        revoked: false,
+        members: [{ principalId: "usr_aaaaaaaaaaaaaaaa", role: "owner" }],
+      },
+    });
+    expect(response.payload.members).toHaveLength(1);
   });
 });
 

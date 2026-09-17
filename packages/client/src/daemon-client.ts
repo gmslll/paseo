@@ -5183,6 +5183,36 @@ export class DaemonClient {
     );
   }
 
+  async listCollabMembers(input: { workspaceId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.members.list.response">({
+      requestId,
+      message: { type: "collab.members.list.request", ...input },
+    });
+  }
+
+  async setCollabMember(
+    input: { workspaceId: string; principalId: string; role: "editor" | "viewer" },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.members.set.response">({
+      requestId,
+      message: { type: "collab.members.set.request", ...input },
+    });
+  }
+
+  async removeCollabMember(
+    input: { workspaceId: string; principalId: string },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.members.remove.response">({
+      requestId,
+      message: { type: "collab.members.remove.request", ...input },
+    });
+  }
+
   async connectHub(
     hubUrl: string,
     token: string,
@@ -6118,6 +6148,13 @@ export class DaemonClient {
     // COMPAT(codeCollabTurnDiff): added in v0.9.0, remove gate after 2027-03-16.
     if (this.lastServerInfoMessage?.features?.codeCollabTurnDiff !== true) {
       throw new Error("Update the host to view per-turn diffs.");
+    }
+  }
+
+  private requireEnterpriseCollaborationSupport(): void {
+    // COMPAT(enterpriseCollaborationV1): added in v0.9.0, remove gate after 2027-03-09.
+    if (this.lastServerInfoMessage?.features?.enterpriseCollaborationV1 !== true) {
+      throw new Error("Update the host to share this workspace.");
     }
   }
 

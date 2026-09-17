@@ -100,6 +100,11 @@ export interface Agent {
   parentAgentId: string | null;
   labels: Record<string, string>;
   projectPlacement?: ProjectPlacementPayload | null;
+  queuedTurns?: readonly {
+    messageId: string;
+    author: { principalId: string; displayName?: string };
+    queuedAt: string;
+  }[];
 }
 
 export interface WorkspaceDescriptor {

@@ -1673,6 +1673,102 @@ export class EnterpriseManagementPlane {
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
+  /**
+   * Owner-driven membership from a collaborating node (ADR-0033). The node is signed; the actor
+   * must be the Workspace owner. Platform `identity.manage` still uses `setCollabMember`.
+   */
+  async applyOwnedCollabMemberChange(
+    nodeId: string,
+    input: {
+      readonly actorPrincipalId: string;
+      readonly workspaceUid: string;
+      readonly principalId: string;
+      readonly role?: Exclude<WorkspaceMemberRole, "owner">;
+    },
+  ): Promise<readonly CollabMember[]> {
+    this.assertOpen();
+    const hosted = this.readNodeWorkspaceMemberships(nodeId);
+    const onNode = hosted?.some((entry) => entry.workspaceUid === input.workspaceUid) === true;
+    if (!onNode) throw new Error("workspace is not placed on this node");
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.actorPrincipalId !== workspace.ownerPrincipalId) {
+      throw new Error("only the workspace owner can change members");
+    }
+    if (input.role) {
+      return await this.setCollabMemberAsOwner(input.actorPrincipalId, {
+        workspaceUid: input.workspaceUid,
+        principalId: input.principalId,
+        role: input.role,
+      });
+    }
+    return await this.removeCollabMemberAsOwner(input.actorPrincipalId, {
+      workspaceUid: input.workspaceUid,
+      principalId: input.principalId,
+    });
+  }
+
+  private async setCollabMemberAsOwner(
+    actorPrincipalId: string,
+    input: {
+      readonly workspaceUid: string;
+      readonly principalId: string;
+      readonly role: Exclude<WorkspaceMemberRole, "owner">;
+    },
+  ): Promise<readonly CollabMember[]> {
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.principalId === workspace.ownerPrincipalId) {
+      throw new Error("cannot change the workspace owner");
+    }
+    const member = this.requirePrincipal(input.principalId);
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare(
+          `INSERT INTO collab_members (workspace_uid, principal_id, role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (workspace_uid, principal_id)
+           DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+        )
+        .run(input.workspaceUid, member.principalId, input.role, now, now);
+      this.reprojectMembership(member.principalId, input.workspaceUid, input.role, now);
+      this.appendPlaneAudit({
+        action: "collab.member.set",
+        outcome: "allowed",
+        actorPrincipalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { principalId: member.principalId, role: input.role },
+      });
+    });
+    return this.listCollabMembersUnchecked(input.workspaceUid);
+  }
+
+  private async removeCollabMemberAsOwner(
+    actorPrincipalId: string,
+    input: { readonly workspaceUid: string; readonly principalId: string },
+  ): Promise<readonly CollabMember[]> {
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.principalId === workspace.ownerPrincipalId) {
+      throw new Error("cannot remove the workspace owner");
+    }
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare("DELETE FROM collab_members WHERE workspace_uid = ? AND principal_id = ?")
+        .run(input.workspaceUid, input.principalId);
+      this.reprojectMembership(input.principalId, input.workspaceUid, null, now);
+      this.appendPlaneAudit({
+        action: "collab.member.remove",
+        outcome: "allowed",
+        actorPrincipalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { principalId: input.principalId },
+      });
+    });
+    return this.listCollabMembersUnchecked(input.workspaceUid);
+  }
+
   async setCollabCollaboration(
     actor: AuthenticatedManagementPrincipal,
     input: { readonly workspaceUid: string; readonly enabled: boolean },

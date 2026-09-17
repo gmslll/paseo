@@ -1600,6 +1600,7 @@ export const AgentTimelineAuthorPayloadSchema = z.object({
   principalId: PrincipalIdSchema,
   displayName: z.string().optional(),
 });
+export type AgentTimelineAuthorPayload = z.infer<typeof AgentTimelineAuthorPayloadSchema>;
 
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
@@ -2424,6 +2425,32 @@ export const CodeCollabAllChangesGetDiffRequestSchema = z.object({
   workspaceId: z.string(),
   agentId: z.string().optional(),
   ignoreWhitespace: z.boolean().optional(),
+});
+
+const CollabWireMemberSchema = z.object({
+  principalId: ManagedPrincipalIdSchema,
+  role: z.enum(["owner", "editor", "viewer"]),
+});
+
+export const CollabMembersListRequestSchema = z.object({
+  type: z.literal("collab.members.list.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+});
+
+export const CollabMembersSetRequestSchema = z.object({
+  type: z.literal("collab.members.set.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  principalId: ManagedPrincipalIdSchema,
+  role: z.enum(["editor", "viewer"]),
+});
+
+export const CollabMembersRemoveRequestSchema = z.object({
+  type: z.literal("collab.members.remove.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  principalId: ManagedPrincipalIdSchema,
 });
 
 export const HubManagementDaemonConnectRequestSchema = z.object({
@@ -4875,6 +4902,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CodeCollabTurnDiffListTurnsRequestSchema,
   CodeCollabTurnDiffGetFilesRequestSchema,
   CodeCollabAllChangesGetDiffRequestSchema,
+  CollabMembersListRequestSchema,
+  CollabMembersSetRequestSchema,
+  CollabMembersRemoveRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6653,6 +6683,9 @@ export type CodeCollabTurnDiffGetFilesRequest = z.infer<
 export type CodeCollabAllChangesGetDiffRequest = z.infer<
   typeof CodeCollabAllChangesGetDiffRequestSchema
 >;
+export type CollabMembersListRequest = z.infer<typeof CollabMembersListRequestSchema>;
+export type CollabMembersSetRequest = z.infer<typeof CollabMembersSetRequestSchema>;
+export type CollabMembersRemoveRequest = z.infer<typeof CollabMembersRemoveRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6712,6 +6745,36 @@ export const CodeCollabAllChangesGetDiffResponseSchema = z.object({
     requestId: z.string(),
     workspaceId: z.string(),
     files: z.array(ParsedDiffFileSchema),
+  }),
+});
+
+export const CollabMembersListResponseSchema = z.object({
+  type: z.literal("collab.members.list.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    workspaceUid: z.string().nullable(),
+    viewerRole: z.enum(["owner", "editor", "viewer"]).nullable(),
+    revoked: z.boolean(),
+    members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabMembersSetResponseSchema = z.object({
+  type: z.literal("collab.members.set.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabMembersRemoveResponseSchema = z.object({
+  type: z.literal("collab.members.remove.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    members: z.array(CollabWireMemberSchema),
   }),
 });
 
@@ -8544,6 +8607,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CodeCollabTurnDiffListTurnsResponseSchema,
   CodeCollabTurnDiffGetFilesResponseSchema,
   CodeCollabAllChangesGetDiffResponseSchema,
+  CollabMembersListResponseSchema,
+  CollabMembersSetResponseSchema,
+  CollabMembersRemoveResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,

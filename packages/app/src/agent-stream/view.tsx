@@ -51,6 +51,9 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useSessionStore } from "@/stores/session-store";
+import { AuthorLabel } from "@/collab/author-label";
+import { QueuedTurnBanner } from "@/collab/queued-turn-banner";
+import { useCollabViewer } from "@/collab/use-collab-viewer";
 import { useRevealedText } from "@/hooks/use-revealed-text";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
 import { useLoadOlderAgentHistory } from "@/hooks/use-load-older-agent-history";
@@ -113,13 +116,20 @@ import { projectPluginTimelineItems } from "@/plugins/timeline/projection";
 function renderLiveAuxiliaryNode(input: {
   pendingPermissions: ReactNode;
   turnFooter: ReactNode;
+  queuedBanner: ReactNode;
   bottomOverlayInset: number;
 }): ReactNode {
-  if (!input.pendingPermissions && !input.turnFooter && input.bottomOverlayInset === 0) {
+  if (
+    !input.pendingPermissions &&
+    !input.turnFooter &&
+    !input.queuedBanner &&
+    input.bottomOverlayInset === 0
+  ) {
     return null;
   }
   return (
     <>
+      {input.queuedBanner}
       {input.turnFooter}
       {input.pendingPermissions ? (
         <View style={stylesheet.contentWrapper}>
@@ -376,6 +386,10 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     // Get serverId (fallback to agent's serverId if not provided)
     const resolvedServerId = serverId ?? context.serverId ?? "";
+    const collabViewer = useCollabViewer(resolvedServerId);
+    const queuedTurns = useSessionStore(
+      (state) => state.sessions[resolvedServerId]?.agents.get(agentId)?.queuedTurns,
+    );
     const transformTimelineItem = useInstalledTimelineTransform(resolvedServerId);
 
     const client = useSessionStore((state) => state.sessions[resolvedServerId]?.client ?? null);
@@ -699,26 +713,40 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const renderUserMessageItem = useCallback(
       (layoutItem: StreamLayoutItem, item: Extract<StreamItem, { kind: "user_message" }>) => {
         return (
-          <UserMessage
-            serverId={resolvedServerId}
-            agentId={agentId}
-            messageId={item.messageId}
-            message={item.text}
-            images={item.images}
-            attachments={item.attachments}
-            timestamp={item.timestamp.getTime()}
-            capabilities={context.capabilities}
-            client={client}
-            isFirstInGroup={layoutItem.isFirstInUserGroup}
-            isLastInGroup={layoutItem.isLastInUserGroup}
-            isPending={
-              item.clientMessageId !== undefined &&
-              pendingClientMessageIds.has(item.clientMessageId)
-            }
-          />
+          <>
+            <AuthorLabel
+              serverId={resolvedServerId}
+              author={item.author}
+              viewerPrincipalId={collabViewer.principalId}
+            />
+            <UserMessage
+              serverId={resolvedServerId}
+              agentId={agentId}
+              messageId={item.messageId}
+              message={item.text}
+              images={item.images}
+              attachments={item.attachments}
+              timestamp={item.timestamp.getTime()}
+              capabilities={context.capabilities}
+              client={client}
+              isFirstInGroup={layoutItem.isFirstInUserGroup}
+              isLastInGroup={layoutItem.isLastInUserGroup}
+              isPending={
+                item.clientMessageId !== undefined &&
+                pendingClientMessageIds.has(item.clientMessageId)
+              }
+            />
+          </>
         );
       },
-      [context.capabilities, agentId, client, pendingClientMessageIds, resolvedServerId],
+      [
+        context.capabilities,
+        agentId,
+        client,
+        collabViewer.principalId,
+        pendingClientMessageIds,
+        resolvedServerId,
+      ],
     );
 
     const renderAssistantMessageItem = useCallback(
@@ -1046,6 +1074,16 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           renderStreamItem,
         }),
     );
+    const queuedBannerNode = useMemo(
+      () => (
+        <QueuedTurnBanner
+          serverId={resolvedServerId}
+          queuedTurns={queuedTurns}
+          viewerPrincipalId={collabViewer.principalId}
+        />
+      ),
+      [collabViewer.principalId, queuedTurns, resolvedServerId],
+    );
     const renderLiveAuxiliary = useCallback<StreamSegmentRenderers["renderLiveAuxiliary"]>(() => {
       const existingTailSpacing =
         auxiliary.turnFooter && !auxiliary.pendingPermissions ? TURN_FOOTER_BOTTOM_SPACING : 0;
@@ -1056,9 +1094,15 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       return renderLiveAuxiliaryNode({
         pendingPermissions: auxiliary.pendingPermissions,
         turnFooter: auxiliary.turnFooter,
+        queuedBanner: queuedBannerNode,
         bottomOverlayInset,
       });
-    }, [auxiliary.pendingPermissions, auxiliary.turnFooter, bottomOverlayTailClearance]);
+    }, [
+      auxiliary.pendingPermissions,
+      auxiliary.turnFooter,
+      bottomOverlayTailClearance,
+      queuedBannerNode,
+    ]);
 
     const renderers = useMemo<StreamSegmentRenderers>(
       () => ({

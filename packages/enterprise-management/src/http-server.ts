@@ -591,6 +591,7 @@ async function handleNodeRequest(
   }
   const node = plane.authenticateSignedNodeRequest(authentication, { method, path, body });
   if (await handleNodeRuntimeRequest(plane, response, method, path, node.nodeId)) return;
+  if (await handleNodeCollabMemberRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodePlacementRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeLeaseRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeAuditRequest(plane, response, method, path, body, node.nodeId)) return;
@@ -1189,6 +1190,30 @@ async function handleNodeRuntimeRequest(
     [MANAGED_RUNTIME_ARTIFACT_HEADERS.sha256]: match[1]!,
   });
   await pipeline(createReadStream(filePath), response);
+  return true;
+}
+
+async function handleNodeCollabMemberRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/members") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      workspaceUid: z.string().min(1),
+      principalId: z.string().min(1),
+      role: z.enum(["editor", "viewer"]).optional(),
+    })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 200, {
+    members: await plane.applyOwnedCollabMemberChange(nodeId, input),
+  });
   return true;
 }
 

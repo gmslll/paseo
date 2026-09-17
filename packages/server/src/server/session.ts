@@ -306,6 +306,14 @@ import {
   type CodeCollabTurnDiffRequest,
 } from "./code-collab/code-collab-session.js";
 import type { TurnDiffControl } from "./code-collab/turn-diff-runtime.js";
+import {
+  COLLAB_MEMBERS_UNAVAILABLE,
+  type CollabMembersControl,
+} from "./enterprise/managed-node/collab/members-control.js";
+import {
+  handleCollabMembersRequest as answerCollabMembersRequest,
+  type CollabMembersRequest,
+} from "./enterprise/managed-node/collab/members-session.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -1135,6 +1143,7 @@ export class Session {
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
   private readonly turnDiff: TurnDiffControl | null;
+  private readonly collabMembers: CollabMembersControl | null;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
@@ -1527,6 +1536,7 @@ export class Session {
       reloadConfig: () => daemonConfigStore.reload(),
     });
     this.turnDiff = daemonRuntimeConfig?.turnDiff ?? null;
+    this.collabMembers = daemonRuntimeConfig?.collabMembers ?? null;
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
           agents: options.hubExecutionAgents,
@@ -3982,12 +3992,57 @@ export class Session {
     }
   }
 
+  private async handleCollabMembersRequest(msg: CollabMembersRequest): Promise<void> {
+    const control = this.collabMembers;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_MEMBERS_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    const resourceAction =
+      msg.type === "collab.members.list.request" ? "workspace.metadata.read" : "workspace.write";
+    if (!(await this.assertLegacyWorkspaceResource(resourceAction, msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const actorPrincipalId = this.enterpriseContext?.principal.principalId ?? null;
+    try {
+      this.emit(await answerCollabMembersRequest(control, msg, actorPrincipalId), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_MEMBERS_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+    }
+  }
+
   private dispatchCodeCollabMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "code_collab.turn_diff.list_turns.request":
       case "code_collab.turn_diff.get_files.request":
       case "code_collab.all_changes.get_diff.request":
         return this.handleCodeCollabTurnDiffRequest(msg);
+      case "collab.members.list.request":
+      case "collab.members.set.request":
+      case "collab.members.remove.request":
+        return this.handleCollabMembersRequest(msg);
       default:
         return undefined;
     }
