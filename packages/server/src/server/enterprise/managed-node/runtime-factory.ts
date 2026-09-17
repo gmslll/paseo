@@ -34,6 +34,7 @@ import {
 } from "./management-client.js";
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
 import { createCollabMembersControl } from "./collab/members-control.js";
+import { createCollabPresenceRoster } from "./collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
 import { ManagedPrincipalGrantSource } from "./principal-source.js";
@@ -251,6 +252,7 @@ export async function createManagedEnterpriseRuntime(
               attachSessions: (sessions: HeadlessSessionFactory) => {
                 collaboration.replicas.attachSessions(sessions);
               },
+              presence: createCollabPresenceRoster(),
               members: createCollabMembersControl({
                 catalog: collaboration.catalog,
                 mutator: {

@@ -2,9 +2,11 @@ import { useCallback, useMemo, type ReactElement } from "react";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import type {
+  PresenceEntry,
   WorkspaceMember,
   WorkspaceMemberRole,
 } from "@getpaseo/protocol/enterprise-collaboration";
+import { PresenceList } from "./presence-list";
 import { AdaptiveModalSheet, type SheetHeader } from "@/components/adaptive-modal-sheet";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -34,6 +36,8 @@ export interface ShareWorkspaceSheetProps {
   viewerRole: WorkspaceMemberRole | null;
   members: readonly WorkspaceMember[];
   revoked: boolean;
+  presenceEntries?: readonly PresenceEntry[];
+  presenceNow?: number;
   onClose: () => void;
   port: ShareWorkspacePort;
 }
@@ -107,6 +111,9 @@ export function ShareWorkspaceSheet(props: ShareWorkspaceSheetProps): ReactEleme
 function ShareWorkspaceSheetOpen({
   viewerPrincipalId,
   viewerRole,
+  serverId,
+  presenceEntries,
+  presenceNow,
   members,
   revoked,
   onClose,
@@ -285,6 +292,16 @@ function ShareWorkspaceSheetOpen({
           />
         ))}
       </View>
+      {presenceEntries ? (
+        <View style={styles.presence}>
+          <PresenceList
+            serverId={serverId}
+            entries={presenceEntries}
+            viewerPrincipalId={viewerPrincipalId}
+            now={presenceNow ?? Date.now()}
+          />
+        </View>
+      ) : null}
     </AdaptiveModalSheet>
   );
 }
@@ -298,6 +315,9 @@ const styles = StyleSheet.create((theme) => ({
   fields: {
     gap: theme.spacing[4],
     marginBottom: theme.spacing[6],
+  },
+  presence: {
+    marginTop: theme.spacing[6],
   },
   footer: {
     flexDirection: "row",

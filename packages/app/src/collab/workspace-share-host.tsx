@@ -5,6 +5,7 @@ import type {
 } from "@getpaseo/protocol/enterprise-collaboration";
 import { useHostRuntimeClient } from "@/runtime/host-runtime";
 import { ShareWorkspaceSheet, type ShareWorkspacePort } from "./share-form-sheet";
+import { useCollabPresence } from "./use-collab-presence";
 import { useCollabViewer } from "./use-collab-viewer";
 
 export function WorkspaceShareHost({
@@ -20,6 +21,13 @@ export function WorkspaceShareHost({
 }): ReactElement | null {
   const client = useHostRuntimeClient(serverId);
   const viewer = useCollabViewer(serverId);
+  const presence = useCollabPresence({
+    serverId,
+    workspaceId,
+    focusAgentId: null,
+    displayName: viewer.displayName,
+    enabled: visible,
+  });
   const [members, setMembers] = useState<readonly WorkspaceMember[]>([]);
   const [viewerRole, setViewerRole] = useState<WorkspaceMemberRole | null>(null);
   const [revoked, setRevoked] = useState(false);
@@ -79,6 +87,8 @@ export function WorkspaceShareHost({
       viewerRole={viewerRole}
       members={members}
       revoked={revoked}
+      presenceEntries={presence.entries}
+      presenceNow={presence.now}
       onClose={handleClose}
       port={port}
     />

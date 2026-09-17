@@ -2571,6 +2571,7 @@ export async function createPaseoDaemon(
                   orchestration: operationService ?? undefined,
                   turnDiff: turnDiffRuntime,
                   collabMembers: enterpriseRuntime?.collaboration?.members,
+                  collabPresence: enterpriseRuntime?.collaboration?.presence,
                   localPlanes: () => localPlanes?.controlAvailable === true,
                   terminalPlane: terminalPlaneAccess,
                   dataPlane: dataPlaneAccess,

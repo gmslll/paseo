@@ -2453,6 +2453,24 @@ export const CollabMembersRemoveRequestSchema = z.object({
   principalId: ManagedPrincipalIdSchema,
 });
 
+const CollabWirePresenceEntrySchema = z.object({
+  kind: z.literal("principal"),
+  principalId: ManagedPrincipalIdSchema,
+  displayName: z.string().optional(),
+  clientId: z.string().min(1),
+  focusAgentId: z.string().min(1).nullable(),
+  heartbeatAt: z.string(),
+});
+
+export const CollabPresenceBeatRequestSchema = z.object({
+  type: z.literal("collab.presence.beat.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  clientId: z.string().min(1),
+  focusAgentId: z.string().min(1).nullable(),
+  displayName: z.string().optional(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4905,6 +4923,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CollabMembersListRequestSchema,
   CollabMembersSetRequestSchema,
   CollabMembersRemoveRequestSchema,
+  CollabPresenceBeatRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6686,6 +6705,7 @@ export type CodeCollabAllChangesGetDiffRequest = z.infer<
 export type CollabMembersListRequest = z.infer<typeof CollabMembersListRequestSchema>;
 export type CollabMembersSetRequest = z.infer<typeof CollabMembersSetRequestSchema>;
 export type CollabMembersRemoveRequest = z.infer<typeof CollabMembersRemoveRequestSchema>;
+export type CollabPresenceBeatRequest = z.infer<typeof CollabPresenceBeatRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6775,6 +6795,15 @@ export const CollabMembersRemoveResponseSchema = z.object({
     requestId: z.string(),
     workspaceId: z.string(),
     members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabPresenceBeatResponseSchema = z.object({
+  type: z.literal("collab.presence.beat.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    entries: z.array(CollabWirePresenceEntrySchema),
   }),
 });
 
@@ -8610,6 +8639,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CollabMembersListResponseSchema,
   CollabMembersSetResponseSchema,
   CollabMembersRemoveResponseSchema,
+  CollabPresenceBeatResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,

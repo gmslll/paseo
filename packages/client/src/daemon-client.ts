@@ -5213,6 +5213,22 @@ export class DaemonClient {
     });
   }
 
+  async beatCollabPresence(
+    input: {
+      workspaceId: string;
+      clientId: string;
+      focusAgentId: string | null;
+      displayName?: string;
+    },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.presence.beat.response">({
+      requestId,
+      message: { type: "collab.presence.beat.request", ...input },
+    });
+  }
+
   async connectHub(
     hubUrl: string,
     token: string,

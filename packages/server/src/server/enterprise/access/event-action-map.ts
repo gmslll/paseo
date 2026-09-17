@@ -100,6 +100,7 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   // Turn directory is metadata; file bodies are content (ADR-0045).
   "code_collab.turn_diff.list_turns.request": ["workspace.metadata.read"],
   "collab.members.list.request": ["workspace.metadata.read"],
+  "collab.presence.beat.request": ["workspace.metadata.read"],
   create_terminal_request: ["terminal.use"],
   // An attach token only reopens the terminal stream the Session may already use.
   "local_plane.attach_token.create.request": ["terminal.use"],
@@ -175,6 +176,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "orchestration.operation.list.response",
       "code_collab.turn_diff.list_turns.response",
       "collab.members.list.response",
+      "collab.presence.beat.response",
       "agent_status",
       "agent_update",
       "agent_attention_required",

@@ -52,7 +52,9 @@ import type {
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useSessionStore } from "@/stores/session-store";
 import { AuthorLabel } from "@/collab/author-label";
+import { PresenceList } from "@/collab/presence-list";
 import { QueuedTurnBanner } from "@/collab/queued-turn-banner";
+import { useCollabPresence } from "@/collab/use-collab-presence";
 import { useCollabViewer } from "@/collab/use-collab-viewer";
 import { useRevealedText } from "@/hooks/use-revealed-text";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
@@ -117,18 +119,21 @@ function renderLiveAuxiliaryNode(input: {
   pendingPermissions: ReactNode;
   turnFooter: ReactNode;
   queuedBanner: ReactNode;
+  presence: ReactNode;
   bottomOverlayInset: number;
 }): ReactNode {
   if (
     !input.pendingPermissions &&
     !input.turnFooter &&
     !input.queuedBanner &&
+    !input.presence &&
     input.bottomOverlayInset === 0
   ) {
     return null;
   }
   return (
     <>
+      {input.presence}
       {input.queuedBanner}
       {input.turnFooter}
       {input.pendingPermissions ? (
@@ -387,6 +392,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     // Get serverId (fallback to agent's serverId if not provided)
     const resolvedServerId = serverId ?? context.serverId ?? "";
     const collabViewer = useCollabViewer(resolvedServerId);
+    const presence = useCollabPresence({
+      serverId: resolvedServerId,
+      workspaceId: context.workspaceId,
+      focusAgentId: agentId,
+      displayName: collabViewer.displayName,
+    });
     const queuedTurns = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agents.get(agentId)?.queuedTurns,
     );
@@ -1084,6 +1095,22 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       ),
       [collabViewer.principalId, queuedTurns, resolvedServerId],
     );
+    const presenceNode = useMemo(
+      () =>
+        presence.entries.length > 0 ? (
+          <View style={stylesheet.contentWrapper}>
+            <View style={stylesheet.listHeaderContent}>
+              <PresenceList
+                serverId={resolvedServerId}
+                entries={presence.entries}
+                viewerPrincipalId={collabViewer.principalId}
+                now={presence.now}
+              />
+            </View>
+          </View>
+        ) : null,
+      [collabViewer.principalId, presence.entries, presence.now, resolvedServerId],
+    );
     const renderLiveAuxiliary = useCallback<StreamSegmentRenderers["renderLiveAuxiliary"]>(() => {
       const existingTailSpacing =
         auxiliary.turnFooter && !auxiliary.pendingPermissions ? TURN_FOOTER_BOTTOM_SPACING : 0;
@@ -1095,12 +1122,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         pendingPermissions: auxiliary.pendingPermissions,
         turnFooter: auxiliary.turnFooter,
         queuedBanner: queuedBannerNode,
+        presence: presenceNode,
         bottomOverlayInset,
       });
     }, [
       auxiliary.pendingPermissions,
       auxiliary.turnFooter,
       bottomOverlayTailClearance,
+      presenceNode,
       queuedBannerNode,
     ]);
 

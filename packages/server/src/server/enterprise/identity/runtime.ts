@@ -25,6 +25,7 @@ import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../sessi
 import type { ManagedPlacementSnapshotSource } from "../managed-node/lifecycle.js";
 import type { CollabRuntimeDependencies } from "../managed-node/collab/collab-runtime.js";
 import type { CollabMembersControl } from "../managed-node/collab/members-control.js";
+import type { CollabPresenceControl } from "../managed-node/collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "../managed-node/collab/machine-rpc-server.js";
 
 export interface EnterpriseAdmissionPort {
@@ -86,6 +87,7 @@ export interface EnterpriseAdmissionRuntime {
      */
     attachSessions(sessions: HeadlessSessionFactory): void;
     members?: CollabMembersControl;
+    presence?: CollabPresenceControl;
   }>;
   readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;

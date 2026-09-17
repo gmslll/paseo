@@ -6,6 +6,8 @@ import {
   AgentTimelineItemPayloadSchema,
   CollabMembersListRequestSchema,
   CollabMembersListResponseSchema,
+  CollabPresenceBeatRequestSchema,
+  CollabPresenceBeatResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
   SendAgentMessageRequestSchema,
   ServerInfoStatusPayloadSchema,
@@ -72,6 +74,34 @@ describe("collab member RPCs", () => {
       },
     });
     expect(response.payload.members).toHaveLength(1);
+  });
+
+  test("a presence beat carries the roster without a prompt", () => {
+    const request = CollabPresenceBeatRequestSchema.parse({
+      type: "collab.presence.beat.request",
+      requestId: "r2",
+      workspaceId: "ws-1",
+      clientId: "client-a",
+      focusAgentId: null,
+    });
+    expect(request.focusAgentId).toBeNull();
+    const response = CollabPresenceBeatResponseSchema.parse({
+      type: "collab.presence.beat.response",
+      payload: {
+        requestId: "r2",
+        workspaceId: "ws-1",
+        entries: [
+          {
+            kind: "principal",
+            principalId: "usr_aaaaaaaaaaaaaaaa",
+            clientId: "client-a",
+            focusAgentId: null,
+            heartbeatAt: "2026-09-17T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(response.payload.entries).toHaveLength(1);
   });
 });
 
