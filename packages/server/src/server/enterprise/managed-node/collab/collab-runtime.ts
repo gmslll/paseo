@@ -130,10 +130,13 @@ export class CollabRuntime {
   /** What this node reads: the shared Workspace documents, the RPCs addressed to it, and whatever
    * it already holds a cursor for. */
   private pullSet(container: CollabContainer): readonly string[] {
+    // `rpc:req:<nodeId>` is deliberately absent until a consumer exists. Reading it advances the
+    // cursor past envelopes the replica does not keep — a log segment's bytes are the entry, and
+    // only documents are stored (ADR-0032) — so pulling it without something to answer with would
+    // consume machine RPCs and drop them. It returns with the machine RPC server (ADR-0053).
     const segments = new Set<string>([
       formatCollabSegment({ kind: "meta" }),
       formatCollabSegment({ kind: "workspace_kv" }),
-      formatCollabSegment({ kind: "rpc_request", nodeId: this.options.relationship.node.nodeId }),
       ...Object.keys(container.store.remoteCursors()),
     ]);
     return [...segments];

@@ -85,6 +85,14 @@ export interface PullOutcome {
   readonly applied: number;
   readonly nextOffset: string;
   readonly upToDate: boolean;
+  /**
+   * The updates this read carried, in order.
+   *
+   * A log segment's bytes are the entry rather than a change to a document, and the replica stores
+   * only documents (ADR-0032), so this is a caller's one chance to see them: the cursor has moved
+   * past them by the time this returns.
+   */
+  readonly messages: readonly Uint8Array[];
 }
 
 export class CollabStreamUplink {
@@ -178,18 +186,16 @@ export class CollabStreamUplink {
       schema: StreamReadResponseSchema,
     });
 
-    this.options.store.applyRemoteUpdates(
-      segment,
-      result.messages.map((message) => ({
-        offset: message.offset,
-        update: new Uint8Array(Buffer.from(message.update, "base64")),
-      })),
-      result.nextOffset,
-    );
+    const messages = result.messages.map((message) => ({
+      offset: message.offset,
+      update: new Uint8Array(Buffer.from(message.update, "base64")),
+    }));
+    this.options.store.applyRemoteUpdates(segment, messages, result.nextOffset);
     return {
-      applied: result.messages.length,
+      applied: messages.length,
       nextOffset: result.nextOffset,
       upToDate: result.upToDate,
+      messages: messages.map((message) => message.update),
     };
   }
 

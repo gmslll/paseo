@@ -231,7 +231,7 @@ describe("collaborating on behalf of a node", () => {
     expect(sent[0]!.headers["producer-id"]).toBe(`nod:${NODE_ID}`);
   });
 
-  test("reads the documents the members write and the RPCs addressed to this node", async () => {
+  test("reads the documents the members write, and not the RPC log it cannot answer", async () => {
     const collab = runtime([catalogEntry(CONTAINER, WORKSPACE_ID)]);
     await collab.install({ workspaceRegistry: registry(), agents: agents() });
 
@@ -239,8 +239,10 @@ describe("collaborating on behalf of a node", () => {
 
     expect(read).toContain(`/v1/ds/${CONTAINER}/meta`);
     expect(read).toContain(`/v1/ds/${CONTAINER}/wf`);
+    // Not rpc:req. Reading it advances the cursor past envelopes the replica does not keep, so
+    // until something answers them, pulling it would consume machine RPCs and drop them.
     expect(read.some((entry) => entry.includes(encodeURIComponent(`rpc:req:${NODE_ID}`)))).toBe(
-      true,
+      false,
     );
   });
 

@@ -318,6 +318,69 @@ describe("pulling from the plane", () => {
     expect(second.upToDate).toBe(true);
   });
 
+  test("hands back a log segment's bytes, which the replica does not keep", async () => {
+    const harness = await start();
+    const rpcId = "rpc_0123abcd-0123-0123-0123-0123456789ab";
+    const segment = `rpc:req:${harness.nodeId}`;
+
+    // rpc:req is written by members and read by the node (ADR-0032), so the append needs a real
+    // member rather than the node itself.
+    const member = await harness.plane.createPrincipal(harness.admin, {
+      displayName: "Member",
+      principalType: "human",
+      role: "employee",
+    });
+    await harness.plane.setCollabMember(harness.admin, {
+      workspaceUid: harness.containerId,
+      principalId: member.principalId,
+      role: "editor",
+    });
+    // Joining projects onto the Principal's grants and rotates its grantVersion, and the plane
+    // refuses a handle whose snapshot no longer matches. So authenticate after joining, not before.
+    const issued = await harness.plane.issuePersonalAccessToken(harness.admin, member.principalId);
+    const authenticated = (await harness.plane.authenticatePersonalAccessToken(issued.token))!;
+
+    await harness.plane.appendCollabStream(authenticated, {
+      containerId: harness.containerId,
+      segment,
+      producerId: `usr:${member.principalId}`,
+      producerEpoch: 1,
+      producerSeq: 1,
+      update: new TextEncoder().encode(
+        JSON.stringify({
+          kind: "request",
+          rpcVersion: 1,
+          rpcId,
+          method: "agent.send",
+          nodeId: harness.nodeId,
+          containerId: harness.containerId,
+          clientId: "laptop-1",
+          sentAt: "2025-06-01T00:00:00.000Z",
+          expiresAt: "2025-06-01T00:01:00.000Z",
+          payload: { type: "send_agent_message_request" },
+        }),
+      ),
+    });
+
+    const outcome = await harness.uplink.pullSegment(segment);
+
+    // A log segment is not a document (ADR-0032), so the replica keeps nothing and this read is the
+    // only place its bytes exist. A caller that ignored them would advance the cursor past an RPC.
+    expect(outcome.applied).toBe(1);
+    expect(outcome.messages).toHaveLength(1);
+    const envelope = JSON.parse(new TextDecoder().decode(outcome.messages[0]!)) as {
+      rpcId: string;
+      method: string;
+      attestation: string;
+    };
+    expect(envelope.rpcId).toBe(rpcId);
+    expect(envelope.method).toBe("agent.send");
+    // The plane rewrites this one segment's bytes to attach what it signed, so what comes back is
+    // the attested envelope rather than what the member wrote.
+    expect(envelope.attestation).toMatch(/^pmr_v1\./);
+    expect(harness.store.documentSnapshot(segment)).toBeNull();
+  });
+
   test("resumes from the stored cursor after a restart", async () => {
     const harness = await start();
     harness.uplink.beginEpoch("s:agent-1");
