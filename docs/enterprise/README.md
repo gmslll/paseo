@@ -61,3 +61,7 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0048: Review policy](decisions/0048-review-policy.md)
 - [ADR 0049: Pull request poller state and task links](decisions/0049-pr-poller-state-and-task-links.md)
 - [ADR 0050: Local plane break-glass admission](decisions/0050-local-plane-break-glass-admission.md)
+- [ADR 0051: Workspace membership invitations](decisions/0051-workspace-membership-invitations.md)
+- [ADR 0052: What shared turn control needs before it can be built](decisions/0052-shared-turn-control-substrate.md)
+- [ADR 0053: What a machine RPC needs before a node can answer one](decisions/0053-headless-sessions-for-machine-rpc.md)
+- [ADR 0054: Who implements the ADR-0045 Agent `turn_diff` content-read view](decisions/0054-turn-diff-content-read-workstream.md) (`DECISION_REQUIRED`)
