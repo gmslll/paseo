@@ -99,16 +99,18 @@ The distinction it needs is the sender against the turn's controller and the Wor
 the member's role. Whether a viewer may send at all is a `workspace.write` question, answered before
 this one and elsewhere.
 
-## The feature is not declared yet
+## The feature declaration follows the stack, not the config key
 
-The plan has this work declare `enterpriseCollaborationV1` and `enterpriseDistributedNodeV1`. It
-does not. Both flags exist in the protocol and only the protocol's own tests ever set them; no
-daemon code declares either, and nothing reads the `collaboration.enabled` key that
-`persisted-config.ts` already parses.
+This was written while the collaboration stack was built but unwired, and said the flag stays
+undeclared until the wiring lands. The wiring landed, so `enterpriseCollaborationV1` is now
+declared — from the seam the enterprise runtime actually built, not from the `collaboration.enabled`
+key that asks for it.
 
-A feature flag is a promise to the client that the capability is there. Declaring it while the
-collaboration stack is built but unwired would gate clients onto a path the daemon cannot serve.
-The declaration belongs with the runtime wiring that makes `collaboration.enabled` mean something.
+The difference matters. The runtime holds that seam only when collaboration is enabled on a managed
+node and the replicas were constructed; the config key can be true while the factory refused. A
+feature flag is a promise that the capability is there, so it follows the thing that serves it.
+
+`enterpriseDistributedNodeV1` is still undeclared. Nothing in this milestone made it true.
 
 ## Still open: nothing watches the node's scheduled work
 

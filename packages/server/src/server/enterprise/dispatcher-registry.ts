@@ -34,7 +34,11 @@ export type EnterpriseFeatureAdvertisement = Readonly<
       | "enterpriseAppSlotContentReadV1"
       | "enterpriseWorkspaceOwnershipTransferV1"
       | "enterpriseBrowserPageIdentityObservationV1"
-      | "enterpriseBrowserPageIdentityInvalidationV1",
+      | "enterpriseBrowserPageIdentityInvalidationV1"
+      // Not a dispatcher family: collaboration is the node's replication stack, so bootstrap
+      // derives this one from the runtime it built rather than from a registration. The content,
+      // transfer and page-identity keys are already manifest-derived the same way.
+      | "enterpriseCollaborationV1",
       true
     >
   >
@@ -93,6 +97,24 @@ export function pageIdentityFeaturesForEnterpriseManifest(
       ? { enterpriseBrowserPageIdentityInvalidationV1: true as const }
       : {}),
   });
+}
+
+/**
+ * Whether this daemon advertises collaboration (ADR-0031).
+ *
+ * Derived from the seam the enterprise runtime actually built rather than from the config key that
+ * asks for it: the runtime only holds one when collaboration is enabled on a managed node, so its
+ * presence is the difference between a capability a client can use and a promise nothing serves.
+ *
+ * Takes the seam rather than the runtime so this file keeps knowing nothing about the runtime
+ * interface, the same way its siblings take a manifest rather than a registry.
+ */
+export function collaborationFeatureForRuntime(
+  collaboration: object | undefined,
+): EnterpriseFeatureAdvertisement {
+  return collaboration
+    ? Object.freeze({ enterpriseCollaborationV1: true as const })
+    : Object.freeze({});
 }
 
 const familyFlags: Readonly<Record<EnterpriseFeatureFamily, keyof EnterpriseFeatureAdvertisement>> =

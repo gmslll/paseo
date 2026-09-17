@@ -237,6 +237,7 @@ import type {
   EnterpriseFeatureAdvertisement,
 } from "./enterprise/dispatcher-registry.js";
 import {
+  collaborationFeatureForRuntime,
   contentFeaturesForEnterpriseManifest,
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
@@ -1645,6 +1646,10 @@ export async function createPaseoDaemon(
         ...pageIdentityFeaturesForEnterpriseManifest(
           productionEnterpriseDispatcherRegistration.manifest,
         ),
+        // ADR-0052 kept this undeclared while the collaboration stack was built but unwired.
+        // The runtime now carries the seam only when the replicas are actually running, so the
+        // advertisement follows the stack rather than the config key that asks for it.
+        ...collaborationFeatureForRuntime(enterpriseRuntime.collaboration),
       });
       browserToolsBroker = new BrowserToolsBroker({
         enterprise: browserBundle.browserToolsRuntime,

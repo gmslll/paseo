@@ -5,6 +5,7 @@ import {
   createEnterpriseDispatcherRegistry,
   createEnterpriseSessionDispatcherRegistration,
   pageIdentityFeaturesForEnterpriseManifest,
+  collaborationFeatureForRuntime,
   workspaceOwnershipTransferFeatureForManifest,
 } from "./dispatcher-registry.js";
 
@@ -16,6 +17,17 @@ const response = {
 } as never;
 
 describe("enterprise dispatcher registry", () => {
+  it("advertises collaboration from the seam the runtime built, not from a config key", () => {
+    // The runtime holds this only when collaboration is enabled on a managed node, so presence is
+    // what separates a capability a client can use from a promise nothing serves.
+    expect(collaborationFeatureForRuntime({ install: () => {}, attachSessions: () => {} })).toEqual(
+      {
+        enterpriseCollaborationV1: true,
+      },
+    );
+    expect(collaborationFeatureForRuntime(undefined)).toEqual({});
+  });
+
   it("advertises page identity operations independently and ignores unknown operations", () => {
     expect(
       pageIdentityFeaturesForEnterpriseManifest({
