@@ -6,7 +6,7 @@ import type {
 
 export type ShareableMemberRole = Exclude<WorkspaceMemberRole, "owner">;
 export type SharePrincipalIssue = "invalid" | "self" | "owner";
-export type ShareSubmitError = "revoked" | "failed";
+export type ShareSubmitError = "revoked" | "failed" | "enable_failed";
 
 export interface ShareWorkspaceFormSnapshot {
   readonly viewerPrincipalId: string;
@@ -14,6 +14,7 @@ export interface ShareWorkspaceFormSnapshot {
   readonly members: readonly WorkspaceMember[];
   readonly revoked: boolean;
   readonly collaborationEnabled: boolean;
+  readonly canEnable: boolean;
 }
 
 export interface ShareWorkspaceMemberRow {
@@ -29,6 +30,8 @@ export interface ShareWorkspaceFormState {
   readonly members: readonly ShareWorkspaceMemberRow[];
   readonly principalIssue: SharePrincipalIssue | null;
   readonly canManage: boolean;
+  readonly canEnable: boolean;
+  readonly collaborationEnabled: boolean;
   readonly canSubmit: boolean;
   readonly isSubmitting: boolean;
   readonly submitError: ShareSubmitError | null;
@@ -48,6 +51,7 @@ export interface ShareWorkspaceFormModel {
   setSubmitError: (value: ShareSubmitError | null) => void;
   applyMembers: (members: readonly WorkspaceMember[]) => void;
   applyRevoked: (revoked: boolean) => void;
+  applySnapshot: (snapshot: Omit<ShareWorkspaceFormSnapshot, "viewerPrincipalId">) => void;
 }
 
 function cloneMembers(members: readonly WorkspaceMember[]): WorkspaceMember[] {
@@ -62,12 +66,13 @@ export function openShareWorkspaceForm(
   snapshot: ShareWorkspaceFormSnapshot,
 ): ShareWorkspaceFormModel {
   const viewerPrincipalId = snapshot.viewerPrincipalId;
-  const viewerRole = snapshot.viewerRole;
+  let viewerRole = snapshot.viewerRole;
   let principalId = "";
   let role: ShareableMemberRole = "editor";
   let members = cloneMembers(snapshot.members);
   let revoked = snapshot.revoked;
-  const collaborationEnabled = snapshot.collaborationEnabled;
+  let collaborationEnabled = snapshot.collaborationEnabled;
+  let canEnableFlag = snapshot.canEnable;
   let isSubmitting = false;
   let submitError: ShareSubmitError | null = null;
   let principalResetKey = 0;
@@ -81,6 +86,7 @@ export function openShareWorkspaceForm(
 
   function derive(): ShareWorkspaceFormState {
     const canManage = collaborationEnabled && !revoked && viewerRole === "owner";
+    const canEnable = canEnableFlag && !collaborationEnabled && !revoked && !isSubmitting;
     const trimmed = principalId.trim();
     const ownerId = ownerPrincipalId(members);
     let principalIssue: SharePrincipalIssue | null = null;
@@ -103,6 +109,8 @@ export function openShareWorkspaceForm(
       })),
       principalIssue,
       canManage,
+      canEnable,
+      collaborationEnabled,
       canSubmit,
       isSubmitting,
       submitError: revoked ? "revoked" : submitError,
@@ -159,6 +167,21 @@ export function openShareWorkspaceForm(
         isSubmitting = false;
         members = [];
         submitError = "revoked";
+        canEnableFlag = false;
+      }
+      publish();
+    },
+    applySnapshot(next) {
+      viewerRole = next.viewerRole;
+      members = cloneMembers(next.members);
+      revoked = next.revoked;
+      collaborationEnabled = next.collaborationEnabled;
+      canEnableFlag = next.canEnable;
+      if (next.revoked) {
+        isSubmitting = false;
+        members = [];
+        submitError = "revoked";
+        canEnableFlag = false;
       }
       publish();
     },

@@ -44,6 +44,8 @@ describe("collab members control", () => {
         { principalId: OWNER, role: "owner" },
         { principalId: EDITOR, role: "editor" },
       ],
+      collaborationEnabled: true,
+      canEnable: false,
     });
   });
 
@@ -58,6 +60,62 @@ describe("collab members control", () => {
       revoked: false,
       revokeReason: null,
       members: [],
+      collaborationEnabled: false,
+      canEnable: false,
+    });
+  });
+
+  test("the local owner can enable a Workspace that is not yet collaborative", () => {
+    const control = createCollabMembersControl({
+      catalog: { current: () => catalog() },
+    });
+
+    expect(control.list("ws-local", OWNER, OWNER)).toEqual({
+      workspaceUid: null,
+      viewerRole: null,
+      revoked: false,
+      revokeReason: null,
+      members: [],
+      collaborationEnabled: false,
+      canEnable: true,
+    });
+    expect(control.list("ws-local", EDITOR, OWNER).canEnable).toBe(false);
+  });
+
+  test("enable asks the plane and returns the owner as a member", async () => {
+    const control = createCollabMembersControl({
+      catalog: { current: () => catalog() },
+      mutator: {
+        async setMember() {
+          throw new Error("unused");
+        },
+        async removeMember() {
+          throw new Error("unused");
+        },
+        async enableWorkspace(change) {
+          expect(change).toEqual({
+            localWorkspaceId: "ws-local",
+            actorPrincipalId: OWNER,
+          });
+          return {
+            workspaceUid: WORKSPACE_UID,
+            members: [{ principalId: OWNER, role: "owner" }],
+          };
+        },
+      },
+    });
+
+    await expect(control.enable("ws-local", EDITOR, OWNER)).rejects.toThrow(
+      "only the workspace owner can enable collaboration",
+    );
+    expect(await control.enable("ws-local", OWNER, OWNER)).toEqual({
+      workspaceUid: WORKSPACE_UID,
+      viewerRole: "owner",
+      revoked: false,
+      revokeReason: null,
+      members: [{ principalId: OWNER, role: "owner" }],
+      collaborationEnabled: true,
+      canEnable: false,
     });
   });
 

@@ -592,6 +592,7 @@ async function handleNodeRequest(
   const node = plane.authenticateSignedNodeRequest(authentication, { method, path, body });
   if (await handleNodeRuntimeRequest(plane, response, method, path, node.nodeId)) return;
   if (await handleNodeCollabMemberRequest(plane, response, method, path, body, node.nodeId)) return;
+  if (await handleNodeCollabEnableRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodePlacementRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeLeaseRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeAuditRequest(plane, response, method, path, body, node.nodeId)) return;
@@ -1213,6 +1214,33 @@ async function handleNodeCollabMemberRequest(
     .parse(parseJson(body));
   sendJson(response, 200, {
     members: await plane.applyOwnedCollabMemberChange(nodeId, input),
+  });
+  return true;
+}
+
+async function handleNodeCollabEnableRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/enable") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      localWorkspaceId: z.string().min(1),
+    })
+    .strict()
+    .parse(parseJson(body));
+  const result = await plane.enableOwnedCollabWorkspace(nodeId, input);
+  sendJson(response, 200, {
+    workspaceUid: result.workspace.workspaceUid,
+    localWorkspaceId: result.workspace.localWorkspaceId,
+    ownerPrincipalId: result.workspace.ownerPrincipalId,
+    collaborationEnabled: result.workspace.collaborationEnabled,
+    members: result.members,
   });
   return true;
 }

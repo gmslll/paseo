@@ -1,3 +1,4 @@
+import { ManagedPrincipalIdSchema } from "@getpaseo/protocol/messages";
 import type {
   WorkspaceCatalogEntry,
   WorkspaceMember,
@@ -6,6 +7,7 @@ import type {
 import type { ManagedWorkspaceCatalog } from "./workspace-catalog.js";
 
 export const COLLAB_MEMBERS_UNAVAILABLE = "Workspace sharing is unavailable on this daemon";
+export const COLLAB_ENABLE_DENIED = "only the workspace owner can enable collaboration";
 
 function resolveMemberRevoke(
   entry: WorkspaceCatalogEntry,
@@ -33,6 +35,8 @@ export interface CollabMembersSnapshot {
   readonly revoked: boolean;
   readonly revokeReason: string | null;
   readonly members: readonly WorkspaceMember[];
+  readonly collaborationEnabled: boolean;
+  readonly canEnable: boolean;
 }
 
 export interface CollabMembersMutator {
@@ -47,10 +51,18 @@ export interface CollabMembersMutator {
     actorPrincipalId: string;
     principalId: string;
   }): Promise<readonly WorkspaceMember[]>;
+  enableWorkspace(input: {
+    localWorkspaceId: string;
+    actorPrincipalId: string;
+  }): Promise<{ workspaceUid: string; members: readonly WorkspaceMember[] }>;
 }
 
 export interface CollabMembersControl {
-  list(workspaceId: string, viewerPrincipalId: string | null): CollabMembersSnapshot;
+  list(
+    workspaceId: string,
+    viewerPrincipalId: string | null,
+    localOwnerPrincipalId?: string | null,
+  ): CollabMembersSnapshot;
   set(
     workspaceId: string,
     actorPrincipalId: string,
@@ -62,6 +74,11 @@ export interface CollabMembersControl {
     actorPrincipalId: string,
     principalId: string,
   ): Promise<readonly WorkspaceMember[]>;
+  enable(
+    workspaceId: string,
+    actorPrincipalId: string,
+    localOwnerPrincipalId: string | null,
+  ): Promise<CollabMembersSnapshot>;
 }
 
 export function createCollabMembersControl(input: {
@@ -73,28 +90,48 @@ export function createCollabMembersControl(input: {
     return catalog?.workspaces.find((entry) => entry.localWorkspaceId === workspaceId) ?? null;
   }
 
-  return {
-    list(workspaceId, viewerPrincipalId) {
-      const entry = lookup(workspaceId);
-      if (!entry) {
-        return {
-          workspaceUid: null,
-          viewerRole: null,
-          revoked: false,
-          revokeReason: null,
-          members: [],
-        };
-      }
-      const viewerRole =
-        entry.members.find((member) => member.principalId === viewerPrincipalId)?.role ?? null;
-      const revoke = resolveMemberRevoke(entry, viewerPrincipalId);
+  function snapshotFor(
+    workspaceId: string,
+    viewerPrincipalId: string | null,
+    localOwnerPrincipalId: string | null,
+  ): CollabMembersSnapshot {
+    const entry = lookup(workspaceId);
+    const ownerPrincipalId = entry?.ownerPrincipalId ?? localOwnerPrincipalId;
+    const isOwner =
+      viewerPrincipalId !== null &&
+      ownerPrincipalId !== null &&
+      viewerPrincipalId === ownerPrincipalId;
+    const isPrincipal =
+      viewerPrincipalId !== null && ManagedPrincipalIdSchema.safeParse(viewerPrincipalId).success;
+    if (!entry) {
       return {
-        workspaceUid: entry.workspaceUid,
-        viewerRole,
-        revoked: revoke.revoked,
-        revokeReason: revoke.reason,
-        members: entry.members,
+        workspaceUid: null,
+        viewerRole: null,
+        revoked: false,
+        revokeReason: null,
+        members: [],
+        collaborationEnabled: false,
+        canEnable: isOwner && isPrincipal,
       };
+    }
+    const viewerRole =
+      entry.members.find((member) => member.principalId === viewerPrincipalId)?.role ?? null;
+    const revoke = resolveMemberRevoke(entry, viewerPrincipalId);
+    const collaborationEnabled = entry.state === "active";
+    return {
+      workspaceUid: entry.workspaceUid,
+      viewerRole,
+      revoked: revoke.revoked,
+      revokeReason: revoke.reason,
+      members: entry.members,
+      collaborationEnabled,
+      canEnable: !collaborationEnabled && !revoke.revoked && isOwner && isPrincipal,
+    };
+  }
+
+  return {
+    list(workspaceId, viewerPrincipalId, localOwnerPrincipalId = null) {
+      return snapshotFor(workspaceId, viewerPrincipalId, localOwnerPrincipalId);
     },
     async set(workspaceId, actorPrincipalId, principalId, role) {
       const entry = lookup(workspaceId);
@@ -116,6 +153,31 @@ export function createCollabMembersControl(input: {
         actorPrincipalId,
         principalId,
       });
+    },
+    async enable(workspaceId, actorPrincipalId, localOwnerPrincipalId) {
+      const current = snapshotFor(workspaceId, actorPrincipalId, localOwnerPrincipalId);
+      const ownerPrincipalId =
+        current.members.find((member) => member.role === "owner")?.principalId ??
+        localOwnerPrincipalId;
+      if (current.collaborationEnabled) {
+        if (actorPrincipalId !== ownerPrincipalId) throw new Error(COLLAB_ENABLE_DENIED);
+        return current;
+      }
+      if (!current.canEnable) throw new Error(COLLAB_ENABLE_DENIED);
+      if (!input.mutator) throw new Error(COLLAB_MEMBERS_UNAVAILABLE);
+      const enabled = await input.mutator.enableWorkspace({
+        localWorkspaceId: workspaceId,
+        actorPrincipalId,
+      });
+      return {
+        workspaceUid: enabled.workspaceUid,
+        viewerRole: "owner",
+        revoked: false,
+        revokeReason: null,
+        members: enabled.members,
+        collaborationEnabled: true,
+        canEnable: false,
+      };
     },
   };
 }

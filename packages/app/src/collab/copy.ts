@@ -29,6 +29,10 @@ export interface CollabCopy {
     failed: string;
     readOnly: string;
     collaborationOff: string;
+    enable: string;
+    enabling: string;
+    enableHint: string;
+    enableFailed: string;
   };
   presence: {
     title: string;
@@ -78,7 +82,11 @@ const en: CollabCopy = {
     revoked: "This workspace is no longer shared with you.",
     failed: "Unable to update members",
     readOnly: "Only the owner can add or remove people.",
-    collaborationOff: "Sharing is not available on this host.",
+    collaborationOff: "Sharing is not turned on for this workspace.",
+    enable: "Turn on sharing",
+    enabling: "Turning on…",
+    enableHint: "Turn on sharing to add people to this workspace.",
+    enableFailed: "Unable to turn on sharing",
   },
   presence: {
     title: "Here now",
@@ -128,7 +136,11 @@ const ar: CollabCopy = {
     revoked: "لم يعد هذا Workspace مشتركاً معك.",
     failed: "تعذر تحديث الأعضاء",
     readOnly: "المالك وحده يمكنه إضافة الأشخاص أو إزالتهم.",
-    collaborationOff: "المشاركة غير متاحة على هذا المضيف.",
+    collaborationOff: "المشاركة غير مفعّلة لهذا Workspace.",
+    enable: "تفعيل المشاركة",
+    enabling: "جارٍ التفعيل…",
+    enableHint: "فعّل المشاركة لإضافة أشخاص إلى هذا Workspace.",
+    enableFailed: "تعذر تفعيل المشاركة",
   },
   presence: {
     title: "المتواجدون الآن",
@@ -178,7 +190,11 @@ const es: CollabCopy = {
     revoked: "Este workspace ya no se comparte contigo.",
     failed: "No se pudieron actualizar los miembros",
     readOnly: "Solo el propietario puede añadir o quitar personas.",
-    collaborationOff: "El uso compartido no está disponible en este host.",
+    collaborationOff: "El uso compartido no está activado en este workspace.",
+    enable: "Activar uso compartido",
+    enabling: "Activando…",
+    enableHint: "Activa el uso compartido para añadir personas a este workspace.",
+    enableFailed: "No se pudo activar el uso compartido",
   },
   presence: {
     title: "Ahora aquí",
@@ -228,7 +244,11 @@ const fr: CollabCopy = {
     revoked: "Ce workspace n’est plus partagé avec vous.",
     failed: "Impossible de mettre à jour les membres",
     readOnly: "Seul le propriétaire peut ajouter ou retirer des personnes.",
-    collaborationOff: "Le partage n’est pas disponible sur cet hôte.",
+    collaborationOff: "Le partage n’est pas activé pour ce workspace.",
+    enable: "Activer le partage",
+    enabling: "Activation…",
+    enableHint: "Activez le partage pour ajouter des personnes à ce workspace.",
+    enableFailed: "Impossible d’activer le partage",
   },
   presence: {
     title: "Présents",
@@ -278,7 +298,11 @@ const ja: CollabCopy = {
     revoked: "この Workspace はもうあなたと共有されていません。",
     failed: "メンバーを更新できません",
     readOnly: "追加と削除ができるのはオーナーだけです。",
-    collaborationOff: "このホストでは共有を使えません。",
+    collaborationOff: "この Workspace では共有がオンになっていません。",
+    enable: "共有をオンにする",
+    enabling: "オンにしています…",
+    enableHint: "共有をオンにすると、この Workspace に人を追加できます。",
+    enableFailed: "共有をオンにできません",
   },
   presence: {
     title: "いまここにいる人",
@@ -328,7 +352,11 @@ const ko: CollabCopy = {
     revoked: "이 Workspace는 더 이상 나와 공유되지 않습니다.",
     failed: "멤버를 업데이트할 수 없습니다",
     readOnly: "소유자만 사람을 추가하거나 제거할 수 있습니다.",
-    collaborationOff: "이 호스트에서는 공유를 사용할 수 없습니다.",
+    collaborationOff: "이 Workspace에서는 공유가 켜져 있지 않습니다.",
+    enable: "공유 켜기",
+    enabling: "켜는 중…",
+    enableHint: "공유를 켜면 이 Workspace에 사람을 추가할 수 있습니다.",
+    enableFailed: "공유를 켤 수 없습니다",
   },
   presence: {
     title: "지금 여기",
@@ -378,7 +406,11 @@ const ptBR: CollabCopy = {
     revoked: "Este workspace não é mais compartilhado com você.",
     failed: "Não foi possível atualizar os membros",
     readOnly: "Só o proprietário pode adicionar ou remover pessoas.",
-    collaborationOff: "O compartilhamento não está disponível neste host.",
+    collaborationOff: "O compartilhamento não está ativado neste workspace.",
+    enable: "Ativar compartilhamento",
+    enabling: "Ativando…",
+    enableHint: "Ative o compartilhamento para adicionar pessoas a este workspace.",
+    enableFailed: "Não foi possível ativar o compartilhamento",
   },
   presence: {
     title: "Aqui agora",
@@ -428,7 +460,11 @@ const ru: CollabCopy = {
     revoked: "Этот workspace больше не открыт для вас.",
     failed: "Не удалось обновить участников",
     readOnly: "Добавлять и удалять людей может только владелец.",
-    collaborationOff: "На этом хосте общий доступ недоступен.",
+    collaborationOff: "Общий доступ для этого workspace не включён.",
+    enable: "Включить общий доступ",
+    enabling: "Включение…",
+    enableHint: "Включите общий доступ, чтобы добавлять людей в этот workspace.",
+    enableFailed: "Не удалось включить общий доступ",
   },
   presence: {
     title: "Сейчас здесь",
@@ -478,7 +514,11 @@ const zhCN: CollabCopy = {
     revoked: "此 Workspace 已不再与你共享。",
     failed: "无法更新成员",
     readOnly: "只有所有者可以添加或移除人员。",
-    collaborationOff: "此主机不支持共享。",
+    collaborationOff: "此 Workspace 尚未开启共享。",
+    enable: "开启共享",
+    enabling: "正在开启…",
+    enableHint: "开启共享后，才能把人加入此 Workspace。",
+    enableFailed: "无法开启共享",
   },
   presence: {
     title: "此刻在此",

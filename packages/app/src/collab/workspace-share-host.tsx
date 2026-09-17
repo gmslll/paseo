@@ -31,6 +31,8 @@ export function WorkspaceShareHost({
   const [members, setMembers] = useState<readonly WorkspaceMember[]>([]);
   const [viewerRole, setViewerRole] = useState<WorkspaceMemberRole | null>(null);
   const [revoked, setRevoked] = useState(false);
+  const [collaborationEnabled, setCollaborationEnabled] = useState(false);
+  const [canEnable, setCanEnable] = useState(false);
 
   useEffect(() => {
     if (!visible || !client) return;
@@ -42,6 +44,8 @@ export function WorkspaceShareHost({
         setMembers(payload.members);
         setViewerRole(payload.viewerRole);
         setRevoked(payload.revoked);
+        setCollaborationEnabled(payload.collaborationEnabled === true);
+        setCanEnable(payload.canEnable === true);
         return undefined;
       })
       .catch(() => {
@@ -49,6 +53,8 @@ export function WorkspaceShareHost({
         setMembers([]);
         setViewerRole(null);
         setRevoked(false);
+        setCollaborationEnabled(false);
+        setCanEnable(false);
       });
     return () => {
       cancelled = true;
@@ -69,6 +75,15 @@ export function WorkspaceShareHost({
         setMembers(payload.members);
         return payload.members;
       },
+      async enable() {
+        if (!client) throw new Error("Host disconnected");
+        const payload = await client.enableCollabWorkspace({ workspaceId });
+        setMembers(payload.members);
+        setViewerRole(payload.viewerRole);
+        setCollaborationEnabled(true);
+        setCanEnable(false);
+        return { members: payload.members, viewerRole: payload.viewerRole };
+      },
     }),
     [client, workspaceId],
   );
@@ -87,6 +102,8 @@ export function WorkspaceShareHost({
       viewerRole={viewerRole}
       members={members}
       revoked={revoked}
+      collaborationEnabled={collaborationEnabled}
+      canEnable={canEnable}
       presenceEntries={presence.entries}
       presenceNow={presence.now}
       onClose={handleClose}

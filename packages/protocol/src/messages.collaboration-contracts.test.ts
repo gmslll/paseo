@@ -8,6 +8,8 @@ import {
   CollabMembersListResponseSchema,
   CollabPresenceBeatRequestSchema,
   CollabPresenceBeatResponseSchema,
+  CollabWorkspaceEnableRequestSchema,
+  CollabWorkspaceEnableResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
   SendAgentMessageRequestSchema,
   ServerInfoStatusPayloadSchema,
@@ -74,6 +76,40 @@ describe("collab member RPCs", () => {
       },
     });
     expect(response.payload.members).toHaveLength(1);
+    const listed = CollabMembersListResponseSchema.parse({
+      type: "collab.members.list.response",
+      payload: {
+        requestId: "r1",
+        workspaceId: "ws-1",
+        workspaceUid: null,
+        viewerRole: null,
+        revoked: false,
+        members: [],
+        collaborationEnabled: false,
+        canEnable: true,
+      },
+    });
+    expect(listed.payload.canEnable).toBe(true);
+  });
+
+  test("enable collaboration names the local workspace only", () => {
+    const request = CollabWorkspaceEnableRequestSchema.parse({
+      type: "collab.workspace.enable.request",
+      requestId: "r3",
+      workspaceId: "ws-1",
+    });
+    expect(request.workspaceId).toBe("ws-1");
+    const response = CollabWorkspaceEnableResponseSchema.parse({
+      type: "collab.workspace.enable.response",
+      payload: {
+        requestId: "r3",
+        workspaceId: "ws-1",
+        workspaceUid: "cws_0123456789abcdef",
+        viewerRole: "owner",
+        members: [{ principalId: "usr_aaaaaaaaaaaaaaaa", role: "owner" }],
+      },
+    });
+    expect(response.payload.workspaceUid).toBe("cws_0123456789abcdef");
   });
 
   test("a presence beat carries the roster without a prompt", () => {

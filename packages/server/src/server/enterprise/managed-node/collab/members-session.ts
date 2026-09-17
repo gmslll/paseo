@@ -7,7 +7,8 @@ export type CollabMembersRequest = Extract<
     type:
       | "collab.members.list.request"
       | "collab.members.set.request"
-      | "collab.members.remove.request";
+      | "collab.members.remove.request"
+      | "collab.workspace.enable.request";
   }
 >;
 
@@ -21,10 +22,11 @@ export async function handleCollabMembersRequest(
   control: CollabMembersControl,
   msg: CollabMembersRequest,
   actorPrincipalId: string | null,
+  localOwnerPrincipalId: string | null = null,
 ): Promise<SessionOutboundMessage> {
   switch (msg.type) {
     case "collab.members.list.request": {
-      const snapshot = control.list(msg.workspaceId, actorPrincipalId);
+      const snapshot = control.list(msg.workspaceId, actorPrincipalId, localOwnerPrincipalId);
       return {
         type: "collab.members.list.response",
         payload: {
@@ -35,6 +37,8 @@ export async function handleCollabMembersRequest(
           revoked: snapshot.revoked,
           revokeReason: snapshot.revokeReason,
           members: [...snapshot.members],
+          collaborationEnabled: snapshot.collaborationEnabled,
+          canEnable: snapshot.canEnable,
         },
       };
     }
@@ -64,6 +68,25 @@ export async function handleCollabMembersRequest(
           requestId: msg.requestId,
           workspaceId: msg.workspaceId,
           members: [...members],
+        },
+      };
+    }
+    case "collab.workspace.enable.request": {
+      if (!actorPrincipalId) throw new Error(COLLAB_MEMBERS_UNAVAILABLE);
+      const snapshot = await control.enable(
+        msg.workspaceId,
+        actorPrincipalId,
+        localOwnerPrincipalId,
+      );
+      if (!snapshot.workspaceUid) throw new Error(COLLAB_MEMBERS_UNAVAILABLE);
+      return {
+        type: "collab.workspace.enable.response",
+        payload: {
+          requestId: msg.requestId,
+          workspaceId: msg.workspaceId,
+          workspaceUid: snapshot.workspaceUid,
+          viewerRole: snapshot.viewerRole,
+          members: [...snapshot.members],
         },
       };
     }

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, type ReactElement } from "react";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import type {
@@ -27,6 +27,10 @@ import { useShareWorkspaceFormModel, useShareWorkspaceFormState } from "./use-sh
 export interface ShareWorkspacePort {
   share(principalId: string, role: ShareableMemberRole): Promise<readonly WorkspaceMember[]>;
   unshare(principalId: string): Promise<readonly WorkspaceMember[]>;
+  enable(): Promise<{
+    members: readonly WorkspaceMember[];
+    viewerRole: WorkspaceMemberRole | null;
+  }>;
 }
 
 export interface ShareWorkspaceSheetProps {
@@ -36,6 +40,8 @@ export interface ShareWorkspaceSheetProps {
   viewerRole: WorkspaceMemberRole | null;
   members: readonly WorkspaceMember[];
   revoked: boolean;
+  collaborationEnabled: boolean;
+  canEnable: boolean;
   presenceEntries?: readonly PresenceEntry[];
   presenceNow?: number;
   onClose: () => void;
@@ -99,7 +105,12 @@ function principalError(issue: SharePrincipalIssue | null, copy: CollabCopy): st
 function submitErrorText(error: ShareSubmitError | null, copy: CollabCopy): string | null {
   if (error === "revoked") return copy.share.revoked;
   if (error === "failed") return copy.share.failed;
+  if (error === "enable_failed") return copy.share.enableFailed;
   return null;
+}
+
+function isAccessRevoked(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("revoked");
 }
 
 export function ShareWorkspaceSheet(props: ShareWorkspaceSheetProps): ReactElement | null {
@@ -116,6 +127,8 @@ function ShareWorkspaceSheetOpen({
   presenceNow,
   members,
   revoked,
+  collaborationEnabled,
+  canEnable,
   onClose,
   port,
 }: ShareWorkspaceSheetProps): ReactElement {
@@ -125,9 +138,20 @@ function ShareWorkspaceSheetOpen({
     viewerRole,
     members,
     revoked,
-    collaborationEnabled: true,
+    collaborationEnabled,
+    canEnable,
   });
   const state = useShareWorkspaceFormState(model);
+
+  useEffect(() => {
+    model.applySnapshot({
+      viewerRole,
+      members,
+      revoked,
+      collaborationEnabled,
+      canEnable,
+    });
+  }, [canEnable, collaborationEnabled, members, model, revoked, viewerRole]);
 
   const roleOptions = useMemo<SelectFieldOption<ShareableMemberRole>[]>(
     () => [
@@ -147,8 +171,7 @@ function ShareWorkspaceSheetOpen({
       model.resetPrincipal();
       model.setSubmitting(false);
     } catch (error) {
-      const accessRevoked = error instanceof Error && error.message.includes("revoked");
-      if (accessRevoked) {
+      if (isAccessRevoked(error)) {
         model.applyRevoked(true);
         return;
       }
@@ -172,8 +195,7 @@ function ShareWorkspaceSheetOpen({
         model.applyMembers(nextMembers);
         model.setSubmitting(false);
       } catch (error) {
-        const accessRevoked = error instanceof Error && error.message.includes("revoked");
-        if (accessRevoked) {
+        if (isAccessRevoked(error)) {
           model.applyRevoked(true);
           return;
         }
@@ -192,6 +214,29 @@ function ShareWorkspaceSheetOpen({
   const handleSharePress = useCallback(() => {
     void handleShare();
   }, [handleShare]);
+  const handleEnable = useCallback(async () => {
+    model.setSubmitting(true);
+    try {
+      const result = await port.enable();
+      model.applySnapshot({
+        viewerRole: result.viewerRole,
+        members: result.members,
+        revoked: false,
+        collaborationEnabled: true,
+        canEnable: false,
+      });
+      model.setSubmitting(false);
+    } catch (error) {
+      if (isAccessRevoked(error)) {
+        model.applyRevoked(true);
+        return;
+      }
+      model.setSubmitError("enable_failed");
+    }
+  }, [model, port]);
+  const handleEnablePress = useCallback(() => {
+    void handleEnable();
+  }, [handleEnable]);
   const handleRoleChange = useCallback(
     (value: ShareableMemberRole) => {
       model.setRole(value);
@@ -199,34 +244,47 @@ function ShareWorkspaceSheetOpen({
     [model],
   );
 
+  let primaryAction: ReactElement | null = null;
+  if (state.canEnable) {
+    primaryAction = (
+      <Button
+        variant="default"
+        size="md"
+        style={styles.footerButton}
+        onPress={handleEnablePress}
+        disabled={state.isSubmitting}
+        loading={state.isSubmitting}
+        testID="collab-share-enable"
+      >
+        {state.isSubmitting ? copy.share.enabling : copy.share.enable}
+      </Button>
+    );
+  } else if (state.canManage) {
+    primaryAction = (
+      <Button
+        variant="default"
+        size="md"
+        style={styles.footerButton}
+        onPress={handleSharePress}
+        disabled={!state.canSubmit}
+        loading={state.isSubmitting}
+        testID="collab-share-add"
+      >
+        {state.isSubmitting ? copy.share.adding : copy.share.add}
+      </Button>
+    );
+  }
+
   const footer = useMemo(
     () => (
       <View style={styles.footer}>
         <Button variant="secondary" size="md" style={styles.footerButton} onPress={onClose}>
           {copy.share.close}
         </Button>
-        <Button
-          variant="default"
-          size="md"
-          style={styles.footerButton}
-          onPress={handleSharePress}
-          disabled={!state.canSubmit}
-          loading={state.isSubmitting}
-          testID="collab-share-add"
-        >
-          {state.isSubmitting ? copy.share.adding : copy.share.add}
-        </Button>
+        {primaryAction}
       </View>
     ),
-    [
-      copy.share.add,
-      copy.share.adding,
-      copy.share.close,
-      handleSharePress,
-      onClose,
-      state.canSubmit,
-      state.isSubmitting,
-    ],
+    [copy.share.close, onClose, primaryAction],
   );
 
   return (
@@ -238,10 +296,15 @@ function ShareWorkspaceSheetOpen({
       desktopMaxWidth={440}
       testID="collab-share-sheet"
     >
-      <Text style={styles.subtitle}>{copy.share.subtitle}</Text>
+      <Text style={styles.subtitle}>
+        {state.canEnable ? copy.share.enableHint : copy.share.subtitle}
+      </Text>
       {errorText ? <Alert variant="error" title={errorText} /> : null}
-      {!state.canManage && !state.revoked ? (
-        <Alert variant="info" title={copy.share.readOnly} />
+      {!state.canManage && !state.revoked && !state.canEnable ? (
+        <Alert
+          variant="info"
+          title={state.collaborationEnabled ? copy.share.readOnly : copy.share.collaborationOff}
+        />
       ) : null}
       {state.canManage ? (
         <View style={styles.fields}>
@@ -276,22 +339,26 @@ function ShareWorkspaceSheetOpen({
           />
         </View>
       ) : null}
-      <Text style={settingsStyles.sectionHeaderTitle}>{copy.share.members}</Text>
-      <View style={settingsStyles.card}>
-        {state.members.map((member, index) => (
-          <MemberRow
-            key={member.principalId}
-            principalId={member.principalId}
-            label={member.isSelf ? copy.share.you : member.principalId}
-            roleLabel={copy.roles[member.role]}
-            canRemove={member.canRemove}
-            bordered={index > 0}
-            removeLabel={copy.share.remove}
-            disabled={state.isSubmitting}
-            onRemove={handleRemove}
-          />
-        ))}
-      </View>
+      {state.collaborationEnabled || state.members.length > 0 ? (
+        <>
+          <Text style={settingsStyles.sectionHeaderTitle}>{copy.share.members}</Text>
+          <View style={settingsStyles.card}>
+            {state.members.map((member, index) => (
+              <MemberRow
+                key={member.principalId}
+                principalId={member.principalId}
+                label={member.isSelf ? copy.share.you : member.principalId}
+                roleLabel={copy.roles[member.role]}
+                canRemove={member.canRemove}
+                bordered={index > 0}
+                removeLabel={copy.share.remove}
+                disabled={state.isSubmitting}
+                onRemove={handleRemove}
+              />
+            ))}
+          </View>
+        </>
+      ) : null}
       {presenceEntries ? (
         <View style={styles.presence}>
           <PresenceList

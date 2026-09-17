@@ -5213,6 +5213,14 @@ export class DaemonClient {
     });
   }
 
+  async enableCollabWorkspace(input: { workspaceId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.workspace.enable.response">({
+      requestId,
+      message: { type: "collab.workspace.enable.request", ...input },
+    });
+  }
+
   async beatCollabPresence(
     input: {
       workspaceId: string;

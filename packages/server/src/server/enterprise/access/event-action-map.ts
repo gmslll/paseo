@@ -315,6 +315,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "close_items_response",
       "collab.members.remove.response",
       "collab.members.set.response",
+      "collab.workspace.enable.response",
       "create_paseo_worktree_response",
       "loop/inspect/response",
       "loop/list/response",

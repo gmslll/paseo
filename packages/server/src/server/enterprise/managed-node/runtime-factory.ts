@@ -268,6 +268,15 @@ export async function createManagedEnterpriseRuntime(
                     collaboration.catalog.refresh();
                     return members;
                   },
+                  async enableWorkspace(change) {
+                    const enabled = await client.enableOwnedCollabWorkspace(change);
+                    await client.refreshPolicy();
+                    collaboration.catalog.refresh();
+                    return {
+                      workspaceUid: enabled.workspaceUid,
+                      members: enabled.members,
+                    };
+                  },
                 },
               }),
             }),

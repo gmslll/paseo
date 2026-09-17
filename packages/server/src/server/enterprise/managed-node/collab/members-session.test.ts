@@ -45,6 +45,44 @@ describe("collab members session", () => {
         workspaceUid: "cws_0123456789abcdef",
         viewerRole: "owner",
         revoked: false,
+        collaborationEnabled: true,
+        canEnable: false,
+      },
+    });
+  });
+
+  test("enable returns the owner membership for a local Workspace", async () => {
+    const response = await handleCollabMembersRequest(
+      createCollabMembersControl({
+        catalog: { current: () => catalog() },
+        mutator: {
+          async setMember() {
+            throw new Error("unused");
+          },
+          async removeMember() {
+            throw new Error("unused");
+          },
+          async enableWorkspace() {
+            return {
+              workspaceUid: "cws_0123456789abcdef",
+              members: [{ principalId: OWNER, role: "owner" }],
+            };
+          },
+        },
+      }),
+      { type: "collab.workspace.enable.request", requestId: "r2", workspaceId: "ws-local" },
+      OWNER,
+      OWNER,
+    );
+
+    expect(response).toEqual({
+      type: "collab.workspace.enable.response",
+      payload: {
+        requestId: "r2",
+        workspaceId: "ws-local",
+        workspaceUid: "cws_0123456789abcdef",
+        viewerRole: "owner",
+        members: [{ principalId: OWNER, role: "owner" }],
       },
     });
   });

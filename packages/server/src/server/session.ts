@@ -4028,8 +4028,13 @@ export class Session {
       return;
     }
     const actorPrincipalId = this.enterpriseContext?.principal.principalId ?? null;
+    const workspace = await this.workspaceRegistry.get(msg.workspaceId);
+    const localOwnerPrincipalId = workspace?.ownerPrincipalId ?? null;
     try {
-      this.emit(await answerCollabMembersRequest(control, msg, actorPrincipalId), context);
+      this.emit(
+        await answerCollabMembersRequest(control, msg, actorPrincipalId, localOwnerPrincipalId),
+        context,
+      );
     } catch (error) {
       this.onMessage({
         type: "rpc_error",
@@ -4052,6 +4057,7 @@ export class Session {
       case "collab.members.list.request":
       case "collab.members.set.request":
       case "collab.members.remove.request":
+      case "collab.workspace.enable.request":
         return this.handleCollabMembersRequest(msg);
       case "collab.presence.beat.request":
         return this.handleCollabPresenceRequest(msg);

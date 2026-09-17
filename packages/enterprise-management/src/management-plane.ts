@@ -1707,6 +1707,111 @@ export class EnterpriseManagementPlane {
     });
   }
 
+  /**
+   * Owner-driven enable from a collaborating node (ADR-0031). The node is signed and must have
+   * already checked that the actor owns the local Workspace; the plane has no local registry.
+   * Platform `identity.manage` still uses `registerCollabWorkspace` / `setCollabCollaboration`.
+   */
+  async enableOwnedCollabWorkspace(
+    nodeId: string,
+    input: { readonly actorPrincipalId: string; readonly localWorkspaceId: string },
+  ): Promise<{
+    readonly workspace: CollabWorkspaceRecord;
+    readonly members: readonly CollabMember[];
+  }> {
+    this.assertOpen();
+    if (input.localWorkspaceId.length === 0) throw new Error("invalid workspace");
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) {
+      throw new Error("collaboration is not available on this node");
+    }
+    const actor = this.requirePrincipal(input.actorPrincipalId);
+    const existing = this.readCollabWorkspaceByLocalId(input.localWorkspaceId);
+    const placementOwner = this.readWorkspacePlacementOwner(nodeId, input.localWorkspaceId);
+    const actorOwnsExisting = !existing || existing.ownerPrincipalId === actor.principalId;
+    const actorOwnsPlacement = !placementOwner || placementOwner === actor.principalId;
+    if (!actorOwnsExisting || !actorOwnsPlacement) {
+      throw new Error("only the workspace owner can enable collaboration");
+    }
+
+    const workspaceUid =
+      existing && existing.collaborationEnabled && placementOwner === actor.principalId
+        ? existing.workspaceUid
+        : this.persistOwnedCollabEnable({
+            nodeId,
+            actorPrincipalId: actor.principalId,
+            localWorkspaceId: input.localWorkspaceId,
+            existing,
+            placementOwner,
+          });
+    const workspace = this.requireCollabWorkspace(workspaceUid);
+    return { workspace, members: this.listCollabMembersUnchecked(workspace.workspaceUid) };
+  }
+
+  private persistOwnedCollabEnable(input: {
+    readonly nodeId: string;
+    readonly actorPrincipalId: string;
+    readonly localWorkspaceId: string;
+    readonly existing: CollabWorkspaceRecord | null;
+    readonly placementOwner: string | null;
+  }): string {
+    const now = this.nowIso();
+    const workspaceUid = input.existing?.workspaceUid ?? createOpaqueId("cws_", 8);
+    transaction(this.database, () => {
+      if (!input.existing) {
+        this.database
+          .prepare(
+            "INSERT INTO collab_workspaces (workspace_uid, organization_id, local_workspace_id, owner_principal_id, collaboration_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+          )
+          .run(
+            workspaceUid,
+            this.options.organizationId,
+            input.localWorkspaceId,
+            input.actorPrincipalId,
+            now,
+            now,
+          );
+        this.database
+          .prepare(
+            "INSERT INTO collab_members (workspace_uid, principal_id, role, created_at, updated_at) VALUES (?, ?, 'owner', ?, ?)",
+          )
+          .run(workspaceUid, input.actorPrincipalId, now, now);
+        this.reprojectMembership(input.actorPrincipalId, workspaceUid, "owner", now);
+      } else {
+        this.database
+          .prepare(
+            "UPDATE collab_workspaces SET collaboration_enabled = 1, updated_at = ? WHERE workspace_uid = ? AND organization_id = ?",
+          )
+          .run(now, workspaceUid, this.options.organizationId);
+      }
+      if (!input.placementOwner) {
+        this.database
+          .prepare(
+            "INSERT INTO placements (organization_id, node_id, resource_kind, local_resource_id, owner_principal_id, assigned_at, updated_at) VALUES (?, ?, 'workspace', ?, ?, ?, ?)",
+          )
+          .run(
+            this.options.organizationId,
+            input.nodeId,
+            input.localWorkspaceId,
+            input.actorPrincipalId,
+            now,
+            now,
+          );
+      }
+      if (!input.existing || input.existing.collaborationEnabled !== true) {
+        this.appendPlaneAudit({
+          action: "collab.workspace.enable",
+          outcome: "allowed",
+          actorPrincipalId: input.actorPrincipalId,
+          resourceKind: "workspace",
+          resourceId: workspaceUid,
+          metadata: { enabled: true, localWorkspaceId: input.localWorkspaceId },
+        });
+      }
+    });
+    return workspaceUid;
+  }
+
   private async setCollabMemberAsOwner(
     actorPrincipalId: string,
     input: {
@@ -1930,6 +2035,32 @@ export class EnterpriseManagementPlane {
         .get(workspaceUid, this.options.organizationId),
     );
     if (!row) throw new Error("collaborative workspace unavailable");
+    return this.collabWorkspaceFromRow(row);
+  }
+
+  private readCollabWorkspaceByLocalId(localWorkspaceId: string): CollabWorkspaceRecord | null {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT * FROM collab_workspaces WHERE organization_id = ? AND local_workspace_id = ?",
+        )
+        .get(this.options.organizationId, localWorkspaceId),
+    );
+    return row ? this.collabWorkspaceFromRow(row) : null;
+  }
+
+  private readWorkspacePlacementOwner(nodeId: string, localWorkspaceId: string): string | null {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT owner_principal_id FROM placements WHERE organization_id = ? AND node_id = ? AND resource_kind = 'workspace' AND local_resource_id = ?",
+        )
+        .get(this.options.organizationId, nodeId, localWorkspaceId),
+    );
+    return row ? String(row.owner_principal_id) : null;
+  }
+
+  private collabWorkspaceFromRow(row: DatabaseRow): CollabWorkspaceRecord {
     return {
       workspaceUid: String(row.workspace_uid),
       localWorkspaceId: String(row.local_workspace_id),

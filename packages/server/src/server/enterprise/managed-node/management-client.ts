@@ -153,6 +153,36 @@ export class ManagedNodeControlPlaneClient {
     return result.members as WorkspaceMembershipPolicy["members"];
   }
 
+  async enableOwnedCollabWorkspace(input: {
+    readonly actorPrincipalId: string;
+    readonly localWorkspaceId: string;
+  }): Promise<{
+    readonly workspaceUid: string;
+    readonly localWorkspaceId: string;
+    readonly ownerPrincipalId: string;
+    readonly collaborationEnabled: boolean;
+    readonly members: WorkspaceMembershipPolicy["members"];
+  }> {
+    const result = await this.signedRequest(
+      "POST",
+      "/v1/node/collab/enable",
+      input,
+      z.object({
+        workspaceUid: z.string(),
+        localWorkspaceId: z.string(),
+        ownerPrincipalId: z.string(),
+        collaborationEnabled: z.boolean(),
+        members: z.array(
+          z.object({ principalId: z.string(), role: z.enum(["owner", "editor", "viewer"]) }),
+        ),
+      }),
+    );
+    return {
+      ...result,
+      members: result.members as WorkspaceMembershipPolicy["members"],
+    };
+  }
+
   currentPolicy(principalId: string): ManagedNodePolicyEntry | null {
     const entry = this.policy.get(principalId);
     return entry ? Object.freeze({ ...entry }) : null;

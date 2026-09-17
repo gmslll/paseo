@@ -15,6 +15,7 @@ function snapshot(overrides: Partial<ShareWorkspaceFormSnapshot> = {}): ShareWor
     ],
     revoked: false,
     collaborationEnabled: true,
+    canEnable: false,
     ...overrides,
   };
 }
@@ -93,6 +94,48 @@ describe("share workspace form", () => {
     expect(form.getState().principalId).toBe("");
     expect(form.getState().principalResetKey).toBe(1);
     expect(form.getState().canSubmit).toBe(false);
+  });
+
+  test("the owner of a workspace with sharing off can turn it on, not add people yet", () => {
+    const form = openShareWorkspaceForm(
+      snapshot({
+        viewerRole: null,
+        members: [],
+        collaborationEnabled: false,
+        canEnable: true,
+      }),
+    );
+
+    const state = form.getState();
+    expect(state.canEnable).toBe(true);
+    expect(state.canManage).toBe(false);
+    expect(state.canSubmit).toBe(false);
+  });
+
+  test("turning sharing on lets the owner add people", () => {
+    const form = openShareWorkspaceForm(
+      snapshot({
+        viewerRole: null,
+        members: [],
+        collaborationEnabled: false,
+        canEnable: true,
+      }),
+    );
+    form.applySnapshot({
+      viewerRole: "owner",
+      members: [{ principalId: OWNER, role: "owner" }],
+      revoked: false,
+      collaborationEnabled: true,
+      canEnable: false,
+    });
+
+    const state = form.getState();
+    expect(state.canEnable).toBe(false);
+    expect(state.canManage).toBe(true);
+    expect(state.collaborationEnabled).toBe(true);
+    expect(state.members).toEqual([
+      { principalId: OWNER, role: "owner", isSelf: true, canRemove: false },
+    ]);
   });
 
   test("pending submit disables a second add", () => {

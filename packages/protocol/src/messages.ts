@@ -2471,6 +2471,12 @@ export const CollabPresenceBeatRequestSchema = z.object({
   displayName: z.string().optional(),
 });
 
+export const CollabWorkspaceEnableRequestSchema = z.object({
+  type: z.literal("collab.workspace.enable.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4924,6 +4930,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CollabMembersSetRequestSchema,
   CollabMembersRemoveRequestSchema,
   CollabPresenceBeatRequestSchema,
+  CollabWorkspaceEnableRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6706,6 +6713,7 @@ export type CollabMembersListRequest = z.infer<typeof CollabMembersListRequestSc
 export type CollabMembersSetRequest = z.infer<typeof CollabMembersSetRequestSchema>;
 export type CollabMembersRemoveRequest = z.infer<typeof CollabMembersRemoveRequestSchema>;
 export type CollabPresenceBeatRequest = z.infer<typeof CollabPresenceBeatRequestSchema>;
+export type CollabWorkspaceEnableRequest = z.infer<typeof CollabWorkspaceEnableRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6778,6 +6786,8 @@ export const CollabMembersListResponseSchema = z.object({
     revoked: z.boolean(),
     revokeReason: z.string().nullable().optional(),
     members: z.array(CollabWireMemberSchema),
+    collaborationEnabled: z.boolean().optional(),
+    canEnable: z.boolean().optional(),
   }),
 });
 
@@ -6805,6 +6815,17 @@ export const CollabPresenceBeatResponseSchema = z.object({
     requestId: z.string(),
     workspaceId: z.string(),
     entries: z.array(CollabWirePresenceEntrySchema),
+  }),
+});
+
+export const CollabWorkspaceEnableResponseSchema = z.object({
+  type: z.literal("collab.workspace.enable.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    workspaceUid: z.string(),
+    viewerRole: z.enum(["owner", "editor", "viewer"]).nullable(),
+    members: z.array(CollabWireMemberSchema),
   }),
 });
 
@@ -8641,6 +8662,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CollabMembersSetResponseSchema,
   CollabMembersRemoveResponseSchema,
   CollabPresenceBeatResponseSchema,
+  CollabWorkspaceEnableResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
