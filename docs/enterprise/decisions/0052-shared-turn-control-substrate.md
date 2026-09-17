@@ -125,6 +125,26 @@ and five test files that override the factory.
 Left as one deliberate change covering all five operations rather than threaded through here for
 the newest one, which would leave the four older ones silent and the seam widened anyway.
 
+## Machine RPC does not get its own entry surface
+
+The plan registers the machine RPC method allowlist as a new `machine_rpc` entry in
+`entry-inventory.ts`. It is not registered that way, because there is nothing new to register.
+
+Every method in `MACHINE_RPC_METHODS` names an entry that is already a reviewed inbound entry —
+`send_agent_message_request`, `agent_permission_response`, `fs.file.write.request` and the rest are
+in `REVIEWED_INBOUND_ENTRIES` today. An attested request reaches them through a real Session
+(ADR-0035), so the transport is `session_json` and the authorization, canEmit and audit are the ones
+those entries already carry.
+
+`EnterpriseEntrySurface` is a closed union and every item owes twelve fields. A `machine_rpc`
+surface would restate eight reviewed rows under a second heading, kept in step with
+`MACHINE_RPC_METHODS` by hand — a second source of truth for the same entries, and one that a
+future method could drift from silently.
+
+What is worth holding is the property the plan was reaching for: a machine RPC method may not name
+an entry nobody reviewed. That is a cross-check between the two tables, and it is a test rather than
+a table.
+
 ## Acceptance
 
 Whichever option is taken, the tests ADR-0034 names stay the acceptance bar for the rules that are
