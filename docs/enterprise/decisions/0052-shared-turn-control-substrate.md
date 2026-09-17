@@ -152,6 +152,24 @@ when a method resolves to an empty action list that every role would pass vacuou
 
 So nothing is owed here. The surface is not added, and the property is held.
 
+## The client gate already exists
+
+The plan adds `packages/app/src/collab/collab-capability.ts` as the one place collaboration surfaces
+consult. The app already has that place: `useHostFeature(serverId, feature)` in
+`runtime/host-features.ts`, whose feature parameter is typed
+`keyof NonNullable<DaemonServerInfo["features"]>` and which reads
+`serverInfo?.features?.[feature] === true` off the session store.
+
+Because that type is derived from the protocol schema rather than an app-side list,
+`enterpriseCollaborationV1` became usable the moment the daemon started advertising it — no app
+change, no new module. `useManagedRuntimes` shows the shape a gated surface takes: one
+`useHostFeature` call, `enabled: Boolean(client && isConnected && supported)` on the query, and an
+`unsupported` arm in the view.
+
+A `collab-capability` wrapper would be a second name for the gate that exists, and a second place to
+keep in step with the protocol. So collaboration surfaces call `useHostFeature` directly, as every
+other host feature does.
+
 ## Acceptance
 
 Whichever option is taken, the tests ADR-0034 names stay the acceptance bar for the rules that are
