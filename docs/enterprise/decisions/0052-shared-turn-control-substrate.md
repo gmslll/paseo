@@ -142,8 +142,13 @@ surface would restate eight reviewed rows under a second heading, kept in step w
 future method could drift from silently.
 
 What is worth holding is the property the plan was reaching for: a machine RPC method may not name
-an entry nobody reviewed. That is a cross-check between the two tables, and it is a test rather than
-a table.
+an entry the daemon does not accept. That is a cross-check between two tables rather than a third
+table, and it already exists — `access/machine-rpc-method-actions.test.ts` pins every
+workspace-scoped method to `inboundActionsForRequestType`, which is stronger than checking a review
+list: it fails when the entry is unknown, when the restated actions drift from the entry's own, and
+when a method resolves to an empty action list that every role would pass vacuously.
+
+So nothing is owed here. The surface is not added, and the property is held.
 
 ## Acceptance
 
