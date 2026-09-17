@@ -271,6 +271,72 @@ export class DiffStore {
     }));
   }
 
+  /** The compressed bytes this Workspace's store holds, which is what the cap is measured against. */
+  compressedBytes(): number {
+    const row = this.database
+      .prepare("SELECT COALESCE(SUM(LENGTH(bytes)), 0) AS total FROM chunks")
+      .get() as { total: number };
+    return Number(row.total);
+  }
+
+  /**
+   * Drops turns that started before the cutoff and releases what nothing else holds.
+   *
+   * Returns the number of turns removed.
+   */
+  evictTurnsBefore(cutoffMs: number): number {
+    return transaction(this.database, () => {
+      const removed = this.database
+        .prepare("DELETE FROM turns WHERE started_at < ?")
+        .run(cutoffMs).changes;
+      this.releaseUnreferenced();
+      return Number(removed);
+    });
+  }
+
+  /**
+   * Drops the oldest turns until the store fits the cap, and releases what nothing else holds.
+   *
+   * A path head can hold content alive after its turn is gone — that is the point of a head, since
+   * the next turn's before image is read from it — so a store made entirely of current heads can sit
+   * above the cap with nothing left to drop. Returns the number of turns removed.
+   */
+  enforceSizeCap(maxCompressedBytes: number): number {
+    return transaction(this.database, () => {
+      let removed = 0;
+      while (this.compressedBytes() > maxCompressedBytes) {
+        const oldest = this.database
+          .prepare("SELECT turn_id FROM turns ORDER BY started_at ASC LIMIT 1")
+          .get() as { turn_id: string } | undefined;
+        if (!oldest) break;
+        this.database.prepare("DELETE FROM turns WHERE turn_id = ?").run(oldest.turn_id);
+        this.releaseUnreferenced();
+        removed += 1;
+      }
+      return removed;
+    });
+  }
+
+  /**
+   * Releases snapshots no turn or head still names, then the chunks no snapshot still names.
+   *
+   * Chunks are deliberately not cascaded from snapshots: one chunk belongs to every snapshot whose
+   * content contains it, so it goes only when the last of them does. Runs inside a caller's
+   * transaction, which is the only place it is correct.
+   */
+  private releaseUnreferenced(): void {
+    this.database.exec(
+      `DELETE FROM snapshots WHERE sha256 NOT IN (
+         SELECT before_sha256 FROM turn_files WHERE before_sha256 IS NOT NULL
+         UNION SELECT after_sha256 FROM turn_files WHERE after_sha256 IS NOT NULL
+         UNION SELECT snapshot_sha256 FROM path_heads WHERE snapshot_sha256 IS NOT NULL
+       )`,
+    );
+    this.database.exec(
+      "DELETE FROM chunks WHERE sha256 NOT IN (SELECT chunk_sha256 FROM snapshot_chunks)",
+    );
+  }
+
   /** What the store last saw at this path, which is the next turn's before image. */
   pathHead(filePath: string): RecordedContent | null {
     const row = this.database

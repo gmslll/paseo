@@ -88,6 +88,92 @@ describe("storing what a turn changed", () => {
   });
 });
 
+describe("making room", () => {
+  /** A turn that wrote one file nobody else references, so dropping it should release the bytes. */
+  function turnWriting(turnId: string, startedAt: number, content: string): void {
+    const after = store.putContent(text(content));
+    store.recordTurn({
+      turnId,
+      agentId: "agent-1",
+      startedAt,
+      endedAt: startedAt + 1,
+      files: [{ path: `${turnId}.txt`, before: { kind: "missing", sha256: null }, after }],
+    });
+    // The head would otherwise hold this content alive after the turn is gone.
+    store.setPathHead(`${turnId}.txt`, { kind: "missing", sha256: null });
+  }
+
+  test("an expired turn takes its chunks with it", () => {
+    turnWriting("turn-old", clock, "old content\n".repeat(100));
+    turnWriting("turn-new", clock + 10_000, "new content\n".repeat(100));
+    expect(countRows(store, "chunks")).toBe(2);
+
+    const removed = store.evictTurnsBefore(clock + 5_000);
+
+    expect(removed).toBe(1);
+    expect(store.listTurns().map((turn) => turn.turnId)).toEqual(["turn-new"]);
+    // Released, not merely unlinked: the chunk goes when the last snapshot naming it does.
+    expect(countRows(store, "chunks")).toBe(1);
+    expect(countRows(store, "snapshots")).toBe(1);
+  });
+
+  test("content two turns share survives the first one's eviction", () => {
+    const shared = store.putContent(text("shared\n".repeat(100)));
+    for (const [index, turnId] of ["turn-1", "turn-2"].entries()) {
+      store.recordTurn({
+        turnId,
+        agentId: "agent-1",
+        startedAt: clock + index * 10_000,
+        endedAt: null,
+        files: [{ path: "shared.txt", before: { kind: "missing", sha256: null }, after: shared }],
+      });
+    }
+    store.setPathHead("shared.txt", { kind: "missing", sha256: null });
+
+    store.evictTurnsBefore(clock + 5_000);
+
+    // One chunk belongs to every snapshot containing it, so the surviving turn keeps it.
+    expect(store.readContent(shared.sha256!)).not.toBeNull();
+    expect(countRows(store, "chunks")).toBe(1);
+  });
+
+  test("the cap drops the oldest turns until the store fits", () => {
+    for (const [index, turnId] of ["turn-1", "turn-2", "turn-3"].entries()) {
+      turnWriting(turnId, clock + index * 1_000, `body ${turnId} `.repeat(500));
+    }
+    const full = store.compressedBytes();
+    expect(full).toBeGreaterThan(0);
+
+    const removed = store.enforceSizeCap(Math.floor(full / 2));
+
+    expect(removed).toBeGreaterThan(0);
+    expect(store.compressedBytes()).toBeLessThanOrEqual(Math.floor(full / 2));
+    // Oldest first: what survives is the newest work.
+    expect(store.listTurns().map((turn) => turn.turnId)).toEqual(
+      ["turn-3", "turn-2", "turn-1"].slice(0, 3 - removed),
+    );
+  });
+
+  test("a store held entirely by current heads stops rather than spinning", () => {
+    // Heads are what the next turn's before image is read from, so their content cannot be dropped.
+    const after = store.putContent(text("held by the head\n".repeat(200)));
+    store.recordTurn({
+      turnId: "turn-1",
+      agentId: "agent-1",
+      startedAt: clock,
+      endedAt: null,
+      files: [{ path: "kept.txt", before: { kind: "missing", sha256: null }, after }],
+    });
+
+    const removed = store.enforceSizeCap(1);
+
+    expect(removed).toBe(1);
+    // Above the cap and nothing left to drop: it returns instead of looping.
+    expect(store.compressedBytes()).toBeGreaterThan(1);
+    expect(store.readContent(after.sha256!)).not.toBeNull();
+  });
+});
+
 describe("what a turn recorded", () => {
   test("keeps each file's before and after, and leaves the head where the turn left it", () => {
     const before = store.putContent(text("one\n"));
