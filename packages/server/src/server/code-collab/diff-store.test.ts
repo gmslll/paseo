@@ -188,7 +188,13 @@ describe("what a turn recorded", () => {
     });
 
     expect(store.listTurns()).toEqual([
-      { turnId: "turn-1", agentId: "agent-1", startedAt: clock, endedAt: clock + 1000 },
+      {
+        turnId: "turn-1",
+        agentId: "agent-1",
+        startedAt: clock,
+        endedAt: clock + 1000,
+        fileCount: 1,
+      },
     ]);
     expect(store.turnFiles("turn-1")).toEqual([
       {
@@ -232,6 +238,61 @@ describe("what a turn recorded", () => {
     }
 
     expect(store.listTurns().map((turn) => turn.turnId)).toEqual(["turn-3", "turn-2", "turn-1"]);
+  });
+
+  test("an agent filter hides another Agent's turns", () => {
+    store.recordTurn({
+      turnId: "mine",
+      agentId: "agent-1",
+      startedAt: clock,
+      endedAt: clock + 1,
+      files: [
+        {
+          path: "a.ts",
+          before: { kind: "missing", sha256: null },
+          after: { kind: "text", sha256: null },
+        },
+      ],
+    });
+    store.recordTurn({
+      turnId: "theirs",
+      agentId: "agent-2",
+      startedAt: clock + 2,
+      endedAt: clock + 3,
+      files: [],
+    });
+
+    expect(store.listTurns({ agentId: "agent-1" }).map((turn) => turn.turnId)).toEqual(["mine"]);
+    expect(store.listTurns({ agentId: "agent-1" })[0]!.fileCount).toBe(1);
+  });
+
+  test("accumulated files keep the first before-image and the last after-image", () => {
+    const original = store.putContent(text("one\n"));
+    const mid = store.putContent(text("two\n"));
+    const latest = store.putContent(text("three\n"));
+    store.recordTurn({
+      turnId: "turn-1",
+      agentId: "agent-1",
+      startedAt: clock,
+      endedAt: clock + 1,
+      files: [{ path: "src/a.ts", before: original, after: mid }],
+    });
+    store.recordTurn({
+      turnId: "turn-2",
+      agentId: "agent-1",
+      startedAt: clock + 2,
+      endedAt: clock + 3,
+      files: [{ path: "src/a.ts", before: mid, after: latest }],
+    });
+
+    expect(store.accumulatedFiles()).toEqual([
+      {
+        path: "src/a.ts",
+        kind: "text",
+        beforeSha256: original.sha256,
+        afterSha256: latest.sha256,
+      },
+    ]);
   });
 
   test("a path with no head reads as absent", () => {

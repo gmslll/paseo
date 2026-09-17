@@ -38,6 +38,7 @@ export interface BuildReviewDraftKeyInput {
   workspaceId?: string | null;
   cwd: string;
   mode: ReviewDraftMode;
+  turnId?: string | null;
   baseRef?: string | null;
   ignoreWhitespace: boolean;
 }
@@ -47,7 +48,9 @@ type BuildReviewDraftScopeKeyInput = Omit<BuildReviewDraftKeyInput, "mode">;
 export interface BuildReviewAttachmentSnapshotInput {
   reviewDraftKey: string;
   cwd: string;
-  mode: ReviewDraftMode;
+  // Wire review attachments still use the checkout comparison vocabulary; turn drafts stay
+  // local until a protocol field exists for them.
+  mode: Exclude<ReviewDraftMode, "turn">;
   baseRef?: string | null;
   comments: readonly ReviewDraftComment[];
   diffFiles: readonly ParsedDiffFile[];
@@ -105,9 +108,17 @@ function buildReviewDraftScopeParts(input: BuildReviewDraftScopeKeyInput): strin
 export function buildReviewDraftKey(input: BuildReviewDraftKeyInput): string {
   const [prefix, serverPart, workspacePart, basePart, whitespacePart] =
     buildReviewDraftScopeParts(input);
-  return [prefix, serverPart, workspacePart, `mode=${input.mode}`, basePart, whitespacePart].join(
-    ":",
-  );
+  const turnPart =
+    input.mode === "turn" ? `turn=${encodeKeyPart(input.turnId?.trim() ?? "")}` : null;
+  return [
+    prefix,
+    serverPart,
+    workspacePart,
+    `mode=${input.mode}`,
+    ...(turnPart ? [turnPart] : []),
+    basePart,
+    whitespacePart,
+  ].join(":");
 }
 
 function createDraftComment(input: ReviewDraftCommentInput): ReviewDraftComment {
@@ -303,7 +314,7 @@ export function useReviewAttachmentSnapshot(input: {
   key: string;
   diffFiles: readonly ParsedDiffFile[];
   cwd: string;
-  mode: ReviewDraftMode;
+  mode: Exclude<ReviewDraftMode, "turn">;
   baseRef?: string | null;
 }): ReviewComposerAttachment | null {
   const comments = useReviewDraftComments(input.key);

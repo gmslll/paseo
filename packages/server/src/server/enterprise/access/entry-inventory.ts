@@ -152,6 +152,9 @@ export const REVIEWED_INBOUND_ENTRIES = [
   "clear_agent_attention",
   "client_heartbeat",
   "close_items_request",
+  "code_collab.all_changes.get_diff.request",
+  "code_collab.turn_diff.get_files.request",
+  "code_collab.turn_diff.list_turns.request",
   "create_agent_request",
   "create_paseo_worktree_request",
   "create_terminal_request",
@@ -328,6 +331,9 @@ export const REVIEWED_INBOUND_ENTRIES = [
 
 const requestWorkspaceIdEntries = new Set<InboundEntry>([
   "chat/create",
+  "code_collab.all_changes.get_diff.request",
+  "code_collab.turn_diff.get_files.request",
+  "code_collab.turn_diff.list_turns.request",
   "create_agent_request",
   "directory_suggestions_request",
   "fetch_recent_provider_sessions_request",

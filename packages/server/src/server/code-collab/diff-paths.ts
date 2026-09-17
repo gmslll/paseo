@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { rmSync } from "node:fs";
 import path from "node:path";
 
 import { ensurePrivateDirectory } from "../private-files.js";
@@ -39,4 +40,9 @@ export function diffStorePath(paths: DiffStorePaths, workspaceId: string): strin
 export function ensureDiffStorePath(paths: DiffStorePaths, workspaceId: string): string {
   ensurePrivateDirectory(diffStoreDirectory(paths, workspaceId));
   return diffStorePath(paths, workspaceId);
+}
+
+/** Drops the Workspace's store directory. Missing is a no-op: archive can race with a first write. */
+export function removeDiffStore(paths: DiffStorePaths, workspaceId: string): void {
+  rmSync(diffStoreDirectory(paths, workspaceId), { recursive: true, force: true });
 }

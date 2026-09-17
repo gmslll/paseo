@@ -17,6 +17,7 @@ import {
   type AssistantForkTarget,
 } from "@/components/message";
 import type { TurnFooterHost } from "./layout";
+import { TurnDiffChangesChip } from "@/code-collab/turn-diff-changes-chip";
 import { AssistantForkMenu } from "@/components/assistant-fork-menu";
 import { SyncedLoader } from "@/components/synced-loader";
 import { useRetainedPanelActive } from "@/components/retained-panel";
@@ -195,6 +196,7 @@ function CompletedTurnFooter({
     },
     [boundary, onForkAssistantTurn],
   );
+  const turnId = items.find((item) => item.turnId)?.turnId;
   return (
     <View style={stylesheet.turnFooterSlot}>
       <AssistantTurnFooter
@@ -203,6 +205,7 @@ function CompletedTurnFooter({
         durationMs={timing?.durationMs}
         onFork={boundary && onForkAssistantTurn ? handleFork : undefined}
       />
+      {turnId ? <TurnDiffChangesChip turnId={turnId} /> : null}
     </View>
   );
 }
@@ -227,6 +230,7 @@ const stylesheet = StyleSheet.create((theme) => ({
     alignItems: "center",
     alignSelf: "flex-start",
     minHeight: 24,
+    gap: theme.spacing[3],
     paddingBottom: TURN_FOOTER_BOTTOM_SPACING,
   },
   turnFooterContent: {

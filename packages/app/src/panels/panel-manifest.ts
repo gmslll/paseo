@@ -87,6 +87,11 @@ const manifests = {
     supportedHosts: ["main", "explorer"],
     resourceKey: (target) => target.sha,
   },
+  turn_diff: {
+    kind: "turn_diff",
+    supportedHosts: ["main", "explorer"],
+    resourceKey: (target) => `${target.agentId}:${target.turnId}`,
+  },
 } satisfies PanelManifestByKind;
 
 export function getPanelManifest<K extends WorkspaceTabTarget["kind"]>(kind: K): PanelManifest<K> {

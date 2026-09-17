@@ -182,6 +182,8 @@ import { resolvePaseoToolPolicy } from "./agent/paseo-tool-policy.js";
 import { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { DaemonConfigBrowserToolsPolicy } from "./browser-tools/policy.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import { createFileObserver } from "./file-observer/index.js";
+import { createTurnDiffRuntime } from "./code-collab/turn-diff-runtime.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   archiveByScope,
@@ -1345,10 +1347,14 @@ export async function createPaseoDaemon(
       workspaceRegistry,
     });
     const github = createGitHubService();
+    // One recursive watcher for git observation and per-turn capture (ADR-0044). Closing the
+    // git service closes this observer, so turn-diff captures must unsubscribe first.
+    const fileObserver = createFileObserver();
     const workspaceGitService = new WorkspaceGitServiceImpl({
       logger,
       paseoHome: capturedPaseoHome,
       worktreesRoot: config.worktreesRoot,
+      fileObserver,
       deps: {
         forgeOverrides: { github },
       },
@@ -1482,6 +1488,16 @@ export async function createPaseoDaemon(
     await workspaceLabelService.initialize();
     requireConstructionAudit();
     logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
+    const turnDiffRuntime = createTurnDiffRuntime({
+      paseoHome: capturedPaseoHome,
+      observer: fileObserver,
+      agents: agentManager,
+      workspaces: workspaceRegistry,
+      logger: logger.child({ module: "turn-diff" }),
+    });
+    await turnDiffRuntime.start();
+    constructionCleanupStack.push(() => turnDiffRuntime.close());
+    logger.info({ elapsed: elapsed() }, "Turn diff capture started");
     if (enterpriseRuntime) {
       if (capturedEnterpriseMultiUser?.enabled !== true) {
         throw new Error("enterprise runtime configuration unavailable");
@@ -2553,6 +2569,7 @@ export async function createPaseoDaemon(
                   desktopManaged: config.desktopManaged === true,
                   managedRuntimes,
                   orchestration: operationService ?? undefined,
+                  turnDiff: turnDiffRuntime,
                   localPlanes: () => localPlanes?.controlAvailable === true,
                   terminalPlane: terminalPlaneAccess,
                   dataPlane: dataPlaneAccess,

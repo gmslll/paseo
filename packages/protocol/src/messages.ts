@@ -2393,6 +2393,39 @@ export const OrchestrationOperationCancelRequestSchema = z.object({
   operationId: z.string(),
 });
 
+// Per-turn diffs (ADR-0044). Gated by server_info.features.codeCollabTurnDiff.
+export const CodeCollabTurnSummarySchema = z.object({
+  turnId: z.string(),
+  agentId: z.string(),
+  startedAt: z.string(),
+  endedAt: z.string().nullable(),
+  fileCount: z.number().int().nonnegative(),
+});
+
+export const CodeCollabTurnDiffListTurnsRequestSchema = z.object({
+  type: z.literal("code_collab.turn_diff.list_turns.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string().optional(),
+  limit: z.number().int().positive().max(200).optional(),
+});
+
+export const CodeCollabTurnDiffGetFilesRequestSchema = z.object({
+  type: z.literal("code_collab.turn_diff.get_files.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  turnId: z.string(),
+  ignoreWhitespace: z.boolean().optional(),
+});
+
+export const CodeCollabAllChangesGetDiffRequestSchema = z.object({
+  type: z.literal("code_collab.all_changes.get_diff.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string().optional(),
+  ignoreWhitespace: z.boolean().optional(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4839,6 +4872,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   OrchestrationOperationListRequestSchema,
   OrchestrationOperationGetRequestSchema,
   OrchestrationOperationCancelRequestSchema,
+  CodeCollabTurnDiffListTurnsRequestSchema,
+  CodeCollabTurnDiffGetFilesRequestSchema,
+  CodeCollabAllChangesGetDiffRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6607,6 +6643,25 @@ export const OrchestrationOperationSummarySchema = z.object({
 });
 
 export type OrchestrationOperationSummary = z.infer<typeof OrchestrationOperationSummarySchema>;
+export type CodeCollabTurnSummary = z.infer<typeof CodeCollabTurnSummarySchema>;
+export type CodeCollabTurnDiffListTurnsRequest = z.infer<
+  typeof CodeCollabTurnDiffListTurnsRequestSchema
+>;
+export type CodeCollabTurnDiffGetFilesRequest = z.infer<
+  typeof CodeCollabTurnDiffGetFilesRequestSchema
+>;
+export type CodeCollabAllChangesGetDiffRequest = z.infer<
+  typeof CodeCollabAllChangesGetDiffRequestSchema
+>;
+export type CodeCollabTurnDiffListTurnsResponse = z.infer<
+  typeof CodeCollabTurnDiffListTurnsResponseSchema
+>;
+export type CodeCollabTurnDiffGetFilesResponse = z.infer<
+  typeof CodeCollabTurnDiffGetFilesResponseSchema
+>;
+export type CodeCollabAllChangesGetDiffResponse = z.infer<
+  typeof CodeCollabAllChangesGetDiffResponseSchema
+>;
 
 export const OrchestrationOperationListResponseSchema = z.object({
   type: z.literal("orchestration.operation.list.response"),
@@ -6629,6 +6684,34 @@ export const OrchestrationOperationCancelResponseSchema = z.object({
   payload: z.object({
     requestId: z.string(),
     operation: OrchestrationOperationSummarySchema,
+  }),
+});
+
+export const CodeCollabTurnDiffListTurnsResponseSchema = z.object({
+  type: z.literal("code_collab.turn_diff.list_turns.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    turns: z.array(CodeCollabTurnSummarySchema),
+  }),
+});
+
+export const CodeCollabTurnDiffGetFilesResponseSchema = z.object({
+  type: z.literal("code_collab.turn_diff.get_files.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    turnId: z.string(),
+    files: z.array(ParsedDiffFileSchema),
+  }),
+});
+
+export const CodeCollabAllChangesGetDiffResponseSchema = z.object({
+  type: z.literal("code_collab.all_changes.get_diff.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    files: z.array(ParsedDiffFileSchema),
   }),
 });
 
@@ -8458,6 +8541,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   OrchestrationOperationListResponseSchema,
   OrchestrationOperationGetResponseSchema,
   OrchestrationOperationCancelResponseSchema,
+  CodeCollabTurnDiffListTurnsResponseSchema,
+  CodeCollabTurnDiffGetFilesResponseSchema,
+  CodeCollabAllChangesGetDiffResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,

@@ -845,6 +845,24 @@ function requireWebSocketServices(params: {
   return { scheduleService, checkoutDiffManager };
 }
 
+function optionalDaemonRuntimeFeatures(config: DaemonRuntimeConfig | undefined) {
+  return {
+    // COMPAT(managedRuntimes): added in v0.9.0, remove gate after 2027-03-16.
+    ...(config?.managedRuntimes ? { managedRuntimes: true as const } : {}),
+    // COMPAT(orchestrationOutbox): added in v0.9.0, remove gate after 2027-03-16.
+    ...(config?.orchestration ? { orchestrationOutbox: true as const } : {}),
+    // COMPAT(codeCollabTurnDiff): added in v0.9.0, remove gate after 2027-03-16.
+    // Advertised only when capture is running, not merely because the RPC exists (ADR-0052).
+    ...(config?.turnDiff ? { codeCollabTurnDiff: true as const } : {}),
+    // COMPAT(localPlanes): added in v0.9.0, remove gate after 2027-03-16.
+    ...(config?.localPlanes?.() ? { localPlanes: true as const } : {}),
+    // COMPAT(terminalPlane): added in v0.9.0, remove gate after 2027-03-16.
+    ...(config?.terminalPlane?.endpoint() ? { terminalPlane: true as const } : {}),
+    // COMPAT(dataPlane): added in v0.9.0, remove gate after 2027-03-16.
+    ...(config?.dataPlane?.endpoint() ? { dataPlane: true as const } : {}),
+  };
+}
+
 /**
  * WebSocket server that only accepts sockets + parses/forwards messages to the session layer.
  */
@@ -1723,6 +1741,9 @@ export class VoiceAssistantWebSocketServer {
       .catch((e) => appendError(e));
     await Promise.resolve()
       .then(() => this.checkoutDiffManager.dispose())
+      .catch((e) => appendError(e));
+    await Promise.resolve()
+      .then(() => this.daemonRuntimeConfig?.turnDiff?.close())
       .catch((e) => appendError(e));
     await Promise.resolve()
       .then(() => this.workspaceGitService.dispose())
@@ -2778,6 +2799,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private buildServerInfoStatusPayload(session: Session): ServerInfoStatusPayload {
+    const runtimeFeatures = optionalDaemonRuntimeFeatures(this.daemonRuntimeConfig);
     return {
       status: "server_info",
       serverId: this.serverId,
@@ -2825,16 +2847,7 @@ export class VoiceAssistantWebSocketServer {
         ...(this.advertiseDaemonStatusRpc ? { daemonStatusRpc: true } : {}),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: true,
-        // COMPAT(managedRuntimes): added in v0.9.0, remove gate after 2027-03-16.
-        ...(this.daemonRuntimeConfig?.managedRuntimes ? { managedRuntimes: true } : {}),
-        // COMPAT(orchestrationOutbox): added in v0.9.0, remove gate after 2027-03-16.
-        ...(this.daemonRuntimeConfig?.orchestration ? { orchestrationOutbox: true } : {}),
-        // COMPAT(localPlanes): added in v0.9.0, remove gate after 2027-03-16.
-        ...(this.daemonRuntimeConfig?.localPlanes?.() ? { localPlanes: true } : {}),
-        // COMPAT(terminalPlane): added in v0.9.0, remove gate after 2027-03-16.
-        ...(this.daemonRuntimeConfig?.terminalPlane?.endpoint() ? { terminalPlane: true } : {}),
-        // COMPAT(dataPlane): added in v0.9.0, remove gate after 2027-03-16.
-        ...(this.daemonRuntimeConfig?.dataPlane?.endpoint() ? { dataPlane: true } : {}),
+        ...runtimeFeatures,
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
         ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.

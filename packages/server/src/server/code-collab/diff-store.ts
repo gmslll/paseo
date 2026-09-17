@@ -105,6 +105,7 @@ export interface TurnRow {
   readonly agentId: string;
   readonly startedAt: number;
   readonly endedAt: number | null;
+  readonly fileCount: number;
 }
 
 export class DiffStoreError extends Error {
@@ -233,23 +234,77 @@ export class DiffStore {
     });
   }
 
-  listTurns(limit = 50): TurnRow[] {
-    const rows = this.database
-      .prepare(
-        "SELECT turn_id, agent_id, started_at, ended_at FROM turns ORDER BY started_at DESC LIMIT ?",
-      )
-      .all(limit) as Array<{
-      turn_id: string;
-      agent_id: string;
-      started_at: number;
-      ended_at: number | null;
-    }>;
+  listTurns(options: { limit?: number; agentId?: string } = {}): TurnRow[] {
+    const limit = options.limit ?? 50;
+    const rows = options.agentId
+      ? (this.database
+          .prepare(
+            `SELECT t.turn_id, t.agent_id, t.started_at, t.ended_at,
+                    COUNT(tf.path) AS file_count
+             FROM turns t
+             LEFT JOIN turn_files tf ON tf.turn_id = t.turn_id
+             WHERE t.agent_id = ?
+             GROUP BY t.turn_id
+             ORDER BY t.started_at DESC
+             LIMIT ?`,
+          )
+          .all(options.agentId, limit) as Array<{
+          turn_id: string;
+          agent_id: string;
+          started_at: number;
+          ended_at: number | null;
+          file_count: number;
+        }>)
+      : (this.database
+          .prepare(
+            `SELECT t.turn_id, t.agent_id, t.started_at, t.ended_at,
+                    COUNT(tf.path) AS file_count
+             FROM turns t
+             LEFT JOIN turn_files tf ON tf.turn_id = t.turn_id
+             GROUP BY t.turn_id
+             ORDER BY t.started_at DESC
+             LIMIT ?`,
+          )
+          .all(limit) as Array<{
+          turn_id: string;
+          agent_id: string;
+          started_at: number;
+          ended_at: number | null;
+          file_count: number;
+        }>);
     return rows.map((row) => ({
       turnId: row.turn_id,
       agentId: row.agent_id,
       startedAt: row.started_at,
       endedAt: row.ended_at,
+      fileCount: Number(row.file_count),
     }));
+  }
+
+  /**
+   * One row per path touched by matching turns: the first before-image and the last after-image.
+   *
+   * That is the "all changes" view (ADR-0044): the conversation's accumulated effect, not one turn
+   * and not the current git working tree.
+   */
+  accumulatedFiles(options: { agentId?: string } = {}): TurnFileRow[] {
+    const turns = this.listTurns({ limit: 10_000, agentId: options.agentId });
+    const firstBefore = new Map<string, string | null>();
+    const latest = new Map<string, TurnFileRow>();
+    for (const turn of turns.toReversed()) {
+      for (const file of this.turnFiles(turn.turnId)) {
+        if (!firstBefore.has(file.path)) firstBefore.set(file.path, file.beforeSha256);
+        latest.set(file.path, file);
+      }
+    }
+    return [...latest.values()]
+      .map((file) => ({
+        path: file.path,
+        kind: file.kind,
+        beforeSha256: firstBefore.get(file.path) ?? file.beforeSha256,
+        afterSha256: file.afterSha256,
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
   }
 
   turnFiles(turnId: string): TurnFileRow[] {

@@ -299,6 +299,13 @@ import {
   type DaemonRuntimeConfig,
   type OrchestrationOperationRequest,
 } from "./session/daemon/daemon-session.js";
+import {
+  TURN_DIFF_UNAVAILABLE,
+  codeCollabTurnDiffAction,
+  handleCodeCollabTurnDiffRequest as answerCodeCollabTurnDiffRequest,
+  type CodeCollabTurnDiffRequest,
+} from "./code-collab/code-collab-session.js";
+import type { TurnDiffControl } from "./code-collab/turn-diff-runtime.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -1127,6 +1134,7 @@ export class Session {
   private readonly agentConfigSession: AgentConfigSession;
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
+  private readonly turnDiff: TurnDiffControl | null;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
@@ -1518,6 +1526,7 @@ export class Session {
       hubRelationships: options.hubRelationships,
       reloadConfig: () => daemonConfigStore.reload(),
     });
+    this.turnDiff = daemonRuntimeConfig?.turnDiff ?? null;
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
           agents: options.hubExecutionAgents,
@@ -3491,6 +3500,7 @@ export class Session {
       this.dispatchAgentLifecycleMessage(msg) ??
       this.dispatchAgentConfigMessage(msg) ??
       this.dispatchDaemonServiceMessage(msg) ??
+      this.dispatchCodeCollabMessage(msg) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceLifecycleMessage(msg) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
@@ -3970,6 +3980,48 @@ export class Session {
       default:
         return undefined;
     }
+  }
+
+  private dispatchCodeCollabMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "code_collab.turn_diff.list_turns.request":
+      case "code_collab.turn_diff.get_files.request":
+      case "code_collab.all_changes.get_diff.request":
+        return this.handleCodeCollabTurnDiffRequest(msg);
+      default:
+        return undefined;
+    }
+  }
+
+  private async handleCodeCollabTurnDiffRequest(msg: CodeCollabTurnDiffRequest): Promise<void> {
+    const control = this.turnDiff;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: TURN_DIFF_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (
+      !(await this.assertLegacyWorkspaceResource(
+        codeCollabTurnDiffAction(msg.type),
+        msg.workspaceId,
+      ))
+    ) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    this.emit(await answerCodeCollabTurnDiffRequest(control, msg), context);
   }
 
   // An attach token names this Session, its Principal, and its Grant version, so a plane channel

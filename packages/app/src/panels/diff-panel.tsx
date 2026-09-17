@@ -11,6 +11,7 @@ import { isWeb } from "@/constants/platform";
 import { DiffDocument } from "@/git/diff-document";
 import { ChangesSurface, DiffLayoutToggle, resolveDiffLayout } from "@/git/diff-pane";
 import { useCommitDiffFiles } from "@/git/use-diff-files";
+import { useTurnDiffQuery } from "@/code-collab/use-turn-diff-query";
 import { useChangesPreferences } from "@/hooks/use-changes-preferences";
 import { useAppSettings } from "@/hooks/use-settings";
 import { usePaneContext } from "@/panels/pane-context";
@@ -251,6 +252,83 @@ export const changesTreePanelRegistration = definePanel("changes_tree", {
 export const commitDiffPanelRegistration = definePanel("commit_diff", {
   component: CommitDiffPanel,
   useDescriptor: useCommitDiffPanelDescriptor,
+});
+
+function TurnDiffPanel() {
+  const { t } = useTranslation();
+  const { serverId, workspaceId, target } = usePaneContext();
+  const panelPreferences = useDiffPanelPreferences();
+  invariant(target.kind === "turn_diff", "TurnDiffPanel requires turn_diff target");
+  const { files, isLoading, error, capabilityMissing } = useTurnDiffQuery({
+    serverId,
+    workspaceId,
+    turnId: target.turnId,
+    ignoreWhitespace: panelPreferences.preferences.hideWhitespace,
+  });
+  const mode = useMemo(() => ({ kind: "commit" as const }), []);
+
+  let body: ReactNode;
+  if (capabilityMissing) {
+    body = (
+      <PanelState
+        message={t("panels.diff.turnCapabilityMissing")}
+        testID="turn-diff-capability-missing"
+      />
+    );
+  } else if (error) {
+    body = (
+      <PanelState message={t("panels.diff.loadError")} tone="error" testID="turn-diff-error" />
+    );
+  } else if (isLoading && files.length === 0) {
+    body = <PanelState message={t("workspace.tabs.loading")} testID="turn-diff-loading" />;
+  } else if (files.length === 0) {
+    body = <PanelState message={t("panels.diff.empty")} testID="turn-diff-empty" />;
+  } else {
+    body = (
+      <DiffDocument
+        files={files}
+        displayPreferences={panelPreferences.displayPreferences}
+        mode={mode}
+      />
+    );
+  }
+
+  return (
+    <View style={styles.container} testID="turn-diff-panel">
+      {panelPreferences.canUseSplitLayout ? (
+        <PaneContentToolbar style={styles.toolbar} testID="turn-diff-header">
+          <View style={styles.toolbarActions} testID="turn-diff-toolbar">
+            <DiffLayoutToggle
+              layout={panelPreferences.preferences.layout}
+              isMobile={panelPreferences.isCompact}
+              testID="turn-diff-toggle-layout"
+              onToggle={panelPreferences.toggleLayout}
+            />
+          </View>
+        </PaneContentToolbar>
+      ) : null}
+      <View style={styles.body}>{body}</View>
+    </View>
+  );
+}
+
+function useTurnDiffPanelDescriptor(
+  target: Extract<WorkspaceTabTarget, { kind: "turn_diff" }>,
+): PanelDescriptor {
+  const { t } = useTranslation();
+  return {
+    label: t("panels.diff.changesLabel"),
+    subtitle: t("panels.diff.turnSubtitle"),
+    tooltip: target.turnId,
+    titleState: "ready",
+    icon: ThemedFileDiff,
+    statusBucket: null,
+  };
+}
+
+export const turnDiffPanelRegistration = definePanel("turn_diff", {
+  component: TurnDiffPanel,
+  useDescriptor: useTurnDiffPanelDescriptor,
 });
 
 const styles = StyleSheet.create((theme) => ({

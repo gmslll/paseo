@@ -97,6 +97,8 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   // Operation summaries carry states and error codes, never prompts or Agent responses.
   "orchestration.operation.get.request": ["workspace.metadata.read"],
   "orchestration.operation.list.request": ["workspace.metadata.read"],
+  // Turn directory is metadata; file bodies are content (ADR-0045).
+  "code_collab.turn_diff.list_turns.request": ["workspace.metadata.read"],
   create_terminal_request: ["terminal.use"],
   // An attach token only reopens the terminal stream the Session may already use.
   "local_plane.attach_token.create.request": ["terminal.use"],
@@ -161,6 +163,8 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "enterprise.agent.content.read.response",
       "enterprise.browser_profile.content.read.response",
       "enterprise.app_slot.content.read.response",
+      "code_collab.turn_diff.get_files.response",
+      "code_collab.all_changes.get_diff.response",
     ],
   },
   {
@@ -168,6 +172,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
     events: [
       "orchestration.operation.get.response",
       "orchestration.operation.list.response",
+      "code_collab.turn_diff.list_turns.response",
       "agent_status",
       "agent_update",
       "agent_attention_required",

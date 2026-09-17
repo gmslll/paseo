@@ -39,7 +39,22 @@ export async function readTurnDiff(
   turnId: string,
   options: TurnDiffOptions = {},
 ): Promise<ParsedDiffFile[]> {
-  const files = store.turnFiles(turnId);
+  return readFiles(store, store.turnFiles(turnId), options);
+}
+
+/** The conversation's accumulated effect: first before-image vs last after-image per path. */
+export async function readAllChangesDiff(
+  store: DiffStore,
+  options: TurnDiffOptions & { agentId?: string } = {},
+): Promise<ParsedDiffFile[]> {
+  return readFiles(store, store.accumulatedFiles({ agentId: options.agentId }), options);
+}
+
+async function readFiles(
+  store: DiffStore,
+  files: TurnFileRow[],
+  options: TurnDiffOptions,
+): Promise<ParsedDiffFile[]> {
   if (files.length === 0) return [];
 
   const workspace = mkdtempSync(path.join(tmpdir(), "paseo-turn-diff-"));

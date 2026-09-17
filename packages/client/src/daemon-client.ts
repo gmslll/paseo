@@ -5146,6 +5146,43 @@ export class DaemonClient {
     });
   }
 
+  async listCodeCollabTurns(
+    input: { workspaceId: string; agentId?: string; limit?: number },
+    requestId?: string,
+  ) {
+    this.requireCodeCollabTurnDiffSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"code_collab.turn_diff.list_turns.response">(
+      {
+        requestId,
+        message: { type: "code_collab.turn_diff.list_turns.request", ...input },
+      },
+    );
+  }
+
+  async getCodeCollabTurnFiles(
+    input: { workspaceId: string; turnId: string; ignoreWhitespace?: boolean },
+    requestId?: string,
+  ) {
+    this.requireCodeCollabTurnDiffSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"code_collab.turn_diff.get_files.response">({
+      requestId,
+      message: { type: "code_collab.turn_diff.get_files.request", ...input },
+    });
+  }
+
+  async getCodeCollabAllChanges(
+    input: { workspaceId: string; agentId?: string; ignoreWhitespace?: boolean },
+    requestId?: string,
+  ) {
+    this.requireCodeCollabTurnDiffSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"code_collab.all_changes.get_diff.response">(
+      {
+        requestId,
+        message: { type: "code_collab.all_changes.get_diff.request", ...input },
+      },
+    );
+  }
+
   async connectHub(
     hubUrl: string,
     token: string,
@@ -6074,6 +6111,13 @@ export class DaemonClient {
     // COMPAT(orchestrationOutbox): added in v0.9.0, remove gate after 2027-03-16.
     if (this.lastServerInfoMessage?.features?.orchestrationOutbox !== true) {
       throw new Error("Update the host to inspect delegation operations.");
+    }
+  }
+
+  private requireCodeCollabTurnDiffSupport(): void {
+    // COMPAT(codeCollabTurnDiff): added in v0.9.0, remove gate after 2027-03-16.
+    if (this.lastServerInfoMessage?.features?.codeCollabTurnDiff !== true) {
+      throw new Error("Update the host to view per-turn diffs.");
     }
   }
 

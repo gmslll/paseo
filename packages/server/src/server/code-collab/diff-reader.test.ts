@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { diffStorePaths, ensureDiffStorePath } from "./diff-paths.js";
-import { readTurnDiff } from "./diff-reader.js";
+import { readAllChangesDiff, readTurnDiff } from "./diff-reader.js";
 import { DiffStore, type RecordedContent } from "./diff-store.js";
 
 const WORKSPACE = "wks_0123456789abcdef";
@@ -117,6 +117,32 @@ describe("reading back what a turn changed", () => {
 
     expect(await readTurnDiff(store, "turn-1")).toEqual([]);
     expect(await readTurnDiff(store, "turn-unknown")).toEqual([]);
+  });
+
+  test("all changes span the first before-image and the last after-image", async () => {
+    const original = store.putContent(text("one\n"));
+    const mid = store.putContent(text("two\n"));
+    const latest = store.putContent(text("three\n"));
+    store.recordTurn({
+      turnId: "turn-1",
+      agentId: "agent-1",
+      startedAt: clock,
+      endedAt: clock + 1,
+      files: [{ path: "src/a.ts", before: original, after: mid }],
+    });
+    store.recordTurn({
+      turnId: "turn-2",
+      agentId: "agent-1",
+      startedAt: clock + 2,
+      endedAt: clock + 3,
+      files: [{ path: "src/a.ts", before: mid, after: latest }],
+    });
+
+    const [file] = await readAllChangesDiff(store);
+
+    expect(file!.path).toBe("src/a.ts");
+    expect(file!.additions).toBe(1);
+    expect(file!.deletions).toBe(1);
   });
 
   test("an unchanged file produces no hunks rather than a failure", async () => {
