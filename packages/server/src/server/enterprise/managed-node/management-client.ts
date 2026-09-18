@@ -195,6 +195,19 @@ export class ManagedNodeControlPlaneClient {
     };
   }
 
+  async issueOwnedCollabStreamToken(input: {
+    readonly actorPrincipalId: string;
+    readonly clientId: string;
+    readonly workspaceUid: string;
+  }): Promise<{ readonly token: string; readonly expiresAt: string }> {
+    return await this.signedRequest(
+      "POST",
+      "/v1/node/collab/stream-token",
+      input,
+      z.object({ token: z.string(), expiresAt: z.string() }),
+    );
+  }
+
   async submitOwnedCollabRpc(input: {
     readonly actorPrincipalId: string;
     readonly credentialId: string;

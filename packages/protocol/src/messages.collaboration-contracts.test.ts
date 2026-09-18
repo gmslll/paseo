@@ -14,6 +14,8 @@ import {
   CollabTurnCancelResponseSchema,
   CollabTimelineGetRequestSchema,
   CollabTimelineGetResponseSchema,
+  CollabStreamTokenRequestSchema,
+  CollabStreamTokenResponseSchema,
   CollabTurnSendRequestSchema,
   CollabTurnSendResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
@@ -186,6 +188,27 @@ describe("collab member RPCs", () => {
     });
     expect(response.payload.epoch).toBe("e1");
     expect(response.payload.stream).toEqual({ turnId: null, text: "" });
+  });
+
+  test("a stream token names the workspace and the client", () => {
+    const request = CollabStreamTokenRequestSchema.parse({
+      type: "collab.stream.token.request",
+      requestId: "r7",
+      workspaceId: "ws-1",
+      clientId: "client-a",
+    });
+    expect(request.clientId).toBe("client-a");
+    const response = CollabStreamTokenResponseSchema.parse({
+      type: "collab.stream.token.response",
+      payload: {
+        requestId: "r7",
+        workspaceId: "ws-1",
+        token: "pst_v1.token",
+        expiresAt: "2026-09-18T00:05:00.000Z",
+        managementBaseUrl: "https://management.test:17443",
+      },
+    });
+    expect(response.payload.token).toBe("pst_v1.token");
   });
 
   test("a presence beat carries the roster without a prompt", () => {

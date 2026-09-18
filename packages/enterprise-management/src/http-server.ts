@@ -594,6 +594,9 @@ async function handleNodeRequest(
   if (await handleNodeCollabMemberRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeCollabEnableRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeCollabRpcRequest(plane, response, method, path, body, node.nodeId)) return;
+  if (await handleNodeCollabStreamTokenRequest(plane, response, method, path, body, node.nodeId)) {
+    return;
+  }
   if (await handleNodePlacementRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeLeaseRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeAuditRequest(plane, response, method, path, body, node.nodeId)) return;
@@ -861,6 +864,23 @@ async function waitForContainerAppend(
  * clients long-poll). Answers at once if anything is already waiting, otherwise holds until an
  * append lands, the client leaves, or the hold expires.
  */
+async function readSubscriptionOrRevoked(
+  plane: EnterpriseManagementPlane,
+  actor: AuthenticatedManagementPrincipal,
+  subscriptionId: string,
+  containerId: string,
+): Promise<{ events: unknown[] }> {
+  try {
+    return { events: await plane.readCollabSubscriptionById(actor, subscriptionId) };
+  } catch {
+    // Long-poll still has a status line, unlike SSE, but the body is the same `revoked` event the
+    // stream sends after headers (ADR-0032). Native clients cannot hold SSE.
+    return {
+      events: [{ type: "revoked", containerId, reason: "membership_removed" }],
+    };
+  }
+}
+
 async function longPollCollabSubscription(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
@@ -869,9 +889,17 @@ async function longPollCollabSubscription(
   subscriptionId: string,
   containerId: string,
 ): Promise<boolean> {
-  const waiting = await plane.readCollabSubscriptionById(actor, subscriptionId);
-  if (waiting.some((event) => event.type === "data")) {
-    sendJson(response, 200, { events: waiting });
+  const waiting = await readSubscriptionOrRevoked(plane, actor, subscriptionId, containerId);
+  if (
+    waiting.events.some(
+      (event) =>
+        typeof event === "object" &&
+        event !== null &&
+        "type" in event &&
+        (event.type === "data" || event.type === "revoked"),
+    )
+  ) {
+    sendJson(response, 200, waiting);
     return true;
   }
 
@@ -879,11 +907,11 @@ async function longPollCollabSubscription(
 
   // The client may have hung up during the hold; writing to a gone response would only throw.
   if (request.destroyed || response.writableEnded) return true;
-  // No headers have been sent yet, which is what lets a refusal here still be a status. The event
-  // stream had to invent a `revoked` event precisely because it no longer has that option.
-  sendJson(response, 200, {
-    events: await plane.readCollabSubscriptionById(actor, subscriptionId),
-  });
+  sendJson(
+    response,
+    200,
+    await readSubscriptionOrRevoked(plane, actor, subscriptionId, containerId),
+  );
   return true;
 }
 
@@ -1243,6 +1271,27 @@ async function handleNodeCollabEnableRequest(
     collaborationEnabled: result.workspace.collaborationEnabled,
     members: result.members,
   });
+  return true;
+}
+
+async function handleNodeCollabStreamTokenRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/stream-token") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      clientId: z.string().min(1).max(160),
+      workspaceUid: z.string().min(1),
+    })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 200, await plane.issueOwnedCollabStreamToken(nodeId, input));
   return true;
 }
 

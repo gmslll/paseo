@@ -1751,6 +1751,60 @@ export class EnterpriseManagementPlane {
     return { workspace, members: this.listCollabMembersUnchecked(workspace.workspaceUid) };
   }
 
+  /**
+   * Mints a stream token for a member the node has already authenticated (ADR-0032). Clients hold
+   * a node ticket, not a PAT, so the node asks for the token they present to the plane.
+   */
+  async issueOwnedCollabStreamToken(
+    nodeId: string,
+    input: {
+      readonly actorPrincipalId: string;
+      readonly clientId: string;
+      readonly workspaceUid: string;
+    },
+  ): Promise<{ readonly token: string; readonly expiresAt: string }> {
+    this.assertOpen();
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) {
+      throw new Error("collaboration is not available on this node");
+    }
+    if (input.clientId.length === 0 || input.clientId.length > 160) {
+      throw new Error("invalid client ID");
+    }
+    const actor = this.requirePrincipal(input.actorPrincipalId);
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (!workspace.collaborationEnabled) throw new Error("collaboration is not enabled");
+    if (!this.isContainerPlacedOnNode(workspace.workspaceUid, nodeId)) {
+      throw new Error("workspace is not placed on this node");
+    }
+    const members = this.listCollabMembersUnchecked(workspace.workspaceUid);
+    if (!members.some((member) => member.principalId === actor.principalId)) {
+      throw new Error("stream authorization denied");
+    }
+    const containerIds = this.listCollabContainersForPrincipal(actor.principalId);
+    if (containerIds.length === 0) throw new Error("no collaborative workspaces");
+    const issuedAtMs = this.clock.nowMs();
+    const expiresAtMs = issuedAtMs + STREAM_TOKEN_TTL_MS;
+    return Object.freeze({
+      token: signStreamToken(
+        {
+          tokenId: createOpaqueId("stk_", 16),
+          organizationId: actor.organizationId,
+          principalId: actor.principalId,
+          credentialId: createOpaqueId("cred_", 12),
+          clientId: input.clientId,
+          grantVersion: actor.grantVersion,
+          revocationEpoch: actor.revocationEpoch,
+          containerIds,
+          issuedAt: new Date(issuedAtMs).toISOString(),
+          expiresAt: new Date(expiresAtMs).toISOString(),
+        },
+        this.options.ticketPrivateKey,
+      ),
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    });
+  }
+
   private persistOwnedCollabEnable(input: {
     readonly nodeId: string;
     readonly actorPrincipalId: string;

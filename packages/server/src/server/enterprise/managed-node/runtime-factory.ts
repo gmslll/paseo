@@ -36,6 +36,7 @@ import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-r
 import { createCollabMembersControl } from "./collab/members-control.js";
 import { createCollabTurnControl } from "./collab/turn-control.js";
 import { createCollabTimelineControl } from "./collab/timeline-control.js";
+import { createCollabStreamTokenControl } from "./collab/stream-token-control.js";
 import { createCollabPresenceRoster } from "./collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
@@ -300,6 +301,11 @@ export async function createManagedEnterpriseRuntime(
                 catalog: collaboration.catalog,
                 read: (_workspaceUid, localWorkspaceId, agentId) =>
                   collaboration.replicas.readSessionDocument(localWorkspaceId, agentId),
+              }),
+              streamTokens: createCollabStreamTokenControl({
+                catalog: collaboration.catalog,
+                managementBaseUrl: relationship.managementBaseUrl,
+                issue: (change) => client.issueOwnedCollabStreamToken(change),
               }),
             }),
           }

@@ -336,6 +336,12 @@ import {
   type CollabTimelineRequest,
 } from "./enterprise/managed-node/collab/timeline-session.js";
 import type { CollabTimelineControl } from "./enterprise/managed-node/collab/timeline-control.js";
+import {
+  COLLAB_STREAM_TOKEN_UNAVAILABLE,
+  handleCollabStreamTokenRequest as answerCollabStreamTokenRequest,
+  type CollabStreamTokenRequest,
+} from "./enterprise/managed-node/collab/stream-token-session.js";
+import type { CollabStreamTokenControl } from "./enterprise/managed-node/collab/stream-token-control.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -1169,6 +1175,7 @@ export class Session {
   private readonly collabPresence: CollabPresenceControl | null;
   private readonly collabTurns: CollabTurnControl | null;
   private readonly collabTimeline: CollabTimelineControl | null;
+  private readonly collabStreamTokens: CollabStreamTokenControl | null;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
@@ -1565,6 +1572,7 @@ export class Session {
     this.collabPresence = daemonRuntimeConfig?.collabPresence ?? null;
     this.collabTurns = daemonRuntimeConfig?.collabTurns ?? null;
     this.collabTimeline = daemonRuntimeConfig?.collabTimeline ?? null;
+    this.collabStreamTokens = daemonRuntimeConfig?.collabStreamTokens ?? null;
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
           agents: options.hubExecutionAgents,
@@ -4084,8 +4092,50 @@ export class Session {
         return this.handleCollabTurnRequest(msg);
       case "collab.timeline.get.request":
         return this.handleCollabTimelineRequest(msg);
+      case "collab.stream.token.request":
+        return this.handleCollabStreamTokenRequest(msg);
       default:
         return undefined;
+    }
+  }
+
+  private async handleCollabStreamTokenRequest(msg: CollabStreamTokenRequest): Promise<void> {
+    const control = this.collabStreamTokens;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_STREAM_TOKEN_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const principalId = this.enterpriseContext?.principal.principalId ?? null;
+    const actor = principalId && principalId !== "owner" ? principalId : null;
+    try {
+      this.emit(await answerCollabStreamTokenRequest(control, msg, actor), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_STREAM_TOKEN_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
     }
   }
 

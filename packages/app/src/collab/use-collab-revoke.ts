@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { PRESENCE_HEARTBEAT_INTERVAL_MS } from "@getpaseo/protocol/enterprise-collaboration";
 import { useHostEnterpriseIdentitySnapshot, useHostRuntimeClient } from "@/runtime/host-runtime";
 import { appCollabReplica } from "./replica-host";
+import { useCollabPlaneSubscribe } from "./use-collab-plane-subscribe";
 import { useCollabReplicaLifecycle } from "./use-collab-replica-lifecycle";
 import { useCollabViewer } from "./use-collab-viewer";
 
@@ -20,6 +21,14 @@ export function useCollabRevoke(input: { serverId: string; workspaceId: string |
   const [reason, setReason] = useState<string | null>(null);
   const enabled = viewer.supported && Boolean(client) && Boolean(input.workspaceId);
   useCollabReplicaLifecycle(input.serverId);
+  useCollabPlaneSubscribe({
+    serverId: input.serverId,
+    workspaceId: input.workspaceId,
+    onRevoked: (nextReason) => {
+      setRevoked(true);
+      setReason(nextReason);
+    },
+  });
 
   useEffect(() => {
     if (!enabled || !client || !input.workspaceId) {

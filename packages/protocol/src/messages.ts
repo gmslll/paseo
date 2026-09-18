@@ -2501,6 +2501,13 @@ export const CollabTimelineGetRequestSchema = z.object({
   agentId: z.string(),
 });
 
+export const CollabStreamTokenRequestSchema = z.object({
+  type: z.literal("collab.stream.token.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  clientId: z.string().min(1),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4958,6 +4965,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CollabTurnSendRequestSchema,
   CollabTurnCancelRequestSchema,
   CollabTimelineGetRequestSchema,
+  CollabStreamTokenRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6744,6 +6752,7 @@ export type CollabWorkspaceEnableRequest = z.infer<typeof CollabWorkspaceEnableR
 export type CollabTurnSendRequest = z.infer<typeof CollabTurnSendRequestSchema>;
 export type CollabTurnCancelRequest = z.infer<typeof CollabTurnCancelRequestSchema>;
 export type CollabTimelineGetRequest = z.infer<typeof CollabTimelineGetRequestSchema>;
+export type CollabStreamTokenRequest = z.infer<typeof CollabStreamTokenRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6909,6 +6918,17 @@ export const CollabTimelineGetResponseSchema = z.object({
         text: z.string(),
       })
       .nullable(),
+  }),
+});
+
+export const CollabStreamTokenResponseSchema = z.object({
+  type: z.literal("collab.stream.token.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    token: z.string(),
+    expiresAt: z.string(),
+    managementBaseUrl: z.string(),
   }),
 });
 
@@ -8749,6 +8769,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CollabTurnSendResponseSchema,
   CollabTurnCancelResponseSchema,
   CollabTimelineGetResponseSchema,
+  CollabStreamTokenResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,

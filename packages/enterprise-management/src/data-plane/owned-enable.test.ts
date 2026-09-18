@@ -253,4 +253,30 @@ describe("owner-driven collaboration enable", () => {
     });
     expect(denied.status).toBe(400);
   });
+
+  test("POST /v1/node/collab/stream-token mints a token for a member on this node", async () => {
+    const harness = await start();
+    const enabled = await nodePost(harness, "/v1/node/collab/enable", {
+      actorPrincipalId: harness.ownerPrincipalId,
+      localWorkspaceId: LOCAL_WORKSPACE,
+    });
+    expect(enabled.status).toBe(200);
+    const { workspaceUid } = (await enabled.json()) as { workspaceUid: string };
+
+    const issued = await nodePost(harness, "/v1/node/collab/stream-token", {
+      actorPrincipalId: harness.ownerPrincipalId,
+      clientId: "client-1",
+      workspaceUid,
+    });
+    expect(issued.status).toBe(200);
+    const body = (await issued.json()) as { token: string; expiresAt: string };
+    expect(body.token.startsWith("pst_v1.")).toBe(true);
+
+    const refused = await nodePost(harness, "/v1/node/collab/stream-token", {
+      actorPrincipalId: harness.memberPrincipalId,
+      clientId: "client-1",
+      workspaceUid,
+    });
+    expect(refused.status).toBe(403);
+  });
 });

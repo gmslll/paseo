@@ -63,7 +63,7 @@ describe("hydrateCollabSessionDocument", () => {
     expect(hydrated.head).toEqual([]);
   });
 
-  test("a CRDT page replaces the daemon stream; an unread replica leaves it in place", () => {
+  test("a live daemon stream stays the body; the CRDT page fills in only when that stream is empty", () => {
     const local: StreamItem[] = [
       { kind: "user_message", id: "local", text: "local", timestamp: new Date() },
     ];
@@ -71,7 +71,8 @@ describe("hydrateCollabSessionDocument", () => {
       { kind: "user_message", id: "plane", text: "plane", timestamp: new Date() },
     ];
     expect(displayedCollabStream({ items: null, head: null }, local, undefined).items).toBe(local);
-    expect(displayedCollabStream({ items: plane, head: [] }, local, undefined)).toEqual({
+    expect(displayedCollabStream({ items: plane, head: [] }, local, undefined).items).toBe(local);
+    expect(displayedCollabStream({ items: plane, head: [] }, [], undefined)).toEqual({
       items: plane,
       head: [],
     });

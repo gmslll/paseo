@@ -5229,6 +5229,17 @@ export class DaemonClient {
     });
   }
 
+  async issueCollabStreamToken(
+    input: { workspaceId: string; clientId: string },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.stream.token.response">({
+      requestId,
+      message: { type: "collab.stream.token.request", ...input },
+    });
+  }
+
   async getCollabTimeline(input: { workspaceId: string; agentId: string }, requestId?: string) {
     this.requireEnterpriseCollaborationSupport();
     return this.sendNamespacedCorrelatedSessionRequest<"collab.timeline.get.response">({

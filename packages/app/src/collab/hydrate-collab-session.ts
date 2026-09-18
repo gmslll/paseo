@@ -72,6 +72,12 @@ export function displayedCollabStream(
   daemonItems: StreamItem[],
   daemonHead: StreamItem[] | undefined,
 ): { items: StreamItem[]; head: StreamItem[] | undefined } {
+  // Direct connections keep the live Agent stream (ADR-0032). The CRDT page is the body for a
+  // client that has not received that stream yet — a remote member, or a reconnect before history
+  // arrives — not a second writer over the same rows.
+  if (daemonItems.length > 0 || (daemonHead !== undefined && daemonHead.length > 0)) {
+    return { items: daemonItems, head: daemonHead };
+  }
   if (collab.items === null) {
     return { items: daemonItems, head: daemonHead };
   }
