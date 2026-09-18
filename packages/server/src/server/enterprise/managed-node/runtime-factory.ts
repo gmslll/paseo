@@ -34,6 +34,7 @@ import {
 } from "./management-client.js";
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
 import { createCollabMembersControl } from "./collab/members-control.js";
+import { createCollabTurnControl } from "./collab/turn-control.js";
 import { createCollabPresenceRoster } from "./collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
@@ -276,6 +277,21 @@ export async function createManagedEnterpriseRuntime(
                       workspaceUid: enabled.workspaceUid,
                       members: enabled.members,
                     };
+                  },
+                },
+              }),
+              turns: createCollabTurnControl({
+                catalog: collaboration.catalog,
+                mutator: {
+                  async submitSend(change) {
+                    return await client.submitOwnedCollabRpc(change);
+                  },
+                  async dispatch(workspaceUid, envelope, rpcId) {
+                    return await collaboration.replicas.dispatchAttestedRpc(
+                      workspaceUid,
+                      new TextEncoder().encode(JSON.stringify(envelope)),
+                      rpcId,
+                    );
                   },
                 },
               }),

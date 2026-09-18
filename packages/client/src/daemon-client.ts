@@ -5221,6 +5221,23 @@ export class DaemonClient {
     });
   }
 
+  async sendCollabTurn(
+    input: {
+      workspaceId: string;
+      agentId: string;
+      text: string;
+      messageId?: string;
+      sharedTurnPolicy?: "queue" | "interrupt";
+    },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.turn.send.response">({
+      requestId,
+      message: { type: "collab.turn.send.request", ...input },
+    });
+  }
+
   async beatCollabPresence(
     input: {
       workspaceId: string;

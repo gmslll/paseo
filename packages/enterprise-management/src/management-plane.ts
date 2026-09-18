@@ -86,9 +86,12 @@ import {
   type CollabSubscriptionEvent,
   type PresenceEntry,
   MACHINE_RPC_DEFAULT_TTL_MS,
+  MachineRpcAttestedRequestSchema,
   MachineRpcClientRequestSchema,
+  formatCollabSegment,
   machineRpcMethodPolicy,
   roleAllowsMachineRpcMethod,
+  type MachineRpcAttestedRequest,
   type MachineRpcClientRequest,
   type WorkspaceMemberRole,
   type WorkspaceMembershipPolicy,
@@ -1812,6 +1815,78 @@ export class EnterpriseManagementPlane {
     return workspaceUid;
   }
 
+  /**
+   * A Session on this node submits a machine RPC as the signed-in member (ADR-0035). The plane
+   * attests and appends to `rpc:req`; the node is not a writer of that segment.
+   */
+  async submitOwnedCollabRpc(
+    nodeId: string,
+    input: {
+      readonly actorPrincipalId: string;
+      readonly credentialId: string;
+      readonly clientId: string;
+      readonly method: string;
+      readonly localWorkspaceId: string;
+      readonly rpcId: string;
+      readonly payload: unknown;
+    },
+  ): Promise<MachineRpcAttestedRequest> {
+    this.assertOpen();
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) {
+      throw new Error("collaboration is not available on this node");
+    }
+    const actorPrincipal = this.requirePrincipal(input.actorPrincipalId);
+    this.requirePrincipalCredential(actorPrincipal.principalId, input.credentialId);
+    const workspace = this.readCollabWorkspaceByLocalId(input.localWorkspaceId);
+    if (!workspace || !workspace.collaborationEnabled) {
+      throw new Error("collaborative workspace unavailable");
+    }
+    if (!this.isContainerPlacedOnNode(workspace.workspaceUid, nodeId)) {
+      throw new Error("workspace is not placed on this node");
+    }
+    const actor: AuthenticatedManagementPrincipal = {
+      ...actorPrincipal,
+      credentialId: input.credentialId,
+    };
+    const nowMs = this.clock.nowMs();
+    const envelope = MachineRpcClientRequestSchema.parse({
+      kind: "request",
+      rpcVersion: 1,
+      rpcId: input.rpcId,
+      method: input.method,
+      nodeId,
+      containerId: workspace.workspaceUid,
+      clientId: input.clientId,
+      sentAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + MACHINE_RPC_DEFAULT_TTL_MS).toISOString(),
+      payload: input.payload,
+    });
+    const segment = formatCollabSegment({ kind: "rpc_request", nodeId });
+    const caller = toStreamActor(actor);
+    this.assertStreamAccess(caller, workspace.workspaceUid, segment, "write");
+    const attested = this.attestRpcRequest(caller, {
+      containerId: workspace.workspaceUid,
+      segment,
+      producerId: `prod-${input.rpcId}`,
+      producerEpoch: 1,
+      producerSeq: 1,
+      update: new TextEncoder().encode(JSON.stringify(envelope)),
+    });
+    const result = this.streams.append(attested);
+    if (result.kind !== "appended") throw new Error("machine rpc append refused");
+    for (const listener of this.streamListeners) {
+      try {
+        listener(workspace.workspaceUid, segment);
+      } catch {
+        // The listener owns its own recovery.
+      }
+    }
+    return MachineRpcAttestedRequestSchema.parse(
+      JSON.parse(Buffer.from(attested.update).toString("utf8")),
+    );
+  }
+
   private async setCollabMemberAsOwner(
     actorPrincipalId: string,
     input: {
@@ -2899,6 +2974,17 @@ export class EnterpriseManagementPlane {
     const principal = this.readPrincipal(principalId);
     if (!principal) throw new Error("principal unavailable");
     return principal;
+  }
+
+  private requirePrincipalCredential(principalId: string, credentialId: string): void {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT credential_id FROM credentials WHERE credential_id = ? AND principal_id = ? AND revoked_at IS NULL",
+        )
+        .get(credentialId, principalId),
+    );
+    if (!row) throw new Error("principal unavailable");
   }
 
   private readNode(nodeId: string): ManagedNode | null {

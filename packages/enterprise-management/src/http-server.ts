@@ -593,6 +593,7 @@ async function handleNodeRequest(
   if (await handleNodeRuntimeRequest(plane, response, method, path, node.nodeId)) return;
   if (await handleNodeCollabMemberRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeCollabEnableRequest(plane, response, method, path, body, node.nodeId)) return;
+  if (await handleNodeCollabRpcRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodePlacementRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeLeaseRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeAuditRequest(plane, response, method, path, body, node.nodeId)) return;
@@ -1241,6 +1242,33 @@ async function handleNodeCollabEnableRequest(
     ownerPrincipalId: result.workspace.ownerPrincipalId,
     collaborationEnabled: result.workspace.collaborationEnabled,
     members: result.members,
+  });
+  return true;
+}
+
+async function handleNodeCollabRpcRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/rpc") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      credentialId: z.string().min(1),
+      clientId: z.string().min(1),
+      method: z.string().min(1),
+      localWorkspaceId: z.string().min(1),
+      rpcId: z.string().min(1),
+      payload: z.unknown(),
+    })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 200, {
+    envelope: await plane.submitOwnedCollabRpc(nodeId, input),
   });
   return true;
 }

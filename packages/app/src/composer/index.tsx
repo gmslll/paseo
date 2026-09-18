@@ -57,6 +57,7 @@ import {
 import type { ImageAttachment, MessagePayload, TextReplacement } from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandConfig } from "@/hooks/use-agent-commands-query";
+import { useCollabPlaneTurn } from "@/collab/use-collab-plane-turn";
 import { encodeImages } from "@/utils/encode-images";
 import { focusWithRetries } from "@/utils/web-focus";
 import {
@@ -1278,6 +1279,7 @@ function ComposerContentImpl({
     workspaceId,
     agentId,
   });
+  const usePlaneTurn = useCollabPlaneTurn(serverId, workspaceId);
   const isComposerLocked = resolveIsComposerLocked(submitBehavior, isSubmitLoading);
   const keyboardHandlerIdRef = useRef(
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
@@ -1493,10 +1495,21 @@ function ComposerContentImpl({
                 targetAgentId,
               ).turnId ?? undefined)
             : undefined,
+        workspaceId,
+        usePlaneTurn,
       });
       onAttentionPromptSend?.();
     };
-  }, [appSettings.sendBehavior, client, onAttentionPromptSend, serverId, supportsForgeSearch, t]);
+  }, [
+    appSettings.sendBehavior,
+    client,
+    onAttentionPromptSend,
+    serverId,
+    supportsForgeSearch,
+    t,
+    usePlaneTurn,
+    workspaceId,
+  ]);
 
   useEffect(() => {
     onSubmitMessageRef.current = onSubmitMessage;

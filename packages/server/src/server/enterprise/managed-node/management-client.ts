@@ -22,7 +22,11 @@ import {
   type ManagedPlacement,
   type ManagedPlacementRegistration,
 } from "@getpaseo/protocol/enterprise-management";
-import type { WorkspaceMembershipPolicy } from "@getpaseo/protocol/enterprise-collaboration";
+import {
+  MachineRpcAttestedRequestSchema,
+  type MachineRpcAttestedRequest,
+  type WorkspaceMembershipPolicy,
+} from "@getpaseo/protocol/enterprise-collaboration";
 import {
   type ManagedRuntimePolicy,
   ManagedRuntimeNodePolicyResponseSchema,
@@ -189,6 +193,24 @@ export class ManagedNodeControlPlaneClient {
       ...result,
       members: result.members as WorkspaceMembershipPolicy["members"],
     };
+  }
+
+  async submitOwnedCollabRpc(input: {
+    readonly actorPrincipalId: string;
+    readonly credentialId: string;
+    readonly clientId: string;
+    readonly method: string;
+    readonly localWorkspaceId: string;
+    readonly rpcId: string;
+    readonly payload: unknown;
+  }): Promise<MachineRpcAttestedRequest> {
+    const result = await this.signedRequest(
+      "POST",
+      "/v1/node/collab/rpc",
+      input,
+      z.object({ envelope: MachineRpcAttestedRequestSchema }),
+    );
+    return result.envelope;
   }
 
   currentPolicy(principalId: string): ManagedNodePolicyEntry | null {

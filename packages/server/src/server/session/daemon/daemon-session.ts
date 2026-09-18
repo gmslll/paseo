@@ -6,6 +6,7 @@ import type { OrchestrationOperationControl } from "../../orchestration/operatio
 import type { TurnDiffControl } from "../../code-collab/turn-diff-runtime.js";
 import type { CollabMembersControl } from "../../enterprise/managed-node/collab/members-control.js";
 import type { CollabPresenceControl } from "../../enterprise/managed-node/collab/presence-roster.js";
+import type { CollabTurnControl } from "../../enterprise/managed-node/collab/turn-control.js";
 import { OperationStatusSchema } from "../../orchestration/operation-store.js";
 import { toOrchestrationOperationSummary } from "../../orchestration/operation-summary.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
@@ -90,6 +91,8 @@ export interface DaemonRuntimeConfig {
   collabMembers?: CollabMembersControl;
   /** Who is connected to a Workspace on this node. */
   collabPresence?: CollabPresenceControl;
+  /** Collaborative turns via plane-attested machine RPC (ADR-0035). */
+  collabTurns?: CollabTurnControl;
   /** Whether the local control plane is accepting Sessions (ADR-0038). */
   localPlanes?: () => boolean;
   /** Attach tokens and the endpoint for the terminal plane, while it is listening (ADR-0038). */

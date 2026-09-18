@@ -1,6 +1,9 @@
 import type { Buffer } from "node:buffer";
 
-import { formatCollabSegment } from "@getpaseo/protocol/enterprise-collaboration";
+import {
+  formatCollabSegment,
+  type MachineRpcResult,
+} from "@getpaseo/protocol/enterprise-collaboration";
 
 import type { AgentManagerEvent } from "../../../agent/agent-manager.js";
 import type { ManagedNodeRelationship } from "../relationship-store.js";
@@ -94,6 +97,24 @@ export class CollabRuntime {
     for (const [containerId, container] of this.containers) {
       this.containers.set(containerId, { ...container, rpc: this.createRpcServer(container) });
     }
+  }
+
+  /**
+   * Runs an envelope the plane just attested (ADR-0035). A concurrent pump that already consumed
+   * the id is answered from the in-memory result, not by acting twice.
+   */
+  async dispatchAttestedRpc(
+    containerId: string,
+    update: Uint8Array,
+    rpcId: string,
+  ): Promise<MachineRpcResult> {
+    const container = this.containers.get(containerId);
+    if (!container?.rpc) throw new Error("machine RPC is unavailable");
+    const handled = await container.rpc.handle(update);
+    const results = handled?.results ?? container.rpc.completedResults(rpcId);
+    const answer = results?.find((result) => result.kind !== "receipt");
+    if (!answer) throw new Error("machine RPC produced no result");
+    return answer;
   }
 
   /**

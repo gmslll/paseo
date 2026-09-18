@@ -435,6 +435,30 @@ describe("dispatchComposerAgentMessage", () => {
     expect(client.calls[0]?.options.activeTurnBehavior).toBe("steer");
   });
 
+  it("sends a collaborative turn through the plane instead of the node session", async () => {
+    const planeCalls: Array<{ workspaceId: string; text: string }> = [];
+    const client = createFakeSendClient();
+    client.sendCollabTurn = async (input) => {
+      planeCalls.push({ workspaceId: input.workspaceId, text: input.text });
+      return { accepted: true };
+    };
+    const stream = createFakeStream();
+
+    await dispatchComposerAgentMessage({
+      client,
+      agentId: "agent",
+      text: "from the plane",
+      attachments: [],
+      encodeImages: async () => [],
+      submission: stream,
+      workspaceId: "ws-1",
+      usePlaneTurn: true,
+    });
+
+    expect(planeCalls).toEqual([{ workspaceId: "ws-1", text: "from the plane" }]);
+    expect(client.calls).toEqual([]);
+  });
+
   it("stamps only a steer optimistic row with the daemon active turn ID", async () => {
     const client = createFakeSendClient();
     const stream = createFakeStream();

@@ -97,10 +97,17 @@ function inboundRequestId(message: SessionInboundMessage): string | null {
 export class MachineRpcServer {
   private readonly now: () => number;
   private readonly responseSegmentFor: (rpcId: string) => string;
+  private readonly completed = new Map<string, readonly MachineRpcResult[]>();
+  private readonly inflight = new Map<string, Promise<HandledMachineRpc | null>>();
 
   constructor(private readonly options: MachineRpcServerOptions) {
     this.now = options.now ?? Date.now;
     this.responseSegmentFor = (rpcId) => formatCollabSegment({ kind: "rpc_response", rpcId });
+  }
+
+  /** Results already produced for this id, including a concurrent pump that won the inbox. */
+  completedResults(rpcId: string): readonly MachineRpcResult[] | null {
+    return this.completed.get(rpcId) ?? null;
   }
 
   /**
@@ -118,6 +125,18 @@ export class MachineRpcServer {
       return null;
     }
 
+    const pending = this.inflight.get(request.rpcId);
+    if (pending) return pending;
+    const work = this.execute(request);
+    this.inflight.set(request.rpcId, work);
+    try {
+      return await work;
+    } finally {
+      this.inflight.delete(request.rpcId);
+    }
+  }
+
+  private async execute(request: MachineRpcAttestedRequest): Promise<HandledMachineRpc | null> {
     const expiresAtMs = Date.parse(request.expiresAt);
     if (!this.options.store.rememberRpc(request.rpcId, request.method, expiresAtMs)) return null;
 
@@ -132,6 +151,7 @@ export class MachineRpcServer {
         message,
       });
       this.publish(request.rpcId, results);
+      this.completed.set(request.rpcId, results);
       return { rpcId: request.rpcId, results };
     };
 
@@ -194,6 +214,7 @@ export class MachineRpcServer {
     const answer = await this.dispatch(principal, request);
     results.push(answer);
     this.publish(request.rpcId, [answer]);
+    this.completed.set(request.rpcId, results);
     return { rpcId: request.rpcId, results };
   }
 

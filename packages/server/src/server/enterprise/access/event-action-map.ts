@@ -289,6 +289,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "hub.execution.agent.create.response",
       "hub.execution.agent.validate.response",
       "hub.execution.control.response",
+      "collab.turn.send.response",
       "send_agent_message_response",
       "set_agent_feature_response",
       "set_agent_mode_response",

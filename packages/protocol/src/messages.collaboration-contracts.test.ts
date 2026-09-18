@@ -10,6 +10,8 @@ import {
   CollabPresenceBeatResponseSchema,
   CollabWorkspaceEnableRequestSchema,
   CollabWorkspaceEnableResponseSchema,
+  CollabTurnSendRequestSchema,
+  CollabTurnSendResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
   SendAgentMessageRequestSchema,
   ServerInfoStatusPayloadSchema,
@@ -110,6 +112,27 @@ describe("collab member RPCs", () => {
       },
     });
     expect(response.payload.workspaceUid).toBe("cws_0123456789abcdef");
+  });
+
+  test("a collaborative turn send names the workspace and the agent", () => {
+    const request = CollabTurnSendRequestSchema.parse({
+      type: "collab.turn.send.request",
+      requestId: "r4",
+      workspaceId: "ws-1",
+      agentId: "agent-1",
+      text: "hi",
+    });
+    expect(request.text).toBe("hi");
+    const response = CollabTurnSendResponseSchema.parse({
+      type: "collab.turn.send.response",
+      payload: {
+        requestId: "r4",
+        workspaceId: "ws-1",
+        agentId: "agent-1",
+        accepted: true,
+      },
+    });
+    expect(response.payload.accepted).toBe(true);
   });
 
   test("a presence beat carries the roster without a prompt", () => {

@@ -2477,6 +2477,16 @@ export const CollabWorkspaceEnableRequestSchema = z.object({
   workspaceId: z.string(),
 });
 
+export const CollabTurnSendRequestSchema = z.object({
+  type: z.literal("collab.turn.send.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string(),
+  text: z.string(),
+  messageId: z.string().optional(),
+  sharedTurnPolicy: z.enum(["queue", "interrupt"]).optional(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4931,6 +4941,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CollabMembersRemoveRequestSchema,
   CollabPresenceBeatRequestSchema,
   CollabWorkspaceEnableRequestSchema,
+  CollabTurnSendRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6714,6 +6725,7 @@ export type CollabMembersSetRequest = z.infer<typeof CollabMembersSetRequestSche
 export type CollabMembersRemoveRequest = z.infer<typeof CollabMembersRemoveRequestSchema>;
 export type CollabPresenceBeatRequest = z.infer<typeof CollabPresenceBeatRequestSchema>;
 export type CollabWorkspaceEnableRequest = z.infer<typeof CollabWorkspaceEnableRequestSchema>;
+export type CollabTurnSendRequest = z.infer<typeof CollabTurnSendRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6826,6 +6838,17 @@ export const CollabWorkspaceEnableResponseSchema = z.object({
     workspaceUid: z.string(),
     viewerRole: z.enum(["owner", "editor", "viewer"]).nullable(),
     members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabTurnSendResponseSchema = z.object({
+  type: z.literal("collab.turn.send.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().optional(),
   }),
 });
 
@@ -8663,6 +8686,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CollabMembersRemoveResponseSchema,
   CollabPresenceBeatResponseSchema,
   CollabWorkspaceEnableResponseSchema,
+  CollabTurnSendResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
