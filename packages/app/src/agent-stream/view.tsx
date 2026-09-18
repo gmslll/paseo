@@ -52,9 +52,11 @@ import type {
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useSessionStore } from "@/stores/session-store";
 import { AuthorLabel } from "@/collab/author-label";
+import { displayedCollabStream } from "@/collab/hydrate-collab-session";
 import { PresenceList } from "@/collab/presence-list";
 import { QueuedTurnBanner } from "@/collab/queued-turn-banner";
 import { useCollabPresence } from "@/collab/use-collab-presence";
+import { useCollabTimeline } from "@/collab/use-collab-timeline";
 import { useCollabViewer } from "@/collab/use-collab-viewer";
 import { useRevealedText } from "@/hooks/use-revealed-text";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
@@ -347,7 +349,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       agentId,
       serverId,
       context,
-      streamItems,
+      streamItems: daemonStreamItems,
       streamHead: providedStreamHead,
       pendingPermissions,
       pendingMessageSubmissions = EMPTY_PENDING_MESSAGE_SUBMISSIONS,
@@ -398,6 +400,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       focusAgentId: agentId,
       displayName: collabViewer.displayName,
     });
+    const collabTimeline = useCollabTimeline({
+      serverId: resolvedServerId,
+      workspaceId: context.workspaceId,
+      agentId,
+      provider: context.provider,
+    });
     const queuedTurns = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agents.get(agentId)?.queuedTurns,
     );
@@ -407,7 +415,11 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const sessionStreamHead = useSessionStore((state) =>
       state.sessions[resolvedServerId]?.agentStreamHead?.get(agentId),
     );
-    const streamHead = providedStreamHead ?? sessionStreamHead;
+    const { items: streamItems, head: streamHead } = displayedCollabStream(
+      collabTimeline,
+      daemonStreamItems,
+      providedStreamHead ?? sessionStreamHead,
+    );
     const forkAgent = useForkAgent({ serverId: resolvedServerId, toast, readOnly });
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>

@@ -10,6 +10,10 @@ import {
   CollabPresenceBeatResponseSchema,
   CollabWorkspaceEnableRequestSchema,
   CollabWorkspaceEnableResponseSchema,
+  CollabTurnCancelRequestSchema,
+  CollabTurnCancelResponseSchema,
+  CollabTimelineGetRequestSchema,
+  CollabTimelineGetResponseSchema,
   CollabTurnSendRequestSchema,
   CollabTurnSendResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
@@ -133,6 +137,55 @@ describe("collab member RPCs", () => {
       },
     });
     expect(response.payload.accepted).toBe(true);
+  });
+
+  test("a collaborative turn cancel names the workspace and the agent", () => {
+    const request = CollabTurnCancelRequestSchema.parse({
+      type: "collab.turn.cancel.request",
+      requestId: "r5",
+      workspaceId: "ws-1",
+      agentId: "agent-1",
+    });
+    expect(request.agentId).toBe("agent-1");
+    const response = CollabTurnCancelResponseSchema.parse({
+      type: "collab.turn.cancel.response",
+      payload: {
+        requestId: "r5",
+        workspaceId: "ws-1",
+        agentId: "agent-1",
+        accepted: true,
+      },
+    });
+    expect(response.payload.accepted).toBe(true);
+  });
+
+  test("a collaborative timeline page is epoch, rows, and the in-flight stream", () => {
+    const request = CollabTimelineGetRequestSchema.parse({
+      type: "collab.timeline.get.request",
+      requestId: "r6",
+      workspaceId: "ws-1",
+      agentId: "agent-1",
+    });
+    expect(request.agentId).toBe("agent-1");
+    const response = CollabTimelineGetResponseSchema.parse({
+      type: "collab.timeline.get.response",
+      payload: {
+        requestId: "r6",
+        workspaceId: "ws-1",
+        agentId: "agent-1",
+        epoch: "e1",
+        rows: {
+          "e1/000000000001": {
+            seq: 1,
+            timestamp: "2026-09-18T00:00:00.000Z",
+            item: { type: "user_message", text: "hi" },
+          },
+        },
+        stream: { turnId: null, text: "" },
+      },
+    });
+    expect(response.payload.epoch).toBe("e1");
+    expect(response.payload.stream).toEqual({ turnId: null, text: "" });
   });
 
   test("a presence beat carries the roster without a prompt", () => {

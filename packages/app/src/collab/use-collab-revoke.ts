@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { PRESENCE_HEARTBEAT_INTERVAL_MS } from "@getpaseo/protocol/enterprise-collaboration";
-import { useHostRuntimeClient } from "@/runtime/host-runtime";
+import { useHostEnterpriseIdentitySnapshot, useHostRuntimeClient } from "@/runtime/host-runtime";
+import { appCollabReplica } from "./replica-host";
+import { useCollabReplicaLifecycle } from "./use-collab-replica-lifecycle";
 import { useCollabViewer } from "./use-collab-viewer";
 
 export function useCollabRevoke(input: { serverId: string; workspaceId: string | undefined }): {
@@ -9,9 +11,15 @@ export function useCollabRevoke(input: { serverId: string; workspaceId: string |
 } {
   const client = useHostRuntimeClient(input.serverId);
   const viewer = useCollabViewer(input.serverId);
+  const identity = useHostEnterpriseIdentitySnapshot(input.serverId);
+  const organizationId =
+    identity?.state === "signed_in"
+      ? (identity.scope?.organizationId ?? identity.projection?.organizationId)
+      : undefined;
   const [revoked, setRevoked] = useState(false);
   const [reason, setReason] = useState<string | null>(null);
   const enabled = viewer.supported && Boolean(client) && Boolean(input.workspaceId);
+  useCollabReplicaLifecycle(input.serverId);
 
   useEffect(() => {
     if (!enabled || !client || !input.workspaceId) {
@@ -29,6 +37,25 @@ export function useCollabRevoke(input: { serverId: string; workspaceId: string |
         if (cancelled) return;
         setRevoked(payload.revoked);
         setReason(payload.revokeReason ?? (payload.revoked ? "membership_removed" : null));
+        if (
+          payload.revoked &&
+          payload.workspaceUid &&
+          organizationId &&
+          viewer.principalId !== "owner"
+        ) {
+          appCollabReplica.apply(
+            {
+              organizationId,
+              principalId: viewer.principalId,
+              workspaceUid: payload.workspaceUid,
+            },
+            {
+              type: "revoked",
+              containerId: payload.workspaceUid,
+              reason: payload.revokeReason ?? "membership_removed",
+            },
+          );
+        }
       } catch {
         if (!cancelled) {
           setRevoked(false);
@@ -45,7 +72,7 @@ export function useCollabRevoke(input: { serverId: string; workspaceId: string |
       cancelled = true;
       clearInterval(timer);
     };
-  }, [client, enabled, input.workspaceId]);
+  }, [client, enabled, input.workspaceId, organizationId, viewer.principalId]);
 
   return { revoked, reason };
 }

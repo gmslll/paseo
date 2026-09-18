@@ -3,7 +3,7 @@ import { COLLAB_TURN_UNAVAILABLE, type CollabTurnControl } from "./turn-control.
 
 export type CollabTurnRequest = Extract<
   SessionInboundMessage,
-  { type: "collab.turn.send.request" }
+  { type: "collab.turn.send.request" | "collab.turn.cancel.request" }
 >;
 
 export async function handleCollabTurnRequest(
@@ -12,6 +12,26 @@ export async function handleCollabTurnRequest(
   actor: { principalId: string; credentialId: string; clientId: string } | null,
 ): Promise<SessionOutboundMessage> {
   if (!actor) throw new Error(COLLAB_TURN_UNAVAILABLE);
+  if (msg.type === "collab.turn.cancel.request") {
+    const result = await control.cancel({
+      workspaceId: msg.workspaceId,
+      actorPrincipalId: actor.principalId,
+      credentialId: actor.credentialId,
+      clientId: actor.clientId,
+      agentId: msg.agentId,
+      requestId: msg.requestId,
+    });
+    return {
+      type: "collab.turn.cancel.response",
+      payload: {
+        requestId: msg.requestId,
+        workspaceId: msg.workspaceId,
+        agentId: msg.agentId,
+        accepted: result.accepted,
+        ...(result.error ? { error: result.error } : {}),
+      },
+    };
+  }
   const result = await control.send({
     workspaceId: msg.workspaceId,
     actorPrincipalId: actor.principalId,

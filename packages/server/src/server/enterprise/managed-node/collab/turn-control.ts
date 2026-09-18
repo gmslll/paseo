@@ -19,16 +19,26 @@ export interface CollabTurnSendInput {
   readonly sharedTurnPolicy?: "queue" | "interrupt";
 }
 
+export interface CollabTurnCancelInput {
+  readonly workspaceId: string;
+  readonly actorPrincipalId: string;
+  readonly credentialId: string;
+  readonly clientId: string;
+  readonly agentId: string;
+  readonly requestId: string;
+}
+
 export interface CollabTurnControl {
   send(input: CollabTurnSendInput): Promise<{ accepted: boolean; error?: string }>;
+  cancel(input: CollabTurnCancelInput): Promise<{ accepted: boolean; error?: string }>;
 }
 
 export interface CollabTurnMutator {
-  submitSend(input: {
+  submitRpc(input: {
     actorPrincipalId: string;
     credentialId: string;
     clientId: string;
-    method: "agent.send";
+    method: "agent.send" | "agent.cancel";
     localWorkspaceId: string;
     rpcId: string;
     payload: unknown;
@@ -44,16 +54,22 @@ export function createCollabTurnControl(input: {
   catalog: Pick<ManagedWorkspaceCatalog, "current">;
   mutator?: CollabTurnMutator;
 }): CollabTurnControl {
+  function requireActive(workspaceId: string) {
+    const catalog = input.catalog.current();
+    const entry = catalog?.workspaces.find(
+      (workspace) => workspace.localWorkspaceId === workspaceId,
+    );
+    if (!entry || entry.state !== "active" || !input.mutator) {
+      throw new Error(COLLAB_TURN_UNAVAILABLE);
+    }
+    return { entry, mutator: input.mutator };
+  }
+
   return {
     async send(request) {
-      const catalog = input.catalog.current();
-      const entry = catalog?.workspaces.find(
-        (workspace) => workspace.localWorkspaceId === request.workspaceId,
-      );
-      if (!entry || entry.state !== "active") throw new Error(COLLAB_TURN_UNAVAILABLE);
-      if (!input.mutator) throw new Error(COLLAB_TURN_UNAVAILABLE);
+      const { entry, mutator } = requireActive(request.workspaceId);
       const rpcId = MachineRpcIdSchema.parse(`rpc_${globalThis.crypto.randomUUID()}`);
-      const envelope = await input.mutator.submitSend({
+      const envelope = await mutator.submitRpc({
         actorPrincipalId: request.actorPrincipalId,
         credentialId: request.credentialId,
         clientId: request.clientId,
@@ -69,7 +85,27 @@ export function createCollabTurnControl(input: {
           ...(request.sharedTurnPolicy ? { sharedTurnPolicy: request.sharedTurnPolicy } : {}),
         },
       });
-      const result = await input.mutator.dispatch(entry.workspaceUid, envelope, rpcId);
+      const result = await mutator.dispatch(entry.workspaceUid, envelope, rpcId);
+      if (result.kind === "error") return { accepted: false, error: result.message };
+      return { accepted: true };
+    },
+    async cancel(request) {
+      const { entry, mutator } = requireActive(request.workspaceId);
+      const rpcId = MachineRpcIdSchema.parse(`rpc_${globalThis.crypto.randomUUID()}`);
+      const envelope = await mutator.submitRpc({
+        actorPrincipalId: request.actorPrincipalId,
+        credentialId: request.credentialId,
+        clientId: request.clientId,
+        method: "agent.cancel",
+        localWorkspaceId: request.workspaceId,
+        rpcId,
+        payload: {
+          type: "cancel_agent_request",
+          requestId: request.requestId,
+          agentId: request.agentId,
+        },
+      });
+      const result = await mutator.dispatch(entry.workspaceUid, envelope, rpcId);
       if (result.kind === "error") return { accepted: false, error: result.message };
       return { accepted: true };
     },

@@ -5221,6 +5221,22 @@ export class DaemonClient {
     });
   }
 
+  async cancelCollabTurn(input: { workspaceId: string; agentId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.turn.cancel.response">({
+      requestId,
+      message: { type: "collab.turn.cancel.request", ...input },
+    });
+  }
+
+  async getCollabTimeline(input: { workspaceId: string; agentId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.timeline.get.response">({
+      requestId,
+      message: { type: "collab.timeline.get.request", ...input },
+    });
+  }
+
   async sendCollabTurn(
     input: {
       workspaceId: string;

@@ -11,6 +11,7 @@ export function handleCollabPresenceRequest(
   msg: CollabPresenceRequest,
   actor: { principalId: string; displayName?: string } | null,
   nowMs: number,
+  hostNodeId: string | null = null,
 ): SessionOutboundMessage {
   const entries =
     actor === null
@@ -29,6 +30,9 @@ export function handleCollabPresenceRequest(
       requestId: msg.requestId,
       workspaceId: msg.workspaceId,
       entries: [...entries],
+      ...(hostNodeId
+        ? { hostNode: { nodeId: hostNodeId, heartbeatAt: new Date(nowMs).toISOString() } }
+        : {}),
     },
   };
 }

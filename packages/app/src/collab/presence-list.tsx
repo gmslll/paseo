@@ -31,7 +31,7 @@ export function PresenceList({
         <View style={settingsStyles.card}>
           {people.map((person, index) => (
             <View
-              key={person.principalId}
+              key={person.id}
               style={[settingsStyles.row, index > 0 ? settingsStyles.rowBorder : null]}
             >
               <Text style={settingsStyles.rowTitle}>{person.label}</Text>

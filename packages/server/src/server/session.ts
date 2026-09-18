@@ -330,6 +330,12 @@ import {
   handleCollabTurnRequest as answerCollabTurnRequest,
   type CollabTurnRequest,
 } from "./enterprise/managed-node/collab/turn-session.js";
+import {
+  COLLAB_TIMELINE_UNAVAILABLE,
+  handleCollabTimelineRequest as answerCollabTimelineRequest,
+  type CollabTimelineRequest,
+} from "./enterprise/managed-node/collab/timeline-session.js";
+import type { CollabTimelineControl } from "./enterprise/managed-node/collab/timeline-control.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -1162,6 +1168,7 @@ export class Session {
   private readonly collabMembers: CollabMembersControl | null;
   private readonly collabPresence: CollabPresenceControl | null;
   private readonly collabTurns: CollabTurnControl | null;
+  private readonly collabTimeline: CollabTimelineControl | null;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
@@ -1557,6 +1564,7 @@ export class Session {
     this.collabMembers = daemonRuntimeConfig?.collabMembers ?? null;
     this.collabPresence = daemonRuntimeConfig?.collabPresence ?? null;
     this.collabTurns = daemonRuntimeConfig?.collabTurns ?? null;
+    this.collabTimeline = daemonRuntimeConfig?.collabTimeline ?? null;
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
           agents: options.hubExecutionAgents,
@@ -4072,9 +4080,50 @@ export class Session {
       case "collab.presence.beat.request":
         return this.handleCollabPresenceRequest(msg);
       case "collab.turn.send.request":
+      case "collab.turn.cancel.request":
         return this.handleCollabTurnRequest(msg);
+      case "collab.timeline.get.request":
+        return this.handleCollabTimelineRequest(msg);
       default:
         return undefined;
+    }
+  }
+
+  private async handleCollabTimelineRequest(msg: CollabTimelineRequest): Promise<void> {
+    const control = this.collabTimeline;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_TIMELINE_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    try {
+      this.emit(answerCollabTimelineRequest(control, msg), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_TIMELINE_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
     }
   }
 
@@ -4151,7 +4200,16 @@ export class Session {
     const principalId = this.enterpriseContext?.principal.principalId ?? null;
     const actor =
       principalId && principalId !== "owner" ? { principalId, displayName: msg.displayName } : null;
-    this.emit(answerCollabPresenceRequest(control, msg, actor, Date.now()), context);
+    this.emit(
+      answerCollabPresenceRequest(
+        control,
+        msg,
+        actor,
+        Date.now(),
+        this.enterpriseContext?.node.nodeId ?? null,
+      ),
+      context,
+    );
   }
 
   private async handleCodeCollabTurnDiffRequest(msg: CodeCollabTurnDiffRequest): Promise<void> {

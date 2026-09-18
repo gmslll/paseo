@@ -1824,6 +1824,8 @@ function ComposerContentImpl({
       isAgentRunning,
       isCancellingAgent,
       isConnected,
+      workspaceId,
+      usePlaneTurn,
     });
     if (!cancellation) return;
     const requestId = getHostRuntimeStore().beginAgentCancellation(serverId, targetAgentId);
@@ -1838,7 +1840,7 @@ function ComposerContentImpl({
         getHostRuntimeStore().settleAgentCancellation(serverId, targetAgentId, requestId);
       });
     messageInputRef.current?.focus();
-  }, [client, isAgentRunning, isCancellingAgent, isConnected, serverId]);
+  }, [client, isAgentRunning, isCancellingAgent, isConnected, serverId, usePlaneTurn, workspaceId]);
 
   const focusMessageInputForKeyboardAction = useCallback(() => {
     focusMessageInputWithPlatformStrategy(messageInputRef);

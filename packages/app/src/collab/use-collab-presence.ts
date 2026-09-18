@@ -47,7 +47,16 @@ export function useCollabPresence(input: {
           ...(input.displayName ? { displayName: input.displayName } : {}),
         });
         if (cancelled) return;
-        setEntries(payload.entries);
+        const host = payload.hostNode
+          ? [
+              {
+                kind: "node" as const,
+                nodeId: payload.hostNode.nodeId,
+                heartbeatAt: payload.hostNode.heartbeatAt,
+              },
+            ]
+          : [];
+        setEntries([...payload.entries, ...host]);
         setNow(Date.now());
       } catch {
         if (!cancelled) setEntries([]);

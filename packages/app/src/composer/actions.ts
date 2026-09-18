@@ -77,6 +77,10 @@ export interface ComposerSendClient {
 
 export interface ComposerCancelClient {
   cancelAgent: (agentId: string) => Promise<void> | void;
+  cancelCollabTurn?: (input: { workspaceId: string; agentId: string }) => Promise<{
+    accepted: boolean;
+    error?: string;
+  }>;
 }
 
 export interface MessageSubmissionWriter {
@@ -163,13 +167,25 @@ export interface CancelComposerAgentInput {
   isAgentRunning: boolean;
   isCancellingAgent: boolean;
   isConnected: boolean;
+  workspaceId?: string | null;
+  usePlaneTurn?: boolean;
 }
 
 export function cancelComposerAgent(input: CancelComposerAgentInput): Promise<void> | null {
   if (!input.isAgentRunning || input.isCancellingAgent) return null;
   if (!input.isConnected || !input.client) return null;
+  const client = input.client;
+  const workspaceId = input.workspaceId;
+  if (input.usePlaneTurn === true && workspaceId && client.cancelCollabTurn) {
+    return client.cancelCollabTurn({ workspaceId, agentId: input.agentId }).then((result) => {
+      if (result.accepted === false) {
+        throw new Error(result.error ?? "Collaborative cancel was not accepted");
+      }
+      return undefined;
+    });
+  }
   try {
-    return Promise.resolve(input.client.cancelAgent(input.agentId));
+    return Promise.resolve(client.cancelAgent(input.agentId));
   } catch (error) {
     return Promise.reject(error);
   }

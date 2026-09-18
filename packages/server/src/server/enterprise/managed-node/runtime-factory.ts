@@ -35,6 +35,7 @@ import {
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
 import { createCollabMembersControl } from "./collab/members-control.js";
 import { createCollabTurnControl } from "./collab/turn-control.js";
+import { createCollabTimelineControl } from "./collab/timeline-control.js";
 import { createCollabPresenceRoster } from "./collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
@@ -283,7 +284,7 @@ export async function createManagedEnterpriseRuntime(
               turns: createCollabTurnControl({
                 catalog: collaboration.catalog,
                 mutator: {
-                  async submitSend(change) {
+                  async submitRpc(change) {
                     return await client.submitOwnedCollabRpc(change);
                   },
                   async dispatch(workspaceUid, envelope, rpcId) {
@@ -294,6 +295,11 @@ export async function createManagedEnterpriseRuntime(
                     );
                   },
                 },
+              }),
+              timeline: createCollabTimelineControl({
+                catalog: collaboration.catalog,
+                read: (_workspaceUid, localWorkspaceId, agentId) =>
+                  collaboration.replicas.readSessionDocument(localWorkspaceId, agentId),
               }),
             }),
           }

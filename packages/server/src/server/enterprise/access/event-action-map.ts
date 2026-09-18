@@ -101,6 +101,7 @@ export const INBOUND_ENTERPRISE_ACTION_OVERRIDES: Partial<
   "code_collab.turn_diff.list_turns.request": ["workspace.metadata.read"],
   "collab.members.list.request": ["workspace.metadata.read"],
   "collab.presence.beat.request": ["workspace.metadata.read"],
+  "collab.timeline.get.request": ["workspace.metadata.read"],
   create_terminal_request: ["terminal.use"],
   // An attach token only reopens the terminal stream the Session may already use.
   "local_plane.attach_token.create.request": ["terminal.use"],
@@ -177,6 +178,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "code_collab.turn_diff.list_turns.response",
       "collab.members.list.response",
       "collab.presence.beat.response",
+      "collab.timeline.get.response",
       "agent_status",
       "agent_update",
       "agent_attention_required",
@@ -289,6 +291,7 @@ export const OUTBOUND_RESOURCE_ACTION_GROUPS: readonly OutboundResourceActionGro
       "hub.execution.agent.create.response",
       "hub.execution.agent.validate.response",
       "hub.execution.control.response",
+      "collab.turn.cancel.response",
       "collab.turn.send.response",
       "send_agent_message_response",
       "set_agent_feature_response",

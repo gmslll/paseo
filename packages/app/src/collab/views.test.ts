@@ -14,7 +14,7 @@ const BOB = "usr_bbbbbbbbbbbbbbbb";
 const NOW = Date.parse("2026-09-17T00:01:30.000Z");
 
 describe("collab views", () => {
-  test("presence keeps live people, drops expired heartbeats, and hides nodes", () => {
+  test("presence keeps live people, drops expired heartbeats, and shows the host node", () => {
     const people = projectPresence({
       now: NOW,
       viewerPrincipalId: ADA,
@@ -54,11 +54,20 @@ describe("collab views", () => {
 
     expect(people).toEqual([
       {
-        principalId: ADA,
+        id: ADA,
         label: "You",
         isSelf: true,
+        isNode: false,
         clientCount: 2,
         focusAgentId: "agent-1",
+      },
+      {
+        id: "nod_0123456789abcdef",
+        label: "Host",
+        isSelf: false,
+        isNode: true,
+        clientCount: 1,
+        focusAgentId: null,
       },
     ]);
   });

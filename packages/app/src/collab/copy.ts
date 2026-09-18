@@ -38,6 +38,7 @@ export interface CollabCopy {
     title: string;
     empty: string;
     you: string;
+    node: string;
   };
   author: {
     you: string;
@@ -92,6 +93,7 @@ const en: CollabCopy = {
     title: "Here now",
     empty: "Nobody else is here",
     you: "You",
+    node: "Host",
   },
   author: {
     you: "You",
@@ -146,6 +148,7 @@ const ar: CollabCopy = {
     title: "المتواجدون الآن",
     empty: "لا يوجد أحد آخر هنا",
     you: "أنت",
+    node: "المضيف",
   },
   author: {
     you: "أنت",
@@ -200,6 +203,7 @@ const es: CollabCopy = {
     title: "Ahora aquí",
     empty: "No hay nadie más aquí",
     you: "Tú",
+    node: "Anfitrión",
   },
   author: {
     you: "Tú",
@@ -254,6 +258,7 @@ const fr: CollabCopy = {
     title: "Présents",
     empty: "Personne d’autre n’est là",
     you: "Vous",
+    node: "Hôte",
   },
   author: {
     you: "Vous",
@@ -308,6 +313,7 @@ const ja: CollabCopy = {
     title: "いまここにいる人",
     empty: "ほかに誰もいません",
     you: "自分",
+    node: "ホスト",
   },
   author: {
     you: "自分",
@@ -362,6 +368,7 @@ const ko: CollabCopy = {
     title: "지금 여기",
     empty: "다른 사람은 없습니다",
     you: "나",
+    node: "호스트",
   },
   author: {
     you: "나",
@@ -416,6 +423,7 @@ const ptBR: CollabCopy = {
     title: "Aqui agora",
     empty: "Não há mais ninguém aqui",
     you: "Você",
+    node: "Anfitrião",
   },
   author: {
     you: "Você",
@@ -470,6 +478,7 @@ const ru: CollabCopy = {
     title: "Сейчас здесь",
     empty: "Кроме вас никого нет",
     you: "Вы",
+    node: "Узел",
   },
   author: {
     you: "Вы",
@@ -524,6 +533,7 @@ const zhCN: CollabCopy = {
     title: "此刻在此",
     empty: "没有其他人在",
     you: "你",
+    node: "主机",
   },
   author: {
     you: "你",

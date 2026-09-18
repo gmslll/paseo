@@ -352,6 +352,25 @@ describe("cancelComposerAgent", () => {
     expect(cancelComposerAgent({ ...input, client: null })).toBeNull();
     expect(input.client.canceledIds).toEqual([]);
   });
+
+  it("cancels a collaborative turn through the plane instead of the node session", async () => {
+    const planeCalls: Array<{ workspaceId: string; agentId: string }> = [];
+    const input = baseInput();
+    input.client.cancelCollabTurn = async (request) => {
+      planeCalls.push(request);
+      return { accepted: true };
+    };
+
+    const result = cancelComposerAgent({
+      ...input,
+      workspaceId: "ws-1",
+      usePlaneTurn: true,
+    });
+    expect(result).not.toBeNull();
+    await result;
+    expect(planeCalls).toEqual([{ workspaceId: "ws-1", agentId: "agent" }]);
+    expect(input.client.canceledIds).toEqual([]);
+  });
 });
 
 describe("pickAndPersistImages", () => {

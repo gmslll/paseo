@@ -14,9 +14,10 @@ export interface QueuedTurnView {
 }
 
 export interface PresencePerson {
-  readonly principalId: string;
+  readonly id: string;
   readonly label: string;
   readonly isSelf: boolean;
+  readonly isNode: boolean;
   readonly clientCount: number;
   readonly focusAgentId: string | null;
 }
@@ -42,9 +43,19 @@ export function projectPresence(input: {
   const ttlMs = input.ttlMs ?? PRESENCE_TTL_MS;
   const grouped = new Map<string, PresencePerson>();
   for (const entry of input.entries) {
-    if (entry.kind !== "principal") continue;
     const heartbeatAt = Date.parse(entry.heartbeatAt);
     if (Number.isNaN(heartbeatAt) || input.now - heartbeatAt >= ttlMs) continue;
+    if (entry.kind === "node") {
+      grouped.set(entry.nodeId, {
+        id: entry.nodeId,
+        label: input.copy.presence.node,
+        isSelf: false,
+        isNode: true,
+        clientCount: 1,
+        focusAgentId: null,
+      });
+      continue;
+    }
     const existing = grouped.get(entry.principalId);
     if (existing) {
       grouped.set(entry.principalId, {
@@ -55,19 +66,21 @@ export function projectPresence(input: {
       continue;
     }
     grouped.set(entry.principalId, {
-      principalId: entry.principalId,
+      id: entry.principalId,
       label: authorName(
         { principalId: entry.principalId, displayName: entry.displayName },
         input.copy,
         input.viewerPrincipalId,
       ),
       isSelf: entry.principalId === input.viewerPrincipalId,
+      isNode: false,
       clientCount: 1,
       focusAgentId: entry.focusAgentId,
     });
   }
   return [...grouped.values()].sort((left, right) => {
     if (left.isSelf !== right.isSelf) return left.isSelf ? -1 : 1;
+    if (left.isNode !== right.isNode) return left.isNode ? 1 : -1;
     return left.label.localeCompare(right.label);
   });
 }

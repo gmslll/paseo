@@ -32,7 +32,7 @@ describe("collab turn control", () => {
     const control = createCollabTurnControl({
       catalog: { current: () => catalog() },
       mutator: {
-        async submitSend(change) {
+        async submitRpc(change) {
           submitted.push(change.payload);
           expect(change.method).toBe("agent.send");
           expect(change.localWorkspaceId).toBe("ws-1");
@@ -80,6 +80,60 @@ describe("collab turn control", () => {
         requestId: "r1",
         agentId: "agent-1",
         text: "hi",
+      },
+    ]);
+  });
+
+  test("submits agent.cancel through the plane and accepts the node's response", async () => {
+    const submitted: unknown[] = [];
+    const control = createCollabTurnControl({
+      catalog: { current: () => catalog() },
+      mutator: {
+        async submitRpc(change) {
+          submitted.push(change.payload);
+          expect(change.method).toBe("agent.cancel");
+          return {
+            kind: "request",
+            rpcVersion: 1,
+            rpcId: change.rpcId,
+            method: "agent.cancel",
+            nodeId: "nod_0123456789abcdef",
+            containerId: WORKSPACE_UID,
+            clientId: change.clientId,
+            sentAt: "2026-09-18T00:00:00.000Z",
+            expiresAt: "2026-09-18T00:01:00.000Z",
+            payload: change.payload,
+            attestation: "pmr_v1.abc.def",
+          };
+        },
+        async dispatch() {
+          return {
+            kind: "response",
+            rpcVersion: 1,
+            rpcId: RPC_ID,
+            nodeId: "nod_0123456789abcdef",
+            completedAt: "2026-09-18T00:00:01.000Z",
+            payload: { type: "cancel_agent_response", payload: { ok: true } },
+          };
+        },
+      },
+    });
+
+    expect(
+      await control.cancel({
+        workspaceId: "ws-1",
+        actorPrincipalId: OWNER,
+        credentialId: "cred-1",
+        clientId: "client-1",
+        agentId: "agent-1",
+        requestId: "r2",
+      }),
+    ).toEqual({ accepted: true });
+    expect(submitted).toEqual([
+      {
+        type: "cancel_agent_request",
+        requestId: "r2",
+        agentId: "agent-1",
       },
     ]);
   });

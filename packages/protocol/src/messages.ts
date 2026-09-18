@@ -2487,6 +2487,20 @@ export const CollabTurnSendRequestSchema = z.object({
   sharedTurnPolicy: z.enum(["queue", "interrupt"]).optional(),
 });
 
+export const CollabTurnCancelRequestSchema = z.object({
+  type: z.literal("collab.turn.cancel.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string(),
+});
+
+export const CollabTimelineGetRequestSchema = z.object({
+  type: z.literal("collab.timeline.get.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4942,6 +4956,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CollabPresenceBeatRequestSchema,
   CollabWorkspaceEnableRequestSchema,
   CollabTurnSendRequestSchema,
+  CollabTurnCancelRequestSchema,
+  CollabTimelineGetRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6726,6 +6742,8 @@ export type CollabMembersRemoveRequest = z.infer<typeof CollabMembersRemoveReque
 export type CollabPresenceBeatRequest = z.infer<typeof CollabPresenceBeatRequestSchema>;
 export type CollabWorkspaceEnableRequest = z.infer<typeof CollabWorkspaceEnableRequestSchema>;
 export type CollabTurnSendRequest = z.infer<typeof CollabTurnSendRequestSchema>;
+export type CollabTurnCancelRequest = z.infer<typeof CollabTurnCancelRequestSchema>;
+export type CollabTimelineGetRequest = z.infer<typeof CollabTimelineGetRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6827,6 +6845,12 @@ export const CollabPresenceBeatResponseSchema = z.object({
     requestId: z.string(),
     workspaceId: z.string(),
     entries: z.array(CollabWirePresenceEntrySchema),
+    hostNode: z
+      .object({
+        nodeId: z.string(),
+        heartbeatAt: z.string(),
+      })
+      .optional(),
   }),
 });
 
@@ -6849,6 +6873,42 @@ export const CollabTurnSendResponseSchema = z.object({
     agentId: z.string(),
     accepted: z.boolean(),
     error: z.string().optional(),
+  }),
+});
+
+export const CollabTurnCancelResponseSchema = z.object({
+  type: z.literal("collab.turn.cancel.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().optional(),
+  }),
+});
+
+export const CollabTimelineGetResponseSchema = z.object({
+  type: z.literal("collab.timeline.get.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    agentId: z.string(),
+    epoch: z.string(),
+    rows: z.record(
+      z.string(),
+      z.object({
+        seq: z.number(),
+        timestamp: z.string(),
+        item: z.unknown(),
+        turnId: z.string().optional(),
+      }),
+    ),
+    stream: z
+      .object({
+        turnId: z.string().nullable(),
+        text: z.string(),
+      })
+      .nullable(),
   }),
 });
 
@@ -8687,6 +8747,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CollabPresenceBeatResponseSchema,
   CollabWorkspaceEnableResponseSchema,
   CollabTurnSendResponseSchema,
+  CollabTurnCancelResponseSchema,
+  CollabTimelineGetResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
