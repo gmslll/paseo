@@ -37,6 +37,10 @@ import { createCollabMembersControl } from "./collab/members-control.js";
 import { createCollabTurnControl } from "./collab/turn-control.js";
 import { createCollabTimelineControl } from "./collab/timeline-control.js";
 import { createCollabStreamTokenControl } from "./collab/stream-token-control.js";
+import {
+  createCollabSubscriptionControl,
+  SUBSCRIPTION_START_OFFSET,
+} from "./collab/subscription-control.js";
 import { createCollabPresenceRoster } from "./collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
@@ -306,6 +310,17 @@ export async function createManagedEnterpriseRuntime(
                 catalog: collaboration.catalog,
                 managementBaseUrl: relationship.managementBaseUrl,
                 issue: (change) => client.issueOwnedCollabStreamToken(change),
+              }),
+              subscriptions: createCollabSubscriptionControl({
+                catalog: collaboration.catalog,
+                issue: (change) => client.issueOwnedCollabStreamToken(change),
+                open: (token, containerId) =>
+                  client.openCollabSubscription(token, {
+                    containerId,
+                    cursors: { meta: SUBSCRIPTION_START_OFFSET },
+                  }),
+                read: (token, subscriptionId) =>
+                  client.pollCollabSubscription(token, subscriptionId),
               }),
             }),
           }

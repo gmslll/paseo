@@ -3,6 +3,8 @@ import type { WorkspaceMemberRole } from "@getpaseo/protocol/enterprise-collabor
 import { useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient } from "@/runtime/host-runtime";
 
+const ACCESS_REFRESH_MS = 3_000;
+
 export interface CollabWorkspaceAccess {
   readonly supported: boolean;
   readonly collaborationEnabled: boolean;
@@ -35,11 +37,13 @@ export function useCollabWorkspaceAccess(
       setAccess(EMPTY);
       return;
     }
+    const daemon = client;
+    const id = workspaceId;
     let cancelled = false;
-    void client
-      .listCollabMembers({ workspaceId })
-      .then((payload) => {
-        if (cancelled) return undefined;
+    async function refresh(): Promise<void> {
+      try {
+        const payload = await daemon.listCollabMembers({ workspaceId: id });
+        if (cancelled) return;
         const collaborationEnabled = payload.collaborationEnabled === true;
         const revoked = payload.revoked === true;
         const viewerRole = payload.viewerRole;
@@ -51,13 +55,18 @@ export function useCollabWorkspaceAccess(
           workspaceUid: payload.workspaceUid,
           readOnly: collaborationEnabled && (revoked || viewerRole === "viewer"),
         });
-        return undefined;
-      })
-      .catch(() => {
+      } catch {
         if (!cancelled) setAccess({ ...EMPTY, supported: true });
-      });
+      }
+    }
+
+    void refresh();
+    const timer = setInterval(() => {
+      void refresh();
+    }, ACCESS_REFRESH_MS);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [client, supported, workspaceId]);
 

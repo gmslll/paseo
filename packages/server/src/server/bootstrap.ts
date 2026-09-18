@@ -2575,6 +2575,7 @@ export async function createPaseoDaemon(
                   collabTurns: enterpriseRuntime?.collaboration?.turns,
                   collabTimeline: enterpriseRuntime?.collaboration?.timeline,
                   collabStreamTokens: enterpriseRuntime?.collaboration?.streamTokens,
+                  collabSubscriptions: enterpriseRuntime?.collaboration?.subscriptions,
                   localPlanes: () => localPlanes?.controlAvailable === true,
                   terminalPlane: terminalPlaneAccess,
                   dataPlane: dataPlaneAccess,

@@ -23,7 +23,10 @@ import {
   type ManagedPlacementRegistration,
 } from "@getpaseo/protocol/enterprise-management";
 import {
+  CollabSubscriptionCreatedSchema,
+  CollabSubscriptionEventSchema,
   MachineRpcAttestedRequestSchema,
+  type CollabSubscriptionEvent,
   type MachineRpcAttestedRequest,
   type WorkspaceMembershipPolicy,
 } from "@getpaseo/protocol/enterprise-collaboration";
@@ -60,7 +63,11 @@ import {
 // the collaboration uplink needs the same class to mean the same thing.
 export { ManagementPlaneRequestError } from "./node-request.js";
 
+const SUBSCRIPTION_POLL_TIMEOUT_MS = 30_000;
 const HeartbeatResponseSchema = z.object({ node: ManagedNodeSchema }).strict();
+const SubscriptionEventsSchema = z.object({
+  events: z.array(CollabSubscriptionEventSchema),
+});
 const PlacementResponseSchema = z.object({ placement: ManagedPlacementSchema }).strict();
 const LeaseResponseSchema = z.object({ lease: ManagedGlobalLeaseSchema }).strict();
 const LeaseReleaseResponseSchema = z.object({ released: z.boolean() }).strict();
@@ -193,6 +200,34 @@ export class ManagedNodeControlPlaneClient {
       ...result,
       members: result.members as WorkspaceMembershipPolicy["members"],
     };
+  }
+
+  async openCollabSubscription(
+    token: string,
+    input: { readonly containerId: string; readonly cursors: Readonly<Record<string, string>> },
+  ): Promise<{ readonly subscriptionId: string }> {
+    const created = await this.bearerRequest(
+      "POST",
+      "/v1/ds/subscriptions",
+      token,
+      input,
+      CollabSubscriptionCreatedSchema,
+    );
+    return { subscriptionId: created.subscriptionId };
+  }
+
+  async pollCollabSubscription(
+    token: string,
+    subscriptionId: string,
+  ): Promise<{ readonly events: CollabSubscriptionEvent[] }> {
+    return this.bearerRequest(
+      "GET",
+      `/v1/ds/subscriptions/${subscriptionId}?live=long-poll`,
+      token,
+      undefined,
+      SubscriptionEventsSchema,
+      SUBSCRIPTION_POLL_TIMEOUT_MS,
+    );
   }
 
   async issueOwnedCollabStreamToken(input: {
@@ -331,6 +366,28 @@ export class ManagedNodeControlPlaneClient {
       caCertificate: this.caCertificate,
       timeoutMs: this.requestTimeoutMs,
       headers: this.signedHeaders(method, path, body),
+      schema,
+    });
+  }
+
+  /** Principal bearer, not a node signature — subscriptions stay client-only (ADR-0032). */
+  private async bearerRequest<T>(
+    method: "GET" | "POST" | "PUT",
+    path: string,
+    token: string,
+    value: unknown,
+    schema: z.ZodType<T>,
+    timeoutMs = this.requestTimeoutMs,
+  ): Promise<T> {
+    const body = value === undefined ? "" : JSON.stringify(value);
+    return requestJson({
+      baseUrl: this.relationship.managementBaseUrl,
+      method,
+      path,
+      body,
+      caCertificate: this.caCertificate,
+      timeoutMs,
+      headers: { authorization: `Bearer ${token}` },
       schema,
     });
   }

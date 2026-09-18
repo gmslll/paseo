@@ -1,19 +1,10 @@
 import { useEffect, useRef } from "react";
-import {
-  CollabSubscriptionCreatedSchema,
-  CollabSubscriptionEventSchema,
-} from "@getpaseo/protocol/enterprise-collaboration";
-import { z } from "zod";
+import { CollabSubscriptionEventSchema } from "@getpaseo/protocol/enterprise-collaboration";
 import { useHostEnterpriseIdentitySnapshot, useHostRuntimeClient } from "@/runtime/host-runtime";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { appCollabReplica } from "./replica-host";
 import { useCollabViewer } from "./use-collab-viewer";
 import { useCollabWorkspaceAccess } from "./use-collab-workspace-access";
-
-const START_OFFSET = "00000000000000000000";
-const EventsBodySchema = z.object({
-  events: z.array(CollabSubscriptionEventSchema),
-});
 
 interface PlaneSubscribeScope {
   readonly workspaceId: string;
@@ -21,10 +12,11 @@ interface PlaneSubscribeScope {
   readonly organizationId: string;
   readonly principalId: string;
   readonly daemon: {
-    issueCollabStreamToken: (input: {
+    pollCollabSubscription: (input: {
       workspaceId: string;
       clientId: string;
-    }) => Promise<{ token: string; managementBaseUrl: string }>;
+      subscriptionId?: string;
+    }) => Promise<{ subscriptionId: string; events: unknown[] }>;
   };
   readonly isCancelled: () => boolean;
   readonly onRevoked: (reason: string) => void;
@@ -33,53 +25,29 @@ interface PlaneSubscribeScope {
 async function subscribeToCollabPlane(scope: PlaneSubscribeScope): Promise<void> {
   const clientId = await getOrCreateClientId();
   if (scope.isCancelled()) return;
-  const issued = await scope.daemon.issueCollabStreamToken({
-    workspaceId: scope.workspaceId,
-    clientId,
-  });
-  if (scope.isCancelled()) return;
-  const opened = await fetch(new URL("/v1/ds/subscriptions", issued.managementBaseUrl), {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${issued.token}`,
-      accept: "application/json",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      containerId: scope.workspaceUid,
-      cursors: { meta: START_OFFSET },
-    }),
-  });
-  if (!opened.ok) return;
-  const created = CollabSubscriptionCreatedSchema.parse(await opened.json());
+  let subscriptionId: string | undefined;
   for (;;) {
     if (scope.isCancelled()) return;
-    const polled = await fetch(
-      new URL(
-        `/v1/ds/subscriptions/${created.subscriptionId}?live=long-poll`,
-        issued.managementBaseUrl,
-      ),
-      {
-        headers: {
-          authorization: `Bearer ${issued.token}`,
-          accept: "application/json",
-        },
-      },
-    );
+    const payload = await scope.daemon.pollCollabSubscription({
+      workspaceId: scope.workspaceId,
+      clientId,
+      ...(subscriptionId ? { subscriptionId } : {}),
+    });
     if (scope.isCancelled()) return;
-    if (!polled.ok) return;
-    const body = EventsBodySchema.parse(await polled.json());
-    for (const event of body.events) {
+    subscriptionId = payload.subscriptionId;
+    for (const raw of payload.events) {
+      const event = CollabSubscriptionEventSchema.safeParse(raw);
+      if (!event.success) continue;
       appCollabReplica.apply(
         {
           organizationId: scope.organizationId,
           principalId: scope.principalId,
           workspaceUid: scope.workspaceUid,
         },
-        event,
+        event.data,
       );
-      if (event.type === "revoked") {
-        scope.onRevoked(event.reason);
+      if (event.data.type === "revoked") {
+        scope.onRevoked(event.data.reason);
         return;
       }
     }
@@ -87,8 +55,8 @@ async function subscribeToCollabPlane(scope: PlaneSubscribeScope): Promise<void>
 }
 
 /**
- * Subscribes to the plane as this Principal (ADR-0032). Hermes cannot apply Loro `data` updates;
- * it uses presence and `revoked` so a membership drop lands immediately instead of on the next poll.
+ * Subscribes through the node (ADR-0032). The App never dials the management plane: phones and
+ * browsers do not have the node's CA pin, so the daemon holds the stream token and long-polls.
  */
 export function useCollabPlaneSubscribe(input: {
   serverId: string;

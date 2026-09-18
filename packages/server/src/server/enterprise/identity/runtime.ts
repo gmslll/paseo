@@ -29,6 +29,7 @@ import type { CollabPresenceControl } from "../managed-node/collab/presence-rost
 import type { CollabTurnControl } from "../managed-node/collab/turn-control.js";
 import type { CollabTimelineControl } from "../managed-node/collab/timeline-control.js";
 import type { CollabStreamTokenControl } from "../managed-node/collab/stream-token-control.js";
+import type { CollabSubscriptionControl } from "../managed-node/collab/subscription-control.js";
 import type { HeadlessSessionFactory } from "../managed-node/collab/machine-rpc-server.js";
 
 export interface EnterpriseAdmissionPort {
@@ -94,6 +95,7 @@ export interface EnterpriseAdmissionRuntime {
     turns?: CollabTurnControl;
     timeline?: CollabTimelineControl;
     streamTokens?: CollabStreamTokenControl;
+    subscriptions?: CollabSubscriptionControl;
   }>;
   readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;

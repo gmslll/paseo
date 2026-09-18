@@ -9,6 +9,7 @@ import type { CollabPresenceControl } from "../../enterprise/managed-node/collab
 import type { CollabTurnControl } from "../../enterprise/managed-node/collab/turn-control.js";
 import type { CollabTimelineControl } from "../../enterprise/managed-node/collab/timeline-control.js";
 import type { CollabStreamTokenControl } from "../../enterprise/managed-node/collab/stream-token-control.js";
+import type { CollabSubscriptionControl } from "../../enterprise/managed-node/collab/subscription-control.js";
 import { OperationStatusSchema } from "../../orchestration/operation-store.js";
 import { toOrchestrationOperationSummary } from "../../orchestration/operation-summary.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
@@ -99,6 +100,8 @@ export interface DaemonRuntimeConfig {
   collabTimeline?: CollabTimelineControl;
   /** Stream tokens so the App can subscribe to the plane as a principal (ADR-0032). */
   collabStreamTokens?: CollabStreamTokenControl;
+  /** Plane subscription polls proxied through the node's CA-pinned HTTPS. */
+  collabSubscriptions?: CollabSubscriptionControl;
   /** Whether the local control plane is accepting Sessions (ADR-0038). */
   localPlanes?: () => boolean;
   /** Attach tokens and the endpoint for the terminal plane, while it is listening (ADR-0038). */

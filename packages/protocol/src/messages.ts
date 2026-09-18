@@ -2508,6 +2508,14 @@ export const CollabStreamTokenRequestSchema = z.object({
   clientId: z.string().min(1),
 });
 
+export const CollabSubscriptionPollRequestSchema = z.object({
+  type: z.literal("collab.subscription.poll.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  clientId: z.string().min(1),
+  subscriptionId: z.string().min(1).optional(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4966,6 +4974,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CollabTurnCancelRequestSchema,
   CollabTimelineGetRequestSchema,
   CollabStreamTokenRequestSchema,
+  CollabSubscriptionPollRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6753,6 +6762,7 @@ export type CollabTurnSendRequest = z.infer<typeof CollabTurnSendRequestSchema>;
 export type CollabTurnCancelRequest = z.infer<typeof CollabTurnCancelRequestSchema>;
 export type CollabTimelineGetRequest = z.infer<typeof CollabTimelineGetRequestSchema>;
 export type CollabStreamTokenRequest = z.infer<typeof CollabStreamTokenRequestSchema>;
+export type CollabSubscriptionPollRequest = z.infer<typeof CollabSubscriptionPollRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6929,6 +6939,16 @@ export const CollabStreamTokenResponseSchema = z.object({
     token: z.string(),
     expiresAt: z.string(),
     managementBaseUrl: z.string(),
+  }),
+});
+
+export const CollabSubscriptionPollResponseSchema = z.object({
+  type: z.literal("collab.subscription.poll.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    subscriptionId: z.string(),
+    events: z.array(z.unknown()),
   }),
 });
 
@@ -8770,6 +8790,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CollabTurnCancelResponseSchema,
   CollabTimelineGetResponseSchema,
   CollabStreamTokenResponseSchema,
+  CollabSubscriptionPollResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,

@@ -16,6 +16,8 @@ import {
   CollabTimelineGetResponseSchema,
   CollabStreamTokenRequestSchema,
   CollabStreamTokenResponseSchema,
+  CollabSubscriptionPollRequestSchema,
+  CollabSubscriptionPollResponseSchema,
   CollabTurnSendRequestSchema,
   CollabTurnSendResponseSchema,
   ENTERPRISE_FEATURE_FLAGS,
@@ -209,6 +211,28 @@ describe("collab member RPCs", () => {
       },
     });
     expect(response.payload.token).toBe("pst_v1.token");
+  });
+
+  test("a subscription poll carries events without a stream token", () => {
+    const request = CollabSubscriptionPollRequestSchema.parse({
+      type: "collab.subscription.poll.request",
+      requestId: "r8",
+      workspaceId: "ws-1",
+      clientId: "client-a",
+    });
+    expect(request.clientId).toBe("client-a");
+    const response = CollabSubscriptionPollResponseSchema.parse({
+      type: "collab.subscription.poll.response",
+      payload: {
+        requestId: "r8",
+        workspaceId: "ws-1",
+        subscriptionId: "sub_0123456789abcdef",
+        events: [
+          { type: "revoked", containerId: "cws_0123456789abcdef", reason: "membership_removed" },
+        ],
+      },
+    });
+    expect(response.payload.events).toHaveLength(1);
   });
 
   test("a presence beat carries the roster without a prompt", () => {

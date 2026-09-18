@@ -342,6 +342,12 @@ import {
   type CollabStreamTokenRequest,
 } from "./enterprise/managed-node/collab/stream-token-session.js";
 import type { CollabStreamTokenControl } from "./enterprise/managed-node/collab/stream-token-control.js";
+import {
+  COLLAB_SUBSCRIPTION_UNAVAILABLE,
+  handleCollabSubscriptionRequest as answerCollabSubscriptionRequest,
+  type CollabSubscriptionRequest,
+} from "./enterprise/managed-node/collab/subscription-session.js";
+import type { CollabSubscriptionControl } from "./enterprise/managed-node/collab/subscription-control.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -1176,6 +1182,7 @@ export class Session {
   private readonly collabTurns: CollabTurnControl | null;
   private readonly collabTimeline: CollabTimelineControl | null;
   private readonly collabStreamTokens: CollabStreamTokenControl | null;
+  private readonly collabSubscriptions: CollabSubscriptionControl | null;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
@@ -1573,6 +1580,7 @@ export class Session {
     this.collabTurns = daemonRuntimeConfig?.collabTurns ?? null;
     this.collabTimeline = daemonRuntimeConfig?.collabTimeline ?? null;
     this.collabStreamTokens = daemonRuntimeConfig?.collabStreamTokens ?? null;
+    this.collabSubscriptions = daemonRuntimeConfig?.collabSubscriptions ?? null;
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
           agents: options.hubExecutionAgents,
@@ -4094,8 +4102,50 @@ export class Session {
         return this.handleCollabTimelineRequest(msg);
       case "collab.stream.token.request":
         return this.handleCollabStreamTokenRequest(msg);
+      case "collab.subscription.poll.request":
+        return this.handleCollabSubscriptionRequest(msg);
       default:
         return undefined;
+    }
+  }
+
+  private async handleCollabSubscriptionRequest(msg: CollabSubscriptionRequest): Promise<void> {
+    const control = this.collabSubscriptions;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_SUBSCRIPTION_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const principalId = this.enterpriseContext?.principal.principalId ?? null;
+    const actor = principalId && principalId !== "owner" ? principalId : null;
+    try {
+      this.emit(await answerCollabSubscriptionRequest(control, msg, actor), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_SUBSCRIPTION_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
     }
   }
 
