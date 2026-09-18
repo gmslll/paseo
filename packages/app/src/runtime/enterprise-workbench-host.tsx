@@ -1,4 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import {
   createBrowserProfileProjectionHydrator,
   isEnterpriseBrowserProfilesEnabled,
@@ -9,9 +11,14 @@ import {
   getHostRuntimeStore,
   useHostEnterpriseIdentityLifecycle,
   useHostEnterpriseIdentitySnapshot,
+  useHosts,
   useHostRuntimeClient,
-  useHostRuntimeSnapshot,
 } from "@/runtime/host-runtime";
+import {
+  isAbortError,
+  resolveUnsignedEnterpriseAccess,
+  type UnsignedEnterpriseDiscovery,
+} from "@/runtime/unsigned-enterprise-access";
 import { useSessionStore } from "@/stores/session-store";
 import { createBossResourceStore } from "@/stores/enterprise/boss-resource-store";
 import { createPatLoginFormModel } from "@/stores/enterprise/pat-login-form-model";
@@ -41,12 +48,93 @@ const unavailableContentReaders: EnterpriseContentReaders<string, never> = {
 /** Root assembly for the host scoped enterprise workbench. Content readers stay unavailable until
  * each resource type has a production port; this component never invents a generic reader. */
 
+function useManagedNodeDiscovery(serverId: string): UnsignedEnterpriseDiscovery {
+  const [discovery, setDiscovery] = useState<UnsignedEnterpriseDiscovery>("pending");
+  useEffect(() => {
+    const controller = new AbortController();
+    setDiscovery("pending");
+    void getHostRuntimeStore()
+      .discoverEnterpriseManagement(serverId, { signal: controller.signal })
+      .then((value) => {
+        if (!controller.signal.aborted) setDiscovery(value !== null ? "managed" : "standalone");
+        return undefined;
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted && !isAbortError(error)) setDiscovery("pending");
+      });
+    return () => controller.abort();
+  }, [serverId]);
+  return discovery;
+}
+
+function useEnterprisePasswordAuthenticator(serverId: string) {
+  return useCallback(
+    async (username: string, password: string, signal: AbortSignal) => {
+      try {
+        const snapshot = await getHostRuntimeStore().authenticateEnterpriseHostWithPassword(
+          serverId,
+          { username, password, signal },
+        );
+        return { ok: true as const, value: snapshot };
+      } catch (error) {
+        return {
+          ok: false as const,
+          reasonCode:
+            error instanceof Error && error.message === "identity.invalid_password"
+              ? "identity.invalid_password"
+              : "identity.unavailable",
+        };
+      }
+    },
+    [serverId],
+  );
+}
+
+export function EnterpriseUnsignedAccessGate({
+  serverId,
+  children,
+}: {
+  serverId: string;
+  children: ReactNode;
+}) {
+  const identitySnapshot = useHostEnterpriseIdentitySnapshot(serverId);
+  const lifecycle = useHostEnterpriseIdentityLifecycle(serverId);
+  const discovery = useManagedNodeDiscovery(serverId);
+  const authenticatePassword = useEnterprisePasswordAuthenticator(serverId);
+  const access = resolveUnsignedEnterpriseAccess({
+    signedIn: isEnterpriseWorkbenchSignedIn(identitySnapshot),
+    hasLifecycle: lifecycle !== null,
+    discovery,
+  });
+  if (access === "children") return children;
+  if (access === "pending") {
+    return <View testID="enterprise-unsigned-access-gate-pending" />;
+  }
+  return (
+    <SafeAreaView testID="enterprise-unsigned-access-gate">
+      <EnterprisePasswordLoginForm authenticate={authenticatePassword} />
+    </SafeAreaView>
+  );
+}
+
+export function EnterpriseUnsignedAccessGateForRegisteredHost({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  const hosts = useHosts();
+  const serverId = hosts[0]?.serverId;
+  if (!serverId) return children;
+  return (
+    <EnterpriseUnsignedAccessGate serverId={serverId}>{children}</EnterpriseUnsignedAccessGate>
+  );
+}
+
 export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   const lifecycle = useHostEnterpriseIdentityLifecycle(serverId);
   const identitySnapshot = useHostEnterpriseIdentitySnapshot(serverId);
   const daemonClient = useHostRuntimeClient(serverId);
-  const runtimeSnapshot = useHostRuntimeSnapshot(serverId);
-  const [managedNodeDiscovered, setManagedNodeDiscovered] = useState(false);
+  const discovery = useManagedNodeDiscovery(serverId);
   const capability = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features ?? null,
   );
@@ -129,26 +217,7 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
     },
     [bundle, serverId],
   );
-  const authenticatePassword = useCallback(
-    async (username: string, password: string, signal: AbortSignal) => {
-      try {
-        const snapshot = await getHostRuntimeStore().authenticateEnterpriseHostWithPassword(
-          serverId,
-          { username, password, signal },
-        );
-        return { ok: true as const, value: snapshot };
-      } catch (error) {
-        return {
-          ok: false as const,
-          reasonCode:
-            error instanceof Error && error.message === "identity.invalid_password"
-              ? "identity.invalid_password"
-              : "identity.unavailable",
-        };
-      }
-    },
-    [serverId],
-  );
+  const authenticatePassword = useEnterprisePasswordAuthenticator(serverId);
   const signedIn = isEnterpriseWorkbenchSignedIn(identitySnapshot);
   const bossStore = useMemo(
     () =>
@@ -174,30 +243,10 @@ export function EnterpriseWorkbenchHost({ serverId }: { serverId: string }) {
   const patModel = useMemo(() => (models ? createPatLoginFormModel() : null), [models]);
 
   useEffect(() => () => bossStore?.dispose(), [bossStore]);
-  useEffect(() => {
-    const controller = new AbortController();
-    setManagedNodeDiscovered(false);
-    void getHostRuntimeStore()
-      .discoverEnterpriseManagement(serverId, { signal: controller.signal })
-      .then((value) => {
-        if (!controller.signal.aborted) setManagedNodeDiscovered(value !== null);
-        return undefined;
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setManagedNodeDiscovered(false);
-      });
-    return () => controller.abort();
-  }, [runtimeSnapshot?.activeConnection, runtimeSnapshot?.clientGeneration, serverId]);
-
   const enterpriseIdentityAvailable =
-    managedNodeDiscovered || isEnterpriseIdentityEnabled(capability);
+    discovery === "managed" || isEnterpriseIdentityEnabled(capability);
 
-  if (
-    !lifecycle ||
-    (identitySnapshot?.target === "legacy_passthrough" && !managedNodeDiscovered) ||
-    !enterpriseIdentityAvailable
-  )
-    return null;
+  if (!lifecycle || discovery === "pending" || !enterpriseIdentityAvailable) return null;
   if (!signedIn) {
     return (
       <>

@@ -160,6 +160,7 @@ export function EnterprisePasswordLoginForm<T>({
   const [password, setPassword] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const usernameRef = useRef<EditingTextInputHandle>(null);
   const passwordRef = useRef<EditingTextInputHandle>(null);
   const requestRef = useRef<AbortController | null>(null);
   const pendingRef = useRef(false);
@@ -171,7 +172,17 @@ export function EnterprisePasswordLoginForm<T>({
     [],
   );
   const submit = async () => {
-    if (pendingRef.current || username.trim().length < 3 || password.length < 12) return;
+    if (pendingRef.current) return;
+    const account = (usernameRef.current?.getText() ?? username).trim();
+    const secret = passwordRef.current?.getText() ?? password;
+    if (account.length < 3) {
+      setError("账号至少 3 个字符。");
+      return;
+    }
+    if (secret.length < 12) {
+      setError("密码至少 12 个字符。");
+      return;
+    }
     pendingRef.current = true;
     const controller = new AbortController();
     requestRef.current?.abort();
@@ -179,7 +190,7 @@ export function EnterprisePasswordLoginForm<T>({
     setPending(true);
     setError(undefined);
     try {
-      const result = await authenticate(username.trim(), password, controller.signal);
+      const result = await authenticate(account, secret, controller.signal);
       if (requestRef.current !== controller) return;
       setPassword("");
       passwordRef.current?.reset();
@@ -200,18 +211,21 @@ export function EnterprisePasswordLoginForm<T>({
       <Text style={styles.title}>使用企业账号登录</Text>
       <Field label="账号" testID="enterprise-account-field">
         <FormTextInput
+          ref={usernameRef}
           accessibilityLabel="企业账号"
           autoCapitalize="none"
           autoCorrect={false}
           editable={!pending}
           onChangeText={setUsername}
+          onSubmitEditing={() => void submit()}
           placeholder="请输入账号"
+          returnKeyType="next"
           testID="enterprise-account-input"
         />
       </Field>
       <Field
         label="密码"
-        hint="密码仅用于换取短期节点票据，不会被保存。"
+        hint="密码至少 12 位，仅用于换取短期节点票据，不会被保存。"
         testID="enterprise-password-field"
       >
         <FormTextInput
@@ -221,7 +235,9 @@ export function EnterprisePasswordLoginForm<T>({
           autoCorrect={false}
           editable={!pending}
           onChangeText={setPassword}
+          onSubmitEditing={() => void submit()}
           placeholder="请输入密码"
+          returnKeyType="go"
           secureTextEntry
           testID="enterprise-password-input"
         />
@@ -230,10 +246,11 @@ export function EnterprisePasswordLoginForm<T>({
       <View style={styles.actions}>
         <Button
           accessibilityLabel="使用企业账号登录"
-          disabled={pending || username.trim().length < 3 || password.length < 12}
+          disabled={pending}
           loading={pending}
-          onPress={submit}
+          onPress={() => void submit()}
           testID="enterprise-password-submit"
+          variant="default"
         >
           登录
         </Button>

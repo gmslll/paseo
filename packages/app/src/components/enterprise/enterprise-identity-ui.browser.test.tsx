@@ -71,6 +71,7 @@ vi.mock("@/components/ui/form-field", () => ({
         replaceText: (value: string) => {
           if (inputRef.current) inputRef.current.value = value;
         },
+        getText: () => inputRef.current?.value ?? "",
       }));
       return (
         <input
@@ -337,6 +338,38 @@ describe("enterprise identity UI", () => {
     expect(model.getSnapshot()).toEqual({ status: "idle", hasToken: false, canSubmit: false });
     expect((input as HTMLInputElement).value).toBe("");
     expect(authenticated).toHaveBeenCalledOnce();
+  });
+
+  it("keeps login pressable and explains a short password", async () => {
+    const authenticate = vi.fn();
+    act(() => root.render(<EnterprisePasswordLoginForm authenticate={authenticate} />));
+    const username = container.querySelector(
+      '[data-testid="enterprise-account-input"]',
+    ) as HTMLInputElement;
+    const password = container.querySelector(
+      '[data-testid="enterprise-password-input"]',
+    ) as HTMLInputElement;
+    const submit = container.querySelector(
+      '[data-testid="enterprise-password-submit"]',
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+        username,
+        "admin",
+      );
+      username.dispatchEvent(new Event("input", { bubbles: true }));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+        password,
+        "short",
+      );
+      password.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      submit.click();
+    });
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("密码至少 12 个字符。");
   });
 
   it("submits an enterprise account password once and clears the password", async () => {

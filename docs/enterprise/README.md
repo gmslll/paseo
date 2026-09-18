@@ -9,6 +9,9 @@ inventory and its exhaustiveness checks.
 Track release evidence and unresolved production boundaries in the
 [P0 security gate checklist](p0-gate-checklist.md).
 
+Current leftover for Lody scene 3 on a USB phone (delete when proven):
+[collab-scene-3-remaining.md](collab-scene-3-remaining.md).
+
 ## Decision index
 
 - [ADR 0001: W0 contract test ownership](decisions/0001-w0-contract-test-ownership.md)
@@ -65,3 +68,4 @@ Track release evidence and unresolved production boundaries in the
 - [ADR 0052: What shared turn control needs before it can be built](decisions/0052-shared-turn-control-substrate.md)
 - [ADR 0053: What a machine RPC needs before a node can answer one](decisions/0053-headless-sessions-for-machine-rpc.md)
 - [ADR 0054: Who implements the ADR-0045 Agent `turn_diff` content-read view](decisions/0054-turn-diff-content-read-workstream.md) (`DECISION_REQUIRED`)
+- [ADR 0055: Phone password login through the node HTTP proxy](decisions/0055-phone-password-session-via-node.md) (`DECISION_REQUIRED`)

@@ -24,6 +24,7 @@ import { normalizeWorkspaceDescriptor, useSessionStore, type Agent } from "@/sto
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
 import { queryClient } from "@/data/query-client";
+import { DaemonConnectionTestError } from "@/utils/test-daemon-connection";
 import {
   createEnterpriseFileRequestFactory,
   HostRuntimeController,
@@ -879,14 +880,14 @@ describe("HostRuntimeController", () => {
     ]);
     expect(String(request.mock.calls[0]?.[0])).toBe("http://lan:6767/api/enterprise/bootstrap");
     expect(String(request.mock.calls[2]?.[0])).toBe(
-      "https://management.test:17443/v1/auth/password/session",
+      "http://lan:6767/api/enterprise/password-session",
     );
     expect(JSON.parse(String(request.mock.calls[2]?.[1]?.body))).toMatchObject({
       username: "employee.b",
       password: "employee-password-2026",
-      nodeId: "nod_aaaaaaaaaaaaaaaa",
       clientId: expect.stringMatching(/^cid_password_login:enterprise:/),
     });
+    expect(JSON.parse(String(request.mock.calls[2]?.[1]?.body))).not.toHaveProperty("nodeId");
     expect(JSON.stringify(controller.getSnapshot())).not.toContain("employee-password-2026");
     expect(JSON.stringify(lifecycle.readSnapshot())).not.toContain("employee-password-2026");
     await controller.stop();
@@ -4968,6 +4969,55 @@ describe("HostRuntimeStore", () => {
         connections: [connection],
       },
     ]);
+
+    store.syncHosts([]);
+  });
+
+  it("probeAndUpsertConnection keeps a managed node that refuses anonymous hello", async () => {
+    const connection: HostConnection = {
+      id: "direct:localhost:6767",
+      type: "directTcp",
+      endpoint: "localhost:6767",
+    };
+    const request = vi.fn<typeof fetch>(async (url) => {
+      expect(String(url)).toBe("http://localhost:6767/api/enterprise/bootstrap");
+      return new Response(
+        JSON.stringify({
+          mode: "managed",
+          managementBaseUrl: "https://management.test:17443",
+          nodeId: "nod_aaaaaaaaaaaaaaaa",
+          paseoServerId: "srv_managed_local",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", request);
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          throw new DaemonConnectionTestError("Enterprise authentication required", {
+            reason: "Enterprise authentication required",
+            lastError: null,
+          });
+        },
+        getClientId: async () => "cid_test_runtime",
+      },
+    });
+
+    const result = await store.probeAndUpsertConnection({ connection });
+
+    expect(result.serverId).toBe("srv_managed_local");
+    expect(store.getHosts()).toMatchObject([
+      {
+        serverId: "srv_managed_local",
+        connections: [connection],
+      },
+    ]);
+    await expect(store.discoverEnterpriseManagement("srv_managed_local")).resolves.toMatchObject({
+      mode: "managed",
+      paseoServerId: "srv_managed_local",
+    });
 
     store.syncHosts([]);
   });

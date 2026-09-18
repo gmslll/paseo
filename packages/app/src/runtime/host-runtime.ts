@@ -50,9 +50,16 @@ import {
   type BrowserProfileBindingProjection,
   type BrowserProfileSummary,
 } from "@getpaseo/protocol/messages";
+import {
+  fetchEnterpriseManagementBootstrap,
+  type EnterpriseManagementBootstrap,
+} from "./enterprise-management-bootstrap";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
-import { connectToDaemon } from "@/utils/test-daemon-connection";
+import {
+  connectToDaemon,
+  isEnterpriseAuthenticationRequired,
+} from "@/utils/test-daemon-connection";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { z } from "zod";
 import { readValidatedJson, readValidatedString } from "@/storage/validated-storage";
@@ -121,16 +128,7 @@ import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
 export type HostRegistryStatus = "loading" | "ready";
-
-const EnterpriseManagementBootstrapSchema = z
-  .object({
-    mode: z.literal("managed"),
-    managementBaseUrl: z.string().url(),
-    nodeId: NodeIdSchema,
-    paseoServerId: z.string().min(1),
-  })
-  .strict();
-export type EnterpriseManagementBootstrap = z.infer<typeof EnterpriseManagementBootstrapSchema>;
+export type { EnterpriseManagementBootstrap };
 
 export type ActiveConnection =
   | { type: "directTcp"; endpoint: string; display: string }
@@ -1367,23 +1365,22 @@ export class HostRuntimeController {
       this.host,
       this.snapshot.activeConnectionId ?? this.host.preferredConnectionId,
     );
-    if (!connection || connection.type !== "directTcp") return null;
-    const bootstrapResponse = await fetch(
-      new URL(
-        "/api/enterprise/bootstrap",
-        `${connection.useTls ? "https" : "http"}://${connection.endpoint}`,
-      ),
-      {
-        method: "GET",
-        signal: input?.signal,
-        headers: { accept: "application/json" },
-      },
-    );
-    if (bootstrapResponse.status === 404) return null;
-    if (!bootstrapResponse.ok) throw new Error("Enterprise management discovery failed");
-    const bootstrap = EnterpriseManagementBootstrapSchema.parse(await bootstrapResponse.json());
+    if (!connection) return null;
+    const bootstrap = await fetchEnterpriseManagementBootstrap(connection, input?.signal);
+    if (!bootstrap) return null;
     if (bootstrap.paseoServerId !== this.host.serverId) {
       throw new Error("Enterprise management discovery returned a different host");
+    }
+    const lifecycle = this.enterpriseIdentityLifecycle;
+    if (
+      lifecycle &&
+      this.productionEnterpriseIdentityPortsEnabled &&
+      lifecycle.readSnapshot().state !== "signed_in"
+    ) {
+      await lifecycle.bootstrap({
+        target: "enterprise_host",
+        enterpriseIdentityV1: true,
+      });
     }
     return bootstrap;
   }
@@ -1399,10 +1396,20 @@ export class HostRuntimeController {
     }
     if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const clientId = `${await this.resolveClientId()}:enterprise:${crypto.randomUUID()}`;
+    const connection = findConnectionById(
+      this.host,
+      this.snapshot.activeConnectionId ?? this.host.preferredConnectionId,
+    );
+    if (!connection || connection.type !== "directTcp") {
+      throw new Error("Enterprise password login requires a managed node connection");
+    }
     const bootstrap = await this.discoverEnterpriseManagement({ signal: input.signal });
     if (!bootstrap) throw new Error("Enterprise password login requires a managed node connection");
     const ticketResponse = await fetch(
-      new URL("/v1/auth/password/session", bootstrap.managementBaseUrl),
+      new URL(
+        "/api/enterprise/password-session",
+        `${connection.useTls ? "https" : "http"}://${connection.endpoint}`,
+      ),
       {
         method: "POST",
         signal: input.signal,
@@ -1410,7 +1417,6 @@ export class HostRuntimeController {
         body: JSON.stringify({
           username: input.username,
           password: input.password,
-          nodeId: bootstrap.nodeId,
           clientId,
           ttlMs: 5 * 60_000,
         }),
@@ -2773,18 +2779,40 @@ export class HostRuntimeStore {
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const { client, serverId, hostname } = await this.deps.connectToDaemon({
-      host: probeHost,
-      connection: input.connection,
-      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
-    });
+    try {
+      const { client, serverId, hostname } = await this.deps.connectToDaemon({
+        host: probeHost,
+        connection: input.connection,
+        ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      });
+      const profile = await this.upsertHostConnection({
+        serverId,
+        label: input.label ?? hostname ?? undefined,
+        connection: input.connection,
+        existingClient: client,
+      });
+      return { profile, serverId, hostname };
+    } catch (error) {
+      const managed = isEnterpriseAuthenticationRequired(error)
+        ? await this.upsertManagedNodeFromHttpBootstrap(input.connection, input.label)
+        : null;
+      if (managed) return managed;
+      throw error;
+    }
+  }
+
+  private async upsertManagedNodeFromHttpBootstrap(
+    connection: HostConnection,
+    label?: string,
+  ): Promise<{ profile: HostProfile; serverId: string; hostname: null } | null> {
+    const bootstrap = await fetchEnterpriseManagementBootstrap(connection);
+    if (!bootstrap) return null;
     const profile = await this.upsertHostConnection({
-      serverId,
-      label: input.label ?? hostname ?? undefined,
-      connection: input.connection,
-      existingClient: client,
+      serverId: bootstrap.paseoServerId,
+      label: label ?? (connection.type === "directTcp" ? connection.endpoint : undefined),
+      connection,
     });
-    return { profile, serverId, hostname };
+    return { profile, serverId: bootstrap.paseoServerId, hostname: null };
   }
 
   async probeAndUpsertDirectConnection(input: {
