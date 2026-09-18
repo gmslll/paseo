@@ -44,6 +44,7 @@ import {
   writeManagedNodeRelationship,
   type ManagedNodeRelationship,
 } from "./relationship-store.js";
+import { bindCollabGrantsToLocalWorkspaces } from "./collab/local-workspace-grants.js";
 import {
   parseRequestTimeout,
   requestJson,
@@ -114,17 +115,24 @@ export class ManagedNodeControlPlaneClient {
       ManagedNodePolicyResponseSchema,
     );
     const next = new Map<string, ManagedNodePolicyEntry>();
-    for (const entry of result.principals) {
-      if (next.has(entry.principalId)) throw new Error("duplicate principal policy");
-      next.set(entry.principalId, Object.freeze({ ...entry }));
-    }
-    this.policy = next;
     // Sent only to nodes that declare collaborationV1, and absent rather than empty for the rest
     // (ADR-0033), so null and [] mean different things: not a collaborating node, versus one that
     // hosts no collaborating Workspaces.
-    this.workspaceMemberships = result.workspaceMemberships
+    const memberships = result.workspaceMemberships
       ? Object.freeze(result.workspaceMemberships.map((entry) => Object.freeze({ ...entry })))
       : null;
+    for (const entry of result.principals) {
+      if (next.has(entry.principalId)) throw new Error("duplicate principal policy");
+      next.set(
+        entry.principalId,
+        Object.freeze({
+          ...entry,
+          grants: bindCollabGrantsToLocalWorkspaces(entry.grants, memberships),
+        }),
+      );
+    }
+    this.policy = next;
+    this.workspaceMemberships = memberships;
     this.policyUpdatedAtMs = this.clock.nowMs();
     return Object.freeze([...next.values()]);
   }
