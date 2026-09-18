@@ -239,9 +239,6 @@ describe("collaboration subscriptions over SSE", () => {
       workspaceUid: harness.workspaceUid,
       principalId: harness.memberPrincipalId,
     });
-    // An append is what wakes the stream, and it has to come from someone still entitled to write.
-    // The status line is long gone by now, so the refusal has to arrive as an event instead.
-    await appendAs(harness, harness.owner, "prod-owner", 1, "after");
 
     await waitFor(() => hasType(stream.events, "revoked"), "the revoked event");
     await waitFor(stream.ended, "the stream to close");

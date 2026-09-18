@@ -22,7 +22,14 @@ import {
   type ManagedPlacement,
   type ManagedPlacementRegistration,
 } from "@getpaseo/protocol/enterprise-management";
-import type { WorkspaceMembershipPolicy } from "@getpaseo/protocol/enterprise-collaboration";
+import {
+  CollabSubscriptionCreatedSchema,
+  CollabSubscriptionEventSchema,
+  MachineRpcAttestedRequestSchema,
+  type CollabSubscriptionEvent,
+  type MachineRpcAttestedRequest,
+  type WorkspaceMembershipPolicy,
+} from "@getpaseo/protocol/enterprise-collaboration";
 import {
   type ManagedRuntimePolicy,
   ManagedRuntimeNodePolicyResponseSchema,
@@ -44,6 +51,7 @@ import {
   writeManagedNodeRelationship,
   type ManagedNodeRelationship,
 } from "./relationship-store.js";
+import { bindCollabGrantsToLocalWorkspaces } from "./collab/local-workspace-grants.js";
 import {
   parseRequestTimeout,
   requestJson,
@@ -55,7 +63,11 @@ import {
 // the collaboration uplink needs the same class to mean the same thing.
 export { ManagementPlaneRequestError } from "./node-request.js";
 
+const SUBSCRIPTION_POLL_TIMEOUT_MS = 30_000;
 const HeartbeatResponseSchema = z.object({ node: ManagedNodeSchema }).strict();
+const SubscriptionEventsSchema = z.object({
+  events: z.array(CollabSubscriptionEventSchema),
+});
 const PlacementResponseSchema = z.object({ placement: ManagedPlacementSchema }).strict();
 const LeaseResponseSchema = z.object({ lease: ManagedGlobalLeaseSchema }).strict();
 const LeaseReleaseResponseSchema = z.object({ released: z.boolean() }).strict();
@@ -114,17 +126,24 @@ export class ManagedNodeControlPlaneClient {
       ManagedNodePolicyResponseSchema,
     );
     const next = new Map<string, ManagedNodePolicyEntry>();
-    for (const entry of result.principals) {
-      if (next.has(entry.principalId)) throw new Error("duplicate principal policy");
-      next.set(entry.principalId, Object.freeze({ ...entry }));
-    }
-    this.policy = next;
     // Sent only to nodes that declare collaborationV1, and absent rather than empty for the rest
     // (ADR-0033), so null and [] mean different things: not a collaborating node, versus one that
     // hosts no collaborating Workspaces.
-    this.workspaceMemberships = result.workspaceMemberships
+    const memberships = result.workspaceMemberships
       ? Object.freeze(result.workspaceMemberships.map((entry) => Object.freeze({ ...entry })))
       : null;
+    for (const entry of result.principals) {
+      if (next.has(entry.principalId)) throw new Error("duplicate principal policy");
+      next.set(
+        entry.principalId,
+        Object.freeze({
+          ...entry,
+          grants: bindCollabGrantsToLocalWorkspaces(entry.grants, memberships),
+        }),
+      );
+    }
+    this.policy = next;
+    this.workspaceMemberships = memberships;
     this.policyUpdatedAtMs = this.clock.nowMs();
     return Object.freeze([...next.values()]);
   }
@@ -132,6 +151,114 @@ export class ManagedNodeControlPlaneClient {
   /** The Workspaces the plane says this node hosts, as of the last policy refresh. */
   currentWorkspaceMemberships(): readonly WorkspaceMembershipPolicy[] | null {
     return this.workspaceMemberships;
+  }
+
+  async applyOwnedCollabMemberChange(input: {
+    readonly actorPrincipalId: string;
+    readonly workspaceUid: string;
+    readonly principalId: string;
+    readonly role?: "editor" | "viewer";
+  }): Promise<WorkspaceMembershipPolicy["members"]> {
+    const result = await this.signedRequest(
+      "POST",
+      "/v1/node/collab/members",
+      input,
+      z.object({
+        members: z.array(
+          z.object({ principalId: z.string(), role: z.enum(["owner", "editor", "viewer"]) }),
+        ),
+      }),
+    );
+    return result.members as WorkspaceMembershipPolicy["members"];
+  }
+
+  async enableOwnedCollabWorkspace(input: {
+    readonly actorPrincipalId: string;
+    readonly localWorkspaceId: string;
+  }): Promise<{
+    readonly workspaceUid: string;
+    readonly localWorkspaceId: string;
+    readonly ownerPrincipalId: string;
+    readonly collaborationEnabled: boolean;
+    readonly members: WorkspaceMembershipPolicy["members"];
+  }> {
+    const result = await this.signedRequest(
+      "POST",
+      "/v1/node/collab/enable",
+      input,
+      z.object({
+        workspaceUid: z.string(),
+        localWorkspaceId: z.string(),
+        ownerPrincipalId: z.string(),
+        collaborationEnabled: z.boolean(),
+        members: z.array(
+          z.object({ principalId: z.string(), role: z.enum(["owner", "editor", "viewer"]) }),
+        ),
+      }),
+    );
+    return {
+      ...result,
+      members: result.members as WorkspaceMembershipPolicy["members"],
+    };
+  }
+
+  async openCollabSubscription(
+    token: string,
+    input: { readonly containerId: string; readonly cursors: Readonly<Record<string, string>> },
+  ): Promise<{ readonly subscriptionId: string }> {
+    const created = await this.bearerRequest(
+      "POST",
+      "/v1/ds/subscriptions",
+      token,
+      input,
+      CollabSubscriptionCreatedSchema,
+    );
+    return { subscriptionId: created.subscriptionId };
+  }
+
+  async pollCollabSubscription(
+    token: string,
+    subscriptionId: string,
+  ): Promise<{ readonly events: CollabSubscriptionEvent[] }> {
+    return this.bearerRequest(
+      "GET",
+      `/v1/ds/subscriptions/${subscriptionId}?live=long-poll`,
+      token,
+      undefined,
+      SubscriptionEventsSchema,
+      SUBSCRIPTION_POLL_TIMEOUT_MS,
+    );
+  }
+
+  async issueOwnedCollabStreamToken(input: {
+    readonly actorPrincipalId: string;
+    readonly clientId: string;
+    readonly workspaceUid: string;
+  }): Promise<{ readonly token: string; readonly expiresAt: string }> {
+    return await this.signedRequest(
+      "POST",
+      "/v1/node/collab/stream-token",
+      input,
+      z.object({ token: z.string(), expiresAt: z.string() }),
+    );
+  }
+
+  async submitOwnedCollabRpc(input: {
+    readonly actorPrincipalId: string;
+    readonly credentialId: string;
+    readonly clientId: string;
+    readonly method: string;
+    readonly localWorkspaceId: string;
+    readonly rpcId: string;
+    readonly payload: unknown;
+  }): Promise<MachineRpcAttestedRequest> {
+    const result = await this.signedRequest(
+      "POST",
+      "/v1/node/collab/rpc",
+      input,
+      z.object({ envelope: MachineRpcAttestedRequestSchema }),
+    );
+    return result.envelope;
   }
 
   currentPolicy(principalId: string): ManagedNodePolicyEntry | null {
@@ -239,6 +366,28 @@ export class ManagedNodeControlPlaneClient {
       caCertificate: this.caCertificate,
       timeoutMs: this.requestTimeoutMs,
       headers: this.signedHeaders(method, path, body),
+      schema,
+    });
+  }
+
+  /** Principal bearer, not a node signature — subscriptions stay client-only (ADR-0032). */
+  private async bearerRequest<T>(
+    method: "GET" | "POST" | "PUT",
+    path: string,
+    token: string,
+    value: unknown,
+    schema: z.ZodType<T>,
+    timeoutMs = this.requestTimeoutMs,
+  ): Promise<T> {
+    const body = value === undefined ? "" : JSON.stringify(value);
+    return requestJson({
+      baseUrl: this.relationship.managementBaseUrl,
+      method,
+      path,
+      body,
+      caCertificate: this.caCertificate,
+      timeoutMs,
+      headers: { authorization: `Bearer ${token}` },
       schema,
     });
   }

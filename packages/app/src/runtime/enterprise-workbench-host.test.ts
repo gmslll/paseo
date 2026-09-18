@@ -4,6 +4,7 @@ import {
   isEnterpriseBrowserProfilesEnabled,
   isEnterpriseWorkbenchSignedIn,
 } from "./enterprise-workbench-assembly";
+import { resolveUnsignedEnterpriseAccess } from "./unsigned-enterprise-access";
 import { normalizeHostSectionSlug } from "@/utils/host-routes";
 import { en } from "@/i18n/resources/en";
 import { zhCN } from "@/i18n/resources/zh-CN";
@@ -11,6 +12,37 @@ import { zhCN } from "@/i18n/resources/zh-CN";
 const projection = { organizationId: "org-acme" } as never;
 
 describe("enterprise workbench host assembly", () => {
+  it("keeps unsigned managed nodes on the password form", () => {
+    expect(
+      resolveUnsignedEnterpriseAccess({
+        signedIn: false,
+        hasLifecycle: true,
+        discovery: "pending",
+      }),
+    ).toBe("pending");
+    expect(
+      resolveUnsignedEnterpriseAccess({
+        signedIn: false,
+        hasLifecycle: true,
+        discovery: "managed",
+      }),
+    ).toBe("password_login");
+    expect(
+      resolveUnsignedEnterpriseAccess({
+        signedIn: false,
+        hasLifecycle: true,
+        discovery: "standalone",
+      }),
+    ).toBe("children");
+    expect(
+      resolveUnsignedEnterpriseAccess({
+        signedIn: true,
+        hasLifecycle: true,
+        discovery: "managed",
+      }),
+    ).toBe("children");
+  });
+
   it("mounts through the host settings section route", () => {
     expect(normalizeHostSectionSlug("enterprise")).toBe("enterprise");
     expect(en.settings.hostSections.enterprise).toBe("Enterprise");

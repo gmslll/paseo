@@ -271,6 +271,26 @@ describe("collaboration subscriptions over HTTP", () => {
     expect((await read(harness, harness.memberToken, "sub_00000000000000ff")).status).toBe(403);
   });
 
+  test("long-poll answers revoked when membership is taken away", async () => {
+    const harness = await start();
+    const id = await openId(harness, harness.memberToken, { meta: FIRST });
+    await harness.plane.removeCollabMember(harness.admin, {
+      workspaceUid: harness.containerId,
+      principalId: harness.member.principalId,
+    });
+
+    const response = await read(harness, harness.memberToken, id, "?live=long-poll");
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { events: Array<{ type: string; reason?: string }> };
+    expect(body.events).toEqual([
+      {
+        type: "revoked",
+        containerId: harness.containerId,
+        reason: "membership_removed",
+      },
+    ]);
+  });
+
   test("refuses a subscription that names no segments", async () => {
     const harness = await start();
 

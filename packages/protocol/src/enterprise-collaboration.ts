@@ -383,6 +383,7 @@ export const WorkspaceMemberSchema = z.object({
   principalId: ManagedPrincipalIdSchema,
   role: WorkspaceMemberRoleSchema,
 });
+export type WorkspaceMember = z.infer<typeof WorkspaceMemberSchema>;
 
 export const WorkspaceCatalogEntrySchema = z.object({
   workspaceUid: CollabWorkspaceUidSchema,

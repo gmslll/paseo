@@ -306,6 +306,48 @@ import {
   type CodeCollabTurnDiffRequest,
 } from "./code-collab/code-collab-session.js";
 import type { TurnDiffControl } from "./code-collab/turn-diff-runtime.js";
+import {
+  COLLAB_MEMBERS_UNAVAILABLE,
+  type CollabMembersControl,
+} from "./enterprise/managed-node/collab/members-control.js";
+import {
+  handleCollabMembersRequest as answerCollabMembersRequest,
+  type CollabMembersRequest,
+} from "./enterprise/managed-node/collab/members-session.js";
+import {
+  COLLAB_PRESENCE_UNAVAILABLE,
+  type CollabPresenceControl,
+} from "./enterprise/managed-node/collab/presence-roster.js";
+import {
+  handleCollabPresenceRequest as answerCollabPresenceRequest,
+  type CollabPresenceRequest,
+} from "./enterprise/managed-node/collab/presence-session.js";
+import {
+  COLLAB_TURN_UNAVAILABLE,
+  type CollabTurnControl,
+} from "./enterprise/managed-node/collab/turn-control.js";
+import {
+  handleCollabTurnRequest as answerCollabTurnRequest,
+  type CollabTurnRequest,
+} from "./enterprise/managed-node/collab/turn-session.js";
+import {
+  COLLAB_TIMELINE_UNAVAILABLE,
+  handleCollabTimelineRequest as answerCollabTimelineRequest,
+  type CollabTimelineRequest,
+} from "./enterprise/managed-node/collab/timeline-session.js";
+import type { CollabTimelineControl } from "./enterprise/managed-node/collab/timeline-control.js";
+import {
+  COLLAB_STREAM_TOKEN_UNAVAILABLE,
+  handleCollabStreamTokenRequest as answerCollabStreamTokenRequest,
+  type CollabStreamTokenRequest,
+} from "./enterprise/managed-node/collab/stream-token-session.js";
+import type { CollabStreamTokenControl } from "./enterprise/managed-node/collab/stream-token-control.js";
+import {
+  COLLAB_SUBSCRIPTION_UNAVAILABLE,
+  handleCollabSubscriptionRequest as answerCollabSubscriptionRequest,
+  type CollabSubscriptionRequest,
+} from "./enterprise/managed-node/collab/subscription-session.js";
+import type { CollabSubscriptionControl } from "./enterprise/managed-node/collab/subscription-control.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./session/daemon/diagnostics.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import { HubExecutionController } from "./hub/execution-controller.js";
@@ -1135,6 +1177,12 @@ export class Session {
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
   private readonly turnDiff: TurnDiffControl | null;
+  private readonly collabMembers: CollabMembersControl | null;
+  private readonly collabPresence: CollabPresenceControl | null;
+  private readonly collabTurns: CollabTurnControl | null;
+  private readonly collabTimeline: CollabTimelineControl | null;
+  private readonly collabStreamTokens: CollabStreamTokenControl | null;
+  private readonly collabSubscriptions: CollabSubscriptionControl | null;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly agentRequests: Pick<AgentRequests, "create" | "send">;
@@ -1527,6 +1575,12 @@ export class Session {
       reloadConfig: () => daemonConfigStore.reload(),
     });
     this.turnDiff = daemonRuntimeConfig?.turnDiff ?? null;
+    this.collabMembers = daemonRuntimeConfig?.collabMembers ?? null;
+    this.collabPresence = daemonRuntimeConfig?.collabPresence ?? null;
+    this.collabTurns = daemonRuntimeConfig?.collabTurns ?? null;
+    this.collabTimeline = daemonRuntimeConfig?.collabTimeline ?? null;
+    this.collabStreamTokens = daemonRuntimeConfig?.collabStreamTokens ?? null;
+    this.collabSubscriptions = daemonRuntimeConfig?.collabSubscriptions ?? null;
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
           agents: options.hubExecutionAgents,
@@ -3982,15 +4036,280 @@ export class Session {
     }
   }
 
+  private async handleCollabMembersRequest(msg: CollabMembersRequest): Promise<void> {
+    const control = this.collabMembers;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_MEMBERS_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    const resourceAction =
+      msg.type === "collab.members.list.request" ? "workspace.metadata.read" : "workspace.write";
+    if (!(await this.assertLegacyWorkspaceResource(resourceAction, msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const actorPrincipalId = this.enterpriseContext?.principal.principalId ?? null;
+    const workspace = await this.workspaceRegistry.get(msg.workspaceId);
+    const localOwnerPrincipalId = workspace?.ownerPrincipalId ?? null;
+    try {
+      this.emit(
+        await answerCollabMembersRequest(control, msg, actorPrincipalId, localOwnerPrincipalId),
+        context,
+      );
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_MEMBERS_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+    }
+  }
+
   private dispatchCodeCollabMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "code_collab.turn_diff.list_turns.request":
       case "code_collab.turn_diff.get_files.request":
       case "code_collab.all_changes.get_diff.request":
         return this.handleCodeCollabTurnDiffRequest(msg);
+      case "collab.members.list.request":
+      case "collab.members.set.request":
+      case "collab.members.remove.request":
+      case "collab.workspace.enable.request":
+        return this.handleCollabMembersRequest(msg);
+      case "collab.presence.beat.request":
+        return this.handleCollabPresenceRequest(msg);
+      case "collab.turn.send.request":
+      case "collab.turn.cancel.request":
+        return this.handleCollabTurnRequest(msg);
+      case "collab.timeline.get.request":
+        return this.handleCollabTimelineRequest(msg);
+      case "collab.stream.token.request":
+        return this.handleCollabStreamTokenRequest(msg);
+      case "collab.subscription.poll.request":
+        return this.handleCollabSubscriptionRequest(msg);
       default:
         return undefined;
     }
+  }
+
+  private async handleCollabSubscriptionRequest(msg: CollabSubscriptionRequest): Promise<void> {
+    const control = this.collabSubscriptions;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_SUBSCRIPTION_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const principalId = this.enterpriseContext?.principal.principalId ?? null;
+    const actor = principalId && principalId !== "owner" ? principalId : null;
+    try {
+      this.emit(await answerCollabSubscriptionRequest(control, msg, actor), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_SUBSCRIPTION_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+    }
+  }
+
+  private async handleCollabStreamTokenRequest(msg: CollabStreamTokenRequest): Promise<void> {
+    const control = this.collabStreamTokens;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_STREAM_TOKEN_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const principalId = this.enterpriseContext?.principal.principalId ?? null;
+    const actor = principalId && principalId !== "owner" ? principalId : null;
+    try {
+      this.emit(await answerCollabStreamTokenRequest(control, msg, actor), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_STREAM_TOKEN_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+    }
+  }
+
+  private async handleCollabTimelineRequest(msg: CollabTimelineRequest): Promise<void> {
+    const control = this.collabTimeline;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_TIMELINE_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    try {
+      this.emit(answerCollabTimelineRequest(control, msg), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_TIMELINE_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+    }
+  }
+
+  private async handleCollabTurnRequest(msg: CollabTurnRequest): Promise<void> {
+    const control = this.collabTurns;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_TURN_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.write", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const principal = this.enterpriseContext?.principal;
+    const actor =
+      principal && principal.principalId !== "owner"
+        ? {
+            principalId: principal.principalId,
+            credentialId: principal.credentialId,
+            clientId: this.clientId,
+          }
+        : null;
+    try {
+      this.emit(await answerCollabTurnRequest(control, msg, actor), context);
+    } catch (error) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : COLLAB_TURN_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+    }
+  }
+
+  private async handleCollabPresenceRequest(msg: CollabPresenceRequest): Promise<void> {
+    const control = this.collabPresence;
+    if (!control) {
+      this.onMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: COLLAB_PRESENCE_UNAVAILABLE,
+          code: "unavailable",
+        },
+      });
+      return;
+    }
+    if (!(await this.assertLegacyWorkspaceResource("workspace.metadata.read", msg.workspaceId))) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const context = this.createWorkspaceOutboundContext(msg.workspaceId);
+    if (this.enterpriseContext && !context) {
+      this.emitLegacyResourceDenied(msg.requestId, msg.type);
+      return;
+    }
+    const principalId = this.enterpriseContext?.principal.principalId ?? null;
+    const actor =
+      principalId && principalId !== "owner" ? { principalId, displayName: msg.displayName } : null;
+    this.emit(
+      answerCollabPresenceRequest(
+        control,
+        msg,
+        actor,
+        Date.now(),
+        this.enterpriseContext?.node.nodeId ?? null,
+      ),
+      context,
+    );
   }
 
   private async handleCodeCollabTurnDiffRequest(msg: CodeCollabTurnDiffRequest): Promise<void> {

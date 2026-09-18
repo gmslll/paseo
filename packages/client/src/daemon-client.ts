@@ -5183,6 +5183,115 @@ export class DaemonClient {
     );
   }
 
+  async listCollabMembers(input: { workspaceId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.members.list.response">({
+      requestId,
+      message: { type: "collab.members.list.request", ...input },
+    });
+  }
+
+  async setCollabMember(
+    input: { workspaceId: string; principalId: string; role: "editor" | "viewer" },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.members.set.response">({
+      requestId,
+      message: { type: "collab.members.set.request", ...input },
+    });
+  }
+
+  async removeCollabMember(
+    input: { workspaceId: string; principalId: string },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.members.remove.response">({
+      requestId,
+      message: { type: "collab.members.remove.request", ...input },
+    });
+  }
+
+  async enableCollabWorkspace(input: { workspaceId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.workspace.enable.response">({
+      requestId,
+      message: { type: "collab.workspace.enable.request", ...input },
+    });
+  }
+
+  async cancelCollabTurn(input: { workspaceId: string; agentId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.turn.cancel.response">({
+      requestId,
+      message: { type: "collab.turn.cancel.request", ...input },
+    });
+  }
+
+  async issueCollabStreamToken(
+    input: { workspaceId: string; clientId: string },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.stream.token.response">({
+      requestId,
+      message: { type: "collab.stream.token.request", ...input },
+    });
+  }
+
+  async pollCollabSubscription(
+    input: { workspaceId: string; clientId: string; subscriptionId?: string },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.subscription.poll.response">({
+      requestId,
+      message: { type: "collab.subscription.poll.request", ...input },
+    });
+  }
+
+  async getCollabTimeline(input: { workspaceId: string; agentId: string }, requestId?: string) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.timeline.get.response">({
+      requestId,
+      message: { type: "collab.timeline.get.request", ...input },
+    });
+  }
+
+  async sendCollabTurn(
+    input: {
+      workspaceId: string;
+      agentId: string;
+      text: string;
+      messageId?: string;
+      sharedTurnPolicy?: "queue" | "interrupt";
+    },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.turn.send.response">({
+      requestId,
+      message: { type: "collab.turn.send.request", ...input },
+    });
+  }
+
+  async beatCollabPresence(
+    input: {
+      workspaceId: string;
+      clientId: string;
+      focusAgentId: string | null;
+      displayName?: string;
+    },
+    requestId?: string,
+  ) {
+    this.requireEnterpriseCollaborationSupport();
+    return this.sendNamespacedCorrelatedSessionRequest<"collab.presence.beat.response">({
+      requestId,
+      message: { type: "collab.presence.beat.request", ...input },
+    });
+  }
+
   async connectHub(
     hubUrl: string,
     token: string,
@@ -6118,6 +6227,13 @@ export class DaemonClient {
     // COMPAT(codeCollabTurnDiff): added in v0.9.0, remove gate after 2027-03-16.
     if (this.lastServerInfoMessage?.features?.codeCollabTurnDiff !== true) {
       throw new Error("Update the host to view per-turn diffs.");
+    }
+  }
+
+  private requireEnterpriseCollaborationSupport(): void {
+    // COMPAT(enterpriseCollaborationV1): added in v0.9.0, remove gate after 2027-03-09.
+    if (this.lastServerInfoMessage?.features?.enterpriseCollaborationV1 !== true) {
+      throw new Error("Update the host to share this workspace.");
     }
   }
 

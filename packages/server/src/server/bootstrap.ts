@@ -1,7 +1,7 @@
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
-import { constants, existsSync, unlinkSync } from "fs";
+import { constants, existsSync, readFileSync, unlinkSync } from "fs";
 import { open, rm } from "fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
@@ -11,6 +11,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
+import {
+  exchangeManagedNodePasswordSession,
+  isInvalidPasswordExchange,
+  parseEnterprisePasswordSessionRequest,
+} from "./enterprise-password-session.js";
 
 export type ListenTarget =
   | { type: "tcp"; host: string; port: number }
@@ -697,6 +702,13 @@ async function resolveEnterpriseRuntime(
       ...(runtime.admissionInvalidationSink
         ? { admissionInvalidationSink: runtime.admissionInvalidationSink }
         : {}),
+      ...(runtime.managedPlacementSource
+        ? { managedPlacementSource: runtime.managedPlacementSource }
+        : {}),
+      ...(runtime.collaboration ? { collaboration: runtime.collaboration } : {}),
+      ...(runtime.managedRuntimeDistribution
+        ? { managedRuntimeDistribution: runtime.managedRuntimeDistribution }
+        : {}),
       ...(capturedClose ? { close: capturedClose } : {}),
     });
   } catch (primary) {
@@ -1159,6 +1171,44 @@ export async function createPaseoDaemon(
         return;
       }
       res.json(bootstrap);
+    });
+
+    app.post("/api/enterprise/password-session", express.json({ limit: "8kb" }), (req, res) => {
+      const bootstrap = resolveEnterpriseManagementBootstrap(capturedEnterpriseMultiUser, serverId);
+      if (
+        !bootstrap ||
+        capturedEnterpriseMultiUser?.enabled !== true ||
+        capturedEnterpriseMultiUser.managementMode !== "managed"
+      ) {
+        res.status(404).json({ error: "enterprise management unavailable" });
+        return;
+      }
+      const parsed = parseEnterprisePasswordSessionRequest(req.body);
+      if (!parsed) {
+        res.status(400).json({ error: "invalid request" });
+        return;
+      }
+      void (async () => {
+        try {
+          const ticket = await exchangeManagedNodePasswordSession({
+            managementBaseUrl: bootstrap.managementBaseUrl,
+            caCertificate: readFileSync(capturedEnterpriseMultiUser.management.caCertificatePath),
+            nodeId: bootstrap.nodeId,
+            username: parsed.username,
+            password: parsed.password,
+            clientId: parsed.clientId,
+            ttlMs: parsed.ttlMs,
+          });
+          res.status(201).json(ticket);
+        } catch (error) {
+          if (res.headersSent) return;
+          if (isInvalidPasswordExchange(error)) {
+            res.status(401).json({ error: "invalid credential" });
+            return;
+          }
+          res.status(503).json({ error: "enterprise password exchange unavailable" });
+        }
+      })();
     });
 
     // Serve the bundled browser web UI when enabled. Mounted after service-proxy
@@ -2570,6 +2620,12 @@ export async function createPaseoDaemon(
                   managedRuntimes,
                   orchestration: operationService ?? undefined,
                   turnDiff: turnDiffRuntime,
+                  collabMembers: enterpriseRuntime?.collaboration?.members,
+                  collabPresence: enterpriseRuntime?.collaboration?.presence,
+                  collabTurns: enterpriseRuntime?.collaboration?.turns,
+                  collabTimeline: enterpriseRuntime?.collaboration?.timeline,
+                  collabStreamTokens: enterpriseRuntime?.collaboration?.streamTokens,
+                  collabSubscriptions: enterpriseRuntime?.collaboration?.subscriptions,
                   localPlanes: () => localPlanes?.controlAvailable === true,
                   terminalPlane: terminalPlaneAccess,
                   dataPlane: dataPlaneAccess,

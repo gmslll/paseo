@@ -21,6 +21,10 @@
       "types": "./dist/enterprise-identity-lifecycle.d.ts",
       "default": "./dist/enterprise-identity-lifecycle.js"
     },
+    "./internal/collab": {
+      "types": "./dist/collab/index.d.ts",
+      "default": "./dist/collab/index.js"
+    },
     "./internal/daemon-client-transport-types": {
       "types": "./dist/daemon-client-transport-types.d.ts",
       "default": "./dist/daemon-client-transport-types.js"

@@ -1600,6 +1600,7 @@ export const AgentTimelineAuthorPayloadSchema = z.object({
   principalId: PrincipalIdSchema,
   displayName: z.string().optional(),
 });
+export type AgentTimelineAuthorPayload = z.infer<typeof AgentTimelineAuthorPayloadSchema>;
 
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
@@ -2424,6 +2425,95 @@ export const CodeCollabAllChangesGetDiffRequestSchema = z.object({
   workspaceId: z.string(),
   agentId: z.string().optional(),
   ignoreWhitespace: z.boolean().optional(),
+});
+
+const CollabWireMemberSchema = z.object({
+  principalId: ManagedPrincipalIdSchema,
+  role: z.enum(["owner", "editor", "viewer"]),
+});
+
+export const CollabMembersListRequestSchema = z.object({
+  type: z.literal("collab.members.list.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+});
+
+export const CollabMembersSetRequestSchema = z.object({
+  type: z.literal("collab.members.set.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  principalId: ManagedPrincipalIdSchema,
+  role: z.enum(["editor", "viewer"]),
+});
+
+export const CollabMembersRemoveRequestSchema = z.object({
+  type: z.literal("collab.members.remove.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  principalId: ManagedPrincipalIdSchema,
+});
+
+const CollabWirePresenceEntrySchema = z.object({
+  kind: z.literal("principal"),
+  principalId: ManagedPrincipalIdSchema,
+  displayName: z.string().optional(),
+  clientId: z.string().min(1),
+  focusAgentId: z.string().min(1).nullable(),
+  heartbeatAt: z.string(),
+});
+
+export const CollabPresenceBeatRequestSchema = z.object({
+  type: z.literal("collab.presence.beat.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  clientId: z.string().min(1),
+  focusAgentId: z.string().min(1).nullable(),
+  displayName: z.string().optional(),
+});
+
+export const CollabWorkspaceEnableRequestSchema = z.object({
+  type: z.literal("collab.workspace.enable.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+});
+
+export const CollabTurnSendRequestSchema = z.object({
+  type: z.literal("collab.turn.send.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string(),
+  text: z.string(),
+  messageId: z.string().optional(),
+  sharedTurnPolicy: z.enum(["queue", "interrupt"]).optional(),
+});
+
+export const CollabTurnCancelRequestSchema = z.object({
+  type: z.literal("collab.turn.cancel.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string(),
+});
+
+export const CollabTimelineGetRequestSchema = z.object({
+  type: z.literal("collab.timeline.get.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  agentId: z.string(),
+});
+
+export const CollabStreamTokenRequestSchema = z.object({
+  type: z.literal("collab.stream.token.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  clientId: z.string().min(1),
+});
+
+export const CollabSubscriptionPollRequestSchema = z.object({
+  type: z.literal("collab.subscription.poll.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  clientId: z.string().min(1),
+  subscriptionId: z.string().min(1).optional(),
 });
 
 export const HubManagementDaemonConnectRequestSchema = z.object({
@@ -4875,6 +4965,16 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CodeCollabTurnDiffListTurnsRequestSchema,
   CodeCollabTurnDiffGetFilesRequestSchema,
   CodeCollabAllChangesGetDiffRequestSchema,
+  CollabMembersListRequestSchema,
+  CollabMembersSetRequestSchema,
+  CollabMembersRemoveRequestSchema,
+  CollabPresenceBeatRequestSchema,
+  CollabWorkspaceEnableRequestSchema,
+  CollabTurnSendRequestSchema,
+  CollabTurnCancelRequestSchema,
+  CollabTimelineGetRequestSchema,
+  CollabStreamTokenRequestSchema,
+  CollabSubscriptionPollRequestSchema,
   LocalPlaneAttachTokenCreateRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
@@ -6653,6 +6753,16 @@ export type CodeCollabTurnDiffGetFilesRequest = z.infer<
 export type CodeCollabAllChangesGetDiffRequest = z.infer<
   typeof CodeCollabAllChangesGetDiffRequestSchema
 >;
+export type CollabMembersListRequest = z.infer<typeof CollabMembersListRequestSchema>;
+export type CollabMembersSetRequest = z.infer<typeof CollabMembersSetRequestSchema>;
+export type CollabMembersRemoveRequest = z.infer<typeof CollabMembersRemoveRequestSchema>;
+export type CollabPresenceBeatRequest = z.infer<typeof CollabPresenceBeatRequestSchema>;
+export type CollabWorkspaceEnableRequest = z.infer<typeof CollabWorkspaceEnableRequestSchema>;
+export type CollabTurnSendRequest = z.infer<typeof CollabTurnSendRequestSchema>;
+export type CollabTurnCancelRequest = z.infer<typeof CollabTurnCancelRequestSchema>;
+export type CollabTimelineGetRequest = z.infer<typeof CollabTimelineGetRequestSchema>;
+export type CollabStreamTokenRequest = z.infer<typeof CollabStreamTokenRequestSchema>;
+export type CollabSubscriptionPollRequest = z.infer<typeof CollabSubscriptionPollRequestSchema>;
 export type CodeCollabTurnDiffListTurnsResponse = z.infer<
   typeof CodeCollabTurnDiffListTurnsResponseSchema
 >;
@@ -6712,6 +6822,133 @@ export const CodeCollabAllChangesGetDiffResponseSchema = z.object({
     requestId: z.string(),
     workspaceId: z.string(),
     files: z.array(ParsedDiffFileSchema),
+  }),
+});
+
+export const CollabMembersListResponseSchema = z.object({
+  type: z.literal("collab.members.list.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    workspaceUid: z.string().nullable(),
+    viewerRole: z.enum(["owner", "editor", "viewer"]).nullable(),
+    revoked: z.boolean(),
+    revokeReason: z.string().nullable().optional(),
+    members: z.array(CollabWireMemberSchema),
+    collaborationEnabled: z.boolean().optional(),
+    canEnable: z.boolean().optional(),
+  }),
+});
+
+export const CollabMembersSetResponseSchema = z.object({
+  type: z.literal("collab.members.set.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabMembersRemoveResponseSchema = z.object({
+  type: z.literal("collab.members.remove.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabPresenceBeatResponseSchema = z.object({
+  type: z.literal("collab.presence.beat.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    entries: z.array(CollabWirePresenceEntrySchema),
+    hostNode: z
+      .object({
+        nodeId: z.string(),
+        heartbeatAt: z.string(),
+      })
+      .optional(),
+  }),
+});
+
+export const CollabWorkspaceEnableResponseSchema = z.object({
+  type: z.literal("collab.workspace.enable.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    workspaceUid: z.string(),
+    viewerRole: z.enum(["owner", "editor", "viewer"]).nullable(),
+    members: z.array(CollabWireMemberSchema),
+  }),
+});
+
+export const CollabTurnSendResponseSchema = z.object({
+  type: z.literal("collab.turn.send.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().optional(),
+  }),
+});
+
+export const CollabTurnCancelResponseSchema = z.object({
+  type: z.literal("collab.turn.cancel.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().optional(),
+  }),
+});
+
+export const CollabTimelineGetResponseSchema = z.object({
+  type: z.literal("collab.timeline.get.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    agentId: z.string(),
+    epoch: z.string(),
+    rows: z.record(
+      z.string(),
+      z.object({
+        seq: z.number(),
+        timestamp: z.string(),
+        item: z.unknown(),
+        turnId: z.string().optional(),
+      }),
+    ),
+    stream: z
+      .object({
+        turnId: z.string().nullable(),
+        text: z.string(),
+      })
+      .nullable(),
+  }),
+});
+
+export const CollabStreamTokenResponseSchema = z.object({
+  type: z.literal("collab.stream.token.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    token: z.string(),
+    expiresAt: z.string(),
+    managementBaseUrl: z.string(),
+  }),
+});
+
+export const CollabSubscriptionPollResponseSchema = z.object({
+  type: z.literal("collab.subscription.poll.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    subscriptionId: z.string(),
+    events: z.array(z.unknown()),
   }),
 });
 
@@ -8544,6 +8781,16 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CodeCollabTurnDiffListTurnsResponseSchema,
   CodeCollabTurnDiffGetFilesResponseSchema,
   CodeCollabAllChangesGetDiffResponseSchema,
+  CollabMembersListResponseSchema,
+  CollabMembersSetResponseSchema,
+  CollabMembersRemoveResponseSchema,
+  CollabPresenceBeatResponseSchema,
+  CollabWorkspaceEnableResponseSchema,
+  CollabTurnSendResponseSchema,
+  CollabTurnCancelResponseSchema,
+  CollabTimelineGetResponseSchema,
+  CollabStreamTokenResponseSchema,
+  CollabSubscriptionPollResponseSchema,
   LocalPlaneAttachTokenCreateResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,

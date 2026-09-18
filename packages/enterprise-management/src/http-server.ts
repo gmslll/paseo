@@ -591,6 +591,12 @@ async function handleNodeRequest(
   }
   const node = plane.authenticateSignedNodeRequest(authentication, { method, path, body });
   if (await handleNodeRuntimeRequest(plane, response, method, path, node.nodeId)) return;
+  if (await handleNodeCollabMemberRequest(plane, response, method, path, body, node.nodeId)) return;
+  if (await handleNodeCollabEnableRequest(plane, response, method, path, body, node.nodeId)) return;
+  if (await handleNodeCollabRpcRequest(plane, response, method, path, body, node.nodeId)) return;
+  if (await handleNodeCollabStreamTokenRequest(plane, response, method, path, body, node.nodeId)) {
+    return;
+  }
   if (await handleNodePlacementRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeLeaseRequest(plane, response, method, path, body, node.nodeId)) return;
   if (await handleNodeAuditRequest(plane, response, method, path, body, node.nodeId)) return;
@@ -815,17 +821,21 @@ async function readCollabSubscription(
 const LONG_POLL_TIMEOUT_MS = 25_000;
 
 /**
- * Resolves on the first of three things: the container takes an append, the client hangs up, or the
- * hold expires. Waking more than once is harmless — resolving a settled promise does nothing — so
- * there is no flag to keep, and teardown lives in one place that runs however the wait ends.
+ * Resolves on the first of: an append, a membership change (when asked), the client hanging up, or
+ * the hold expiring. Waking more than once is harmless — resolving a settled promise does nothing —
+ * so there is no flag to keep, and teardown lives in one place that runs however the wait ends.
  *
  * Pass a segment to wait on just that one; a multiplexed reader omits it and takes the container.
+ * Multiplexed long-poll also wakes on membership so a revoke does not sit until the next write.
  */
 async function waitForContainerAppend(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
-  containerId: string,
-  segment?: string,
+  input: {
+    containerId: string;
+    segment?: string;
+    wakeOnMembership?: boolean;
+  },
 ): Promise<void> {
   let release: (() => void) | null = null;
   const woken = new Promise<void>((resolve) => {
@@ -834,11 +844,16 @@ async function waitForContainerAppend(
   const wake = (): void => release?.();
 
   const unsubscribe = plane.onCollabStreamAppend((changed, changedSegment) => {
-    if (changed !== containerId) return;
+    if (changed !== input.containerId) return;
     // Waking a single-stream reader for a sibling segment would answer its poll with nothing new.
-    if (segment !== undefined && changedSegment !== segment) return;
+    if (input.segment !== undefined && changedSegment !== input.segment) return;
     wake();
   });
+  const unsubscribeMembership = input.wakeOnMembership
+    ? plane.onCollabMembershipChange((changed) => {
+        if (changed === input.containerId) wake();
+      })
+    : () => undefined;
   const timer = setTimeout(wake, LONG_POLL_TIMEOUT_MS);
   // A stray timer must never be the reason a process or a test run refuses to exit.
   timer.unref?.();
@@ -848,6 +863,7 @@ async function waitForContainerAppend(
     await woken;
   } finally {
     unsubscribe();
+    unsubscribeMembership();
     clearTimeout(timer);
     request.off("close", wake);
   }
@@ -858,6 +874,23 @@ async function waitForContainerAppend(
  * clients long-poll). Answers at once if anything is already waiting, otherwise holds until an
  * append lands, the client leaves, or the hold expires.
  */
+async function readSubscriptionOrRevoked(
+  plane: EnterpriseManagementPlane,
+  actor: AuthenticatedManagementPrincipal,
+  subscriptionId: string,
+  containerId: string,
+): Promise<{ events: unknown[] }> {
+  try {
+    return { events: await plane.readCollabSubscriptionById(actor, subscriptionId) };
+  } catch {
+    // Long-poll still has a status line, unlike SSE, but the body is the same `revoked` event the
+    // stream sends after headers (ADR-0032). Native clients cannot hold SSE.
+    return {
+      events: [{ type: "revoked", containerId, reason: "membership_removed" }],
+    };
+  }
+}
+
 async function longPollCollabSubscription(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
@@ -866,21 +899,29 @@ async function longPollCollabSubscription(
   subscriptionId: string,
   containerId: string,
 ): Promise<boolean> {
-  const waiting = await plane.readCollabSubscriptionById(actor, subscriptionId);
-  if (waiting.some((event) => event.type === "data")) {
-    sendJson(response, 200, { events: waiting });
+  const waiting = await readSubscriptionOrRevoked(plane, actor, subscriptionId, containerId);
+  if (
+    waiting.events.some(
+      (event) =>
+        typeof event === "object" &&
+        event !== null &&
+        "type" in event &&
+        (event.type === "data" || event.type === "revoked"),
+    )
+  ) {
+    sendJson(response, 200, waiting);
     return true;
   }
 
-  await waitForContainerAppend(plane, request, containerId);
+  await waitForContainerAppend(plane, request, { containerId, wakeOnMembership: true });
 
   // The client may have hung up during the hold; writing to a gone response would only throw.
   if (request.destroyed || response.writableEnded) return true;
-  // No headers have been sent yet, which is what lets a refusal here still be a status. The event
-  // stream had to invent a `revoked` event precisely because it no longer has that option.
-  sendJson(response, 200, {
-    events: await plane.readCollabSubscriptionById(actor, subscriptionId),
-  });
+  sendJson(
+    response,
+    200,
+    await readSubscriptionOrRevoked(plane, actor, subscriptionId, containerId),
+  );
   return true;
 }
 
@@ -906,12 +947,14 @@ async function streamCollabSubscription(
   let closed = false;
   let unsubscribe: (() => void) | null = null;
   let unsubscribePresence: (() => void) | null = null;
+  let unsubscribeMembership: (() => void) | null = null;
   let keepalive: ReturnType<typeof setInterval> | null = null;
   const finish = (): void => {
     if (closed) return;
     closed = true;
     unsubscribe?.();
     unsubscribePresence?.();
+    unsubscribeMembership?.();
     if (keepalive) clearInterval(keepalive);
     response.end();
   };
@@ -967,6 +1010,9 @@ async function streamCollabSubscription(
   unsubscribePresence = plane.onCollabPresenceChange((changed) => {
     if (changed === containerId) sendPresence();
   });
+  unsubscribeMembership = plane.onCollabMembershipChange((changed) => {
+    if (changed === containerId) void poll().catch(finish);
+  });
   keepalive = setInterval(() => {
     if (!closed) response.write(": keepalive\n\n");
   }, SSE_KEEPALIVE_MS);
@@ -1021,7 +1067,10 @@ async function readCollabStreamSegment(
     });
   let result = await read();
   if (live === "long-poll" && result.messages.length === 0) {
-    await waitForContainerAppend(plane, request, target.containerId, target.segment);
+    await waitForContainerAppend(plane, request, {
+      containerId: target.containerId,
+      segment: target.segment,
+    });
     // The client may have hung up during the hold; writing to a gone response would only throw.
     if (request.destroyed || response.writableEnded) return true;
     result = await read();
@@ -1189,6 +1238,105 @@ async function handleNodeRuntimeRequest(
     [MANAGED_RUNTIME_ARTIFACT_HEADERS.sha256]: match[1]!,
   });
   await pipeline(createReadStream(filePath), response);
+  return true;
+}
+
+async function handleNodeCollabMemberRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/members") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      workspaceUid: z.string().min(1),
+      principalId: z.string().min(1),
+      role: z.enum(["editor", "viewer"]).optional(),
+    })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 200, {
+    members: await plane.applyOwnedCollabMemberChange(nodeId, input),
+  });
+  return true;
+}
+
+async function handleNodeCollabEnableRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/enable") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      localWorkspaceId: z.string().min(1),
+    })
+    .strict()
+    .parse(parseJson(body));
+  const result = await plane.enableOwnedCollabWorkspace(nodeId, input);
+  sendJson(response, 200, {
+    workspaceUid: result.workspace.workspaceUid,
+    localWorkspaceId: result.workspace.localWorkspaceId,
+    ownerPrincipalId: result.workspace.ownerPrincipalId,
+    collaborationEnabled: result.workspace.collaborationEnabled,
+    members: result.members,
+  });
+  return true;
+}
+
+async function handleNodeCollabStreamTokenRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/stream-token") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      clientId: z.string().min(1).max(160),
+      workspaceUid: z.string().min(1),
+    })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 200, await plane.issueOwnedCollabStreamToken(nodeId, input));
+  return true;
+}
+
+async function handleNodeCollabRpcRequest(
+  plane: EnterpriseManagementPlane,
+  response: ServerResponse,
+  method: string,
+  path: string,
+  body: string,
+  nodeId: string,
+): Promise<boolean> {
+  if (method !== "POST" || path !== "/v1/node/collab/rpc") return false;
+  const input = z
+    .object({
+      actorPrincipalId: z.string().min(1),
+      credentialId: z.string().min(1),
+      clientId: z.string().min(1),
+      method: z.string().min(1),
+      localWorkspaceId: z.string().min(1),
+      rpcId: z.string().min(1),
+      payload: z.unknown(),
+    })
+    .strict()
+    .parse(parseJson(body));
+  sendJson(response, 200, {
+    envelope: await plane.submitOwnedCollabRpc(nodeId, input),
+  });
   return true;
 }
 

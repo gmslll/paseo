@@ -24,6 +24,12 @@ import type { BrowserProfileRegistry } from "../browser/profile-registry.js";
 import type { EnterpriseSessionDispatcherFactoryRegistration } from "../../session/enterprise-dispatcher.js";
 import type { ManagedPlacementSnapshotSource } from "../managed-node/lifecycle.js";
 import type { CollabRuntimeDependencies } from "../managed-node/collab/collab-runtime.js";
+import type { CollabMembersControl } from "../managed-node/collab/members-control.js";
+import type { CollabPresenceControl } from "../managed-node/collab/presence-roster.js";
+import type { CollabTurnControl } from "../managed-node/collab/turn-control.js";
+import type { CollabTimelineControl } from "../managed-node/collab/timeline-control.js";
+import type { CollabStreamTokenControl } from "../managed-node/collab/stream-token-control.js";
+import type { CollabSubscriptionControl } from "../managed-node/collab/subscription-control.js";
 import type { HeadlessSessionFactory } from "../managed-node/collab/machine-rpc-server.js";
 
 export interface EnterpriseAdmissionPort {
@@ -84,6 +90,12 @@ export interface EnterpriseAdmissionRuntime {
      * builds long after the replicas (ADR-0053).
      */
     attachSessions(sessions: HeadlessSessionFactory): void;
+    members?: CollabMembersControl;
+    presence?: CollabPresenceControl;
+    turns?: CollabTurnControl;
+    timeline?: CollabTimelineControl;
+    streamTokens?: CollabStreamTokenControl;
+    subscriptions?: CollabSubscriptionControl;
   }>;
   readonly managedRuntimeDistribution?: ManagedNodeRuntimeDistribution;
   nextSessionBindingGeneration(): string;

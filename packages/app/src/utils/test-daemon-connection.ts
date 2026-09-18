@@ -113,6 +113,15 @@ export class DaemonConnectionTestError extends Error {
   }
 }
 
+/** ADR-0030: a managed node refuses anonymous WebSocket hello; discover it over HTTP instead. */
+export function isEnterpriseAuthenticationRequired(error: unknown): boolean {
+  const parts = [error instanceof Error ? error.message : String(error)];
+  if (error instanceof DaemonConnectionTestError) {
+    parts.push(error.reason ?? "", error.lastError ?? "");
+  }
+  return parts.join("\n").toLowerCase().includes("enterprise authentication required");
+}
+
 export async function buildClientConfig(
   connection: HostConnection,
   serverId?: string,

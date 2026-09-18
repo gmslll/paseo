@@ -1,6 +1,9 @@
 import type { Buffer } from "node:buffer";
 
-import { formatCollabSegment } from "@getpaseo/protocol/enterprise-collaboration";
+import {
+  formatCollabSegment,
+  type MachineRpcResult,
+} from "@getpaseo/protocol/enterprise-collaboration";
 
 import type { AgentManagerEvent } from "../../../agent/agent-manager.js";
 import type { ManagedNodeRelationship } from "../relationship-store.js";
@@ -94,6 +97,75 @@ export class CollabRuntime {
     for (const [containerId, container] of this.containers) {
       this.containers.set(containerId, { ...container, rpc: this.createRpcServer(container) });
     }
+  }
+
+  /**
+   * The session document this node has projected for one Agent (ADR-0031). Hermes clients page the
+   * materialized JSON; they do not load the Loro replica.
+   */
+  readSessionDocument(
+    localWorkspaceId: string,
+    agentId: string,
+  ): {
+    epoch: string;
+    rows: Record<string, { seq: number; timestamp: string; item: unknown; turnId?: string }>;
+    stream: { turnId: string | null; text: string } | null;
+  } | null {
+    const container = [...this.containers.values()].find(
+      (entry) => entry.workspaceId === localWorkspaceId,
+    );
+    if (!container) return null;
+    const segment = formatCollabSegment({ kind: "session", agentId });
+    const json = container.store.document(segment).toJSON() as {
+      meta?: { currentEpoch?: unknown };
+      rows?: Record<
+        string,
+        { seq?: unknown; timestamp?: unknown; item?: unknown; turnId?: unknown }
+      >;
+      stream?: { turnId?: unknown; text?: unknown };
+    };
+    const rows: Record<string, { seq: number; timestamp: string; item: unknown; turnId?: string }> =
+      {};
+    for (const [key, row] of Object.entries(json.rows ?? {})) {
+      if (typeof row.seq !== "number" || typeof row.timestamp !== "string") continue;
+      rows[key] = {
+        seq: row.seq,
+        timestamp: row.timestamp,
+        item: row.item,
+        ...(typeof row.turnId === "string" ? { turnId: row.turnId } : {}),
+      };
+    }
+    const epochFromMeta =
+      typeof json.meta?.currentEpoch === "string" ? json.meta.currentEpoch : null;
+    const epochFromRows = Object.keys(rows)
+      .map((key) => key.split("/")[0])
+      .find((value) => Boolean(value));
+    const stream =
+      json.stream && typeof json.stream.text === "string"
+        ? {
+            turnId: typeof json.stream.turnId === "string" ? json.stream.turnId : null,
+            text: json.stream.text,
+          }
+        : null;
+    return { epoch: epochFromMeta ?? epochFromRows ?? "0", rows, stream };
+  }
+
+  /**
+   * Runs an envelope the plane just attested (ADR-0035). A concurrent pump that already consumed
+   * the id is answered from the in-memory result, not by acting twice.
+   */
+  async dispatchAttestedRpc(
+    containerId: string,
+    update: Uint8Array,
+    rpcId: string,
+  ): Promise<MachineRpcResult> {
+    const container = this.containers.get(containerId);
+    if (!container?.rpc) throw new Error("machine RPC is unavailable");
+    const handled = await container.rpc.handle(update);
+    const results = handled?.results ?? container.rpc.completedResults(rpcId);
+    const answer = results?.find((result) => result.kind !== "receipt");
+    if (!answer) throw new Error("machine RPC produced no result");
+    return answer;
   }
 
   /**

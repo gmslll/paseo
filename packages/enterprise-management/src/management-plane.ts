@@ -86,9 +86,12 @@ import {
   type CollabSubscriptionEvent,
   type PresenceEntry,
   MACHINE_RPC_DEFAULT_TTL_MS,
+  MachineRpcAttestedRequestSchema,
   MachineRpcClientRequestSchema,
+  formatCollabSegment,
   machineRpcMethodPolicy,
   roleAllowsMachineRpcMethod,
+  type MachineRpcAttestedRequest,
   type MachineRpcClientRequest,
   type WorkspaceMemberRole,
   type WorkspaceMembershipPolicy,
@@ -291,6 +294,7 @@ export class EnterpriseManagementPlane {
   // because one person on a laptop and a phone is two places, which is what clientId is for.
   private readonly presence = new Map<string, Map<string, PresenceEntry>>();
   private readonly presenceListeners = new Set<(containerId: string) => void>();
+  private readonly membershipListeners = new Set<(containerId: string) => void>();
   private closed = false;
 
   constructor(
@@ -1642,6 +1646,7 @@ export class EnterpriseManagementPlane {
         metadata: { principalId: member.principalId, role: input.role },
       });
     });
+    this.notifyCollabMembershipChange(input.workspaceUid);
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
@@ -1670,6 +1675,336 @@ export class EnterpriseManagementPlane {
         metadata: { principalId: input.principalId },
       });
     });
+    this.notifyCollabMembershipChange(input.workspaceUid);
+    return this.listCollabMembersUnchecked(input.workspaceUid);
+  }
+
+  /**
+   * Owner-driven membership from a collaborating node (ADR-0033). The node is signed; the actor
+   * must be the Workspace owner. Platform `identity.manage` still uses `setCollabMember`.
+   */
+  async applyOwnedCollabMemberChange(
+    nodeId: string,
+    input: {
+      readonly actorPrincipalId: string;
+      readonly workspaceUid: string;
+      readonly principalId: string;
+      readonly role?: Exclude<WorkspaceMemberRole, "owner">;
+    },
+  ): Promise<readonly CollabMember[]> {
+    this.assertOpen();
+    const hosted = this.readNodeWorkspaceMemberships(nodeId);
+    const onNode = hosted?.some((entry) => entry.workspaceUid === input.workspaceUid) === true;
+    if (!onNode) throw new Error("workspace is not placed on this node");
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.actorPrincipalId !== workspace.ownerPrincipalId) {
+      throw new Error("only the workspace owner can change members");
+    }
+    if (input.role) {
+      return await this.setCollabMemberAsOwner(input.actorPrincipalId, {
+        workspaceUid: input.workspaceUid,
+        principalId: input.principalId,
+        role: input.role,
+      });
+    }
+    return await this.removeCollabMemberAsOwner(input.actorPrincipalId, {
+      workspaceUid: input.workspaceUid,
+      principalId: input.principalId,
+    });
+  }
+
+  /**
+   * Owner-driven enable from a collaborating node (ADR-0031). The node is signed and must have
+   * already checked that the actor owns the local Workspace; the plane has no local registry.
+   * Platform `identity.manage` still uses `registerCollabWorkspace` / `setCollabCollaboration`.
+   */
+  async enableOwnedCollabWorkspace(
+    nodeId: string,
+    input: { readonly actorPrincipalId: string; readonly localWorkspaceId: string },
+  ): Promise<{
+    readonly workspace: CollabWorkspaceRecord;
+    readonly members: readonly CollabMember[];
+  }> {
+    this.assertOpen();
+    if (input.localWorkspaceId.length === 0) throw new Error("invalid workspace");
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) {
+      throw new Error("collaboration is not available on this node");
+    }
+    const actor = this.requirePrincipal(input.actorPrincipalId);
+    const existing = this.readCollabWorkspaceByLocalId(input.localWorkspaceId);
+    const placementOwner = this.readWorkspacePlacementOwner(nodeId, input.localWorkspaceId);
+    const actorOwnsExisting = !existing || existing.ownerPrincipalId === actor.principalId;
+    const actorOwnsPlacement = !placementOwner || placementOwner === actor.principalId;
+    if (!actorOwnsExisting || !actorOwnsPlacement) {
+      throw new Error("only the workspace owner can enable collaboration");
+    }
+
+    const workspaceUid =
+      existing && existing.collaborationEnabled && placementOwner === actor.principalId
+        ? existing.workspaceUid
+        : this.persistOwnedCollabEnable({
+            nodeId,
+            actorPrincipalId: actor.principalId,
+            localWorkspaceId: input.localWorkspaceId,
+            existing,
+            placementOwner,
+          });
+    const workspace = this.requireCollabWorkspace(workspaceUid);
+    return { workspace, members: this.listCollabMembersUnchecked(workspace.workspaceUid) };
+  }
+
+  /**
+   * Mints a stream token for a member the node has already authenticated (ADR-0032). Clients hold
+   * a node ticket, not a PAT, so the node asks for the token they present to the plane.
+   */
+  async issueOwnedCollabStreamToken(
+    nodeId: string,
+    input: {
+      readonly actorPrincipalId: string;
+      readonly clientId: string;
+      readonly workspaceUid: string;
+    },
+  ): Promise<{ readonly token: string; readonly expiresAt: string }> {
+    this.assertOpen();
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) {
+      throw new Error("collaboration is not available on this node");
+    }
+    if (input.clientId.length === 0 || input.clientId.length > 160) {
+      throw new Error("invalid client ID");
+    }
+    const actor = this.requirePrincipal(input.actorPrincipalId);
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (!workspace.collaborationEnabled) throw new Error("collaboration is not enabled");
+    if (!this.isContainerPlacedOnNode(workspace.workspaceUid, nodeId)) {
+      throw new Error("workspace is not placed on this node");
+    }
+    const members = this.listCollabMembersUnchecked(workspace.workspaceUid);
+    if (!members.some((member) => member.principalId === actor.principalId)) {
+      throw new Error("stream authorization denied");
+    }
+    const containerIds = this.listCollabContainersForPrincipal(actor.principalId);
+    if (containerIds.length === 0) throw new Error("no collaborative workspaces");
+    const issuedAtMs = this.clock.nowMs();
+    const expiresAtMs = issuedAtMs + STREAM_TOKEN_TTL_MS;
+    return Object.freeze({
+      token: signStreamToken(
+        {
+          tokenId: createOpaqueId("stk_", 16),
+          organizationId: actor.organizationId,
+          principalId: actor.principalId,
+          credentialId: createOpaqueId("cred_", 12),
+          clientId: input.clientId,
+          grantVersion: actor.grantVersion,
+          revocationEpoch: actor.revocationEpoch,
+          containerIds,
+          issuedAt: new Date(issuedAtMs).toISOString(),
+          expiresAt: new Date(expiresAtMs).toISOString(),
+        },
+        this.options.ticketPrivateKey,
+      ),
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    });
+  }
+
+  private persistOwnedCollabEnable(input: {
+    readonly nodeId: string;
+    readonly actorPrincipalId: string;
+    readonly localWorkspaceId: string;
+    readonly existing: CollabWorkspaceRecord | null;
+    readonly placementOwner: string | null;
+  }): string {
+    const now = this.nowIso();
+    const workspaceUid = input.existing?.workspaceUid ?? createOpaqueId("cws_", 8);
+    transaction(this.database, () => {
+      if (!input.existing) {
+        this.database
+          .prepare(
+            "INSERT INTO collab_workspaces (workspace_uid, organization_id, local_workspace_id, owner_principal_id, collaboration_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+          )
+          .run(
+            workspaceUid,
+            this.options.organizationId,
+            input.localWorkspaceId,
+            input.actorPrincipalId,
+            now,
+            now,
+          );
+        this.database
+          .prepare(
+            "INSERT INTO collab_members (workspace_uid, principal_id, role, created_at, updated_at) VALUES (?, ?, 'owner', ?, ?)",
+          )
+          .run(workspaceUid, input.actorPrincipalId, now, now);
+        this.reprojectMembership(input.actorPrincipalId, workspaceUid, "owner", now);
+      } else {
+        this.database
+          .prepare(
+            "UPDATE collab_workspaces SET collaboration_enabled = 1, updated_at = ? WHERE workspace_uid = ? AND organization_id = ?",
+          )
+          .run(now, workspaceUid, this.options.organizationId);
+      }
+      if (!input.placementOwner) {
+        this.database
+          .prepare(
+            "INSERT INTO placements (organization_id, node_id, resource_kind, local_resource_id, owner_principal_id, assigned_at, updated_at) VALUES (?, ?, 'workspace', ?, ?, ?, ?)",
+          )
+          .run(
+            this.options.organizationId,
+            input.nodeId,
+            input.localWorkspaceId,
+            input.actorPrincipalId,
+            now,
+            now,
+          );
+      }
+      if (!input.existing || input.existing.collaborationEnabled !== true) {
+        this.appendPlaneAudit({
+          action: "collab.workspace.enable",
+          outcome: "allowed",
+          actorPrincipalId: input.actorPrincipalId,
+          resourceKind: "workspace",
+          resourceId: workspaceUid,
+          metadata: { enabled: true, localWorkspaceId: input.localWorkspaceId },
+        });
+      }
+    });
+    return workspaceUid;
+  }
+
+  /**
+   * A Session on this node submits a machine RPC as the signed-in member (ADR-0035). The plane
+   * attests and appends to `rpc:req`; the node is not a writer of that segment.
+   */
+  async submitOwnedCollabRpc(
+    nodeId: string,
+    input: {
+      readonly actorPrincipalId: string;
+      readonly credentialId: string;
+      readonly clientId: string;
+      readonly method: string;
+      readonly localWorkspaceId: string;
+      readonly rpcId: string;
+      readonly payload: unknown;
+    },
+  ): Promise<MachineRpcAttestedRequest> {
+    this.assertOpen();
+    const node = this.requireNode(nodeId);
+    if (node.capabilities.collaborationV1 !== true) {
+      throw new Error("collaboration is not available on this node");
+    }
+    const actorPrincipal = this.requirePrincipal(input.actorPrincipalId);
+    this.requirePrincipalCredential(actorPrincipal.principalId, input.credentialId);
+    const workspace = this.readCollabWorkspaceByLocalId(input.localWorkspaceId);
+    if (!workspace || !workspace.collaborationEnabled) {
+      throw new Error("collaborative workspace unavailable");
+    }
+    if (!this.isContainerPlacedOnNode(workspace.workspaceUid, nodeId)) {
+      throw new Error("workspace is not placed on this node");
+    }
+    const actor: AuthenticatedManagementPrincipal = {
+      ...actorPrincipal,
+      credentialId: input.credentialId,
+    };
+    const nowMs = this.clock.nowMs();
+    const envelope = MachineRpcClientRequestSchema.parse({
+      kind: "request",
+      rpcVersion: 1,
+      rpcId: input.rpcId,
+      method: input.method,
+      nodeId,
+      containerId: workspace.workspaceUid,
+      clientId: input.clientId,
+      sentAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + MACHINE_RPC_DEFAULT_TTL_MS).toISOString(),
+      payload: input.payload,
+    });
+    const segment = formatCollabSegment({ kind: "rpc_request", nodeId });
+    const caller = toStreamActor(actor);
+    this.assertStreamAccess(caller, workspace.workspaceUid, segment, "write");
+    const attested = this.attestRpcRequest(caller, {
+      containerId: workspace.workspaceUid,
+      segment,
+      producerId: `prod-${input.rpcId}`,
+      producerEpoch: 1,
+      producerSeq: 1,
+      update: new TextEncoder().encode(JSON.stringify(envelope)),
+    });
+    const result = this.streams.append(attested);
+    if (result.kind !== "appended") throw new Error("machine rpc append refused");
+    for (const listener of this.streamListeners) {
+      try {
+        listener(workspace.workspaceUid, segment);
+      } catch {
+        // The listener owns its own recovery.
+      }
+    }
+    return MachineRpcAttestedRequestSchema.parse(
+      JSON.parse(Buffer.from(attested.update).toString("utf8")),
+    );
+  }
+
+  private async setCollabMemberAsOwner(
+    actorPrincipalId: string,
+    input: {
+      readonly workspaceUid: string;
+      readonly principalId: string;
+      readonly role: Exclude<WorkspaceMemberRole, "owner">;
+    },
+  ): Promise<readonly CollabMember[]> {
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.principalId === workspace.ownerPrincipalId) {
+      throw new Error("cannot change the workspace owner");
+    }
+    const member = this.requirePrincipal(input.principalId);
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare(
+          `INSERT INTO collab_members (workspace_uid, principal_id, role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (workspace_uid, principal_id)
+           DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+        )
+        .run(input.workspaceUid, member.principalId, input.role, now, now);
+      this.reprojectMembership(member.principalId, input.workspaceUid, input.role, now);
+      this.appendPlaneAudit({
+        action: "collab.member.set",
+        outcome: "allowed",
+        actorPrincipalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { principalId: member.principalId, role: input.role },
+      });
+    });
+    this.notifyCollabMembershipChange(input.workspaceUid);
+    return this.listCollabMembersUnchecked(input.workspaceUid);
+  }
+
+  private async removeCollabMemberAsOwner(
+    actorPrincipalId: string,
+    input: { readonly workspaceUid: string; readonly principalId: string },
+  ): Promise<readonly CollabMember[]> {
+    const workspace = this.requireCollabWorkspace(input.workspaceUid);
+    if (input.principalId === workspace.ownerPrincipalId) {
+      throw new Error("cannot remove the workspace owner");
+    }
+    const now = this.nowIso();
+    transaction(this.database, () => {
+      this.database
+        .prepare("DELETE FROM collab_members WHERE workspace_uid = ? AND principal_id = ?")
+        .run(input.workspaceUid, input.principalId);
+      this.reprojectMembership(input.principalId, input.workspaceUid, null, now);
+      this.appendPlaneAudit({
+        action: "collab.member.remove",
+        outcome: "allowed",
+        actorPrincipalId,
+        resourceKind: "workspace",
+        resourceId: input.workspaceUid,
+        metadata: { principalId: input.principalId },
+      });
+    });
+    this.notifyCollabMembershipChange(input.workspaceUid);
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
@@ -1834,6 +2169,32 @@ export class EnterpriseManagementPlane {
         .get(workspaceUid, this.options.organizationId),
     );
     if (!row) throw new Error("collaborative workspace unavailable");
+    return this.collabWorkspaceFromRow(row);
+  }
+
+  private readCollabWorkspaceByLocalId(localWorkspaceId: string): CollabWorkspaceRecord | null {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT * FROM collab_workspaces WHERE organization_id = ? AND local_workspace_id = ?",
+        )
+        .get(this.options.organizationId, localWorkspaceId),
+    );
+    return row ? this.collabWorkspaceFromRow(row) : null;
+  }
+
+  private readWorkspacePlacementOwner(nodeId: string, localWorkspaceId: string): string | null {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT owner_principal_id FROM placements WHERE organization_id = ? AND node_id = ? AND resource_kind = 'workspace' AND local_resource_id = ?",
+        )
+        .get(this.options.organizationId, nodeId, localWorkspaceId),
+    );
+    return row ? String(row.owner_principal_id) : null;
+  }
+
+  private collabWorkspaceFromRow(row: DatabaseRow): CollabWorkspaceRecord {
     return {
       workspaceUid: String(row.workspace_uid),
       localWorkspaceId: String(row.local_workspace_id),
@@ -1950,6 +2311,27 @@ export class EnterpriseManagementPlane {
     return () => {
       this.presenceListeners.delete(listener);
     };
+  }
+
+  /**
+   * Wakes live readers when membership for a container changes. Long-poll and SSE otherwise wait
+   * for an append, so a revoke would sit until the next write or the hold expired.
+   */
+  onCollabMembershipChange(listener: (containerId: string) => void): () => void {
+    this.membershipListeners.add(listener);
+    return () => {
+      this.membershipListeners.delete(listener);
+    };
+  }
+
+  private notifyCollabMembershipChange(containerId: string): void {
+    for (const listener of this.membershipListeners) {
+      try {
+        listener(containerId);
+      } catch {
+        // The listener owns its own recovery; a live reader closes its stream.
+      }
+    }
   }
 
   /** Lazy, like the subscription sweep: a timer would outlive a plane that a test never closes. */
@@ -2412,6 +2794,7 @@ export class EnterpriseManagementPlane {
     this.streamListeners.clear();
     this.presence.clear();
     this.presenceListeners.clear();
+    this.membershipListeners.clear();
     this.database.close();
   }
 
@@ -2672,6 +3055,17 @@ export class EnterpriseManagementPlane {
     const principal = this.readPrincipal(principalId);
     if (!principal) throw new Error("principal unavailable");
     return principal;
+  }
+
+  private requirePrincipalCredential(principalId: string, credentialId: string): void {
+    const row = this.row(
+      this.database
+        .prepare(
+          "SELECT credential_id FROM credentials WHERE credential_id = ? AND principal_id = ? AND revoked_at IS NULL",
+        )
+        .get(credentialId, principalId),
+    );
+    if (!row) throw new Error("principal unavailable");
   }
 
   private readNode(nodeId: string): ManagedNode | null {

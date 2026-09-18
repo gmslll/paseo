@@ -1,4 +1,11 @@
-import { useMemo, type ComponentProps, type PropsWithChildren, type ReactNode } from "react";
+import {
+  useCallback,
+  useMemo,
+  useState,
+  type ComponentProps,
+  type PropsWithChildren,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { type PressableStateCallbackType } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
@@ -12,6 +19,7 @@ import {
   Pin,
   PinOff,
   Tag,
+  Users,
 } from "lucide-react-native";
 import { isWeb } from "@/constants/platform";
 import { getForgePresentation, normalizeForge } from "@/git/forge";
@@ -44,6 +52,9 @@ import {
   WORKSPACE_LABEL_PAGE_ID,
   type WorkspaceLabelTarget,
 } from "@/workspace-labels/picker";
+import { WorkspaceShareHost } from "@/collab/workspace-share-host";
+import { useCollabCopy } from "@/collab/copy";
+import { useHostFeature } from "@/runtime/host-features";
 
 const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foreground });
 const foregroundMutedColorMapping = (theme: Theme) => ({
@@ -59,6 +70,7 @@ const ThemedCircleCheck = withUnistyles(CircleCheck);
 const ThemedPin = withUnistyles(Pin);
 const ThemedPinOff = withUnistyles(PinOff);
 const ThemedTag = withUnistyles(Tag);
+const ThemedUsers = withUnistyles(Users);
 
 const copyLeadingIcon = <ThemedCopy size={14} uniProps={foregroundMutedColorMapping} />;
 const renameLeadingIcon = <ThemedPencil size={14} uniProps={foregroundMutedColorMapping} />;
@@ -69,6 +81,7 @@ const markAsUnreadLeadingIcon = <ThemedCircle size={14} uniProps={foregroundMute
 const archiveLeadingIcon = <ThemedArchive size={14} uniProps={foregroundMutedColorMapping} />;
 const pinLeadingIcon = <ThemedPin size={14} uniProps={foregroundMutedColorMapping} />;
 const unpinLeadingIcon = <ThemedPinOff size={14} uniProps={foregroundMutedColorMapping} />;
+const shareLeadingIcon = <ThemedUsers size={14} uniProps={foregroundMutedColorMapping} />;
 
 function renderTriggerIcon({ hovered }: { hovered?: boolean }) {
   return (
@@ -110,6 +123,8 @@ interface SidebarWorkspaceMenuItemsProps extends Omit<
   "onArchive" | "open" | "onOpenChange"
 > {
   onArchive?: () => void;
+  onShare?: () => void;
+  shareLabel?: string;
 }
 
 type MenuSurface = "context" | "dropdown";
@@ -135,6 +150,8 @@ function SidebarWorkspaceMenuItems({
   onCopyPath,
   onCopyBranchName,
   onRename,
+  onShare,
+  shareLabel,
   onMarkAsRead,
   onMarkAsUnread,
   onArchive,
@@ -186,6 +203,16 @@ function SidebarWorkspaceMenuItems({
           onSelect={onRename}
         >
           {t("sidebar.workspace.actions.rename")}
+        </WorkspaceMenuItem>
+      ) : null}
+      {onShare ? (
+        <WorkspaceMenuItem
+          surface={surface}
+          testID={`sidebar-workspace-menu-share-${workspaceKey}`}
+          leading={shareLeadingIcon}
+          onSelect={onShare}
+        >
+          {shareLabel}
         </WorkspaceMenuItem>
       ) : null}
       {onMarkAsRead ? (
@@ -271,6 +298,15 @@ export function SidebarWorkspaceMenu({
   onOpenChange,
 }: SidebarWorkspaceMenuProps) {
   const { t } = useTranslation();
+  const copy = useCollabCopy();
+  const canShare = useHostFeature(serverId ?? "", "enterpriseCollaborationV1");
+  const [shareOpen, setShareOpen] = useState(false);
+  const handleShare = useCallback(() => {
+    setShareOpen(true);
+  }, []);
+  const handleShareClose = useCallback(() => {
+    setShareOpen(false);
+  }, []);
   const workspaceTarget = useMemo<WorkspaceLabelTarget | null>(
     () =>
       serverId && workspaceId ? { serverId, workspaceId, labels: workspaceLabels ?? [] } : null,
@@ -278,44 +314,56 @@ export function SidebarWorkspaceMenu({
   );
   const pages = useWorkspaceLabelMenuPages(workspaceTarget);
   return (
-    <DropdownMenu compactMode="sheet" open={open} onOpenChange={onOpenChange}>
-      <DropdownMenuTrigger
-        hitSlop={8}
-        style={triggerStyle}
-        accessibilityRole={isWeb ? undefined : "button"}
-        accessibilityLabel={t("sidebar.workspace.actions.menu")}
-        testID={`sidebar-workspace-kebab-${workspaceKey}`}
-      >
-        {renderTriggerIcon}
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        width={260}
-        pages={pages}
-        sheetTitle={t("sidebar.workspace.actions.menu")}
-      >
-        <SidebarWorkspaceMenuItems
-          surface="dropdown"
-          workspaceKey={workspaceKey}
+    <>
+      <DropdownMenu compactMode="sheet" open={open} onOpenChange={onOpenChange}>
+        <DropdownMenuTrigger
+          hitSlop={8}
+          style={triggerStyle}
+          accessibilityRole={isWeb ? undefined : "button"}
+          accessibilityLabel={t("sidebar.workspace.actions.menu")}
+          testID={`sidebar-workspace-kebab-${workspaceKey}`}
+        >
+          {renderTriggerIcon}
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="end"
+          width={260}
+          pages={pages}
+          sheetTitle={t("sidebar.workspace.actions.menu")}
+        >
+          <SidebarWorkspaceMenuItems
+            surface="dropdown"
+            workspaceKey={workspaceKey}
+            serverId={serverId}
+            workspaceId={workspaceId}
+            workspaceLabels={workspaceLabels}
+            onCopyPath={onCopyPath}
+            onCopyBranchName={onCopyBranchName}
+            onRename={onRename}
+            onShare={canShare ? handleShare : undefined}
+            shareLabel={copy.share.title}
+            onMarkAsRead={onMarkAsRead}
+            onMarkAsUnread={onMarkAsUnread}
+            onArchive={onArchive}
+            archiveLabel={archiveLabel}
+            archiveStatus={archiveStatus}
+            archivePendingLabel={archivePendingLabel}
+            archiveShortcutKeys={archiveShortcutKeys}
+            isPinned={isPinned}
+            onTogglePin={onTogglePin}
+            openInFileManagerPath={openInFileManagerPath}
+          />
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {serverId && workspaceId ? (
+        <WorkspaceShareHost
           serverId={serverId}
           workspaceId={workspaceId}
-          workspaceLabels={workspaceLabels}
-          onCopyPath={onCopyPath}
-          onCopyBranchName={onCopyBranchName}
-          onRename={onRename}
-          onMarkAsRead={onMarkAsRead}
-          onMarkAsUnread={onMarkAsUnread}
-          onArchive={onArchive}
-          archiveLabel={archiveLabel}
-          archiveStatus={archiveStatus}
-          archivePendingLabel={archivePendingLabel}
-          archiveShortcutKeys={archiveShortcutKeys}
-          isPinned={isPinned}
-          onTogglePin={onTogglePin}
-          openInFileManagerPath={openInFileManagerPath}
+          visible={shareOpen}
+          onClose={handleShareClose}
         />
-      </DropdownMenuContent>
-    </DropdownMenu>
+      ) : null}
+    </>
   );
 }
 
@@ -390,45 +438,64 @@ export function SidebarWorkspaceContextMenu({
     [workspace],
   );
   const pages = useWorkspaceLabelMenuPages(workspaceTarget);
+  const copy = useCollabCopy();
+  const canShare = useHostFeature(workspace.serverId, "enterpriseCollaborationV1");
+  const [shareOpen, setShareOpen] = useState(false);
+  const handleShare = useCallback(() => {
+    setShareOpen(true);
+  }, []);
+  const handleShareClose = useCallback(() => {
+    setShareOpen(false);
+  }, []);
 
   return (
-    <ContextMenu open={contextMenuOpen} onOpenChange={onContextMenuOpenChange}>
-      <ContextMenuTrigger
-        {...triggerProps}
-        enabledOnMobile={false}
-        accessibilityLabel={accessibilityLabel ?? rowAccessibilityLabel}
-        highlightStyle={highlightStyle}
-      >
-        {children}
-      </ContextMenuTrigger>
-      <ContextMenuContent
-        align="start"
-        width={260}
-        testID={`sidebar-workspace-context-menu-${workspaceKey}`}
-        pages={pages}
-      >
-        <SidebarWorkspaceMenuItems
-          surface="context"
-          workspaceKey={workspaceKey}
-          serverId={workspaceTarget.serverId}
-          workspaceId={workspaceTarget.workspaceId}
-          workspaceLabels={workspaceTarget.labels}
-          onCopyPath={onCopyPath}
-          onCopyBranchName={onCopyBranchName}
-          onRename={onRename}
-          onMarkAsRead={onMarkAsRead}
-          onMarkAsUnread={onMarkAsUnread}
-          onArchive={onArchive}
-          archiveLabel={archiveLabel}
-          archiveStatus={archiveStatus}
-          archivePendingLabel={archivePendingLabel}
-          archiveShortcutKeys={archiveShortcutKeys}
-          isPinned={isPinned}
-          onTogglePin={onTogglePin}
-          openInFileManagerPath={openInFileManagerPath}
-        />
-      </ContextMenuContent>
-    </ContextMenu>
+    <>
+      <ContextMenu open={contextMenuOpen} onOpenChange={onContextMenuOpenChange}>
+        <ContextMenuTrigger
+          {...triggerProps}
+          enabledOnMobile={false}
+          accessibilityLabel={accessibilityLabel ?? rowAccessibilityLabel}
+          highlightStyle={highlightStyle}
+        >
+          {children}
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          align="start"
+          width={260}
+          testID={`sidebar-workspace-context-menu-${workspaceKey}`}
+          pages={pages}
+        >
+          <SidebarWorkspaceMenuItems
+            surface="context"
+            workspaceKey={workspaceKey}
+            serverId={workspaceTarget.serverId}
+            workspaceId={workspaceTarget.workspaceId}
+            workspaceLabels={workspaceTarget.labels}
+            onCopyPath={onCopyPath}
+            onCopyBranchName={onCopyBranchName}
+            onRename={onRename}
+            onShare={canShare ? handleShare : undefined}
+            shareLabel={copy.share.title}
+            onMarkAsRead={onMarkAsRead}
+            onMarkAsUnread={onMarkAsUnread}
+            onArchive={onArchive}
+            archiveLabel={archiveLabel}
+            archiveStatus={archiveStatus}
+            archivePendingLabel={archivePendingLabel}
+            archiveShortcutKeys={archiveShortcutKeys}
+            isPinned={isPinned}
+            onTogglePin={onTogglePin}
+            openInFileManagerPath={openInFileManagerPath}
+          />
+        </ContextMenuContent>
+      </ContextMenu>
+      <WorkspaceShareHost
+        serverId={workspace.serverId}
+        workspaceId={workspace.workspaceId}
+        visible={shareOpen}
+        onClose={handleShareClose}
+      />
+    </>
   );
 }
 

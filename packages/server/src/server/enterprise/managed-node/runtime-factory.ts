@@ -33,6 +33,16 @@ import {
   ManagedNodeControlPlaneClient,
 } from "./management-client.js";
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
+import { collaborationHeartbeatCapabilities } from "./collab/heartbeat-capabilities.js";
+import { createCollabMembersControl } from "./collab/members-control.js";
+import { createCollabTurnControl } from "./collab/turn-control.js";
+import { createCollabTimelineControl } from "./collab/timeline-control.js";
+import { createCollabStreamTokenControl } from "./collab/stream-token-control.js";
+import {
+  createCollabSubscriptionControl,
+  SUBSCRIPTION_START_OFFSET,
+} from "./collab/subscription-control.js";
+import { createCollabPresenceRoster } from "./collab/presence-roster.js";
 import type { HeadlessSessionFactory } from "./collab/machine-rpc-server.js";
 import { ManagedWorkspaceCatalog } from "./collab/workspace-catalog.js";
 import { ManagedPrincipalGrantSource } from "./principal-source.js";
@@ -156,10 +166,13 @@ export async function createManagedEnterpriseRuntime(
         paseoServerId: relationship.node.paseoServerId,
         endpoint: relationship.node.endpoint,
         version: relationship.node.version,
-        capabilities: {
-          ...structuredClone(relationship.node.capabilities),
-          ...(await runtimeDistribution.capabilities()),
-        },
+        capabilities: collaborationHeartbeatCapabilities({
+          capabilities: {
+            ...structuredClone(relationship.node.capabilities),
+            ...(await runtimeDistribution.capabilities()),
+          },
+          collaborationOn: collaboration !== null,
+        }),
         capacity: defaultManagedNodeCapacity({
           activeBrowserProfiles: (await browserProfiles.list()).length,
         }),
@@ -250,6 +263,69 @@ export async function createManagedEnterpriseRuntime(
               attachSessions: (sessions: HeadlessSessionFactory) => {
                 collaboration.replicas.attachSessions(sessions);
               },
+              presence: createCollabPresenceRoster(),
+              members: createCollabMembersControl({
+                catalog: collaboration.catalog,
+                mutator: {
+                  async setMember(change) {
+                    const members = await client.applyOwnedCollabMemberChange(change);
+                    await client.refreshPolicy();
+                    collaboration.catalog.refresh();
+                    return members;
+                  },
+                  async removeMember(change) {
+                    const members = await client.applyOwnedCollabMemberChange(change);
+                    await client.refreshPolicy();
+                    collaboration.catalog.refresh();
+                    return members;
+                  },
+                  async enableWorkspace(change) {
+                    const enabled = await client.enableOwnedCollabWorkspace(change);
+                    await client.refreshPolicy();
+                    collaboration.catalog.refresh();
+                    return {
+                      workspaceUid: enabled.workspaceUid,
+                      members: enabled.members,
+                    };
+                  },
+                },
+              }),
+              turns: createCollabTurnControl({
+                catalog: collaboration.catalog,
+                mutator: {
+                  async submitRpc(change) {
+                    return await client.submitOwnedCollabRpc(change);
+                  },
+                  async dispatch(workspaceUid, envelope, rpcId) {
+                    return await collaboration.replicas.dispatchAttestedRpc(
+                      workspaceUid,
+                      new TextEncoder().encode(JSON.stringify(envelope)),
+                      rpcId,
+                    );
+                  },
+                },
+              }),
+              timeline: createCollabTimelineControl({
+                catalog: collaboration.catalog,
+                read: (_workspaceUid, localWorkspaceId, agentId) =>
+                  collaboration.replicas.readSessionDocument(localWorkspaceId, agentId),
+              }),
+              streamTokens: createCollabStreamTokenControl({
+                catalog: collaboration.catalog,
+                managementBaseUrl: relationship.managementBaseUrl,
+                issue: (change) => client.issueOwnedCollabStreamToken(change),
+              }),
+              subscriptions: createCollabSubscriptionControl({
+                catalog: collaboration.catalog,
+                issue: (change) => client.issueOwnedCollabStreamToken(change),
+                open: (token, containerId) =>
+                  client.openCollabSubscription(token, {
+                    containerId,
+                    cursors: { meta: SUBSCRIPTION_START_OFFSET },
+                  }),
+                read: (token, subscriptionId) =>
+                  client.pollCollabSubscription(token, subscriptionId),
+              }),
             }),
           }
         : {}),
