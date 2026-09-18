@@ -697,6 +697,13 @@ async function resolveEnterpriseRuntime(
       ...(runtime.admissionInvalidationSink
         ? { admissionInvalidationSink: runtime.admissionInvalidationSink }
         : {}),
+      ...(runtime.managedPlacementSource
+        ? { managedPlacementSource: runtime.managedPlacementSource }
+        : {}),
+      ...(runtime.collaboration ? { collaboration: runtime.collaboration } : {}),
+      ...(runtime.managedRuntimeDistribution
+        ? { managedRuntimeDistribution: runtime.managedRuntimeDistribution }
+        : {}),
       ...(capturedClose ? { close: capturedClose } : {}),
     });
   } catch (primary) {
