@@ -33,6 +33,7 @@ import {
   ManagedNodeControlPlaneClient,
 } from "./management-client.js";
 import { CollabRuntime, type CollabRuntimeDependencies } from "./collab/collab-runtime.js";
+import { collaborationHeartbeatCapabilities } from "./collab/heartbeat-capabilities.js";
 import { createCollabMembersControl } from "./collab/members-control.js";
 import { createCollabTurnControl } from "./collab/turn-control.js";
 import { createCollabTimelineControl } from "./collab/timeline-control.js";
@@ -165,10 +166,13 @@ export async function createManagedEnterpriseRuntime(
         paseoServerId: relationship.node.paseoServerId,
         endpoint: relationship.node.endpoint,
         version: relationship.node.version,
-        capabilities: {
-          ...structuredClone(relationship.node.capabilities),
-          ...(await runtimeDistribution.capabilities()),
-        },
+        capabilities: collaborationHeartbeatCapabilities({
+          capabilities: {
+            ...structuredClone(relationship.node.capabilities),
+            ...(await runtimeDistribution.capabilities()),
+          },
+          collaborationOn: collaboration !== null,
+        }),
         capacity: defaultManagedNodeCapacity({
           activeBrowserProfiles: (await browserProfiles.list()).length,
         }),

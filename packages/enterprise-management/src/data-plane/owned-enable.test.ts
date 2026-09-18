@@ -230,6 +230,53 @@ describe("owner-driven collaboration enable", () => {
     ).rejects.toThrow("collaboration is not available on this node");
   });
 
+  test("a node that later heartbeats collaborationV1 can enable a Workspace", async () => {
+    const harness = await start();
+    const lateNode = await enroll(harness.plane, harness.admin, "server-late", {});
+    await expect(
+      harness.plane.enableOwnedCollabWorkspace(lateNode.nodeId, {
+        actorPrincipalId: harness.ownerPrincipalId,
+        localWorkspaceId: LOCAL_WORKSPACE,
+      }),
+    ).rejects.toThrow("collaboration is not available on this node");
+
+    const heartbeat = await nodePost(
+      harness,
+      "/v1/node/heartbeat",
+      {
+        bootId: "boot-server-late",
+        paseoServerId: "server-late",
+        endpoint: "wss://server-late.test:6767",
+        version: "0.8.0",
+        capabilities: { collaborationV1: true },
+        capacity: {
+          cpuLogical: 8,
+          memoryTotalBytes: 16_000_000_000,
+          memoryAvailableBytes: 12_000_000_000,
+          activeAgents: 0,
+          activeBrowserProfiles: 0,
+        },
+      },
+      lateNode,
+    );
+    expect(heartbeat.status).toBe(200);
+
+    const enabled = await harness.plane.enableOwnedCollabWorkspace(lateNode.nodeId, {
+      actorPrincipalId: harness.ownerPrincipalId,
+      localWorkspaceId: LOCAL_WORKSPACE,
+    });
+    expect(enabled.workspace.collaborationEnabled).toBe(true);
+    expect(harness.plane.readNodeWorkspaceMemberships(lateNode.nodeId)).toEqual([
+      {
+        workspaceUid: enabled.workspace.workspaceUid,
+        localWorkspaceId: LOCAL_WORKSPACE,
+        ownerPrincipalId: harness.ownerPrincipalId,
+        membershipVersion: 1,
+        members: [{ principalId: harness.ownerPrincipalId, role: "owner" }],
+      },
+    ]);
+  });
+
   test("POST /v1/node/collab/enable is the node-signed owner path", async () => {
     const harness = await start();
 

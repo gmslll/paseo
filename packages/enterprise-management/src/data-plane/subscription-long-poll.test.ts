@@ -189,23 +189,35 @@ describe("collaboration subscriptions over long-poll", () => {
     ).toBe("one");
   });
 
-  test("still refuses with a status when membership goes away during the hold", async () => {
+  test("answers revoked as soon as membership is taken away, without an append", async () => {
     const harness = await start();
     const subscriptionId = await openSubscription(harness);
 
-    const pending = longPoll(harness, subscriptionId);
+    let settled = false;
+    const pending = longPoll(harness, subscriptionId).then(async (response) => {
+      settled = true;
+      return {
+        status: response.status,
+        body: (await response.json()) as { events: StreamEvent[] },
+      };
+    });
     await delay(100);
+    expect(settled).toBe(false);
 
     await harness.plane.removeCollabMember(harness.admin, {
       workspaceUid: harness.workspaceUid,
       principalId: harness.memberPrincipalId,
     });
-    // An append by someone still entitled to write is what releases the hold.
-    await appendAs(harness, harness.owner, "prod-owner", 1, "after");
 
-    // No headers have gone out yet, so unlike the event stream this can still be a status rather
-    // than a `revoked` event.
-    expect((await pending).status).toBe(403);
+    const result = await pending;
+    expect(result.status).toBe(200);
+    expect(result.body.events).toEqual([
+      {
+        type: "revoked",
+        containerId: harness.workspaceUid,
+        reason: "membership_removed",
+      },
+    ]);
   });
 
   test("lets go when the client hangs up mid-hold", async () => {

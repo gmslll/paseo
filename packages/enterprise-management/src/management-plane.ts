@@ -294,6 +294,7 @@ export class EnterpriseManagementPlane {
   // because one person on a laptop and a phone is two places, which is what clientId is for.
   private readonly presence = new Map<string, Map<string, PresenceEntry>>();
   private readonly presenceListeners = new Set<(containerId: string) => void>();
+  private readonly membershipListeners = new Set<(containerId: string) => void>();
   private closed = false;
 
   constructor(
@@ -1645,6 +1646,7 @@ export class EnterpriseManagementPlane {
         metadata: { principalId: member.principalId, role: input.role },
       });
     });
+    this.notifyCollabMembershipChange(input.workspaceUid);
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
@@ -1673,6 +1675,7 @@ export class EnterpriseManagementPlane {
         metadata: { principalId: input.principalId },
       });
     });
+    this.notifyCollabMembershipChange(input.workspaceUid);
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
@@ -1974,6 +1977,7 @@ export class EnterpriseManagementPlane {
         metadata: { principalId: member.principalId, role: input.role },
       });
     });
+    this.notifyCollabMembershipChange(input.workspaceUid);
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
@@ -2000,6 +2004,7 @@ export class EnterpriseManagementPlane {
         metadata: { principalId: input.principalId },
       });
     });
+    this.notifyCollabMembershipChange(input.workspaceUid);
     return this.listCollabMembersUnchecked(input.workspaceUid);
   }
 
@@ -2306,6 +2311,27 @@ export class EnterpriseManagementPlane {
     return () => {
       this.presenceListeners.delete(listener);
     };
+  }
+
+  /**
+   * Wakes live readers when membership for a container changes. Long-poll and SSE otherwise wait
+   * for an append, so a revoke would sit until the next write or the hold expired.
+   */
+  onCollabMembershipChange(listener: (containerId: string) => void): () => void {
+    this.membershipListeners.add(listener);
+    return () => {
+      this.membershipListeners.delete(listener);
+    };
+  }
+
+  private notifyCollabMembershipChange(containerId: string): void {
+    for (const listener of this.membershipListeners) {
+      try {
+        listener(containerId);
+      } catch {
+        // The listener owns its own recovery; a live reader closes its stream.
+      }
+    }
   }
 
   /** Lazy, like the subscription sweep: a timer would outlive a plane that a test never closes. */
@@ -2768,6 +2794,7 @@ export class EnterpriseManagementPlane {
     this.streamListeners.clear();
     this.presence.clear();
     this.presenceListeners.clear();
+    this.membershipListeners.clear();
     this.database.close();
   }
 

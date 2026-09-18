@@ -821,17 +821,21 @@ async function readCollabSubscription(
 const LONG_POLL_TIMEOUT_MS = 25_000;
 
 /**
- * Resolves on the first of three things: the container takes an append, the client hangs up, or the
- * hold expires. Waking more than once is harmless — resolving a settled promise does nothing — so
- * there is no flag to keep, and teardown lives in one place that runs however the wait ends.
+ * Resolves on the first of: an append, a membership change (when asked), the client hanging up, or
+ * the hold expiring. Waking more than once is harmless — resolving a settled promise does nothing —
+ * so there is no flag to keep, and teardown lives in one place that runs however the wait ends.
  *
  * Pass a segment to wait on just that one; a multiplexed reader omits it and takes the container.
+ * Multiplexed long-poll also wakes on membership so a revoke does not sit until the next write.
  */
 async function waitForContainerAppend(
   plane: EnterpriseManagementPlane,
   request: IncomingMessage,
-  containerId: string,
-  segment?: string,
+  input: {
+    containerId: string;
+    segment?: string;
+    wakeOnMembership?: boolean;
+  },
 ): Promise<void> {
   let release: (() => void) | null = null;
   const woken = new Promise<void>((resolve) => {
@@ -840,11 +844,16 @@ async function waitForContainerAppend(
   const wake = (): void => release?.();
 
   const unsubscribe = plane.onCollabStreamAppend((changed, changedSegment) => {
-    if (changed !== containerId) return;
+    if (changed !== input.containerId) return;
     // Waking a single-stream reader for a sibling segment would answer its poll with nothing new.
-    if (segment !== undefined && changedSegment !== segment) return;
+    if (input.segment !== undefined && changedSegment !== input.segment) return;
     wake();
   });
+  const unsubscribeMembership = input.wakeOnMembership
+    ? plane.onCollabMembershipChange((changed) => {
+        if (changed === input.containerId) wake();
+      })
+    : () => undefined;
   const timer = setTimeout(wake, LONG_POLL_TIMEOUT_MS);
   // A stray timer must never be the reason a process or a test run refuses to exit.
   timer.unref?.();
@@ -854,6 +863,7 @@ async function waitForContainerAppend(
     await woken;
   } finally {
     unsubscribe();
+    unsubscribeMembership();
     clearTimeout(timer);
     request.off("close", wake);
   }
@@ -903,7 +913,7 @@ async function longPollCollabSubscription(
     return true;
   }
 
-  await waitForContainerAppend(plane, request, containerId);
+  await waitForContainerAppend(plane, request, { containerId, wakeOnMembership: true });
 
   // The client may have hung up during the hold; writing to a gone response would only throw.
   if (request.destroyed || response.writableEnded) return true;
@@ -937,12 +947,14 @@ async function streamCollabSubscription(
   let closed = false;
   let unsubscribe: (() => void) | null = null;
   let unsubscribePresence: (() => void) | null = null;
+  let unsubscribeMembership: (() => void) | null = null;
   let keepalive: ReturnType<typeof setInterval> | null = null;
   const finish = (): void => {
     if (closed) return;
     closed = true;
     unsubscribe?.();
     unsubscribePresence?.();
+    unsubscribeMembership?.();
     if (keepalive) clearInterval(keepalive);
     response.end();
   };
@@ -998,6 +1010,9 @@ async function streamCollabSubscription(
   unsubscribePresence = plane.onCollabPresenceChange((changed) => {
     if (changed === containerId) sendPresence();
   });
+  unsubscribeMembership = plane.onCollabMembershipChange((changed) => {
+    if (changed === containerId) void poll().catch(finish);
+  });
   keepalive = setInterval(() => {
     if (!closed) response.write(": keepalive\n\n");
   }, SSE_KEEPALIVE_MS);
@@ -1052,7 +1067,10 @@ async function readCollabStreamSegment(
     });
   let result = await read();
   if (live === "long-poll" && result.messages.length === 0) {
-    await waitForContainerAppend(plane, request, target.containerId, target.segment);
+    await waitForContainerAppend(plane, request, {
+      containerId: target.containerId,
+      segment: target.segment,
+    });
     // The client may have hung up during the hold; writing to a gone response would only throw.
     if (request.destroyed || response.writableEnded) return true;
     result = await read();

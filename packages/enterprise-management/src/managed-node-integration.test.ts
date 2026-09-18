@@ -207,6 +207,123 @@ describe("managed node production channel", () => {
     expect(await authenticator.authenticateBearer(issued.ticket, connection)).toBeNull();
   });
 
+  test("a collaborating node enables a Workspace, subscribes over HTTPS, and sees revoke immediately", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "paseo-managed-collab-"));
+    cleanup.push(() => rmSync(directory, { recursive: true, force: true }));
+    const { certificatePath, privateKeyPath } = createLocalhostCertificate(directory);
+    const port = await reservePort();
+    const managementBaseUrl = `https://localhost:${port}`;
+    const plane = createPlane(managementBaseUrl);
+    cleanup.push(() => plane.close());
+    const server = createManagementHttpsServer({ plane, certificatePath, privateKeyPath });
+    await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+    cleanup.push(async () => {
+      server.closeAllConnections();
+      await closeServer(server);
+    });
+    const caCertificate = readFileSync(certificatePath);
+
+    const bootstrap = await plane.bootstrapAdministrator({
+      bootstrapSecret: BOOTSTRAP_SECRET,
+      displayName: "Platform Admin",
+    });
+    const administrator = await plane.authenticatePersonalAccessToken(bootstrap.token);
+    if (!administrator) throw new Error("missing administrator");
+    const owner = await plane.createPrincipal(administrator, {
+      displayName: "Owner",
+      principalType: "human",
+      role: "employee",
+    });
+    const member = await plane.createPrincipal(administrator, {
+      displayName: "Member",
+      principalType: "human",
+      role: "employee",
+    });
+    const enrollment = await plane.createEnrollmentToken(administrator, { expiresInMs: 60_000 });
+    const heartbeat = {
+      bootId: "boot-collab-a",
+      paseoServerId: "server-collab-a",
+      endpoint: "wss://node-collab-a.internal:6767",
+      version: "0.9.0",
+      capabilities: { platform: "darwin", browserProfiles: true },
+      capacity: {
+        cpuLogical: 8,
+        memoryTotalBytes: 16_000_000_000,
+        memoryAvailableBytes: 12_000_000_000,
+        activeAgents: 0,
+        activeBrowserProfiles: 0,
+      },
+    } as const;
+    const relationship = await enrollManagedNode({
+      managementBaseUrl,
+      enrollmentToken: enrollment.token,
+      relationshipPath: path.join(directory, "relationship.json"),
+      caCertificate,
+      heartbeat,
+    });
+    await plane.setNodeStatus(administrator, relationship.node.nodeId, "active");
+    const client = new ManagedNodeControlPlaneClient({ relationship, caCertificate });
+
+    await expect(
+      client.enableOwnedCollabWorkspace({
+        actorPrincipalId: owner.principalId,
+        localWorkspaceId: "workspace-collab-a",
+      }),
+    ).rejects.toThrow("collaboration is not available on this node");
+
+    await client.heartbeat({
+      ...heartbeat,
+      capabilities: { ...heartbeat.capabilities, collaborationV1: true },
+    });
+    const enabled = await client.enableOwnedCollabWorkspace({
+      actorPrincipalId: owner.principalId,
+      localWorkspaceId: "workspace-collab-a",
+    });
+    expect(enabled.collaborationEnabled).toBe(true);
+    await client.applyOwnedCollabMemberChange({
+      actorPrincipalId: owner.principalId,
+      workspaceUid: enabled.workspaceUid,
+      principalId: member.principalId,
+      role: "editor",
+    });
+
+    const issued = await client.issueOwnedCollabStreamToken({
+      actorPrincipalId: member.principalId,
+      clientId: "client-member-a",
+      workspaceUid: enabled.workspaceUid,
+    });
+    expect(issued.token.startsWith("pst_v1.")).toBe(true);
+    const opened = await client.openCollabSubscription(issued.token, {
+      containerId: enabled.workspaceUid,
+      cursors: { meta: "00000000000000000000" },
+    });
+
+    let settled = false;
+    const pending = client
+      .pollCollabSubscription(issued.token, opened.subscriptionId)
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+    await delay(150);
+    expect(settled).toBe(false);
+
+    await client.applyOwnedCollabMemberChange({
+      actorPrincipalId: owner.principalId,
+      workspaceUid: enabled.workspaceUid,
+      principalId: member.principalId,
+    });
+    expect(await pending).toEqual({
+      events: [
+        {
+          type: "revoked",
+          containerId: enabled.workspaceUid,
+          reason: "membership_removed",
+        },
+      ],
+    });
+  });
+
   test("distributes a pinned runtime that a managed node installs and reports", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "paseo-managed-runtime-"));
     cleanup.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -414,6 +531,10 @@ async function reservePort(): Promise<number> {
   if (!address || typeof address === "string") throw new Error("missing reserved address");
   await new Promise<void>((resolve) => reservation.close(() => resolve()));
   return address.port;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function closeServer(server: { close(callback: () => void): void }): Promise<void> {
