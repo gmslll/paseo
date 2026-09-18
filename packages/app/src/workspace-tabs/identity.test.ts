@@ -5,6 +5,27 @@ import {
   workspaceTabTargetsEqual,
 } from "./identity";
 
+describe("turn diff tab identity", () => {
+  test("normalizes the turn and agent as one tab identity", () => {
+    const target = normalizeWorkspaceTabTarget({
+      kind: "turn_diff",
+      turnId: " turn-1 ",
+      agentId: " agent-1 ",
+    });
+
+    expect(target).toEqual({ kind: "turn_diff", turnId: "turn-1", agentId: "agent-1" });
+    expect(
+      target &&
+        workspaceTabTargetsEqual(target, {
+          kind: "turn_diff",
+          turnId: "turn-1",
+          agentId: "agent-1",
+        }),
+    ).toBe(true);
+    expect(target && buildDeterministicWorkspaceTabId(target)).toBe("turn_diff_7_agent-1_6_turn-1");
+  });
+});
+
 describe("New tab identity", () => {
   it("stays outside deterministic target identity", () => {
     const target = { kind: "new_tab" } as const;

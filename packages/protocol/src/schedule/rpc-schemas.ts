@@ -20,6 +20,8 @@ const ScheduleCreateTargetSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("new-agent"),
+    // Enterprise mode resolves this against the authenticated Principal and canonical registry.
+    workspaceId: z.string().min(1).optional(),
     config: ScheduleCreateNewAgentConfigSchema,
   }),
 ]);

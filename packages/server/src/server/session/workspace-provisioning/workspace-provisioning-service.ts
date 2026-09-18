@@ -19,17 +19,25 @@ import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.j
 import { deriveProjectKey } from "../../project-key.js";
 import { areEquivalentPaths, createRealpathAwarePathMatcher } from "../../../utils/path.js";
 import type { UntrustedWorkspaceSource } from "../../workspace-automation-gate.js";
+import type { EnterpriseResourceOwner } from "@getpaseo/protocol/messages";
+
+export interface WorkspaceCreationContext {
+  expectsInitialAgent?: boolean;
+  ownership?: EnterpriseResourceOwner;
+}
 
 export interface ResolveOrCreateWorkspaceIdInput {
   createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
   requestedWorkspaceId?: string;
   cwd: string;
   initialTitle: string | null;
+  ownership?: EnterpriseResourceOwner;
 }
 
 export interface ImportWorkspaceInput {
   cwd: string;
   requestedWorkspaceId?: string;
+  ownership?: EnterpriseResourceOwner;
 }
 
 export interface ImportWorkspaceResult<T> {
@@ -48,6 +56,7 @@ export interface CreateWorktreeWorkspaceInput {
   title: string | null;
   expectsInitialAgent?: boolean;
   untrustedSource?: UntrustedWorkspaceSource;
+  ownership?: EnterpriseResourceOwner;
 }
 
 export interface WorkspaceProvisioningService {
@@ -55,13 +64,16 @@ export interface WorkspaceProvisioningService {
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
   ): Promise<ImportWorkspaceResult<T>>;
-  findOrCreateWorkspaceForDirectory(cwd: string): Promise<PersistedWorkspaceRecord>;
+  findOrCreateWorkspaceForDirectory(
+    cwd: string,
+    context?: WorkspaceCreationContext,
+  ): Promise<PersistedWorkspaceRecord>;
   resolveOrCreateWorkspaceIdForCreateAgent(input: ResolveOrCreateWorkspaceIdInput): Promise<string>;
   createWorkspaceForDirectory(
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { expectsInitialAgent?: boolean },
+    context?: WorkspaceCreationContext,
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
     input: CreateWorktreeWorkspaceInput,
@@ -124,7 +136,9 @@ export function createWorkspaceProvisioningService(deps: {
       projectRegistry.list(),
       workspaceRegistry.list(),
     ]);
-    const workspace = await findOrCreateWorkspaceForDirectory(input.cwd);
+    const workspace = await findOrCreateWorkspaceForDirectory(input.cwd, {
+      ownership: input.ownership,
+    });
     const createdWorkspace = workspacesBeforeImport.some(
       (candidate) => candidate.workspaceId === workspace.workspaceId,
     )
@@ -201,7 +215,7 @@ export function createWorkspaceProvisioningService(deps: {
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { expectsInitialAgent?: boolean },
+    context?: WorkspaceCreationContext,
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
@@ -215,6 +229,7 @@ export function createWorkspaceProvisioningService(deps: {
       projectId: project.projectId,
       ...initialWorkspacePlacement({ source: "checkout", cwd: normalizedCwd, checkout }),
       title: title?.trim() || null,
+      ownership: context?.ownership,
       createdAt: timestamp,
       updatedAt: timestamp,
     });
@@ -248,6 +263,7 @@ export function createWorkspaceProvisioningService(deps: {
         mainRepoRoot: repoRoot,
       }),
       title: input.title,
+      ownership: input.ownership,
       createdAt: timestamp,
       updatedAt: timestamp,
       ...(input.untrustedSource ? { untrustedSource: input.untrustedSource } : {}),
@@ -300,7 +316,10 @@ export function createWorkspaceProvisioningService(deps: {
     return refreshProjectKind(project);
   }
 
-  async function findOrCreateWorkspaceForDirectory(cwd: string): Promise<PersistedWorkspaceRecord> {
+  async function findOrCreateWorkspaceForDirectory(
+    cwd: string,
+    context?: WorkspaceCreationContext,
+  ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     const workspaces = await workspaceRegistry.list();
     const active = workspaces
@@ -326,7 +345,7 @@ export function createWorkspaceProvisioningService(deps: {
       const project = await projectRegistry.get(archived.projectId);
       if (project && !project.archivedAt) return ensureWorkspaceRecordUnarchived(archived);
     }
-    return createWorkspaceForDirectory(normalizedCwd);
+    return createWorkspaceForDirectory(normalizedCwd, undefined, undefined, context);
   }
 
   async function resolveOrCreateWorkspaceIdForCreateAgent(
@@ -337,6 +356,7 @@ export function createWorkspaceProvisioningService(deps: {
     return (
       await createWorkspaceForDirectory(input.cwd, input.initialTitle, undefined, {
         expectsInitialAgent: true,
+        ownership: input.ownership,
       })
     ).workspaceId;
   }

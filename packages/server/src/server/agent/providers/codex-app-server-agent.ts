@@ -62,10 +62,11 @@ import {
   checkProviderLaunchAvailable,
   createProviderEnv,
   createProviderEnvSpec,
-  resolveProviderLaunch,
+  resolveManagedProviderLaunch,
   type ProviderRuntimeSettings,
-  type ResolvedProviderLaunch,
+  type ManagedProviderLaunch,
 } from "../provider-launch-config.js";
+import type { ManagedProviderBinary } from "../../managed-runtimes/managed-provider-binary.js";
 import {
   findExecutable,
   probeExecutable,
@@ -260,6 +261,7 @@ interface CodexAppServerAgentDeps {
     extends: string;
   };
   customCodexConfig?: Record<string, unknown> | null;
+  managedBinary?: ManagedProviderBinary;
   _createCodexClient?: (
     child: ChildProcessWithoutNullStreams,
     logger: Logger,
@@ -514,12 +516,15 @@ export async function findDefaultCodexBinary(): Promise<string | null> {
   return await findCodexMicrosoftStoreBinary();
 }
 
-async function resolveCodexLaunchPrefix(runtimeSettings?: ProviderRuntimeSettings): Promise<{
+async function resolveCodexLaunchPrefix(
+  runtimeSettings?: ProviderRuntimeSettings,
+  managed?: ManagedProviderBinary,
+): Promise<{
   command: string;
   args: string[];
 }> {
-  const launch = await resolveCodexLaunch(runtimeSettings);
-  const availability = await checkCodexLaunchAvailable(launch);
+  const { launch, defaultBinary } = await resolveCodexLaunch(runtimeSettings, managed);
+  const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
   if (!availability.available) {
     throw new Error(
       "Codex binary not found. Install the Codex CLI (https://github.com/openai/codex) and ensure it is available in your shell PATH.",
@@ -532,22 +537,17 @@ async function resolveCodexLaunchPrefix(runtimeSettings?: ProviderRuntimeSetting
   };
 }
 
-async function resolveCodexLaunch(
+function resolveCodexLaunch(
   runtimeSettings?: ProviderRuntimeSettings,
-): Promise<ResolvedProviderLaunch> {
-  return resolveProviderLaunch({
+  managed?: ManagedProviderBinary,
+): Promise<ManagedProviderLaunch> {
+  return resolveManagedProviderLaunch({
     commandConfig: runtimeSettings?.command,
     defaultBinary: {
       command: "codex",
       resolvePath: findDefaultCodexBinary,
     },
-  });
-}
-
-async function checkCodexLaunchAvailable(launch: ResolvedProviderLaunch) {
-  return checkProviderLaunchAvailable(launch, {
-    command: "codex",
-    resolvePath: findDefaultCodexBinary,
+    managed,
   });
 }
 
@@ -6965,7 +6965,10 @@ export class CodexAppServerAgentClient implements AgentClient {
     if (!this.goalsEnabledPromise) {
       this.goalsEnabledPromise = (async () => {
         try {
-          const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+          const launchPrefix = await resolveCodexLaunchPrefix(
+            this.runtimeSettings,
+            this.deps.managedBinary,
+          );
           const versionOutput = await resolveBinaryVersion(launchPrefix.command);
           const enabled = codexVersionAtLeast(versionOutput, CODEX_GOALS_MIN_VERSION);
           this.logger.trace(
@@ -6996,7 +6999,10 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   private async probeAutoReviewEnabled(signal?: AbortSignal): Promise<boolean> {
     try {
-      const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+      const launchPrefix = await resolveCodexLaunchPrefix(
+        this.runtimeSettings,
+        this.deps.managedBinary,
+      );
       signal?.throwIfAborted();
       const versionOutput = await resolveBinaryVersion(launchPrefix.command, signal);
       signal?.throwIfAborted();
@@ -7017,7 +7023,10 @@ export class CodexAppServerAgentClient implements AgentClient {
     launchEnv?: Record<string, string>,
     options?: { goalsEnabled?: boolean; agentId?: string },
   ): Promise<ChildProcessWithoutNullStreams> {
-    const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+    const launchPrefix = await resolveCodexLaunchPrefix(
+      this.runtimeSettings,
+      this.deps.managedBinary,
+    );
     const args = [...launchPrefix.args, "app-server"];
     if (options?.goalsEnabled) {
       args.push("--enable", "goals");
@@ -7289,15 +7298,21 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
-    const launch = await resolveCodexLaunch(this.runtimeSettings);
-    const availability = await checkCodexLaunchAvailable(launch);
+    const { launch, defaultBinary } = await resolveCodexLaunch(
+      this.runtimeSettings,
+      this.deps.managedBinary,
+    );
+    const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
     return availability.available;
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
-      const launch = await resolveCodexLaunch(this.runtimeSettings);
-      const availability = await checkCodexLaunchAvailable(launch);
+      const { launch, defaultBinary } = await resolveCodexLaunch(
+        this.runtimeSettings,
+        this.deps.managedBinary,
+      );
+      const availability = await checkProviderLaunchAvailable(launch, defaultBinary);
       const entries: Array<{ label: string; value: string }> = [
         ...(await buildCommandResolutionDiagnosticRows(launch, {
           knownBinaryNames: ["codex"],

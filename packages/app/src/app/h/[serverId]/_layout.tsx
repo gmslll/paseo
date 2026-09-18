@@ -3,6 +3,7 @@ import { useHostRuntimeBootstrapState } from "@/app/_layout";
 import { HostRouteProvider } from "@/navigation/host-route-context";
 import { resolveStartupRoute } from "@/navigation/host-runtime-bootstrap";
 import { ThemedStack } from "@/navigation/themed-stack";
+import { EnterpriseUnsignedAccessGate } from "@/runtime/enterprise-workbench-host";
 import { useHostRegistryStatus, useHosts } from "@/runtime/host-runtime";
 
 const HOST_STACK_SCREEN_OPTIONS = {
@@ -50,5 +51,9 @@ function KnownHostRoute() {
     return stack;
   }
 
-  return <HostRouteProvider serverId={routeServerId}>{stack}</HostRouteProvider>;
+  return (
+    <HostRouteProvider serverId={routeServerId}>
+      <EnterpriseUnsignedAccessGate serverId={routeServerId}>{stack}</EnterpriseUnsignedAccessGate>
+    </HostRouteProvider>
+  );
 }

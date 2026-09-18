@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 
+import { normalizeBrowserAutomationHostCapability } from "./browser-automation/capabilities.js";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "./browser-automation/rpc-schemas.js";
 import { CLIENT_CAPS } from "./client-capabilities.js";
 import {
@@ -35,68 +36,60 @@ describe("browser automation protocol integration", () => {
     });
   });
 
-  test("browser host capability requires at least one supported command", () => {
+  test("browser host capability normalization requires at least one supported command", () => {
     expect(() =>
-      WSHelloMessageSchema.parse({
-        type: "hello",
-        clientId: "client-1",
-        clientType: "mobile",
-        protocolVersion: 1,
-        capabilities: {
-          [CLIENT_CAPS.browserHost]: {
-            supportedCommands: [],
-            hostKind: "desktop app",
-          },
-        },
+      normalizeBrowserAutomationHostCapability({
+        supportedCommands: [],
+        hostKind: "desktop app",
       }),
     ).toThrow();
 
     expect(() =>
-      WSHelloMessageSchema.parse({
-        type: "hello",
-        clientId: "client-2",
-        clientType: "mobile",
-        protocolVersion: 1,
-        capabilities: {
-          [CLIENT_CAPS.browserHost]: {},
-        },
-      }),
+      normalizeBrowserAutomationHostCapability(
+        WSHelloMessageSchema.parse({
+          type: "hello",
+          clientId: "client-2",
+          clientType: "mobile",
+          protocolVersion: 1,
+          capabilities: {
+            [CLIENT_CAPS.browserHost]: {},
+          },
+        }).capabilities?.[CLIENT_CAPS.browserHost],
+      ),
     ).toThrow();
 
-    expect(() =>
-      WSHelloMessageSchema.parse({
-        type: "hello",
-        clientId: "client-3",
-        clientType: "mobile",
-        protocolVersion: 1,
-        capabilities: {
-          [CLIENT_CAPS.browserHost]: {
-            supportedCommands: ["future_command"],
-          },
+    const futureOnly = WSHelloMessageSchema.parse({
+      type: "hello",
+      clientId: "client-3",
+      clientType: "mobile",
+      protocolVersion: 1,
+      capabilities: {
+        [CLIENT_CAPS.browserHost]: {
+          supportedCommands: ["future_command"],
         },
-      }),
-    ).toThrow();
+      },
+    }).capabilities?.[CLIENT_CAPS.browserHost];
+    expect(futureOnly?.supportedCommands).toEqual(["future_command"]);
+    expect(() => normalizeBrowserAutomationHostCapability(futureOnly)).toThrow();
   });
 
   test("browser host capability ignores unknown future commands when known commands remain", () => {
-    expect(
-      WSHelloMessageSchema.parse({
-        type: "hello",
-        clientId: "client-1",
-        clientType: "mobile",
-        protocolVersion: 1,
-        capabilities: {
-          [CLIENT_CAPS.browserHost]: {
-            supportedCommands: ["list_tabs", "future_command", "list_tabs"],
-            hostKind: "desktop app",
-          },
+    const capability = WSHelloMessageSchema.parse({
+      type: "hello",
+      clientId: "client-1",
+      clientType: "mobile",
+      protocolVersion: 1,
+      capabilities: {
+        [CLIENT_CAPS.browserHost]: {
+          supportedCommands: ["list_tabs", "future_command", "list_tabs"],
+          hostKind: "desktop app",
         },
-      }).capabilities,
-    ).toMatchObject({
-      [CLIENT_CAPS.browserHost]: {
-        supportedCommands: ["list_tabs"],
-        hostKind: "desktop app",
       },
+    }).capabilities?.[CLIENT_CAPS.browserHost];
+
+    expect(normalizeBrowserAutomationHostCapability(capability)).toMatchObject({
+      supportedCommands: ["list_tabs"],
+      hostKind: "desktop app",
     });
   });
 

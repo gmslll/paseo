@@ -1,7 +1,8 @@
 import { useCallback, useMemo } from "react";
-import { useHosts } from "@/runtime/host-runtime";
+import { useHostEnterpriseIdentitySnapshot, useHosts } from "@/runtime/host-runtime";
 import { useDownloadStore } from "@/stores/download-store";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
+import { useHostFeature } from "@/runtime/host-features";
 
 interface UseFileDownloadParams {
   serverId: string;
@@ -21,16 +22,23 @@ export function useFileDownload({
   workspaceRoot,
 }: UseFileDownloadParams): (input: { fileName: string; path: string }) => void {
   const daemons = useHosts();
+  const enterpriseIdentitySnapshot = useHostEnterpriseIdentitySnapshot(serverId);
+  const enterpriseScopeGeneration = enterpriseIdentitySnapshot?.generation;
+  const enterpriseResourceAuthorizationEnabled = useHostFeature(
+    serverId,
+    "enterpriseResourceAuthorizationV1",
+  );
   const daemonProfile = useMemo(
     () => daemons.find((daemon) => daemon.serverId === serverId),
     [daemons, serverId],
   );
   const normalizedWorkspaceRoot = useMemo(() => workspaceRoot.trim(), [workspaceRoot]);
+  const normalizedWorkspaceId = useMemo(() => workspaceId?.trim() || null, [workspaceId]);
   const workspaceScopeId = useMemo(
-    () => workspaceId?.trim() || normalizedWorkspaceRoot,
-    [normalizedWorkspaceRoot, workspaceId],
+    () => normalizedWorkspaceId || normalizedWorkspaceRoot,
+    [normalizedWorkspaceId, normalizedWorkspaceRoot],
   );
-  const { requestFileDownloadToken } = useFileExplorerActions({
+  const { requestFileDownloadToken, requestEnterpriseFileDownload } = useFileExplorerActions({
     serverId,
     workspaceId,
     workspaceRoot: normalizedWorkspaceRoot,
@@ -48,9 +56,25 @@ export function useFileDownload({
         fileName,
         path,
         daemonProfile,
+        ...(enterpriseResourceAuthorizationEnabled
+          ? {
+              enterpriseScopeGeneration,
+              enterpriseFileDownload: ({ relativePath, scopeGeneration }) =>
+                requestEnterpriseFileDownload({ relativePath, scopeGeneration }),
+            }
+          : {}),
         requestFileDownloadToken: (targetPath) => requestFileDownloadToken(targetPath),
       });
     },
-    [daemonProfile, requestFileDownloadToken, serverId, startDownload, workspaceScopeId],
+    [
+      daemonProfile,
+      enterpriseScopeGeneration,
+      enterpriseResourceAuthorizationEnabled,
+      requestEnterpriseFileDownload,
+      requestFileDownloadToken,
+      serverId,
+      startDownload,
+      workspaceScopeId,
+    ],
   );
 }

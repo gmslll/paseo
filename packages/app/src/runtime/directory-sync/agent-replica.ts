@@ -2,7 +2,7 @@ import type { FetchAgentsEntry } from "@getpaseo/client/internal/daemon-client";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { clearArchiveAgentPending } from "@/hooks/use-archive-agent";
 import { queryClient } from "@/data/query-client";
-import type { Agent } from "@/stores/session-store";
+import { useSessionStore, type Agent } from "@/stores/session-store";
 import { normalizeAgentSnapshot, projectAgentSnapshot } from "@/utils/agent-snapshots";
 import { type AgentDirectoryDelta } from "@/utils/agent-directory-sync";
 import { reconcileAgentDirectory } from "@/utils/agent-directory-reconciliation";
@@ -32,6 +32,10 @@ export class AgentDirectoryReplica {
     private readonly serverId: string,
     private readonly onStoppedRunning: (agentId: string) => void,
     private readonly persist: (mutations: readonly DirectoryReplicaMutation[]) => void,
+    private readonly isWorkspacePublicationBlocked: (
+      workspaceId: string | undefined,
+    ) => boolean = () => false,
+    private readonly onBlockedAgent: (agentId: string) => void = () => undefined,
   ) {
     this.storeProjection = new AgentStoreProjection(serverId);
   }
@@ -50,7 +54,15 @@ export class AgentDirectoryReplica {
   }
 
   commitCached(agents: Map<string, Agent>): void {
-    const merged = this.storeProjection.commitCached(agents);
+    const accepted = new Map<string, Agent>();
+    for (const [agentId, agent] of agents) {
+      if (this.isWorkspacePublicationBlocked(agent.workspaceId)) {
+        this.rejectBlockedAgent(agentId);
+      } else {
+        accepted.set(agentId, agent);
+      }
+    }
+    const merged = this.storeProjection.commitCached(accepted);
     this.members.clear();
     for (const agentId of merged.keys()) {
       this.members.add(agentId);
@@ -60,6 +72,10 @@ export class AgentDirectoryReplica {
   commitCachedAgent(token: AgentLifecycleToken, agent: Agent): boolean {
     this.pendingCacheReads.delete(token.agentId);
     if (token.version !== (this.lifecycleVersions.get(token.agentId) ?? 0)) return false;
+    if (this.isWorkspacePublicationBlocked(agent.workspaceId)) {
+      this.rejectBlockedAgent(agent.id);
+      return false;
+    }
     if (this.members.has(agent.id)) return false;
     this.members.add(agent.id);
     this.storeProjection.accept(agent);
@@ -80,6 +96,10 @@ export class AgentDirectoryReplica {
       ...timelineAgent,
       projectPlacement: timelineAgent.projectPlacement ?? existing?.projectPlacement,
     };
+    if (this.isWorkspacePublicationBlocked(normalized.workspaceId)) {
+      this.rejectBlockedAgent(normalized.id);
+      return false;
+    }
     const accepted = this.storeProjection.accept(normalized);
     this.members.add(accepted.id);
     this.storeProjection.replacePendingPermissions(accepted);
@@ -92,6 +112,10 @@ export class AgentDirectoryReplica {
   }
 
   applyDelta(delta: AgentDirectoryDelta): void {
+    if (delta.kind === "upsert" && this.isWorkspacePublicationBlocked(delta.agent.workspaceId)) {
+      this.rejectBlockedAgent(delta.agent.id);
+      return;
+    }
     const before = this.members.has(delta.kind === "remove" ? delta.agentId : delta.agent.id);
     const result = this.storeProjection.applyDelta(delta);
     if (delta.kind === "remove") {
@@ -110,6 +134,10 @@ export class AgentDirectoryReplica {
   }
 
   accept(agent: Agent): Agent {
+    if (this.isWorkspacePublicationBlocked(agent.workspaceId)) {
+      this.rejectBlockedAgent(agent.id);
+      return agent;
+    }
     const accepted = this.storeProjection.accept(agent);
     this.members.add(accepted.id);
     this.persist([this.agentUpsert(accepted)]);
@@ -122,7 +150,14 @@ export class AgentDirectoryReplica {
     persist = true,
   ): Map<string, Agent> {
     const previous = this.storeProjection.snapshot();
-    const reconciled = reconcileAgentDirectory({ snapshot: entries, deltas });
+    const reconciled: FetchAgentsEntry[] = [];
+    for (const entry of reconcileAgentDirectory({ snapshot: entries, deltas })) {
+      if (this.isWorkspacePublicationBlocked(entry.agent.workspaceId)) {
+        this.rejectBlockedAgent(entry.agent.id);
+      } else {
+        reconciled.push(entry);
+      }
+    }
     const nextIds = new Set(reconciled.map((entry) => entry.agent.id));
     for (const agentId of this.pendingCacheReads) {
       if (!nextIds.has(agentId)) this.advance(agentId);
@@ -205,6 +240,19 @@ export class AgentDirectoryReplica {
     this.persist([{ kind: "agent", type: "delete", id: agentId }]);
   }
 
+  evictWorkspace(workspaceId: string): string[] {
+    const session = useSessionStore.getState().sessions[this.serverId];
+    const agentIds = new Set<string>();
+    for (const [agentId, agent] of session?.agents ?? []) {
+      if (agent.workspaceId === workspaceId) agentIds.add(agentId);
+    }
+    for (const [agentId, agent] of session?.agentDetails ?? []) {
+      if (agent.workspaceId === workspaceId) agentIds.add(agentId);
+    }
+    for (const agentId of agentIds) this.remove(agentId);
+    return [...agentIds];
+  }
+
   applyTurnLiveness(
     agentId: string,
     transition: TurnLivenessTransition | readonly TurnLivenessTransition[],
@@ -223,6 +271,14 @@ export class AgentDirectoryReplica {
       id: agent.id,
       value: agent,
     };
+  }
+
+  private rejectBlockedAgent(agentId: string): void {
+    try {
+      this.onBlockedAgent(agentId);
+    } finally {
+      this.remove(agentId);
+    }
   }
 
   private advance(agentId: string): void {

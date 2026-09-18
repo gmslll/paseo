@@ -10,26 +10,33 @@ import { BrowserToolsBroker, type BrowserHostClient } from "./broker.js";
 
 const BROWSER_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_BROWSER_ID = "22222222-2222-4222-8222-222222222222";
-
 class FakeBrowserHostClient implements BrowserHostClient {
   public readonly receivedRequests: BrowserAutomationExecuteRequest[] = [];
   public readonly hostKind: string;
   public readonly supportedCommands: readonly BrowserAutomationCommandName[];
+  public readonly enterpriseProfiles?: { version: 1 };
+  public readonly homeNodeId?: string;
 
   public constructor(
     public readonly id: string,
     options: {
       hostKind?: string;
       supportedCommands?: readonly BrowserAutomationCommandName[];
+      enterpriseProfiles?: { version: 1 };
+      homeNodeId?: string;
     } = {},
   ) {
     this.hostKind = options.hostKind ?? "desktop app";
     this.supportedCommands = options.supportedCommands ?? [...BROWSER_AUTOMATION_COMMAND_NAMES];
+    this.enterpriseProfiles = options.enterpriseProfiles;
+    this.homeNodeId = options.homeNodeId;
   }
 
-  public sendBrowserAutomationRequest(request: BrowserAutomationExecuteRequest): void {
+  public readonly sendBrowserAutomationRequest = (
+    request: BrowserAutomationExecuteRequest,
+  ): void => {
     this.receivedRequests.push(request);
-  }
+  };
 
   public resolveLatestWith(
     broker: BrowserToolsBroker,
@@ -47,7 +54,7 @@ class FakeBrowserHostClient implements BrowserHostClient {
     request: BrowserAutomationExecuteRequest,
     responsePayload: BrowserAutomationExecuteResponse["payload"],
   ): boolean {
-    return broker.receiveResponse({
+    return broker.receiveResponse(this.id, {
       type: "browser.automation.execute.response",
       payload: { ...responsePayload, requestId: request.requestId },
     });
@@ -59,9 +66,9 @@ class FailingBrowserHostClient implements BrowserHostClient {
   public readonly hostKind = "desktop app";
   public readonly supportedCommands = [...BROWSER_AUTOMATION_COMMAND_NAMES];
 
-  public sendBrowserAutomationRequest(): void {
+  public readonly sendBrowserAutomationRequest = (): void => {
     throw new Error("websocket send failed");
-  }
+  };
 }
 
 function createBroker(options: { timeoutMs?: number } = {}): BrowserToolsBroker {
@@ -921,7 +928,7 @@ describe("BrowserToolsBroker", () => {
     expect(broker.getPendingRequestCount()).toBe(1);
 
     expect(
-      broker.receiveResponse({
+      broker.receiveResponse(client.id, {
         type: "browser.automation.execute.response",
         payload: {
           requestId: "req-1",

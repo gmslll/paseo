@@ -17,6 +17,27 @@ import {
   TerminalStreamOpcode,
 } from "@getpaseo/protocol/terminal-stream-protocol";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { wrapSessionMessage } from "@getpaseo/protocol/messages";
+import type { EnterpriseAdmissionRuntime } from "./enterprise/identity/runtime.js";
+import type { EnterpriseAdmissionPort } from "./enterprise/identity/runtime.js";
+import {
+  bindEnterpriseAdmissionSession,
+  createEnterpriseAdmissionAuthorizationIssuer,
+  getEnterpriseAdmissionEvidenceLockPartition,
+  issueEnterpriseAdmissionEvidence,
+  releaseEnterpriseAdmissionSession,
+  replaceEnterpriseAdmissionSession,
+} from "./enterprise/identity/admission-authorization.js";
+import type { ProductionAuditCapability } from "./enterprise/audit/production-audit-runtime.js";
+import {
+  NodeContextSchema,
+  PrincipalContextSchema,
+  type EnterpriseWorkspaceAuthorizationRecord,
+  type PrincipalContext,
+  type ResourceAuthorization,
+} from "@getpaseo/protocol/messages";
+import { createEnterpriseAgentSessionContextRegistry } from "./session/enterprise-agent-session-context-registry.js";
+import { MemoryAuthorityReceiptState } from "./session/enterprise-authority-receipt-state.js";
 
 type SocketListener = (...args: unknown[]) => void;
 
@@ -56,6 +77,7 @@ const sessionMock = vi.hoisted(() => {
     clearAgentTimelineSubscription = vi.fn();
     getClientActivity = vi.fn(() => null);
     getSessionId = vi.fn(() => "mock-session-id");
+    getEnterpriseSessionContext = vi.fn(() => this.args.enterpriseContext);
     getPermissions = vi.fn(() => this.args.permissions as string[]);
     allowsInbound = vi.fn(() => true);
     allowsPermission = vi.fn(() => true);
@@ -102,15 +124,147 @@ vi.mock("./push/index.js", () => ({
 }));
 
 import { z } from "zod";
-import { VoiceAssistantWebSocketServer } from "./websocket-server";
+import { VoiceAssistantWebSocketServer, type SessionAdmission } from "./websocket-server";
+import type { SessionRpcDiagnosticObservation } from "./session.js";
+import type { WebSocketRpcDiagnosticObserver } from "./websocket-server";
 import { DAEMON_PERMISSIONS, parseServerInfoStatusPayload } from "./messages.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
 
 interface WebSocketServerInternals {
-  attachSocket(ws: unknown, req: unknown): Promise<void>;
+  sessions: Map<unknown, unknown>;
+  externalSessionsByKey: Map<unknown, unknown>;
+  externalSessionsByBaseKey: Map<unknown, unknown>;
+  pendingConnections: Map<unknown, unknown>;
+  socketIdentities: Map<unknown, unknown>;
+  providerSnapshotManager: { destroy: () => void };
+  checkoutDiffManager: { dispose: () => void };
+  workspaceGitService: { dispose: () => Promise<void> };
+  wss: { close: () => void };
+  unsubscribeSpeechReadiness: (() => void) | null;
+  attachSocket(
+    ws: unknown,
+    req: unknown,
+    metadata?: unknown,
+    allowDuringStartup?: boolean,
+    admission?: unknown,
+  ): Promise<void>;
+  attachAuthenticatedSocket(ws: unknown, req: unknown, password?: string): Promise<void>;
 }
 
 const TEST_DAEMON_VERSION = "1.2.3-test";
+
+function createEnterpriseRuntimeHarness() {
+  const node = NodeContextSchema.parse({
+    nodeId: "nod_aaaaaaaaaaaaaaaa",
+    paseoServerId: "srv_test",
+    mode: "standalone",
+  });
+  const principal = PrincipalContextSchema.parse({
+    organizationId: "org_aaaaaaaaaaaaaaaa",
+    principalType: "human",
+    principalId: "usr_aaaaaaaaaaaaaaaa",
+    credentialId: "cred-a",
+    grantVersion: "grant-a",
+    grants: [],
+  });
+  const authenticate = vi.fn(async () => principal);
+  const audit = {} as ProductionAuditCapability;
+  const mintSecret = Object.freeze(Object.create(null)) as object;
+  let authorizationCurrent: boolean | "throw" = true;
+  const authorizationIssuer = createEnterpriseAdmissionAuthorizationIssuer(mintSecret, () => {
+    if (authorizationCurrent === "throw") throw new Error("current");
+    return authorizationCurrent;
+  });
+  const authenticateEvidence = vi.fn(async (_token: string, connection: unknown) =>
+    issueEnterpriseAdmissionEvidence(
+      authorizationIssuer,
+      mintSecret,
+      principal,
+      node,
+      connection as never,
+    ),
+  );
+  const bindSession = vi.fn((evidence, clientId) =>
+    bindEnterpriseAdmissionSession(authorizationIssuer, evidence, clientId),
+  );
+  const replaceSession = vi.fn((oldHandle, evidence, clientId) =>
+    replaceEnterpriseAdmissionSession(authorizationIssuer, oldHandle, evidence, clientId),
+  );
+  const releaseSession = vi.fn((handle) =>
+    releaseEnterpriseAdmissionSession(authorizationIssuer, handle),
+  );
+  const current = vi.fn(async () => true);
+  const canEmit = vi.fn(async () => true);
+  function filterWorkspaces<T extends EnterpriseWorkspaceAuthorizationRecord>(
+    _ctx: PrincipalContext,
+    rows: readonly T[],
+  ): T[] {
+    return [...rows];
+  }
+  const deny = async () => {
+    throw new Error("denied");
+  };
+  const resourceAuthorization: ResourceAuthorization = {
+    filterWorkspaces,
+    assertWorkspace: deny,
+    assertAgent: deny,
+    assertBrowserProfile: deny,
+    assertAppSlot: deny,
+    resolveWorkspacePath: deny,
+    canEmit,
+  };
+  const agentContextRegistry = createEnterpriseAgentSessionContextRegistry();
+  const authorityReceiptState = new MemoryAuthorityReceiptState();
+  const grantVersionGuard = { isCurrent: vi.fn(() => true) };
+  let generation = 0;
+  const nextSessionBindingGeneration = vi.fn(() => `generation-${++generation}`);
+  const admission = {
+    audit,
+    authorizationIssuer,
+    authenticator: {
+      node,
+      configuredOrganizationId: principal.organizationId,
+      isCurrentPrincipalContext: current,
+    },
+    authenticate,
+    authenticateEvidence,
+    bindSession,
+    replaceSession,
+    releaseSession,
+    isCurrentPrincipalContext: current,
+  } satisfies EnterpriseAdmissionPort;
+  const runtime = {
+    admission,
+    node,
+    agentContextRegistry,
+    authorityReceiptState,
+    grantVersionGuard,
+    resourceAuthorization,
+    nextSessionBindingGeneration,
+  } satisfies EnterpriseAdmissionRuntime;
+  return {
+    runtime,
+    node,
+    principal,
+    authorizationIssuer,
+    mintSecret,
+    authenticate,
+    authenticateEvidence,
+    bindSession,
+    replaceSession,
+    releaseSession,
+    current,
+    canEmit,
+    agentContextRegistry,
+    authorityReceiptState,
+    grantVersionGuard,
+    resourceAuthorization,
+    nextSessionBindingGeneration,
+    setAuthorizationCurrent(value: boolean | "throw") {
+      authorizationCurrent = value;
+    },
+  };
+}
 
 const WireEnvelopeSchema = z.object({
   type: z.string().optional(),
@@ -228,6 +382,8 @@ function createServer(options?: {
   speechReadiness?: SpeechReadinessSnapshot | null;
   logger?: ReturnType<typeof createLogger>;
   startPaused?: boolean;
+  enterpriseRuntime?: EnterpriseAdmissionRuntime;
+  rpcDiagnosticObserver?: WebSocketRpcDiagnosticObserver;
 }) {
   const speechReadiness = options?.speechReadiness ?? null;
   const daemonConfigStore = {
@@ -302,6 +458,22 @@ function createServer(options?: {
     undefined,
     undefined,
     createProviderSnapshotManagerStub().manager,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    options?.enterpriseRuntime,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    options?.rpcDiagnosticObserver,
   );
 }
 
@@ -403,6 +575,19 @@ function createDirectRequest() {
     },
     url: "/ws",
   };
+}
+
+async function attachEnterpriseAuthenticated(
+  server: VoiceAssistantWebSocketServer,
+  socket: MockSocket,
+): Promise<void> {
+  const request = createDirectRequest();
+  request.headers["sec-websocket-protocol"] = "paseo.bearer.pat-test";
+  await asInternals<WebSocketServerInternals>(server).attachAuthenticatedSocket(
+    socket,
+    request,
+    undefined,
+  );
 }
 
 async function attachRelayAndHello(params: {
@@ -753,6 +938,17 @@ describe("relay external socket reconnect behavior", () => {
       }),
     );
     await Promise.resolve();
+    (
+      server as unknown as {
+        sendMessageToSockets: (sockets: MockSocket[], message: unknown) => void;
+      }
+    ).sendMessageToSockets(
+      [socket],
+      wrapSessionMessage({
+        type: "fetch_agents_response",
+        payload: { requestId: "obs-1", agents: [] },
+      }),
+    );
 
     expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1195,5 +1391,1492 @@ describe("relay external socket reconnect behavior", () => {
     expect(new TextDecoder().decode(frame.payload ?? new Uint8Array())).toBe("ok");
 
     await server.close();
+  });
+});
+
+describe("websocket rpc diagnostic observer", () => {
+  beforeEach(() => {
+    sessionMock.instances.length = 0;
+  });
+  test("records request and response phases through production dispatch", async () => {
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-client" });
+    const session = sessionMock.instances.at(-1)!;
+    expect(session.args.rpcDiagnosticObserver).toBeTypeOf("function");
+    session.handleMessage.mockImplementationOnce(async () => {
+      const observe = session.args.rpcDiagnosticObserver as (
+        event: SessionRpcDiagnosticObservation,
+      ) => void;
+      observe({
+        phase: "session.enter",
+        requestId: "obs-1",
+        requestType: "fetch_agents_request",
+        atUnixMs: 1,
+      });
+      observe({
+        phase: "response.deliver.begin",
+        requestId: "obs-1",
+        responseType: "fetch_agents_response",
+        atUnixMs: 2,
+      });
+      session.publish({
+        type: "fetch_agents_response",
+        payload: { requestId: "obs-1", agents: [] },
+      });
+      observe({
+        phase: "response.deliver.return",
+        requestId: "obs-1",
+        responseType: "fetch_agents_response",
+        atUnixMs: 3,
+      });
+    });
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(
+        wrapSessionMessage({
+          type: "fetch_agents_request",
+          requestId: "obs-1",
+          subscribe: { subscriptionId: "obs-sub" },
+        }),
+      ),
+    );
+    await Promise.resolve();
+    expect(observations.map((item) => (item as { phase: string }).phase)).toEqual([
+      "frame.received",
+      "session.call",
+      "session.enter",
+      "response.deliver.begin",
+      "response.stringify.begin",
+      "response.stringify.return",
+      "response.send.begin",
+      "response.send.return",
+      "response.deliver.return",
+    ]);
+    await server.close();
+  });
+
+  test("default-off and non-target traffic emit no diagnostics", async () => {
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-off" });
+    const session = sessionMock.instances.at(-1)!;
+    expect(session.args.rpcDiagnosticObserver).toBeTypeOf("function");
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(wrapSessionMessage({ type: "fetch_workspaces_request", requestId: "other" })),
+    );
+    expect(observations).toHaveLength(0);
+    await server.close();
+  });
+
+  test("default-off leaves session observer absent", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-default-off" });
+    expect(sessionMock.instances.at(-1)!.args.rpcDiagnosticObserver).toBeUndefined();
+    await server.close();
+  });
+
+  test("rpc_error delivery survives throwing observer", async () => {
+    const server = createServer({
+      rpcDiagnosticObserver: () => {
+        throw new Error("observer");
+      },
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-error" });
+    const session = sessionMock.instances.at(-1)!;
+    session.handleMessage.mockImplementationOnce(async () => {
+      session.publish({
+        type: "rpc_error",
+        payload: { requestId: "err-1", requestType: "fetch_agents_request", error: "x", code: "x" },
+      });
+    });
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(
+        wrapSessionMessage({
+          type: "fetch_agents_request",
+          requestId: "err-1",
+          subscribe: { subscriptionId: "s" },
+        }),
+      ),
+    );
+    await Promise.resolve();
+    const delivered = socket.sent
+      .map((frame) => {
+        try {
+          return JSON.parse(String(frame));
+        } catch {
+          return null;
+        }
+      })
+      .find((frame) => frame?.type === "session" && frame.message?.type === "rpc_error");
+    expect(delivered?.message?.payload).toMatchObject({
+      requestId: "err-1",
+      requestType: "fetch_agents_request",
+    });
+    await server.close();
+  });
+
+  test("rpc_error emits exact response phases", async () => {
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+    });
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "observer-rpc-error" });
+    const session = sessionMock.instances.at(-1)!;
+    session.handleMessage.mockImplementationOnce(async () => {
+      session.publish({
+        type: "rpc_error",
+        payload: { requestId: "err-2", requestType: "fetch_agent_request", error: "x", code: "x" },
+      });
+    });
+    asInternals<{ handleRawMessage: (socket: MockSocket, data: string) => void }>(
+      server,
+    ).handleRawMessage(
+      socket,
+      JSON.stringify(wrapSessionMessage({ type: "fetch_agent_request", requestId: "err-2" })),
+    );
+    await Promise.resolve();
+    const errObservations = observations.filter(
+      (item) => (item as { requestId?: string }).requestId === "err-2",
+    ) as Array<{ phase: string; requestId: string; responseType?: string; atUnixMs: number }>;
+    expect(errObservations).toHaveLength(4);
+    expect(errObservations.map((item) => item.phase)).toEqual([
+      "response.stringify.begin",
+      "response.stringify.return",
+      "response.send.begin",
+      "response.send.return",
+    ]);
+    for (const item of errObservations) {
+      expect(item.requestId).toBe("err-2");
+      expect(item.responseType).toBe("rpc_error");
+      expect(item.atUnixMs).toEqual(expect.any(Number));
+    }
+    const phases = observations.map((item) => (item as { phase: string }).phase);
+    expect(
+      phases.filter(
+        (phase) =>
+          phase.startsWith("response.") &&
+          phase !== "response.deliver.begin" &&
+          phase !== "response.deliver.return",
+      ),
+    ).toEqual([
+      "response.stringify.begin",
+      "response.stringify.return",
+      "response.send.begin",
+      "response.send.return",
+    ]);
+    await server.close();
+  });
+
+  test("pending replay preserves physical target timestamp exactly once", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    const observations: unknown[] = [];
+    const server = createServer({
+      rpcDiagnosticObserver: (observation) => observations.push(observation),
+      enterpriseRuntime: h.runtime,
+    });
+    const socket = new MockSocket();
+    await attachEnterpriseAuthenticated(server, socket);
+    const internals = asInternals<{
+      handleRawMessage: (socket: MockSocket, data: string, capturedAtUnixMs?: number) => void;
+    }>(server);
+    const targetAt = 202;
+    internals.handleRawMessage(socket, JSON.stringify(createHelloMessage("pending-observer")), 101);
+    await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+    const session = sessionMock.instances.at(-1)!;
+    session.handleMessage.mockImplementationOnce(async () => {
+      session.publish({
+        type: "fetch_agents_response",
+        payload: { requestId: "pending-1", agents: [] },
+      });
+    });
+    internals.handleRawMessage(
+      socket,
+      JSON.stringify(
+        wrapSessionMessage({
+          type: "fetch_agents_request",
+          requestId: "pending-1",
+          subscribe: { subscriptionId: "pending" },
+        }),
+      ),
+      targetAt,
+    );
+    expect(session.handleMessage).not.toHaveBeenCalled();
+    release();
+    await vi.waitFor(() => expect(session.handleMessage).toHaveBeenCalledOnce());
+    const frames = observations.filter(
+      (item) => (item as { phase: string }).phase === "frame.received",
+    ) as Array<{ requestId: string; requestType: string; atUnixMs: number }>;
+    expect(frames).toEqual([
+      {
+        phase: "frame.received",
+        requestId: "pending-1",
+        requestType: "fetch_agents_request",
+        atUnixMs: targetAt,
+      },
+    ]);
+    const response = socket.sent
+      .map((frame) => {
+        try {
+          return JSON.parse(String(frame));
+        } catch {
+          return null;
+        }
+      })
+      .find((frame) => frame?.message?.type === "fetch_agents_response");
+    expect(response?.message?.payload?.requestId).toBe("pending-1");
+    await server.close();
+  });
+});
+
+describe("enterprise admission", () => {
+  beforeEach(() => {
+    sessionMock.instances.length = 0;
+  });
+  test("public external enterprise bridge does not inspect caller admission", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    let reads = 0;
+    const callerAdmission = new Proxy(
+      {},
+      {
+        get() {
+          reads++;
+          throw new Error("caller admission must not be read");
+        },
+        ownKeys() {
+          reads++;
+          throw new Error("caller admission must not be enumerated");
+        },
+      },
+    ) as unknown as SessionAdmission;
+    try {
+      await server.attachExternalSocket(socket, { transport: "relay" }, callerAdmission);
+      expect(reads).toBe(0);
+      expect(socket.readyState).toBe(3);
+      expect(h.authenticateEvidence).not.toHaveBeenCalled();
+      expect(h.bindSession).not.toHaveBeenCalled();
+      expect(sessionMock.instances).toHaveLength(0);
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The closed handshake is the expected failure for this case.
+      }
+    }
+  });
+
+  test("does not publish a session when server_info is blocked and socket closes", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseCanEmit!: () => void;
+    const canEmitGate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await canEmitGate;
+      return true;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-close-race")));
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      socket.close();
+      let closeSettled = false;
+      const closePromise = server.close().finally(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      releaseCanEmit();
+      await expect(closePromise).rejects.toThrow("WebSocket closed during enterprise handshake");
+      expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce();
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+      expect(socket.readyState).toBe(3);
+    } finally {
+      releaseCanEmit();
+      try {
+        await server.close();
+      } catch {
+        // The handshake failure is the expected close result in this case.
+      }
+    }
+  });
+
+  test("drops queued hello work after the pending socket closes", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseCanEmit!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("queued-close")));
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      socket.emit("message", JSON.stringify(createHelloMessage("queued-close")));
+      socket.close();
+      const closePromise = server.close();
+      releaseCanEmit();
+      await expect(closePromise).rejects.toThrow("WebSocket closed during enterprise handshake");
+      expect(sessionMock.instances).toHaveLength(1);
+      expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce();
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.pendingConnections.size).toBe(0);
+    } finally {
+      releaseCanEmit();
+      try {
+        await server.close();
+      } catch {
+        // The closed handshake is the expected failure for this case.
+      }
+    }
+  });
+
+  test("drops a closed queued socket without affecting the active same-client hello", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseCanEmit!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const activeSocket = new MockSocket();
+    const queuedSocket = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, activeSocket);
+      await attachEnterpriseAuthenticated(server, queuedSocket);
+      const hello = JSON.stringify(createHelloMessage("same-client-queue"));
+      activeSocket.emit("message", hello);
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      queuedSocket.emit("message", hello);
+      queuedSocket.close();
+      releaseCanEmit();
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(activeSocket)).toHaveLength(1));
+      await Promise.resolve();
+      expect(h.bindSession).not.toHaveBeenCalled();
+      expect(h.replaceSession).not.toHaveBeenCalled();
+      expect(sessionMock.instances).toHaveLength(1);
+      expect(sentServerInfoEnvelopes(queuedSocket)).toHaveLength(0);
+    } finally {
+      releaseCanEmit();
+      try {
+        await server.close();
+      } catch {
+        // The queued socket was intentionally closed during the handshake.
+      }
+    }
+  });
+
+  test("lock partition accessor preserves evidence for later bind", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let evidence: EnterpriseAdmissionAuthenticationEvidence | null = null;
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) => {
+      evidence = issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        h.node,
+        connection as never,
+      );
+      return evidence;
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    await attachEnterpriseAuthenticated(server, new MockSocket());
+    expect(evidence).not.toBeNull();
+    const partition = getEnterpriseAdmissionEvidenceLockPartition(
+      h.authorizationIssuer,
+      evidence!,
+      "partition-client",
+    );
+    expect(partition).toBe("org_aaaaaaaaaaaaaaaa:usr_aaaaaaaaaaaaaaaa:partition-client");
+    expect(
+      getEnterpriseAdmissionEvidenceLockPartition(
+        h.authorizationIssuer,
+        evidence!,
+        new Proxy(
+          {},
+          {
+            get: () => {
+              throw new Error("client getter");
+            },
+          },
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      bindEnterpriseAdmissionSession(h.authorizationIssuer, evidence!, "partition-client"),
+    ).not.toBeNull();
+    await server.close();
+  });
+
+  test("different organizations with one client do not share the handshake lock", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await firstGate;
+      return true;
+    });
+    const foreignPrincipal = PrincipalContextSchema.parse({
+      ...h.principal,
+      organizationId: "org_bbbbbbbbbbbbbbbb",
+      principalId: "usr_bbbbbbbbbbbbbbbb",
+      credentialId: "cred-b",
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) =>
+      issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        foreignPrincipal,
+        h.node,
+        connection as never,
+      ),
+    );
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, first);
+      await attachEnterpriseAuthenticated(server, second);
+      first.emit("message", JSON.stringify(createHelloMessage("partition-parallel")));
+      await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledOnce());
+      second.emit("message", JSON.stringify(createHelloMessage("partition-parallel")));
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+      expect(sentServerInfoEnvelopes(first)).toHaveLength(0);
+      releaseFirst();
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(first)).toHaveLength(1));
+      expect(sessionMock.instances).toHaveLength(2);
+    } finally {
+      releaseFirst();
+      await server.close();
+    }
+  });
+
+  test("a rejected same-partition hello does not poison its queued successor", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    h.canEmit.mockRejectedValueOnce(new Error("first authorization failed"));
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, first);
+      await attachEnterpriseAuthenticated(server, second);
+      const hello = JSON.stringify(createHelloMessage("partition-retry"));
+      first.emit("message", hello);
+      second.emit("message", hello);
+      await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+      expect(sentServerInfoEnvelopes(first)).toHaveLength(0);
+      expect(sessionMock.instances.length).toBeGreaterThanOrEqual(2);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The first rejected handshake is expected to be observed by close.
+      }
+    }
+  });
+
+  test("resume authorization close waits for shared connection cleanup", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("resume-close")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    let releaseCanEmit!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCanEmit = resolve;
+    });
+    h.canEmit.mockImplementationOnce(async () => {
+      await gate;
+      return true;
+    });
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("resume-close")));
+    await vi.waitFor(() => expect(h.canEmit).toHaveBeenCalledTimes(2));
+    const cleanupError = new Error("resume cleanup failed");
+    sessionMock.instances[0]!.cleanup.mockRejectedValueOnce(cleanupError);
+    const closePromise = server.close();
+    releaseCanEmit();
+    let closeError: unknown;
+    try {
+      await closePromise;
+    } catch (error) {
+      closeError = error;
+    }
+    expect(closeError).toBeInstanceOf(AggregateError);
+    const closeErrors = (closeError as AggregateError).errors;
+    expect(closeErrors).toHaveLength(2);
+    expect((closeErrors[0] as Error).message).toBe("WebSocket closed during session resume");
+    expect(closeErrors[1]).toBe(cleanupError);
+    expect((closeError as AggregateError).cause).toBe(closeErrors[0]);
+    expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce();
+    expect(h.releaseSession).toHaveBeenCalledOnce();
+  });
+
+  test("does not attach a closed socket after deferred enterprise authentication", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let releaseAuthentication!: () => void;
+    const authenticationGate = new Promise<void>((resolve) => {
+      releaseAuthentication = resolve;
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) => {
+      await authenticationGate;
+      return issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        h.node,
+        connection as never,
+      );
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    try {
+      const request = createDirectRequest();
+      request.headers["sec-websocket-protocol"] = "paseo.bearer.pat-test";
+      const webSocketServer = wsModuleMock.MockWebSocketServer.instances.at(-1);
+      webSocketServer?.handlers.get("connection")?.(socket, request);
+      await vi.waitFor(() => expect(h.authenticateEvidence).toHaveBeenCalledOnce());
+      socket.close();
+      let closeSettled = false;
+      const closePromise = server.close().finally(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      releaseAuthentication();
+      await closePromise;
+      expect(internals.pendingConnections.size).toBe(0);
+      expect(internals.socketIdentities.size).toBe(0);
+      expect(internals.sessions.size).toBe(0);
+      expect(sessionMock.instances).toHaveLength(0);
+    } finally {
+      releaseAuthentication();
+      await server.close();
+    }
+  });
+
+  test("buffers eager hello until deferred authentication installs handlers", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) => {
+      await gate;
+      return issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        h.node,
+        connection as never,
+      );
+    });
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const request = createDirectRequest() as ReturnType<typeof createDirectRequest> & {
+      socket: { pause: () => void; resume: () => void };
+    };
+    let paused = false;
+    request.socket.pause = () => {
+      paused = true;
+    };
+    let eagerHello = false;
+    request.socket.resume = () => {
+      paused = false;
+      if (eagerHello) socket.emit("message", JSON.stringify(createHelloMessage("eager-client")));
+    };
+    request.headers["sec-websocket-protocol"] = "paseo.bearer.pat-test";
+    const wsServer = wsModuleMock.MockWebSocketServer.instances.at(-1);
+    const connectionHandler = wsServer?.handlers.get("connection");
+    connectionHandler?.(socket, request);
+    eagerHello = true;
+    await vi.waitFor(() => expect(h.authenticateEvidence).toHaveBeenCalledOnce());
+    expect(paused).toBe(true);
+    expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+    release();
+    await vi.waitFor(() => expect(sentServerInfoEnvelopes(socket)).toHaveLength(1));
+    expect(sentServerInfoEnvelopes(socket)).toHaveLength(1);
+    await server.close();
+  });
+
+  test("rechecks socket and admission immediately before server_info send", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const internals = asInternals<WebSocketServerInternals>(server);
+    h.canEmit.mockImplementationOnce(async () => {
+      socket.close();
+      return true;
+    });
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-send-fence")));
+      await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
+      expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The closed handshake is the expected failure for this case.
+      }
+    }
+  });
+  test("legacy admission preserves hub execution agents", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    const hubExecutionAgents = {
+      create: vi.fn(),
+      control: vi.fn(),
+      subscribe: vi.fn(),
+      invalidateAuthority: vi.fn(),
+    };
+    const admission = {
+      kind: "legacy" as const,
+      principalId: "owner",
+      permissions: ["daemon.read", "daemon.read"],
+      hubExecutionAgents,
+    };
+    try {
+      await asInternals<WebSocketServerInternals>(server).attachSocket(
+        socket,
+        createDirectRequest(),
+        undefined,
+        false,
+        admission,
+      );
+      socket.emit("message", JSON.stringify(createHelloMessage("legacy-hub")));
+      await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+      const args = sessionMock.instances[0]!.args;
+      expect(args.hubExecutionAgents).toBe(hubExecutionAgents);
+      expect(args.permissions).toEqual(["daemon.read"]);
+      expect(Object.isFrozen(args.permissions)).toBe(true);
+      expect(args.enterpriseContext).toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("enterprise server_info throw cleans unpublished session", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const primary = new Error("emit failed");
+    h.canEmit.mockRejectedValueOnce(primary);
+    const logger = createLogger();
+    const server = createServer({ enterpriseRuntime: h.runtime, logger });
+    const socket = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      expect(h.authenticateEvidence).toHaveBeenCalledOnce();
+      expect(socket.readyState).toBe(1);
+      const internals = asInternals<WebSocketServerInternals>(server);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-throw")));
+      await vi.waitFor(() => expect(sessionMock.instances[0]).toBeDefined());
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
+      const earlyWarning = logger.warn.mock.calls.find(
+        (call) => call[1] === "pending websocket message failed",
+      );
+      expect(earlyWarning?.[0].err).toBe(primary);
+      await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
+      expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
+      const warning = logger.warn.mock.calls.find(
+        (call) => call[1] === "pending websocket message failed",
+      );
+      expect(warning?.[0].err).toBe(primary);
+      expect(socket.readyState).toBe(3);
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+      expect(h.releaseSession).toHaveBeenCalledOnce();
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The rejected handshake is asserted above.
+      }
+    }
+  });
+
+  test("enterprise server_info and cleanup errors are observed", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const primary = new Error("emit failed");
+    const cleanup = new Error("cleanup failed");
+    h.canEmit.mockImplementationOnce(async () => {
+      const s = sessionMock.instances[0];
+      s?.cleanup.mockRejectedValueOnce(cleanup);
+      throw primary;
+    });
+    const logger = createLogger();
+    const server = createServer({ enterpriseRuntime: h.runtime, logger });
+    const internals = asInternals<WebSocketServerInternals>(server);
+    const socket = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-throw-aggregate")));
+      await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
+      expect(socket.readyState).toBe(3);
+      expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+      const warning = logger.warn.mock.calls.find(
+        (call) => call[1] === "pending websocket message failed",
+      );
+      expect(warning).toBeDefined();
+      const warningError = warning![0].err;
+      expect(warningError).toBeInstanceOf(AggregateError);
+      expect((warningError as AggregateError).errors[0]).toBe(primary);
+      expect((warningError as AggregateError).errors[1]).toBe(cleanup);
+      expect((warningError as AggregateError).cause).toBe(primary);
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The aggregated handshake failure is asserted above.
+      }
+    }
+  });
+
+  test("enterprise server_info false cleanup runs once", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const cleanupError = new Error("cleanup failed");
+    h.canEmit.mockResolvedValueOnce(false);
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const internals = asInternals<WebSocketServerInternals>(server);
+    const socket = new MockSocket();
+    try {
+      await attachEnterpriseAuthenticated(server, socket);
+      socket.emit("message", JSON.stringify(createHelloMessage("enterprise-false")));
+      await vi.waitFor(() => expect(sessionMock.instances[0]).toBeDefined());
+      sessionMock.instances[0]!.cleanup.mockRejectedValueOnce(cleanupError);
+      await vi.waitFor(() => expect(sessionMock.instances[0]?.cleanup).toHaveBeenCalledOnce());
+      expect(socket.readyState).toBe(3);
+      expect(sentServerInfoEnvelopes(socket)).toHaveLength(0);
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+      expect(internals.sessions.size).toBe(0);
+      expect(internals.externalSessionsByKey.size).toBe(0);
+      expect(internals.externalSessionsByBaseKey.size).toBe(0);
+    } finally {
+      try {
+        await server.close();
+      } catch {
+        // The failed handshake cleanup is observed by the test above.
+      }
+    }
+  });
+
+  test("close waits for all sessions and reuses promise", async () => {
+    const server = createServer();
+    const socketA = new MockSocket();
+    const socketB = new MockSocket();
+    await attachDirectAndHello({ server, socket: socketA, clientId: "close-a" });
+    await attachDirectAndHello({ server, socket: socketB, clientId: "close-b" });
+    const [sessionA, sessionB] = sessionMock.instances.slice(-2);
+    const primary = new Error("sync cleanup");
+    const secondary = new Error("async cleanup");
+    sessionA!.cleanup.mockImplementationOnce(() => {
+      throw primary;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    sessionB!.cleanup.mockImplementationOnce(async () => {
+      await gate;
+      throw secondary;
+    });
+    const internals = asInternals<WebSocketServerInternals>(server);
+    const destroy = vi.spyOn(internals.providerSnapshotManager, "destroy");
+    const diffDispose = vi.spyOn(internals.checkoutDiffManager, "dispose");
+    const gitDispose = vi.spyOn(internals.workspaceGitService, "dispose");
+    const wssClose = vi.spyOn(internals.wss, "close");
+    const closeA = server.close();
+    const closeB = server.close();
+    expect(closeA).toBe(closeB);
+    let settled = false;
+    void closeA.then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      () => {
+        settled = true;
+        return undefined;
+      },
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    const error = await closeA.catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([primary, secondary]);
+    expect((error as AggregateError).cause).toBe(primary);
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(diffDispose).toHaveBeenCalledOnce();
+    expect(gitDispose).toHaveBeenCalledOnce();
+    expect(wssClose).toHaveBeenCalledOnce();
+    expect(internals.sessions.size).toBe(0);
+    expect(internals.externalSessionsByKey.size).toBe(0);
+    expect(internals.externalSessionsByBaseKey.size).toBe(0);
+    expect(internals.pendingConnections.size).toBe(0);
+    expect(internals.socketIdentities.size).toBe(0);
+    expect(sessionA!.cleanup).toHaveBeenCalledOnce();
+    expect(sessionB!.cleanup).toHaveBeenCalledOnce();
+  });
+
+  test("close continues teardown after a pre-barrier unsubscribe throw", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    await attachDirectAndHello({ server, socket, clientId: "close-prebarrier" });
+    const session = sessionMock.instances.at(-1)!;
+    const internals = asInternals<WebSocketServerInternals>(server);
+    const primary = new Error("unsubscribe failed");
+    let nestedClose: Promise<void> | undefined;
+    internals.unsubscribeSpeechReadiness = () => {
+      nestedClose = server.close();
+      throw primary;
+    };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    session.cleanup.mockImplementationOnce(async () => {
+      await gate;
+    });
+    const destroy = vi.spyOn(internals.providerSnapshotManager, "destroy");
+    const wssClose = vi.spyOn(internals.wss, "close");
+    const closePromise = server.close();
+    expect(nestedClose).toBe(closePromise);
+    let settled = false;
+    void closePromise.then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      () => {
+        settled = true;
+        return undefined;
+      },
+    );
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    const error = await closePromise.catch((reason: unknown) => reason);
+    expect(error).toBe(primary);
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(wssClose).toHaveBeenCalledOnce();
+    expect(internals.sessions.size).toBe(0);
+    expect(internals.externalSessionsByKey.size).toBe(0);
+    expect(internals.externalSessionsByBaseKey.size).toBe(0);
+    expect(session.cleanup).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    ["enumerable extra", (base: object) => ({ ...base, extra: true })],
+    ["symbol extra", (base: object) => Object.assign({ ...base }, { [Symbol("extra")]: true })],
+    [
+      "non-enumerable extra",
+      (base: object) => Object.defineProperty({ ...base }, "extra", { value: true }),
+    ],
+    [
+      "partial enterprise",
+      (_base: object) => ({
+        kind: "enterprise",
+        principalId: "usr_aaaaaaaaaaaaaaaa",
+        permissions: [],
+        enterprise: {},
+      }),
+    ],
+    [
+      "principal accessor",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: object }).enterprise,
+          get principal() {
+            throw new Error("getter");
+          },
+        },
+      }),
+    ],
+    [
+      "node accessor",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: object }).enterprise,
+          get node() {
+            throw new Error("getter");
+          },
+        },
+      }),
+    ],
+    [
+      "ownKeys throwing",
+      (base: object) =>
+        new Proxy(base, {
+          ownKeys() {
+            throw new Error("ownKeys");
+          },
+        }),
+    ],
+    [
+      "legacy enterprise mixed",
+      (base: object) => ({
+        ...base,
+        kind: "legacy",
+        enterprise: (base as { enterprise: object }).enterprise,
+      }),
+    ],
+    [
+      "nested enterprise symbol",
+      (base: object) => ({
+        ...base,
+        enterprise: { ...(base as { enterprise: object }).enterprise, [Symbol("x")]: true },
+      }),
+    ],
+    [
+      "cross-kind selector extra",
+      (base: object) => {
+        const b = base as { enterprise: { principal: object } };
+        return {
+          ...base,
+          enterprise: {
+            ...b.enterprise,
+            principal: {
+              ...b.enterprise.principal,
+              grants: [
+                {
+                  action: "app.use",
+                  selector: { kind: "self", organizationId: "org_aaaaaaaaaaaaaaaa" },
+                },
+              ],
+            },
+          },
+        };
+      },
+    ],
+    [
+      "permissions sparse",
+      (base: object) => ({
+        ...base,
+        permissions: Object.assign([], { 1: "daemon.read", length: 2 }),
+      }),
+    ],
+    [
+      "permissions symbol",
+      (base: object) => ({
+        ...base,
+        permissions: Object.assign(["daemon.read"], { [Symbol("x")]: true }),
+      }),
+    ],
+    [
+      "grants sparse",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: object }).enterprise,
+          principal: {
+            ...(base as { enterprise: { principal: object } }).enterprise.principal,
+            grants: Object.assign([], { 1: {}, length: 2 }),
+          },
+        },
+      }),
+    ],
+    [
+      "grants symbol",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: object }).enterprise,
+          principal: {
+            ...(base as { enterprise: { principal: object } }).enterprise.principal,
+            grants: Object.assign([], { [Symbol("x")]: true }),
+          },
+        },
+      }),
+    ],
+    [
+      "workspaceIds sparse",
+      (base: object) => {
+        const b = base as { enterprise: { principal: Record<string, unknown> } };
+        return {
+          ...base,
+          enterprise: {
+            ...(base as { enterprise: object }).enterprise,
+            principal: {
+              ...b.enterprise.principal,
+              grants: [
+                {
+                  action: "workspace.metadata.read",
+                  selector: {
+                    kind: "workspace",
+                    workspaceIds: Object.assign([], { 1: "ws-a", length: 2 }),
+                  },
+                },
+              ],
+            },
+          },
+        };
+      },
+    ],
+    [
+      "workspaceIds symbol",
+      (base: object) => {
+        const b = base as { enterprise: { principal: Record<string, unknown> } };
+        return {
+          ...base,
+          enterprise: {
+            ...(base as { enterprise: object }).enterprise,
+            principal: {
+              ...b.enterprise.principal,
+              grants: [
+                {
+                  action: "workspace.metadata.read",
+                  selector: {
+                    kind: "workspace",
+                    workspaceIds: Object.assign(["ws-a"], { [Symbol("x")]: true }),
+                  },
+                },
+              ],
+            },
+          },
+        };
+      },
+    ],
+    [
+      "principal non-enumerable",
+      (base: object) => {
+        const e = (base as { enterprise: { principal: object } }).enterprise;
+        const p = Object.defineProperty({ ...e.principal }, "extra", { value: true });
+        return {
+          ...base,
+          enterprise: { ...(base as { enterprise: object }).enterprise, principal: p },
+        };
+      },
+    ],
+    [
+      "node symbol",
+      (base: object) => {
+        const e = (base as { enterprise: object }).enterprise;
+        const n = Object.assign(
+          { nodeId: "nod_aaaaaaaaaaaaaaaa", paseoServerId: "srv_test", mode: "standalone" },
+          { [Symbol("x")]: true },
+        );
+        return { ...base, enterprise: { ...e, node: n } };
+      },
+    ],
+    ["principal mismatch", (base: object) => ({ ...base, principalId: "usr_bbbbbbbbbbbbbbbb" })],
+    [
+      "runtime copy",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: { runtime: object } }).enterprise,
+          runtime: { ...(base as { enterprise: { runtime: object } }).enterprise.runtime },
+        },
+      }),
+    ],
+    [
+      "guard copy",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: { grantVersionGuard: object } }).enterprise,
+          grantVersionGuard: {
+            ...(base as { enterprise: { grantVersionGuard: object } }).enterprise.grantVersionGuard,
+          },
+        },
+      }),
+    ],
+    [
+      "node mismatch",
+      (base: object) => ({
+        ...base,
+        enterprise: {
+          ...(base as { enterprise: object }).enterprise,
+          node: { nodeId: "nod_bbbbbbbbbbbbbbbb", paseoServerId: "srv_test", mode: "standalone" },
+        },
+      }),
+    ],
+    ["invalid permission", (base: object) => ({ ...base, permissions: ["invalid"] })],
+    ["inherited prototype", (base: object) => Object.create({ evil: true, ...base })],
+    [
+      "own __proto__",
+      (base: object) =>
+        Object.defineProperty({ ...base }, "__proto__", { enumerable: true, value: true }),
+    ],
+  ])("strict admission rejects %s before session side effects", async (_name, mutate) => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const closes: unknown[][] = [];
+    socket.on("close", (...args) => closes.push(args));
+    const admission = mutate({
+      kind: "enterprise",
+      principalId: h.principal.principalId,
+      permissions: [],
+      enterprise: {
+        principal: h.principal,
+        node: h.node,
+        runtime: h.runtime,
+        grantVersionGuard: h.grantVersionGuard,
+      },
+    });
+    try {
+      await expect(
+        asInternals<WebSocketServerInternals>(server).attachSocket(
+          socket,
+          createDirectRequest(),
+          undefined,
+          false,
+          admission,
+        ),
+      ).resolves.toBeUndefined();
+      expect(closes.length).toBeGreaterThan(0);
+      expect(sessionMock.instances).toHaveLength(0);
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+      expect(h.canEmit).not.toHaveBeenCalled();
+    } finally {
+      await server.close();
+    }
+  });
+  test.each(["permissions", "grants", "workspaceIds"])(
+    "admission array accessor %s",
+    async (field) => {
+      const h = createEnterpriseRuntimeHarness();
+      const server = createServer({ enterpriseRuntime: h.runtime });
+      const socket = new MockSocket();
+      const closes: unknown[][] = [];
+      socket.on("close", (...args) => closes.push(args));
+      const getter = vi.fn(() => {
+        if (field === "permissions") return "daemon.read";
+        if (field === "workspaceIds") return "ws-a";
+        return { action: "app.use", selector: { kind: "self" } };
+      });
+      const arr: unknown[] = [];
+      Object.defineProperty(arr, "0", { enumerable: true, get: getter });
+      const base = {
+        kind: "enterprise",
+        principalId: h.principal.principalId,
+        permissions: [],
+        enterprise: {
+          principal: h.principal,
+          node: h.node,
+          runtime: h.runtime,
+          grantVersionGuard: h.grantVersionGuard,
+        },
+      };
+      if (field === "permissions") base.permissions = arr as never;
+      else
+        base.enterprise.principal = {
+          ...h.principal,
+          grants:
+            field === "grants"
+              ? arr
+              : [
+                  {
+                    action: "workspace.metadata.read",
+                    selector: { kind: "workspace", workspaceIds: arr },
+                  },
+                ],
+        } as never;
+      try {
+        await asInternals<WebSocketServerInternals>(server).attachSocket(
+          socket,
+          createDirectRequest(),
+          undefined,
+          false,
+          base,
+        );
+        expect(getter).not.toHaveBeenCalled();
+        expect(closes.length).toBeGreaterThan(0);
+        expect(sessionMock.instances).toHaveLength(0);
+        expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+        expect(h.canEmit).not.toHaveBeenCalled();
+      } finally {
+        await server.close();
+      }
+    },
+  );
+  test("enterprise direct authentication creates a canonical session", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const base = createDirectRequest();
+    const request = {
+      ...base,
+      headers: { ...base.headers, "sec-websocket-protocol": "paseo.bearer.pat-test" },
+    };
+    await asInternals<WebSocketServerInternals>(server).attachAuthenticatedSocket(
+      socket,
+      request,
+      undefined,
+    );
+    expect(h.authenticate).not.toHaveBeenCalled();
+    expect(h.authenticateEvidence).toHaveBeenCalledTimes(1);
+    expect(h.authenticateEvidence.mock.calls[0]?.[0]).toBe("pat-test");
+    expect(h.authenticateEvidence.mock.calls[0]?.[1]).toEqual({
+      node: h.node,
+      transport: "direct",
+      peer: "loopback",
+      remoteAddress: "127.0.0.1",
+      origin: "http://localhost:6767",
+      userAgent: "vitest",
+    });
+    socket.emit("message", JSON.stringify(createHelloMessage("enterprise-client")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    const args = sessionMock.instances[0]!.args;
+    const enterpriseValue = args.enterpriseContext;
+    expect(enterpriseValue).toBeDefined();
+    if (!enterpriseValue || typeof enterpriseValue !== "object")
+      throw new Error("missing enterprise context");
+    const principalValue: unknown = Reflect.get(enterpriseValue, "principal");
+    const nodeValue: unknown = Reflect.get(enterpriseValue, "node");
+    if (
+      !principalValue ||
+      typeof principalValue !== "object" ||
+      !Array.isArray(Reflect.get(principalValue, "grants"))
+    )
+      throw new Error("invalid principal context");
+    if (!nodeValue || typeof nodeValue !== "object") throw new Error("invalid node context");
+    const enterprise = { principal: principalValue, node: nodeValue };
+    expect(enterprise.principal).toEqual(h.principal);
+    expect(enterprise.node).toEqual(h.node);
+    expect(Object.isFrozen(enterprise.principal)).toBe(true);
+    expect(Object.isFrozen(enterprise.principal.grants)).toBe(true);
+    expect(Object.isFrozen(enterprise.node)).toBe(true);
+    expect(args.enterpriseAgentContextRegistry).toBe(h.agentContextRegistry);
+    expect(args.authorityReceiptState).toBe(h.authorityReceiptState);
+    expect(args.principalGrantVersionGuard).toBe(h.grantVersionGuard);
+    expect(args.resourceAuthorization).toBe(h.resourceAuthorization);
+    expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+    expect(h.canEmit).toHaveBeenCalledWith(
+      h.principal,
+      expect.objectContaining({
+        type: "status",
+        payload: expect.objectContaining({ status: "server_info" }),
+      }),
+      { kind: "transport_control", control: "server_info" },
+    );
+    await vi.waitFor(() =>
+      expect(asInternals<WebSocketServerInternals>(server).sessions.size).toBe(1),
+    );
+    await server.close();
+    expect(h.releaseSession).toHaveBeenCalledOnce();
+  });
+
+  test("enterprise reconnect atomically replaces the opaque session handle", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("enterprise-reconnect")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    expect(h.bindSession).not.toHaveBeenCalled();
+
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("enterprise-reconnect")));
+    await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+    expect(sessionMock.instances).toHaveLength(1);
+    expect(h.releaseSession).not.toHaveBeenCalled();
+
+    await server.close();
+    expect(h.releaseSession).toHaveBeenCalledOnce();
+  });
+
+  test("keeps same-client foreign principal in a separate session", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("same-client-foreign")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    const foreignPrincipal = PrincipalContextSchema.parse({
+      ...h.principal,
+      organizationId: "org_bbbbbbbbbbbbbbbb",
+      principalId: "usr_bbbbbbbbbbbbbbbb",
+      credentialId: "cred-foreign",
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) =>
+      issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        foreignPrincipal,
+        h.node,
+        connection as never,
+      ),
+    );
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("same-client-foreign")));
+    await vi.waitFor(() => expect(sentServerInfoEnvelopes(second)).toHaveLength(1));
+    expect(h.replaceSession).not.toHaveBeenCalled();
+    expect(h.releaseSession).not.toHaveBeenCalled();
+    expect(sessionMock.instances).toHaveLength(2);
+    expect(sessionMock.instances[0]?.cleanup).not.toHaveBeenCalled();
+    expect(asInternals<WebSocketServerInternals>(server).sessions.get(first)).toBeDefined();
+    await server.close();
+  });
+
+  test("burns same-slot wrong-node evidence without touching the old session", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const first = new MockSocket();
+    const second = new MockSocket();
+    await attachEnterpriseAuthenticated(server, first);
+    first.emit("message", JSON.stringify(createHelloMessage("same-slot-node")));
+    await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
+    const wrongNode = NodeContextSchema.parse({
+      ...h.node,
+      nodeId: "nod_bbbbbbbbbbbbbbbb",
+    });
+    h.authenticateEvidence.mockImplementationOnce(async (_token, connection) =>
+      issueEnterpriseAdmissionEvidence(
+        h.authorizationIssuer,
+        h.mintSecret,
+        h.principal,
+        wrongNode,
+        connection as never,
+      ),
+    );
+    await attachEnterpriseAuthenticated(server, second);
+    second.emit("message", JSON.stringify(createHelloMessage("same-slot-node")));
+    await vi.waitFor(() => expect(second.readyState).toBe(3));
+    expect(sessionMock.instances).toHaveLength(1);
+    expect(sessionMock.instances[0]?.cleanup).not.toHaveBeenCalled();
+    expect(asInternals<WebSocketServerInternals>(server).sessions.get(first)).toBeDefined();
+    await server.close();
+  });
+
+  test("rejects caller structural enterprise authority without reading it", async () => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const grant = {
+      action: "workspace.metadata.read",
+      selector: { kind: "workspace", workspaceIds: ["ws-a"] },
+    };
+    const principalTarget = { ...h.principal, grants: [grant] };
+    let pKeys = 0;
+    let tKeys = 0;
+    const principal = new Proxy(principalTarget, {
+      ownKeys: () => {
+        pKeys++;
+        return Reflect.ownKeys(principalTarget);
+      },
+    });
+    const topTarget = {
+      kind: "enterprise",
+      principalId: h.principal.principalId,
+      permissions: [],
+      enterprise: {
+        principal,
+        node: h.node,
+        runtime: h.runtime,
+        grantVersionGuard: h.grantVersionGuard,
+      },
+    };
+    const top = new Proxy(topTarget, {
+      ownKeys: () => {
+        tKeys++;
+        return Reflect.ownKeys(topTarget);
+      },
+    });
+    try {
+      await asInternals<WebSocketServerInternals>(server).attachSocket(
+        socket,
+        createDirectRequest(),
+        undefined,
+        false,
+        top,
+      );
+      expect(socket.readyState).toBe(3);
+      expect(sessionMock.instances).toHaveLength(0);
+      expect(tKeys).toBe(0);
+      expect(pKeys).toBe(0);
+      expect(h.bindSession).not.toHaveBeenCalled();
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test.each([false, "throw"])("auth current fence %s closes before session", async (mode) => {
+    const h = createEnterpriseRuntimeHarness();
+    const server = createServer({ enterpriseRuntime: h.runtime });
+    const socket = new MockSocket();
+    const req = createDirectRequest();
+    req.headers["sec-websocket-protocol"] = "paseo.bearer.pat-test";
+    try {
+      await asInternals<WebSocketServerInternals>(server).attachAuthenticatedSocket(
+        socket,
+        req,
+        undefined,
+      );
+      h.setAuthorizationCurrent(mode);
+      socket.emit("message", JSON.stringify(createHelloMessage("stale")));
+      await vi.waitFor(() => expect(socket.readyState).toBe(3));
+      expect(sessionMock.instances).toHaveLength(0);
+      expect(h.nextSessionBindingGeneration).not.toHaveBeenCalled();
+      expect(h.canEmit).not.toHaveBeenCalled();
+    } finally {
+      await server.close();
+    }
   });
 });

@@ -19,6 +19,11 @@ import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
+import {
+  createEnterpriseAgentSessionContextRegistry,
+  type EnterpriseSessionContext,
+} from "./session/enterprise-agent-session-context-registry.js";
+import { createAuthorityReceiptStatePort } from "./session/enterprise-authority-receipt-state.js";
 import { OWNER_PERMISSIONS } from "./authorization/index.js";
 import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-service.js";
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
@@ -351,6 +356,7 @@ function makeManagedAgent(input: {
       attentionReason: null,
       attentionTimestamp: now,
     },
+    queuedTurns: [],
     foregroundTurnWaiters: new Set(),
     unsubscribeSession: null,
     session: null,
@@ -568,6 +574,8 @@ function createSessionForWorkspaceTests(
       newName: string,
     ) => Promise<{ previousBranch: string | null; currentBranch: string | null }>;
     generateWorkspaceName?: () => Promise<GeneratedWorkspaceName | null>;
+    enterpriseContext?: EnterpriseSessionContext;
+    resourceAuthorization?: SessionOptions["resourceAuthorization"];
   } = {},
 ): TestSession {
   const logger = {
@@ -742,6 +750,15 @@ function createSessionForWorkspaceTests(
       tts: null,
       providerSnapshotManager,
       terminalManager: options.terminalManager ?? null,
+      enterpriseContext: options.enterpriseContext,
+      enterpriseAgentContextRegistry: options.enterpriseContext
+        ? createEnterpriseAgentSessionContextRegistry()
+        : undefined,
+      authorityReceiptState: options.enterpriseContext
+        ? createAuthorityReceiptStatePort()
+        : undefined,
+      principalGrantVersionGuard: options.enterpriseContext ? { isCurrent: () => true } : undefined,
+      resourceAuthorization: options.resourceAuthorization,
     }),
   );
   return session;
@@ -3735,6 +3752,7 @@ test("workspace update stream keeps persisted workspace visible after agents sto
     subscriptionId: "sub-1",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -3829,6 +3847,7 @@ test("archiving the last workspace emits a remove carrying the now-empty project
     subscriptionId: "sub-1",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map([
       [
@@ -3919,6 +3938,7 @@ test("project.remove.request archives active workspaces and removes the project 
     subscriptionId: "sub-project-remove",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -4016,6 +4036,7 @@ test("project.remove.request removes an already-empty project", async () => {
     subscriptionId: "sub-empty-project-remove",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map([
       [archivedWorkspace.workspaceId, { kind: "remove", id: archivedWorkspace.workspaceId }],
@@ -4233,6 +4254,7 @@ test("workspace updates stay scoped to the matching cwd", async () => {
     subscriptionId: "sub-dedup",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -4396,6 +4418,7 @@ test("import_agent_request registers a workspace for a never-seen cwd", async ()
     subscriptionId: "sub-import",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -4660,6 +4683,7 @@ test("open_project_request emits a workspace_update with githubRuntime once the 
     subscriptionId: "sub-open-project",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -5307,6 +5331,7 @@ test("workspace recovery stays accepted when git observer warming fails", async 
     subscriptionId: "sub-recovery-warm-failure",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -6109,6 +6134,7 @@ test.skip("opening a new worktree reconciles older local workspaces into the rem
     subscriptionId: "sub-reconcile",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -6872,6 +6898,7 @@ test("emitWorkspaceUpdatesForWorkspaceIds includes archiving state and dedupes u
     subscriptionId: "sub-archiving",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -6941,6 +6968,7 @@ test("external workspace updates emit one deduplicated batch", async () => {
     subscriptionId: "sub-observer-batch",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -7205,6 +7233,7 @@ test("workspace_update includes updated runtime fields", async () => {
     subscriptionId: "sub-runtime",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map(),
   };
@@ -7642,6 +7671,7 @@ test("project removal mutation broadcasts the final delta to another subscribed 
     subscriptionId: "sub-global-remove",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     pendingUpdatesByWorkspaceId: new Map(),
     lastEmittedByWorkspaceId: new Map([
       [
@@ -8076,6 +8106,7 @@ test("project.rename.request stores customName and emits an updated workspace de
     subscriptionId: "sub-workspaces",
     filter: {},
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     lastEmittedByWorkspaceId: new Map(),
     pendingUpdatesByWorkspaceId: new Map(),
   };
@@ -8253,6 +8284,7 @@ test("workspace.title.set.request stores the title and emits an updated descript
     subscriptionId: "sub-workspaces",
     filter: {},
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     lastEmittedByWorkspaceId: new Map(),
     pendingUpdatesByWorkspaceId: new Map(),
   };
@@ -8323,6 +8355,7 @@ test("workspace.pin.set.request stores the pin timestamp and emits an updated de
     subscriptionId: "sub-workspaces",
     filter: {},
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     lastEmittedByWorkspaceId: new Map(),
     pendingUpdatesByWorkspaceId: new Map(),
   };
@@ -8463,6 +8496,7 @@ function createSessionWithTerminalManager(options: {
     subscriptionId: "sub-workspaces",
     filter: undefined,
     isBootstrapping: false,
+    excludedWorkspaceIds: new Set(),
     lastEmittedByWorkspaceId: new Map(),
     pendingUpdatesByWorkspaceId: new Map(),
   };
@@ -9443,6 +9477,79 @@ test("workspace.create.response persists the first prompt as the initial title",
   const persisted = await session.workspaceRegistry.get(workspaceId as string);
   expect(persisted?.title).toBe("Add retries to the payments flow");
   expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
+});
+
+test("enterprise workspace.create.response carries the newly created workspace authorization context", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
+  const canEmit = vi.fn(async () => true);
+  const enterpriseContext: EnterpriseSessionContext = {
+    principal: {
+      principalType: "human",
+      principalId: "usr_aaaaaaaaaaaaaaaa",
+      organizationId: "org_aaaaaaaaaaaaaaaa",
+      grants: [
+        {
+          action: "workspace.manage",
+          selector: { kind: "organization", organizationId: "org_aaaaaaaaaaaaaaaa" },
+        },
+      ],
+      credentialId: "cred_workspace_create",
+      grantVersion: "grant-workspace-create",
+    },
+    node: {
+      nodeId: "nod_aaaaaaaaaaaaaaaa",
+      paseoServerId: "server-workspace-create",
+      mode: "managed",
+    },
+    sessionBindingGeneration: "generation-workspace-create",
+  };
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    enterpriseContext,
+    resourceAuthorization: { canEmit } as SessionOptions["resourceAuthorization"],
+    workspaceRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => Array.from(workspaces.values()),
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+      upsert: async (workspace) => {
+        workspaces.set(workspace.workspaceId, workspace);
+      },
+      archive: async () => {},
+      remove: async () => {},
+    },
+  });
+
+  await session.handleMessage({
+    type: "workspace.create.request",
+    requestId: "req-enterprise-create-context",
+    source: { kind: "directory", path: REPO_CWD },
+  });
+
+  const response = findByType(emitted, "workspace.create.response");
+  expect(response?.payload.error).toBeNull();
+  const workspaceId = response?.payload.workspace?.id;
+  expect(workspaceId).toEqual(expect.any(String));
+  expect(canEmit).toHaveBeenCalledWith(
+    expect.objectContaining({ principalId: enterpriseContext.principal.principalId }),
+    expect.objectContaining({
+      type: "workspace.create.response",
+      payload: expect.objectContaining({ requestId: "req-enterprise-create-context" }),
+    }),
+    {
+      kind: "resources",
+      resources: [
+        {
+          resourceKind: "workspace",
+          organizationId: enterpriseContext.principal.organizationId,
+          nodeId: enterpriseContext.node.nodeId,
+          localResourceId: workspaceId,
+        },
+      ],
+    },
+  );
+  await session.cleanup();
 });
 
 test("workspace create emits through a matching workspace subscription", async () => {

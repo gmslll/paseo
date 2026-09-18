@@ -18,6 +18,10 @@ import {
 import type { Logger } from "pino";
 import type { ProviderOptions, ToolPolicy } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import {
+  AgentOwnershipEnvelopeSchema,
+  type AgentOwnershipEnvelope,
+} from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
@@ -52,8 +56,14 @@ import {
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
+import { isTurnTerminalStreamEvent, markQueuedAgentRun } from "./agent-sdk-types.js";
+import { resolveSharedTurnDisposition } from "@getpaseo/protocol/enterprise-collaboration";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import {
+  storedAgentOwnership,
+  type StoredAgentRecord,
+  type AgentStorage,
+} from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -77,6 +87,7 @@ import {
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
+import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
@@ -285,7 +296,15 @@ export interface CreateAgentOptions {
   initialTitle?: string | null;
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
+  enterpriseOwnership?: AgentOwnershipEnvelope;
   owner?: AgentOwner;
+}
+
+// Kept outside the constructor so optional wiring does not add constructor branches.
+function resolveMcpCallerTokenMinter(
+  options: AgentManagerOptions | undefined,
+): (agentId: string) => string | null {
+  return options?.mintMcpCallerToken ?? (() => null);
 }
 
 export interface AgentManagerOptions {
@@ -300,6 +319,7 @@ export interface AgentManagerOptions {
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
+  mintMcpCallerToken?: (agentId: string) => string;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
@@ -368,6 +388,22 @@ interface HandleStreamEventOptions {
   fromHistory?: boolean;
 }
 
+/** A run that produces nothing, for a send that was queued rather than started (ADR-0034). */
+function emptyAgentRunStream(): AsyncGenerator<AgentStreamEvent> {
+  return markQueuedAgentRun((async function* () {})());
+}
+
+/**
+ * One collaborator's send waiting behind another's turn (ADR-0034). The prompt itself is not kept
+ * here: the queue is visible to every member of the Workspace, and what someone is about to say is
+ * not theirs to read.
+ */
+export interface QueuedTurn {
+  messageId: string;
+  author: { principalId: string; displayName?: string };
+  queuedAt: Date;
+}
+
 interface ManagedAgentBase {
   id: string;
   provider: AgentProvider;
@@ -378,6 +414,7 @@ interface ManagedAgentBase {
    * Null/undefined for legacy agents created before ownership stamping.
    */
   workspaceId?: string;
+  enterpriseOwnership?: AgentOwnershipEnvelope;
   owner?: AgentOwner;
   capabilities: AgentCapabilityFlags;
   config: AgentSessionConfig;
@@ -399,6 +436,12 @@ interface ManagedAgentBase {
   lastUserMessageAt: Date | null;
   activeTurnId: string | null;
   activeTurnStartedAt: Date | null;
+  /**
+   * Sends from other Principals waiting for the running turn to finish, oldest first (ADR-0034).
+   * Empty for a single-user daemon: a sender who controls the turn steers or interrupts it and
+   * never queues behind themselves.
+   */
+  queuedTurns: QueuedTurn[];
   lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
@@ -555,14 +598,6 @@ function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
 }
 
-function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
-  return (
-    event.type === "turn_completed" ||
-    event.type === "turn_failed" ||
-    event.type === "turn_canceled"
-  );
-}
-
 function abortMessage(reason: unknown, fallbackMessage: string): string {
   if (typeof reason === "string") return reason;
   if (reason instanceof Error) return reason.message;
@@ -572,6 +607,26 @@ function abortMessage(reason: unknown, fallbackMessage: string): string {
 function createAbortError(signal: AbortSignal | undefined, fallbackMessage: string): Error {
   const message = abortMessage(signal?.reason, fallbackMessage);
   return Object.assign(new Error(message), { name: "AbortError" });
+}
+
+function validateAgentOwnership(
+  workspaceId: string | undefined,
+  ownership: AgentOwnershipEnvelope | undefined,
+): AgentOwnershipEnvelope | undefined {
+  if (!ownership) return undefined;
+  const parsed = AgentOwnershipEnvelopeSchema.parse(ownership);
+  if (workspaceId !== parsed.workspaceId) {
+    throw new Error("Agent ownership workspaceId must match the Agent Workspace");
+  }
+  return parsed;
+}
+
+function projectAgentOwnership(
+  ownership: AgentOwnershipEnvelope | undefined,
+): Omit<AgentOwnershipEnvelope, "workspaceId"> | Record<string, never> {
+  if (!ownership) return {};
+  const { workspaceId: _workspaceId, ...owner } = ownership;
+  return owner;
 }
 
 function validateAgentId(agentId: string, source: string): string {
@@ -714,6 +769,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
+  private readonly mintMcpCallerToken: (agentId: string) => string | null;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -738,6 +794,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.mintMcpCallerToken = resolveMcpCallerTokenMinter(options);
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -775,6 +832,7 @@ export class AgentManager {
   updateProviderRegistry(input: {
     providerDefinitions: ProviderEnabledMap;
     clients: ProviderClientMap;
+    retiredProviders?: readonly AgentProvider[];
   }): void {
     this.providerEnabled.clear();
     this.providerDefinitions.clear();
@@ -789,6 +847,18 @@ export class AgentManager {
     for (const [provider, client] of Object.entries(input.clients)) {
       if (client) {
         this.clients.set(provider, client);
+      }
+    }
+
+    for (const provider of input.retiredProviders ?? []) {
+      for (const agent of this.agents.values()) {
+        if (agent.provider !== provider) continue;
+        void this.closeAgent(agent.id).catch((error) => {
+          this.logger.warn(
+            { err: error, agentId: agent.id, provider },
+            "Failed to close agent after provider retirement",
+          );
+        });
       }
     }
   }
@@ -1197,6 +1267,10 @@ export class AgentManager {
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    const enterpriseOwnership = validateAgentOwnership(
+      options.workspaceId,
+      options.enterpriseOwnership,
+    );
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
     if (this.pluginLifecycle && !config.internal) {
       const request = await this.pluginLifecycle.before("agent.create", {
@@ -1233,6 +1307,7 @@ export class AgentManager {
       labels: options.labels,
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
+      enterpriseOwnership,
       owner: options.owner,
       historyPrimed: true,
     });
@@ -1264,6 +1339,7 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
       owner?: AgentOwner;
     },
     resumeOptions?: AgentResumeSessionOptions,
@@ -1283,11 +1359,16 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
       owner?: AgentOwner;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    const enterpriseOwnership = validateAgentOwnership(
+      options?.workspaceId,
+      options?.enterpriseOwnership,
+    );
     const resolvedAgentId = validateAgentId(
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
@@ -1333,6 +1414,7 @@ export class AgentManager {
     await this.requireExternalMcpSupport(session, storedConfig);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
+      enterpriseOwnership,
       persistence: handle,
     });
   }
@@ -1342,6 +1424,7 @@ export class AgentManager {
     providerHandleId: string;
     cwd: string;
     workspaceId: string;
+    enterpriseOwnership?: AgentOwnershipEnvelope;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(this.importProviderSessionInternal(input));
@@ -1352,9 +1435,14 @@ export class AgentManager {
     providerHandleId: string;
     cwd: string;
     workspaceId: string;
+    enterpriseOwnership?: AgentOwnershipEnvelope;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    const enterpriseOwnership = validateAgentOwnership(
+      input.workspaceId,
+      input.enterpriseOwnership,
+    );
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
 
@@ -1399,6 +1487,7 @@ export class AgentManager {
       const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
         labels: input.labels,
         workspaceId: input.workspaceId,
+        enterpriseOwnership,
         timelineRows,
         timelineNextSeq: timelineRows.length + 1,
         persistence: imported.persistence,
@@ -1515,6 +1604,7 @@ export class AgentManager {
       return this.registerSession(session, storedConfig, agentId, {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
+        enterpriseOwnership: existing.enterpriseOwnership,
         owner: existing.owner,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
@@ -1818,6 +1908,7 @@ export class AgentManager {
         provider: record.provider,
         cwd: record.cwd,
         workspaceId: record.workspaceId,
+        enterpriseOwnership: storedAgentOwnership(record),
         owner: record.owner,
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
@@ -1836,6 +1927,7 @@ export class AgentManager {
         activeForegroundTurnId: null,
         activeTurnId: null,
         activeTurnStartedAt: null,
+        queuedTurns: [],
         foregroundTurnWaiters: new Set(),
         finalizedForegroundTurnIds: new Set(),
         unsubscribeSession: null,
@@ -2129,7 +2221,11 @@ export class AgentManager {
 
   async unarchiveSnapshot(
     agentId: string,
-    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
+    updates?: {
+      workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
+      labels?: AgentLabelPatch;
+    },
   ): Promise<boolean> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
@@ -2141,9 +2237,16 @@ export class AgentManager {
     await this.closeAgent(agentId);
     await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
+    const workspaceId = updates?.workspaceId ?? record.workspaceId;
+    const enterpriseOwnership = validateAgentOwnership(
+      workspaceId,
+      updates?.enterpriseOwnership ?? storedAgentOwnership(record),
+    );
+
     await registry.upsert({
       ...record,
-      ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+      ...projectAgentOwnership(enterpriseOwnership),
       ...(updates?.labels ? { labels: applyLabelPatch(record.labels, updates.labels) } : {}),
       archivedAt: null,
       updatedAt: new Date().toISOString(),
@@ -2274,7 +2377,12 @@ export class AgentManager {
       return false;
     }
     if (options?.clientMessageId) {
-      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId);
+      this.recordSubmittedPrompt(
+        agent,
+        prompt,
+        options.clientMessageId,
+        options.author ? { author: options.author } : undefined,
+      );
       this.emitState(agent);
     }
     const dispatch = (event: AgentStreamEvent): void => {
@@ -2358,6 +2466,13 @@ export class AgentManager {
       return result.turnId;
     } catch (error) {
       if (pendingRun.settled) {
+        throw error;
+      }
+      if (isStaleProviderSessionError(error)) {
+        pendingRun.start = { status: "failed", error: error.message };
+        agent.pendingReplacement = false;
+        if (!agent.activeForegroundTurnId) agent.lifecycle = "idle";
+        this.runs.settleForegroundRun(agentId, pendingRun.token);
         throw error;
       }
       agent.pendingReplacement = false;
@@ -2459,6 +2574,7 @@ export class AgentManager {
             stagedSubmittedPromptEcho?.item.type === "user_message"
               ? stagedSubmittedPromptEcho.item.messageId
               : undefined,
+          ...(options.author ? { author: options.author } : {}),
         });
       }
       for (const stagedEvent of pendingRun.stagedEvents.splice(0)) {
@@ -2492,7 +2608,7 @@ export class AgentManager {
           turnId,
         };
         yield acceptedTurnStartedEvent;
-        for await (const event of turnStream.events(isTurnTerminalEvent)) {
+        for await (const event of turnStream.events(isTurnTerminalStreamEvent)) {
           yield event;
         }
       } finally {
@@ -2527,6 +2643,9 @@ export class AgentManager {
       nextLifecycle = "idle";
     }
     mutableAgent.lifecycle = nextLifecycle;
+    if (nextLifecycle === "idle") {
+      this.drainQueuedTurn(mutableAgent);
+    }
     const persistenceHandle =
       mutableAgent.session.describePersistence() ??
       (mutableAgent.runtimeInfo?.sessionId
@@ -2551,6 +2670,111 @@ export class AgentManager {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
     }
+  }
+
+  /**
+   * What each queued send is waiting to run, by agent and message id.
+   *
+   * Kept here rather than on the queue entry because `queuedTurns` is projected to every member of
+   * the Workspace, and ADR-0034 keeps the prompt text out of it. A structure that cannot carry the
+   * text is a better guarantee than remembering to strip it.
+   */
+  private readonly queuedPrompts = new Map<string, Map<string, AgentPromptInput>>();
+
+  /**
+   * Whether this send waits behind the running turn instead of replacing it (ADR-0034).
+   *
+   * The turn belongs to the author of the user message that opened it. A different Principal
+   * queues; the Workspace owner does not, and neither does the controller sending again. A send
+   * with no author is a single-user daemon or a prompt the daemon injected, and those keep today's
+   * behaviour exactly — this returns false and the caller replaces as it always has.
+   */
+  private queueBehindRunningTurn(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    options: AgentRunOptions | undefined,
+  ): boolean {
+    const sender = options?.author;
+    if (!sender) return false;
+    const controller = this.activeTurnAuthor(agent);
+    const disposition = resolveSharedTurnDisposition({
+      senderPrincipalId: sender.principalId,
+      controllerPrincipalId: controller?.principalId ?? null,
+      ownerPrincipalId: agent.enterpriseOwnership?.ownerPrincipalId ?? null,
+      requested: options?.sharedTurnPolicy,
+    });
+    if (disposition === "proceed") return false;
+
+    const messageId = options?.clientMessageId ?? randomUUID();
+    agent.queuedTurns = [...agent.queuedTurns, { messageId, author: sender, queuedAt: new Date() }];
+    const pending = this.queuedPrompts.get(agent.id) ?? new Map<string, AgentPromptInput>();
+    pending.set(messageId, prompt);
+    this.queuedPrompts.set(agent.id, pending);
+    this.touchUpdatedAt(agent);
+    this.emitState(agent);
+    return true;
+  }
+
+  /**
+   * Starts the oldest waiting send once the turn it was waiting for has ended (ADR-0034).
+   *
+   * Only when the Agent actually came to rest: a replacement already in flight keeps the lifecycle
+   * running, and starting a queued send into that would have two turns racing for the same Agent.
+   */
+  private drainQueuedTurn(agent: ActiveManagedAgent): void {
+    const next = agent.queuedTurns[0];
+    if (!next) return;
+    const pending = this.queuedPrompts.get(agent.id);
+    const prompt = pending?.get(next.messageId);
+    agent.queuedTurns = agent.queuedTurns.slice(1);
+    pending?.delete(next.messageId);
+    if (pending && pending.size === 0) this.queuedPrompts.delete(agent.id);
+    this.emitState(agent);
+    // The prompt is gone only if the Agent was reloaded while the send waited. Dropping the entry
+    // is right either way: the queue must not keep advertising a send that can no longer run.
+    if (prompt === undefined) return;
+    void (async () => {
+      try {
+        const run = this.streamAgent(agent.id, prompt, {
+          clientMessageId: next.messageId,
+          author: next.author,
+        });
+        for await (const _event of run) {
+          // Events reach subscribers through the manager; nothing to collect here.
+        }
+      } catch (error) {
+        this.logger.warn(
+          { agentId: agent.id, messageId: next.messageId, err: error },
+          "agent.manager.queued_turn_failed",
+        );
+      }
+    })();
+  }
+
+  /**
+   * Who controls this Agent's running turn, or null when nothing is running and when the turn was
+   * opened without an author (ADR-0034). Callers that gate on it must treat null as "not known to
+   * be someone else's" rather than as a refusal: turns opened before authorship, and by the daemon
+   * itself, have no controller and were always answerable by anyone.
+   */
+  turnControllerOf(agentId: string): { principalId: string; displayName?: string } | null {
+    const agent = this.agents.get(agentId);
+    // Same narrowing requireSessionAgent uses, without its throw: an unknown or closed Agent has no
+    // controller, and a question about one is not an error.
+    if (!agent || agent.session === null) return null;
+    return this.activeTurnAuthor(agent);
+  }
+
+  /** Who opened the running turn, from the user message committed under its turn id. */
+  private activeTurnAuthor(
+    agent: ActiveManagedAgent,
+  ): { principalId: string; displayName?: string } | null {
+    const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    if (!turnId || !this.timelineStore.has(agent.id)) return null;
+    const row = this.timelineStore
+      .getRows(agent.id)
+      .find((candidate) => candidate.turnId === turnId && candidate.item.type === "user_message");
+    return row?.item.type === "user_message" ? (row.item.author ?? null) : null;
   }
 
   private openActiveTurn(agent: ActiveManagedAgent, turnId: string, startedAt: Date): void {
@@ -2586,6 +2810,11 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
+    if (this.queueBehindRunningTurn(agent, prompt, options)) {
+      // Nothing to stream: the send is waiting, not running. An empty run would read to the caller
+      // as a turn that started and produced nothing.
+      return emptyAgentRunStream();
+    }
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -2619,7 +2848,13 @@ export class AgentManager {
         expectedTurnId,
       });
       if (admission.status === "accepted") {
-        await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
+        await this.recordAcceptedSteer(
+          agent,
+          prompt,
+          options?.clientMessageId,
+          expectedTurnId,
+          options?.author,
+        );
       }
       return admission;
     });
@@ -2649,7 +2884,13 @@ export class AgentManager {
             expectedTurnId,
           });
           if (admission.status === "accepted") {
-            await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
+            await this.recordAcceptedSteer(
+              agent,
+              prompt,
+              options?.clientMessageId,
+              expectedTurnId,
+              options?.author,
+            );
           }
           return admission;
         })
@@ -2754,6 +2995,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     clientMessageId: string | undefined,
     expectedTurnId: string,
+    author?: { principalId: string; displayName?: string },
   ): Promise<void> {
     if (!clientMessageId) {
       return;
@@ -2761,6 +3003,7 @@ export class AgentManager {
     this.recordSubmittedPrompt(agent, prompt, clientMessageId, {
       messageId: clientMessageId,
       turnId: expectedTurnId,
+      ...(author ? { author } : {}),
     });
     this.emitState(agent);
   }
@@ -3360,6 +3603,7 @@ export class AgentManager {
       initialTitle?: string | null;
       publishWhenReady?: boolean;
       workspaceId?: string;
+      enterpriseOwnership?: AgentOwnershipEnvelope;
       owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
@@ -3511,16 +3755,21 @@ export class AgentManager {
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
+          enterpriseOwnership?: AgentOwnershipEnvelope;
           owner?: AgentOwner;
         }
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const enterpriseOwnership = options
+      ? validateAgentOwnership(options.workspaceId, options.enterpriseOwnership)
+      : undefined;
     return {
       id: resolvedAgentId,
       provider: config.provider,
       cwd: config.cwd,
       workspaceId: options?.workspaceId,
+      enterpriseOwnership,
       owner: options?.owner,
       session,
       capabilities: session.capabilities,
@@ -3538,6 +3787,7 @@ export class AgentManager {
       activeForegroundTurnId: null,
       activeTurnId: null,
       activeTurnStartedAt: null,
+      queuedTurns: [],
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
       unsubscribeSession: null,
@@ -3593,6 +3843,7 @@ export class AgentManager {
       activeForegroundTurnId: null,
       activeTurnId: null,
       activeTurnStartedAt: null,
+      queuedTurns: [],
       pendingPermissions: new Map(),
       bufferedPermissionResolutions: new Map(),
       inFlightPermissionResponses: new Set(),
@@ -3734,7 +3985,7 @@ export class AgentManager {
     }
 
     this.runs.notifyWaiters(matchingWaiters, event, {
-      terminal: isTurnTerminalEvent(event),
+      terminal: isTurnTerminalStreamEvent(event),
     });
     this.logger.trace(
       {
@@ -3743,7 +3994,7 @@ export class AgentManager {
         sessionId: agent.persistence?.sessionId ?? undefined,
         turnId,
         notifiedWaiterCount: matchingWaiters.length,
-        terminal: isTurnTerminalEvent(event),
+        terminal: isTurnTerminalStreamEvent(event),
         event,
       },
       "agent.manager.notify_waiters",
@@ -4022,7 +4273,7 @@ export class AgentManager {
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
       eventTurnId &&
-      isTurnTerminalEvent(event) &&
+      isTurnTerminalStreamEvent(event) &&
       this.runs.hasFinalizedTurn(agent, eventTurnId)
     ) {
       return false;
@@ -4039,7 +4290,7 @@ export class AgentManager {
     }
 
     let terminalDisposition: ActiveTurnTerminalDisposition = "untracked";
-    if (isTurnTerminalEvent(event)) {
+    if (isTurnTerminalStreamEvent(event)) {
       terminalDisposition = this.applyActiveTurnTerminal(
         agent,
         eventTurnId,
@@ -4063,7 +4314,7 @@ export class AgentManager {
     }
 
     if (!options?.fromHistory) {
-      if (isTurnTerminalEvent(event)) {
+      if (isTurnTerminalStreamEvent(event)) {
         this.runs.settleTerminalRun(agent.id, eventTurnId);
         if (isForegroundEvent) {
           this.finalizeForegroundTurn(agent, eventTurnId);
@@ -4535,7 +4786,12 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
-    options?: { messageId?: string; providerMessageId?: string; turnId?: string },
+    options?: {
+      messageId?: string;
+      providerMessageId?: string;
+      turnId?: string;
+      author?: { principalId: string; displayName?: string };
+    },
   ): void {
     if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
       return;
@@ -4547,6 +4803,8 @@ export class AgentManager {
       text: submittedPromptText(prompt),
       clientMessageId,
       ...(options?.messageId ? { messageId: options.messageId } : {}),
+      // Absent for a single-user daemon and for prompts the daemon injects itself (ADR-0034).
+      ...(options?.author ? { author: options.author } : {}),
     };
     this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
   }
@@ -4564,6 +4822,8 @@ export class AgentManager {
         messageId: clientMessageId,
         ...(messageId ? { providerMessageId: messageId } : {}),
         ...(turnId ? { turnId } : {}),
+        // The echo carries whatever the submission recorded, so an author survives the round trip.
+        ...(item.author ? { author: item.author } : {}),
       });
       existing = this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId);
     }
@@ -5025,12 +5285,12 @@ export class AgentManager {
     const launchConfig = this.applyDaemonAppendSystemPrompt(
       withRuntimePaseoMcpServer({
         config: storedConfig,
-        agentId,
         mcpBaseUrl:
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
             ? this.mcpBaseUrl
             : null,
         mcpAuthToken: this.mcpAuthToken,
+        mcpCallerToken: this.mintMcpCallerToken(agentId),
       }),
     );
     return { storedConfig, launchConfig, paseoToolPolicy };

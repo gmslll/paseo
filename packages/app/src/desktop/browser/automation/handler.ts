@@ -1,7 +1,10 @@
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { getDesktopHost, type DesktopHostBridge } from "@/desktop/host";
 import {
+  type BrowserProfileAuthorizationResult,
   ensureResidentBrowserWebview as ensureResidentBrowserWebviewDefault,
+  getBrowserWebviewProfile,
+  parseBrowserProfileAuthorizationResult,
   removeResidentBrowserWebview,
   resizeResidentBrowserWebview,
 } from "@/desktop/browser/resident-webviews";
@@ -25,6 +28,13 @@ type BrowserAutomationExecuteResponse = Extract<
 type BrowserAutomationResponsePayload = BrowserAutomationExecuteResponse["payload"];
 type BrowserAutomationFailurePayload = Extract<BrowserAutomationResponsePayload, { ok: false }>;
 type BrowserAutomationErrorCode = BrowserAutomationFailurePayload["error"]["code"];
+
+interface EnterpriseBrowserProfileBridge {
+  resolveProfileLease(input: {
+    workspaceId: string;
+    enterpriseContext: NonNullable<BrowserAutomationExecuteRequest["enterpriseContext"]>;
+  }): Promise<BrowserProfileAuthorizationResult | null>;
+}
 
 interface BrowserAutomationClient {
   on(
@@ -97,86 +107,140 @@ async function handleBrowserAutomationRequest(params: {
     registrationPollIntervalMs,
   } = params;
   const browserHost = getHost()?.browser;
+  const enterpriseBrowserHost = browserHost as
+    | (NonNullable<DesktopHostBridge["browser"]> & Partial<EnterpriseBrowserProfileBridge>)
+    | undefined;
   const executeAutomationCommand = browserHost?.executeAutomationCommand;
+  const send = (payload: BrowserAutomationResponsePayload): void => {
+    client.sendBrowserAutomationExecuteResponse({
+      type: "browser.automation.execute.response",
+      payload: bindRequestEnterpriseContext(request, payload),
+    });
+  };
+  const profile = await resolveEnterpriseProfileForRequest({
+    enterpriseBrowserHost,
+    request,
+  });
+  if (request.enterpriseContext && !profile) {
+    send(
+      browserAutomationFailure({
+        requestId: request.requestId,
+        code: "browser_denied",
+        message: "Enterprise Browser Profile authorization is not current for this host.",
+      }),
+    );
+    return;
+  }
 
   if (request.command.command === "new_tab") {
     try {
-      client.sendBrowserAutomationExecuteResponse({
-        type: "browser.automation.execute.response",
-        payload: await openBrowserTabForRequest({
+      send(
+        await openBrowserTabForRequest({
           request,
           serverId,
           browserHost,
           ensureResidentBrowserWebview,
+          ...(profile ? { profile } : {}),
           ...(registrationWaitTimeoutMs !== undefined ? { registrationWaitTimeoutMs } : {}),
           ...(registrationPollIntervalMs !== undefined ? { registrationPollIntervalMs } : {}),
         }),
-      });
+      );
     } catch (error) {
-      client.sendBrowserAutomationExecuteResponse({
-        type: "browser.automation.execute.response",
-        payload: normalizeThrownBridgeError(request.requestId, error),
-      });
+      send(normalizeThrownBridgeError(request.requestId, error));
     }
     return;
   }
 
   if (request.command.command === "resize") {
-    client.sendBrowserAutomationExecuteResponse({
-      type: "browser.automation.execute.response",
-      payload: resizeBrowserTabForRequest({ request, serverId }),
-    });
+    send(resizeBrowserTabForRequest({ request, serverId, ...(profile ? { profile } : {}) }));
     return;
   }
 
   if (request.command.command === "close_tab") {
     try {
-      client.sendBrowserAutomationExecuteResponse({
-        type: "browser.automation.execute.response",
-        payload: await closeBrowserTabForRequest({
+      send(
+        await closeBrowserTabForRequest({
           request,
           serverId,
           browserHost,
+          ...(profile ? { profile } : {}),
         }),
-      });
+      );
     } catch (error) {
-      client.sendBrowserAutomationExecuteResponse({
-        type: "browser.automation.execute.response",
-        payload: normalizeThrownBridgeError(request.requestId, error),
-      });
+      send(normalizeThrownBridgeError(request.requestId, error));
     }
     return;
   }
 
   if (!executeAutomationCommand) {
-    client.sendBrowserAutomationExecuteResponse({
-      type: "browser.automation.execute.response",
-      payload: browserAutomationFailure({
+    send(
+      browserAutomationFailure({
         requestId: request.requestId,
         code: "browser_unsupported",
         message: "Browser automation is not available in this app runtime.",
       }),
-    });
+    );
     return;
   }
 
   try {
     const payload = await executeAutomationCommand(request);
-    client.sendBrowserAutomationExecuteResponse({
-      type: "browser.automation.execute.response",
-      payload: normalizeBridgePayload(request.requestId, payload),
-    });
+    send(normalizeBridgePayload(request.requestId, payload));
   } catch (error) {
-    client.sendBrowserAutomationExecuteResponse({
-      type: "browser.automation.execute.response",
-      payload: normalizeThrownBridgeError(request.requestId, error),
-    });
+    send(normalizeThrownBridgeError(request.requestId, error));
   }
+}
+
+async function resolveEnterpriseProfileForRequest(input: {
+  enterpriseBrowserHost:
+    | (NonNullable<DesktopHostBridge["browser"]> & Partial<EnterpriseBrowserProfileBridge>)
+    | undefined;
+  request: BrowserAutomationExecuteRequest;
+}): Promise<BrowserProfileAuthorizationResult | null> {
+  const { enterpriseBrowserHost, request } = input;
+  if (!request.enterpriseContext) {
+    return null;
+  }
+  if (!request.workspaceId || !enterpriseBrowserHost?.resolveProfileLease) {
+    return null;
+  }
+  try {
+    const unresolvedProfile = await enterpriseBrowserHost.resolveProfileLease({
+      workspaceId: request.workspaceId,
+      enterpriseContext: request.enterpriseContext,
+    });
+    const resolvedProfile = unresolvedProfile
+      ? parseBrowserProfileAuthorizationResult(unresolvedProfile)
+      : null;
+    return resolvedProfile && browserProfileMatchesRequest(resolvedProfile, request)
+      ? resolvedProfile
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function browserProfileMatchesRequest(
+  profile: BrowserProfileAuthorizationResult,
+  request: BrowserAutomationExecuteRequest,
+): boolean {
+  const { authorization, partition } = profile;
+  const enterpriseContext = request.enterpriseContext;
+  return (
+    enterpriseContext !== undefined &&
+    authorization.workspaceId === request.workspaceId &&
+    authorization.browserProfileId === enterpriseContext.browserProfileId &&
+    authorization.homeNodeId === enterpriseContext.nodeId &&
+    authorization.bindingRevision.length > 0 &&
+    authorization.lifecycleGeneration.length > 0 &&
+    partition === `persist:paseo-enterprise-${authorization.browserProfileId}`
+  );
 }
 
 function resizeBrowserTabForRequest(params: {
   request: BrowserAutomationExecuteRequest;
   serverId?: string;
+  profile?: BrowserProfileAuthorizationResult;
 }): BrowserAutomationResponsePayload {
   const { request, serverId } = params;
   const command = request.command as Extract<
@@ -184,6 +248,13 @@ function resizeBrowserTabForRequest(params: {
     { command: "resize" }
   >;
   const browserId = command.args.browserId;
+  if (params.profile && !browserUsesProfile(browserId, params.profile)) {
+    return browserAutomationFailure({
+      requestId: request.requestId,
+      code: "browser_tab_not_found",
+      message: `No browser tab found for ID: ${browserId}`,
+    });
+  }
   if (!getBrowserRecord(browserId)) {
     return browserAutomationFailure({
       requestId: request.requestId,
@@ -233,6 +304,7 @@ async function closeBrowserTabForRequest(params: {
   request: BrowserAutomationExecuteRequest;
   serverId?: string;
   browserHost: DesktopHostBridge["browser"] | undefined;
+  profile?: BrowserProfileAuthorizationResult;
 }): Promise<BrowserAutomationResponsePayload> {
   const { request, serverId, browserHost } = params;
   const command = request.command as Extract<
@@ -240,6 +312,13 @@ async function closeBrowserTabForRequest(params: {
     { command: "close_tab" }
   >;
   const browserId = command.args.browserId;
+  if (params.profile && !browserUsesProfile(browserId, params.profile)) {
+    return browserAutomationFailure({
+      requestId: request.requestId,
+      code: "browser_tab_not_found",
+      message: `No browser tab found for ID: ${browserId}`,
+    });
+  }
   const workspaceId = request.workspaceId;
   const workspaceTab = serverId
     ? findWorkspaceBrowserTab({ serverId, workspaceId, browserId })
@@ -302,6 +381,7 @@ async function openBrowserTabForRequest(params: {
   serverId?: string;
   browserHost: DesktopHostBridge["browser"] | undefined;
   ensureResidentBrowserWebview: typeof ensureResidentBrowserWebviewDefault;
+  profile?: BrowserProfileAuthorizationResult;
   registrationWaitTimeoutMs?: number;
   registrationPollIntervalMs?: number;
 }): Promise<BrowserAutomationResponsePayload> {
@@ -312,6 +392,7 @@ async function openBrowserTabForRequest(params: {
     ensureResidentBrowserWebview,
     registrationWaitTimeoutMs,
     registrationPollIntervalMs,
+    profile,
   } = params;
   const command = request.command as Extract<
     BrowserAutomationExecuteRequest["command"],
@@ -343,7 +424,12 @@ async function openBrowserTabForRequest(params: {
   });
 
   if (browserHost?.executeAutomationCommand) {
-    ensureResidentBrowserWebview({ browserId, workspaceId, url: normalizedUrl });
+    ensureResidentBrowserWebview({
+      browserId,
+      workspaceId,
+      url: normalizedUrl,
+      ...(profile ? { profile } : {}),
+    });
     const registered = await waitForBrowserRegistration({
       request,
       browserId,
@@ -390,6 +476,9 @@ async function waitForBrowserRegistration(params: {
       cwd: params.request.cwd,
       workspaceId: params.workspaceId,
       command: { command: "list_tabs", args: {} },
+      ...(params.request.enterpriseContext
+        ? { enterpriseContext: params.request.enterpriseContext }
+        : {}),
     });
     if (payload.ok && payload.result.command === "list_tabs") {
       if (payload.result.tabs.some((tab) => tab.browserId === params.browserId)) {
@@ -410,6 +499,34 @@ function normalizeBridgePayload(
   payload: BrowserAutomationResponsePayload,
 ): BrowserAutomationResponsePayload {
   return { ...payload, requestId } as BrowserAutomationResponsePayload;
+}
+
+function bindRequestEnterpriseContext(
+  request: BrowserAutomationExecuteRequest,
+  payload: BrowserAutomationResponsePayload,
+): BrowserAutomationResponsePayload {
+  return request.enterpriseContext
+    ? ({
+        ...payload,
+        enterpriseContext: request.enterpriseContext,
+      } as BrowserAutomationResponsePayload)
+    : payload;
+}
+
+function browserUsesProfile(
+  browserId: string,
+  profile: BrowserProfileAuthorizationResult,
+): boolean {
+  const current = getBrowserWebviewProfile(browserId);
+  return (
+    current?.partition === profile.partition &&
+    current.authorization.organizationId === profile.authorization.organizationId &&
+    current.authorization.homeNodeId === profile.authorization.homeNodeId &&
+    current.authorization.workspaceId === profile.authorization.workspaceId &&
+    current.authorization.browserProfileId === profile.authorization.browserProfileId &&
+    current.authorization.bindingRevision === profile.authorization.bindingRevision &&
+    current.authorization.lifecycleGeneration === profile.authorization.lifecycleGeneration
+  );
 }
 
 function normalizeThrownBridgeError(

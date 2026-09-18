@@ -1,4 +1,17 @@
 import type pino from "pino";
+import type { ManagedRuntimeControl } from "../../managed-runtimes/runtime-manager.js";
+import type { LocalPlaneAccess } from "../../local-planes/local-plane-access.js";
+import type { DataPlaneDocHandler } from "../../local-planes/data-plane-access.js";
+import type { OrchestrationOperationControl } from "../../orchestration/operation-service.js";
+import type { TurnDiffControl } from "../../code-collab/turn-diff-runtime.js";
+import type { CollabMembersControl } from "../../enterprise/managed-node/collab/members-control.js";
+import type { CollabPresenceControl } from "../../enterprise/managed-node/collab/presence-roster.js";
+import type { CollabTurnControl } from "../../enterprise/managed-node/collab/turn-control.js";
+import type { CollabTimelineControl } from "../../enterprise/managed-node/collab/timeline-control.js";
+import type { CollabStreamTokenControl } from "../../enterprise/managed-node/collab/stream-token-control.js";
+import type { CollabSubscriptionControl } from "../../enterprise/managed-node/collab/subscription-control.js";
+import { OperationStatusSchema } from "../../orchestration/operation-store.js";
+import { toOrchestrationOperationSummary } from "../../orchestration/operation-summary.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
@@ -13,11 +26,89 @@ import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../../wor
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
 import type { DaemonConfigReloadResult } from "../../daemon-config-store.js";
 
+const MANAGED_RUNTIMES_UNAVAILABLE = "Managed Agent runtimes are unavailable on this daemon";
+const ORCHESTRATION_UNAVAILABLE = "Delegation operations are unavailable on this daemon";
+const DEFAULT_LISTED_OPERATIONS = 50;
+
+export type OrchestrationOperationRequest = Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "orchestration.operation.list.request"
+      | "orchestration.operation.get.request"
+      | "orchestration.operation.cancel.request";
+  }
+>;
+
+function orchestrationOperationResponse(
+  orchestration: OrchestrationOperationControl,
+  msg: OrchestrationOperationRequest,
+): SessionOutboundMessage {
+  switch (msg.type) {
+    case "orchestration.operation.list.request":
+      return {
+        type: "orchestration.operation.list.response",
+        payload: {
+          requestId: msg.requestId,
+          operations: orchestration
+            .listOperations({
+              requesterAgentId: msg.requesterAgentId,
+              status:
+                msg.status === undefined ? undefined : OperationStatusSchema.parse(msg.status),
+              limit: msg.limit ?? DEFAULT_LISTED_OPERATIONS,
+            })
+            .map(toOrchestrationOperationSummary),
+        },
+      };
+    case "orchestration.operation.get.request": {
+      const operation = orchestration.getOperation(msg);
+      return {
+        type: "orchestration.operation.get.response",
+        payload: {
+          requestId: msg.requestId,
+          operation: operation ? toOrchestrationOperationSummary(operation) : null,
+        },
+      };
+    }
+    case "orchestration.operation.cancel.request":
+      return {
+        type: "orchestration.operation.cancel.response",
+        payload: {
+          requestId: msg.requestId,
+          operation: toOrchestrationOperationSummary(orchestration.cancel(msg)),
+        },
+      };
+  }
+}
+
 export interface DaemonRuntimeConfig {
   listen: string | null;
   worktreesRoot?: string;
   appBaseUrl?: string;
   desktopManaged?: boolean;
+  managedRuntimes?: ManagedRuntimeControl;
+  orchestration?: OrchestrationOperationControl;
+  /** Per-turn diffs (ADR-0044). Present only when capture is actually running. */
+  turnDiff?: TurnDiffControl;
+  /** Collaborative membership from the node catalog (ADR-0033). */
+  collabMembers?: CollabMembersControl;
+  /** Who is connected to a Workspace on this node. */
+  collabPresence?: CollabPresenceControl;
+  /** Collaborative turns via plane-attested machine RPC (ADR-0035). */
+  collabTurns?: CollabTurnControl;
+  /** Session document from the node's collab replica (ADR-0031). */
+  collabTimeline?: CollabTimelineControl;
+  /** Stream tokens so the App can subscribe to the plane as a principal (ADR-0032). */
+  collabStreamTokens?: CollabStreamTokenControl;
+  /** Plane subscription polls proxied through the node's CA-pinned HTTPS. */
+  collabSubscriptions?: CollabSubscriptionControl;
+  /** Whether the local control plane is accepting Sessions (ADR-0038). */
+  localPlanes?: () => boolean;
+  /** Attach tokens and the endpoint for the terminal plane, while it is listening (ADR-0038). */
+  terminalPlane?: LocalPlaneAccess;
+  /** The same for the data plane, which listens only when a document handler is configured. */
+  dataPlane?: LocalPlaneAccess;
+  dataPlaneDocHandler?: DataPlaneDocHandler;
   getRelayConfig(): {
     enabled: boolean;
     endpoint: string;
@@ -206,6 +297,87 @@ export class DaemonSession {
           providers: [],
         },
       });
+    }
+  }
+
+  async handleRuntimeStatusRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.runtime.get_status.request" }>,
+  ): Promise<void> {
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.managedRuntimes,
+      MANAGED_RUNTIMES_UNAVAILABLE,
+      async (runtimes) => ({
+        type: "daemon.runtime.get_status.response",
+        payload: { requestId: msg.requestId, runtimes: await runtimes.status() },
+      }),
+    );
+  }
+
+  async handleRuntimeInstallRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.runtime.install.request" }>,
+  ): Promise<void> {
+    await this.respondWithService(
+      msg,
+      this.daemonRuntimeConfig?.managedRuntimes,
+      MANAGED_RUNTIMES_UNAVAILABLE,
+      async (runtimes) => ({
+        type: "daemon.runtime.install.response",
+        payload: { requestId: msg.requestId, runtime: await runtimes.install(msg.runtimeName) },
+      }),
+    );
+  }
+
+  async handleOrchestrationOperationRequest(msg: OrchestrationOperationRequest): Promise<void> {
+    this.host.emit(await this.buildOrchestrationOperationResponse(msg));
+  }
+
+  /** Builds the response, or a correlated rpc_error, without emitting it. */
+  buildOrchestrationOperationResponse(
+    msg: OrchestrationOperationRequest,
+  ): Promise<SessionOutboundMessage> {
+    return this.buildServiceResponse(
+      msg,
+      this.daemonRuntimeConfig?.orchestration,
+      ORCHESTRATION_UNAVAILABLE,
+      async (orchestration) => orchestrationOperationResponse(orchestration, msg),
+    );
+  }
+
+  private async respondWithService<T>(
+    msg: { type: string; requestId: string },
+    service: T | undefined,
+    unavailableMessage: string,
+    respond: (service: T) => Promise<SessionOutboundMessage>,
+  ): Promise<void> {
+    this.host.emit(await this.buildServiceResponse(msg, service, unavailableMessage, respond));
+  }
+
+  private async buildServiceResponse<T>(
+    msg: { type: string; requestId: string },
+    service: T | undefined,
+    unavailableMessage: string,
+    respond: (service: T) => Promise<SessionOutboundMessage>,
+  ): Promise<SessionOutboundMessage> {
+    try {
+      if (!service) {
+        throw new Error(unavailableMessage);
+      }
+      return await respond(service);
+    } catch (error) {
+      this.logger.error(
+        { err: error, requestType: msg.type },
+        "Failed to handle daemon service request",
+      );
+      return {
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : String(error),
+          code: "handler_error",
+        },
+      };
     }
   }
 

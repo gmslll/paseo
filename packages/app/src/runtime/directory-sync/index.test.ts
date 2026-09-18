@@ -7,19 +7,27 @@ import {
 } from "@/runtime/replica-cache/row-store-sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import type { AgentStreamEventPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import {
   normalizeProjectDescriptor,
   normalizeWorkspaceDescriptor,
   useSessionStore,
+  type Agent,
 } from "@/stores/session-store";
-import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
+import { normalizeAgentSnapshot, projectAgentSnapshot } from "@/utils/agent-snapshots";
 import { selectWorkspaceDirectoryServerIds } from "@/stores/session-store-hooks/selectors";
 import type { DirectoryReplicaMutation } from "@/runtime/replica-cache";
+import {
+  providerSubagentKey,
+  refreshProviderSubagents,
+  useProviderSubagentStore,
+} from "@/subagents/provider-store";
+import { createTimelineReplica, createViewedTimelineOwner } from "@/timeline/viewed-timeline-sync";
 import {
   DirectoryRefreshSupersededError,
   DirectorySync,
   type DirectoryCheckpointStorage,
+  type DirectoryEnterpriseIdentity,
 } from "./index";
 
 type WorkspaceFetchResult = Awaited<ReturnType<DaemonClient["fetchWorkspaces"]>>;
@@ -56,6 +64,14 @@ class FakeDirectoryClient {
     message: Extract<SessionOutboundMessage, { type: TType }>,
   ): void {
     for (const handler of this.handlers.get(message.type) ?? []) handler(message);
+  }
+
+  snapshotHandlers<TType extends SessionOutboundMessage["type"]>(
+    type: TType,
+  ): Array<(message: Extract<SessionOutboundMessage, { type: TType }>) => void> {
+    return [...(this.handlers.get(type) ?? [])] as Array<
+      (message: Extract<SessionOutboundMessage, { type: TType }>) => void
+    >;
   }
 
   holdWorkspaceFetch(): (result: WorkspaceFetchResult) => void {
@@ -183,9 +199,85 @@ function createAgent(serverId: string, id: string) {
   };
 }
 
+function agentFetchEntry(agent: Agent): AgentFetchResult["entries"][number] {
+  return {
+    agent: projectAgentSnapshot(agent),
+    project: {
+      projectKey: agent.cwd,
+      projectName: "Transfer project",
+      checkout: {
+        cwd: agent.cwd,
+        isGit: false,
+        currentBranch: null,
+        remoteUrl: null,
+        worktreeRoot: null,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: null,
+      },
+    },
+  };
+}
+
+const ENTERPRISE_IDENTITY: DirectoryEnterpriseIdentity = Object.freeze({
+  organizationId: "org_aaaaaaaaaaaaaaaa",
+  nodeId: "nod_aaaaaaaaaaaaaaaa",
+  paseoServerId: "",
+  principalId: "usr_aaaaaaaaaaaaaaaa",
+  lifecycleGeneration: "generation-a",
+});
+
+function enterpriseIdentity(
+  serverId: string,
+  input: Partial<DirectoryEnterpriseIdentity> = {},
+): DirectoryEnterpriseIdentity {
+  return Object.freeze({ ...ENTERPRISE_IDENTITY, paseoServerId: serverId, ...input });
+}
+
+function enterpriseWorkspace(id: string) {
+  return normalizeWorkspaceDescriptor({
+    id,
+    projectId: `project-${id}`,
+    projectDisplayName: id,
+    projectRootPath: `/repo/${id}`,
+    workspaceDirectory: `/repo/${id}`,
+    projectKind: "git",
+    workspaceKind: "local_checkout",
+    name: id,
+    status: "done",
+    statusEnteredAt: null,
+    activityAt: null,
+    archivingAt: null,
+    diffStat: null,
+    scripts: [],
+  });
+}
+
+function ownershipTransferTombstone(workspaceId: string) {
+  return {
+    type: "enterprise.workspace.ownership.transfer.tombstone" as const,
+    payload: {
+      eventId: `event-${workspaceId}`,
+      resource: {
+        organizationId: ENTERPRISE_IDENTITY.organizationId,
+        nodeId: ENTERPRISE_IDENTITY.nodeId,
+        resourceKind: "workspace" as const,
+        localResourceId: workspaceId,
+      },
+      oldPrincipalId: ENTERPRISE_IDENTITY.principalId,
+      newRevision: `opaque-${workspaceId}`,
+      transferReceiptId: `receipt-${workspaceId}`,
+    },
+  };
+}
+
 afterEach(() => {
   for (const serverId of serverIds) useSessionStore.getState().clearSession(serverId);
   serverIds.clear();
+  useProviderSubagentStore.setState({
+    descriptors: new Map(),
+    timelines: new Map(),
+    hiddenFromTrack: new Set(),
+  });
 });
 
 describe("DirectorySync session readiness", () => {
@@ -1257,4 +1349,473 @@ it("fills every cached workspace beneath live updates received during the SQLite
   directory.dispose();
   await cache.flush();
   database.close();
+});
+
+describe("enterprise workspace ownership transfer tombstones", () => {
+  function connectEnterprise(
+    directory: DirectorySync,
+    client: FakeDirectoryClient,
+    identity: DirectoryEnterpriseIdentity | null,
+  ): void {
+    directory.connectionChanged({
+      client: client as unknown as DaemonClient,
+      status: "online",
+      source: { clientGeneration: 1, connectionEpoch: 1 },
+      enterpriseTarget: "enterprise_host",
+      enterpriseIdentity: identity,
+    });
+  }
+
+  it("clears only the transferred workspace, its agents, and durable timelines", async () => {
+    const serverId = "enterprise-transfer-cache";
+    serverIds.add(serverId);
+    const { cache, database } = createSqliteCache();
+    cache.setHosts([serverId]);
+    const workspaceA = enterpriseWorkspace("workspace-a");
+    const workspaceB = enterpriseWorkspace("workspace-b");
+    const agentA = { ...createAgent(serverId, "agent-a"), workspaceId: workspaceA.id };
+    const agentB = { ...createAgent(serverId, "agent-b"), workspaceId: workspaceB.id };
+    cache.replaceDirectoryBaseline(serverId, {
+      agents: new Map([
+        [agentA.id, agentA],
+        [agentB.id, agentB],
+      ]),
+      workspaces: new Map([
+        [workspaceA.id, workspaceA],
+        [workspaceB.id, workspaceB],
+      ]),
+      projects: new Map(),
+    });
+    cache.commitTimeline(serverId, agentA.id, {
+      agentId: agentA.id,
+      items: [],
+      range: null,
+      hasOlder: false,
+    });
+    cache.commitTimeline(serverId, agentB.id, {
+      agentId: agentB.id,
+      items: [],
+      range: null,
+      hasOlder: false,
+    });
+    await cache.flush();
+
+    const client = new FakeDirectoryClient();
+    const evictedTimelineAgents: string[][] = [];
+    const directory = new DirectorySync(
+      serverId,
+      {
+        onAgentStoppedRunning: () => undefined,
+        markAgentLoading: () => undefined,
+        markAgentReady: () => undefined,
+        markAgentError: () => undefined,
+        evictAgentTimelines: (agentIds) => evictedTimelineAgents.push([...agentIds]),
+      },
+      cache,
+    );
+    useSessionStore.getState().initializeSession(serverId, client as unknown as DaemonClient, 1);
+    connectEnterprise(directory, client, enterpriseIdentity(serverId));
+    await directory.restoreCachedDirectory();
+    useSessionStore.getState().setAgentStreamTail(
+      serverId,
+      new Map([
+        [agentA.id, []],
+        [agentB.id, []],
+      ]),
+    );
+    const providerChild = {
+      id: "provider-child-a",
+      parentAgentId: agentA.id,
+      provider: "codex" as const,
+      title: "Queued child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-07-12T10:00:00.000Z",
+      updatedAt: "2026-07-12T10:00:01.000Z",
+      toolCallId: "call-queued",
+    };
+    useProviderSubagentStore.getState().applyUpdate(serverId, {
+      kind: "upsert",
+      subagent: providerChild,
+    });
+    let releaseProviderList!: (value: {
+      requestId: string;
+      parentAgentId: string;
+      subagents: [typeof providerChild];
+      error: null;
+    }) => void;
+    const providerList = new Promise<Parameters<typeof releaseProviderList>[0]>((resolve) => {
+      releaseProviderList = resolve;
+    });
+    const pendingProviderRefresh = refreshProviderSubagents(
+      { listProviderSubagents: () => providerList },
+      serverId,
+      agentA.id,
+    );
+
+    const tombstone = ownershipTransferTombstone(workspaceA.id);
+    client.emit(tombstone);
+    client.emit(tombstone);
+    releaseProviderList({
+      requestId: "late-provider-list",
+      parentAgentId: agentA.id,
+      subagents: [{ ...providerChild, title: "Late queued child" }],
+      error: null,
+    });
+    await pendingProviderRefresh;
+    useProviderSubagentStore.getState().replaceTimeline(serverId, {
+      requestId: "late-provider-timeline",
+      parentAgentId: agentA.id,
+      subagentId: providerChild.id,
+      provider: "codex",
+      direction: "tail",
+      epoch: "late-epoch",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      window: { minSeq: 1, maxSeq: 1, nextSeq: 2 },
+      hasOlder: false,
+      hasNewer: false,
+      rows: [
+        {
+          seq: 1,
+          timestamp: "2026-07-12T10:00:02.000Z",
+          item: { type: "assistant_message", text: "Late provider timeline" },
+        },
+      ],
+      error: null,
+    });
+    await cache.flush();
+
+    const session = useSessionStore.getState().sessions[serverId];
+    expect([...session.workspaces.keys()]).toEqual([workspaceB.id]);
+    expect([...session.agents.keys()]).toEqual([agentB.id]);
+    expect([...session.agentStreamTail.keys()]).toEqual([agentB.id]);
+    expect(evictedTimelineAgents).toEqual([[agentA.id]]);
+    expect(directory.isAgentPublicationBlocked(agentA.id)).toBe(true);
+    expect(directory.isAgentPublicationBlocked(agentB.id)).toBe(false);
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.has(providerSubagentKey(serverId, agentA.id, providerChild.id)),
+    ).toBe(false);
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .timelines.has(providerSubagentKey(serverId, agentA.id, providerChild.id)),
+    ).toBe(false);
+    const durable = await cache.readDirectory(serverId);
+    expect([...durable.workspaces.keys()]).toEqual([workspaceB.id]);
+    expect([...durable.agents.keys()]).toEqual([agentB.id]);
+    expect(await cache.readTimeline(serverId, agentA.id)).toBeUndefined();
+    expect(await cache.readTimeline(serverId, agentB.id)).toMatchObject({ agentId: agentB.id });
+
+    directory.dispose();
+    database.close();
+  });
+
+  it("fails closed for missing or mismatched identity and rejects a stale generation callback", () => {
+    const serverId = "enterprise-transfer-current";
+    serverIds.add(serverId);
+    const client = new FakeDirectoryClient();
+    const directory = new DirectorySync(serverId, {
+      onAgentStoppedRunning: () => undefined,
+      markAgentLoading: () => undefined,
+      markAgentReady: () => undefined,
+      markAgentError: () => undefined,
+    });
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+    const target = enterpriseWorkspace("workspace-current");
+    const agent = { ...createAgent(serverId, "agent-current"), workspaceId: target.id };
+    directory.acceptWorkspaces([target]);
+    directory.acceptAgent(agent);
+
+    connectEnterprise(directory, client, null);
+    client.emit(ownershipTransferTombstone(target.id));
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(target.id)).toBe(true);
+
+    const identityA = enterpriseIdentity(serverId);
+    connectEnterprise(directory, client, identityA);
+    const staleHandler = client.snapshotHandlers(
+      "enterprise.workspace.ownership.transfer.tombstone",
+    )[0];
+    expect(staleHandler).toBeDefined();
+    const mismatched = ownershipTransferTombstone(target.id);
+    mismatched.payload.resource.nodeId = "nod_bbbbbbbbbbbbbbbb";
+    client.emit(mismatched);
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(target.id)).toBe(true);
+
+    connectEnterprise(
+      directory,
+      client,
+      enterpriseIdentity(serverId, { lifecycleGeneration: "generation-b" }),
+    );
+    staleHandler?.(ownershipTransferTombstone(target.id));
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(target.id)).toBe(true);
+
+    client.emit(ownershipTransferTombstone(target.id));
+    expect(directory.isAgentPublicationBlocked(agent.id)).toBe(true);
+    directory.connectionChanged({
+      client: client as unknown as DaemonClient,
+      status: "offline",
+      source: { clientGeneration: 1, connectionEpoch: 2 },
+    });
+    expect(directory.isAgentPublicationBlocked(agent.id)).toBe(false);
+    directory.dispose();
+  });
+
+  it("does not treat an ordinary workspace removal as a transfer tombstone", () => {
+    const serverId = "ordinary-workspace-removal";
+    serverIds.add(serverId);
+    const client = new FakeDirectoryClient();
+    const evictedTimelineAgents: string[][] = [];
+    const directory = new DirectorySync(serverId, {
+      onAgentStoppedRunning: () => undefined,
+      markAgentLoading: () => undefined,
+      markAgentReady: () => undefined,
+      markAgentError: () => undefined,
+      evictAgentTimelines: (agentIds) => evictedTimelineAgents.push([...agentIds]),
+    });
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+    connectEnterprise(directory, client, enterpriseIdentity(serverId));
+    const target = enterpriseWorkspace("workspace-ordinary");
+    const agent = { ...createAgent(serverId, "agent-ordinary"), workspaceId: target.id };
+    directory.acceptWorkspaces([target]);
+    directory.acceptAgent(agent);
+
+    client.emit({
+      type: "workspace_update",
+      payload: { kind: "remove", id: target.id },
+    });
+
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(target.id)).toBe(false);
+    expect(useSessionStore.getState().sessions[serverId]?.agents.has(agent.id)).toBe(true);
+    expect(evictedTimelineAgents).toEqual([]);
+    expect(directory.isAgentPublicationBlocked(agent.id)).toBe(false);
+    directory.dispose();
+  });
+
+  it("fences a cached agent read that resolves after the tombstone", async () => {
+    const serverId = "enterprise-transfer-late-cache";
+    serverIds.add(serverId);
+    const client = new FakeDirectoryClient();
+    const target = enterpriseWorkspace("workspace-late");
+    const agent = { ...createAgent(serverId, "agent-late"), workspaceId: target.id };
+    let resolveAgent!: (value: Agent | undefined) => void;
+    const agentRead = new Promise<Agent | undefined>((resolve) => {
+      resolveAgent = resolve;
+    });
+    const directory = new DirectorySync(
+      serverId,
+      {
+        onAgentStoppedRunning: () => undefined,
+        markAgentLoading: () => undefined,
+        markAgentReady: () => undefined,
+        markAgentError: () => undefined,
+      },
+      {
+        readAgent: async () => agentRead,
+        readWorkspace: async () => ({ workspace: target }),
+        readDirectory: async () => ({
+          agents: new Map(),
+          workspaces: new Map(),
+          projects: new Map(),
+        }),
+        commitDirectoryMutations: () => undefined,
+        deleteTimelines: () => undefined,
+      },
+    );
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+    connectEnterprise(directory, client, enterpriseIdentity(serverId));
+    directory.acceptWorkspaces([target]);
+
+    const load = directory.loadCachedAgent(agent.id);
+    client.emit(ownershipTransferTombstone(target.id));
+    resolveAgent(agent);
+    await load;
+
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(target.id)).toBe(false);
+    expect(useSessionStore.getState().sessions[serverId]?.agents.has(agent.id)).toBe(false);
+    expect(directory.isAgentPublicationBlocked(agent.id)).toBe(true);
+    directory.dispose();
+  });
+
+  it("fences agents first discovered in a late snapshot before derived publications", async () => {
+    const serverId = "enterprise-transfer-late-snapshot";
+    serverIds.add(serverId);
+    const client = new FakeDirectoryClient();
+    const workspaceA = enterpriseWorkspace("workspace-late-a");
+    const workspaceB = enterpriseWorkspace("workspace-late-b");
+    const lateAgentA = {
+      ...createAgent(serverId, "agent-late-snapshot-a"),
+      workspaceId: workspaceA.id,
+    };
+    const lateAgentB = {
+      ...createAgent(serverId, "agent-late-snapshot-b"),
+      workspaceId: workspaceB.id,
+    };
+    const evictedTimelineAgents: string[][] = [];
+    const timelineCommits: string[] = [];
+    const timelineReplica = createTimelineReplica({
+      serverId,
+      storage: {
+        readTimeline: async () => undefined,
+        commitTimeline: (_serverId, agentId) => timelineCommits.push(agentId),
+      },
+      prepareAgent: async () => undefined,
+    });
+    const timelineOwner = createViewedTimelineOwner({
+      serverId,
+      replica: timelineReplica,
+      replaceDemandedAgentIds: () => undefined,
+      drainQueuedAgentMessage: () => undefined,
+      ports: {
+        initialDeliveryMode: "legacy",
+        setSubscription: async () => undefined,
+        readCursor: () => undefined,
+        fetchPage: async () => ({ hasNewer: false, endCursor: null }),
+        fetchLatestTail: async () => ({ hasNewer: false, endCursor: null }),
+        reportError: () => undefined,
+        schedule: () => () => undefined,
+      },
+    });
+    const directory = new DirectorySync(serverId, {
+      onAgentStoppedRunning: () => undefined,
+      markAgentLoading: () => undefined,
+      markAgentReady: () => undefined,
+      markAgentError: () => undefined,
+      evictAgentTimelines: (agentIds) => {
+        evictedTimelineAgents.push([...agentIds]);
+        timelineReplica.evictAgents(agentIds);
+      },
+    });
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+    store.updateSessionServerInfo(serverId, {
+      serverId,
+      hostname: null,
+      version: "test",
+      features: { directorySync: true, workspaceMultiplicity: true },
+    });
+    connectEnterprise(directory, client, enterpriseIdentity(serverId));
+    directory.acceptWorkspaces([workspaceA, workspaceB]);
+    client.emit(ownershipTransferTombstone(workspaceA.id));
+
+    const releaseSnapshot = client.holdAgentFetch();
+    const refresh = directory.refreshAgents();
+    await expect.poll(() => client.fetchAgentsCalls).toBe(1);
+    releaseSnapshot({
+      requestId: "late-snapshot",
+      entries: [agentFetchEntry(lateAgentA), agentFetchEntry(lateAgentB)],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+    });
+    await refresh;
+
+    const session = useSessionStore.getState().sessions[serverId];
+    expect(session?.agents.has(lateAgentA.id)).toBe(false);
+    expect(session?.agents.has(lateAgentB.id)).toBe(true);
+    expect(directory.isAgentPublicationBlocked(lateAgentA.id)).toBe(true);
+    expect(directory.isAgentPublicationBlocked(lateAgentB.id)).toBe(false);
+    expect(evictedTimelineAgents).toEqual([[lateAgentA.id]]);
+
+    client.emit({
+      type: "agent_update",
+      payload: {
+        kind: "upsert",
+        agent: projectAgentSnapshot({ ...lateAgentA, title: "Blocked update" }),
+      },
+    });
+    client.emit({
+      type: "agent_update",
+      payload: {
+        kind: "upsert",
+        agent: projectAgentSnapshot({ ...lateAgentB, title: "Accepted update" }),
+      },
+    });
+    expect(useSessionStore.getState().sessions[serverId]?.agents.has(lateAgentA.id)).toBe(false);
+    expect(useSessionStore.getState().sessions[serverId]?.agents.get(lateAgentB.id)?.title).toBe(
+      "Accepted update",
+    );
+
+    const timelineResponse = (agentId: string, epoch: string) => ({
+      requestId: `timeline-${agentId}-${epoch}`,
+      agentId,
+      agent: null,
+      direction: "tail" as const,
+      projection: "projected" as const,
+      reset: true,
+      epoch,
+      window: { minSeq: 1, maxSeq: 0, nextSeq: 1 },
+      startCursor: null,
+      endCursor: null,
+      entries: [],
+      error: null,
+      hasNewer: false,
+      hasOlder: false,
+      staleCursor: false,
+      gap: false,
+    });
+    timelineOwner.applyTimelineResponse(timelineResponse(lateAgentB.id, "late-stream"));
+    timelineCommits.length = 0;
+    const streamEvent = (agentId: string): AgentStreamEventPayload => ({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: agentId, messageId: `message-${agentId}` },
+    });
+    timelineOwner.enqueueStreamEvent(lateAgentA.id, {
+      event: streamEvent(lateAgentA.id),
+      seq: 1,
+      epoch: "late-stream",
+      timestamp: new Date("2026-09-11T00:00:02.000Z"),
+    });
+    timelineOwner.enqueueStreamEvent(lateAgentB.id, {
+      event: streamEvent(lateAgentB.id),
+      seq: 1,
+      epoch: "late-stream",
+      timestamp: new Date("2026-09-11T00:00:02.000Z"),
+    });
+    timelineOwner.flushStreamAgent(lateAgentA.id);
+    timelineOwner.flushStreamAgent(lateAgentB.id);
+    expect(timelineCommits).toEqual([lateAgentB.id]);
+
+    timelineOwner.applyTimelineResponse(timelineResponse(lateAgentA.id, "late-timeline"));
+    timelineOwner.applyTimelineResponse(timelineResponse(lateAgentB.id, "late-timeline"));
+    expect(timelineCommits).toEqual([lateAgentB.id, lateAgentB.id]);
+
+    const childA = {
+      id: "child-late-a",
+      parentAgentId: lateAgentA.id,
+      provider: "codex" as const,
+      title: "Blocked child",
+      description: null,
+      status: "running" as const,
+      createdAt: "2026-09-11T00:00:00.000Z",
+      updatedAt: "2026-09-11T00:00:01.000Z",
+      toolCallId: "call-blocked",
+    };
+    const childB = { ...childA, id: "child-late-b", parentAgentId: lateAgentB.id };
+    useProviderSubagentStore.getState().applyUpdate(serverId, {
+      kind: "upsert",
+      subagent: childA,
+    });
+    useProviderSubagentStore.getState().applyUpdate(serverId, {
+      kind: "upsert",
+      subagent: childB,
+    });
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.has(providerSubagentKey(serverId, lateAgentA.id, childA.id)),
+    ).toBe(false);
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.has(providerSubagentKey(serverId, lateAgentB.id, childB.id)),
+    ).toBe(true);
+    timelineOwner.dispose();
+    directory.dispose();
+  });
 });

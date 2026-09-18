@@ -33,6 +33,8 @@ interface ProviderSubagentState {
   descriptors: Map<string, ProviderSubagentDescriptorPayload>;
   timelines: Map<string, ProviderSubagentTimelineState>;
   hiddenFromTrack: Set<string>;
+  clearParentAgent(serverId: string, parentAgentId: string): void;
+  clearServer(serverId: string): void;
   hideFromTrack(serverId: string, parentAgentId: string, subagentIds: readonly string[]): void;
   replaceList(
     serverId: string,
@@ -73,13 +75,66 @@ export function providerSubagentLifecycleStatus(
 
 type ProviderSubagentListClient = Pick<DaemonClient, "listProviderSubagents">;
 
-const pendingListRequests = new WeakMap<ProviderSubagentListClient, Map<string, Promise<void>>>();
+interface PendingParentRequestToken {
+  active: boolean;
+}
+
+interface PendingListRequest {
+  promise: Promise<void>;
+  token: PendingParentRequestToken;
+}
+
+const pendingListRequests = new WeakMap<
+  ProviderSubagentListClient,
+  Map<string, PendingListRequest>
+>();
+const pendingParentRequestTokensByServer = new Map<
+  string,
+  Map<string, Set<PendingParentRequestToken>>
+>();
+const blockedParentAgentIdsByServer = new Map<string, Set<string>>();
+
+function invalidatePendingProviderSubagentRequests(serverId: string): void {
+  const serverTokens = pendingParentRequestTokensByServer.get(serverId);
+  for (const tokens of serverTokens?.values() ?? []) {
+    for (const token of tokens) token.active = false;
+  }
+  pendingParentRequestTokensByServer.delete(serverId);
+}
+
+export function invalidateProviderSubagentParent(serverId: string, parentAgentId: string): void {
+  const serverTokens = pendingParentRequestTokensByServer.get(serverId);
+  for (const token of serverTokens?.get(parentAgentId) ?? []) token.active = false;
+  serverTokens?.delete(parentAgentId);
+  if (serverTokens?.size === 0) pendingParentRequestTokensByServer.delete(serverId);
+  useProviderSubagentStore.getState().clearParentAgent(serverId, parentAgentId);
+}
+
+export function blockProviderSubagentParent(serverId: string, parentAgentId: string): void {
+  invalidateProviderSubagentParent(serverId, parentAgentId);
+  const blocked = blockedParentAgentIdsByServer.get(serverId) ?? new Set();
+  blocked.add(parentAgentId);
+  blockedParentAgentIdsByServer.set(serverId, blocked);
+}
+
+export function resetProviderSubagentServerLifecycle(serverId: string): void {
+  invalidatePendingProviderSubagentRequests(serverId);
+  blockedParentAgentIdsByServer.delete(serverId);
+}
+
+export function invalidateProviderSubagentServer(serverId: string): void {
+  resetProviderSubagentServerLifecycle(serverId);
+  useProviderSubagentStore.getState().clearServer(serverId);
+}
 
 export function refreshProviderSubagents(
   client: ProviderSubagentListClient,
   serverId: string,
   parentAgentId: string,
 ): Promise<void> {
+  if (blockedParentAgentIdsByServer.get(serverId)?.has(parentAgentId)) {
+    return Promise.resolve();
+  }
   const requestKey = `${serverId}\0${parentAgentId}`;
   let clientRequests = pendingListRequests.get(client);
   if (!clientRequests) {
@@ -87,18 +142,33 @@ export function refreshProviderSubagents(
     pendingListRequests.set(client, clientRequests);
   }
   const pending = clientRequests.get(requestKey);
-  if (pending) return pending;
+  if (pending?.token.active) return pending.promise;
+  if (pending) clientRequests.delete(requestKey);
 
+  const token: PendingParentRequestToken = { active: true };
+  const serverTokens = pendingParentRequestTokensByServer.get(serverId) ?? new Map();
+  const tokens = serverTokens.get(parentAgentId) ?? new Set();
+  tokens.add(token);
+  serverTokens.set(parentAgentId, tokens);
+  pendingParentRequestTokensByServer.set(serverId, serverTokens);
   const request = client
     .listProviderSubagents(parentAgentId)
     .then((payload) => {
+      if (!token.active) return;
       useProviderSubagentStore.getState().replaceList(serverId, parentAgentId, payload.subagents);
       return undefined;
     })
     .finally(() => {
-      clientRequests?.delete(requestKey);
+      if (clientRequests?.get(requestKey)?.token === token) {
+        clientRequests.delete(requestKey);
+      }
+      const currentServerTokens = pendingParentRequestTokensByServer.get(serverId);
+      const currentTokens = currentServerTokens?.get(parentAgentId);
+      currentTokens?.delete(token);
+      if (currentTokens?.size === 0) currentServerTokens?.delete(parentAgentId);
+      if (currentServerTokens?.size === 0) pendingParentRequestTokensByServer.delete(serverId);
     });
-  clientRequests.set(requestKey, request);
+  clientRequests.set(requestKey, { promise: request, token });
   return request;
 }
 
@@ -196,6 +266,46 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
   descriptors: new Map(),
   timelines: new Map(),
   hiddenFromTrack: new Set(),
+  clearParentAgent(serverId, parentAgentId) {
+    set((state) => {
+      const prefix = parentPrefix(serverId, parentAgentId);
+      const descriptors = new Map(
+        [...state.descriptors].filter(([key]) => !key.startsWith(prefix)),
+      );
+      const timelines = new Map([...state.timelines].filter(([key]) => !key.startsWith(prefix)));
+      const hiddenFromTrack = new Set(
+        [...state.hiddenFromTrack].filter((key) => !key.startsWith(prefix)),
+      );
+      if (
+        descriptors.size === state.descriptors.size &&
+        timelines.size === state.timelines.size &&
+        hiddenFromTrack.size === state.hiddenFromTrack.size
+      ) {
+        return state;
+      }
+      return { descriptors, timelines, hiddenFromTrack };
+    });
+  },
+  clearServer(serverId) {
+    set((state) => {
+      const prefix = `${serverId}\0`;
+      const descriptors = new Map(
+        [...state.descriptors].filter(([key]) => !key.startsWith(prefix)),
+      );
+      const timelines = new Map([...state.timelines].filter(([key]) => !key.startsWith(prefix)));
+      const hiddenFromTrack = new Set(
+        [...state.hiddenFromTrack].filter((key) => !key.startsWith(prefix)),
+      );
+      if (
+        descriptors.size === state.descriptors.size &&
+        timelines.size === state.timelines.size &&
+        hiddenFromTrack.size === state.hiddenFromTrack.size
+      ) {
+        return state;
+      }
+      return { descriptors, timelines, hiddenFromTrack };
+    });
+  },
   hideFromTrack(serverId, parentAgentId, subagentIds) {
     set((state) => {
       const hiddenFromTrack = new Set(state.hiddenFromTrack);
@@ -207,6 +317,7 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
     });
   },
   replaceList(serverId, parentAgentId, subagents) {
+    if (blockedParentAgentIdsByServer.get(serverId)?.has(parentAgentId)) return;
     set((state) => {
       const prefix = parentPrefix(serverId, parentAgentId);
       const descriptors = new Map(
@@ -239,6 +350,9 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
     });
   },
   applyUpdate(serverId, payload) {
+    const parentAgentId =
+      payload.kind === "upsert" ? payload.subagent.parentAgentId : payload.parentAgentId;
+    if (blockedParentAgentIdsByServer.get(serverId)?.has(parentAgentId)) return;
     set((state) => {
       if (payload.kind === "upsert") {
         const key = providerSubagentKey(
@@ -309,6 +423,7 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
     });
   },
   replaceTimeline(serverId, payload) {
+    if (blockedParentAgentIdsByServer.get(serverId)?.has(payload.parentAgentId)) return;
     const provider = payload.provider;
     if (!provider) {
       return;

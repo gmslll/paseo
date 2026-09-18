@@ -1,7 +1,140 @@
 import { describe, expect, it } from "vitest";
+import type { BrowserProfileRuntimeAuthorization } from "../browser-profile.js";
 import { PaseoBrowserWebviewRegistry } from "./registry.js";
 
+const ENTERPRISE_AUTHORIZATION: BrowserProfileRuntimeAuthorization = {
+  organizationId: "org_1111111111111111",
+  homeNodeId: "nod_1111111111111111",
+  workspaceId: "workspace-enterprise",
+  browserProfileId: "brp_1111111111111111",
+  bindingRevision: "binding-a",
+  lifecycleGeneration: "lifecycle-a",
+};
+
 describe("PaseoBrowserWebviewRegistry", () => {
+  it("snapshots Profile registrations and returns detached frozen values", () => {
+    const registry = new PaseoBrowserWebviewRegistry();
+    const authorization = { ...ENTERPRISE_AUTHORIZATION };
+    registry.registerWebContents({
+      webContentsId: 7,
+      browserId: "browser-enterprise",
+      hostWebContentsId: 101,
+      workspaceId: authorization.workspaceId,
+      profileAuthorization: authorization,
+    });
+    authorization.bindingRevision = "mutated";
+
+    const first = registry.getRegistrationForWebContents(7);
+    const second = registry.getRegistrationForWebContents(7);
+    expect(first?.profileAuthorization).toEqual(ENTERPRISE_AUTHORIZATION);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(first?.profileAuthorization)).toBe(true);
+    expect(first).not.toBe(second);
+    expect(first?.profileAuthorization).not.toBe(second?.profileAuthorization);
+  });
+
+  it("rejects accessor and Proxy Profile registrations without reading authority getters", () => {
+    const registry = new PaseoBrowserWebviewRegistry();
+    const accessor = { ...ENTERPRISE_AUTHORIZATION } as Record<string, unknown>;
+    let reads = 0;
+    Object.defineProperty(accessor, "browserProfileId", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return ENTERPRISE_AUTHORIZATION.browserProfileId;
+      },
+    });
+    const proxy = new Proxy(
+      { ...ENTERPRISE_AUTHORIZATION },
+      {
+        ownKeys: () => {
+          throw new Error("proxy trap");
+        },
+      },
+    );
+
+    expect(() =>
+      registry.registerWebContents({
+        webContentsId: 7,
+        browserId: "browser-accessor",
+        hostWebContentsId: 101,
+        workspaceId: ENTERPRISE_AUTHORIZATION.workspaceId,
+        profileAuthorization: accessor as never,
+      }),
+    ).toThrow(/invalid/i);
+    expect(() =>
+      registry.registerWebContents({
+        webContentsId: 8,
+        browserId: "browser-proxy",
+        hostWebContentsId: 101,
+        workspaceId: ENTERPRISE_AUTHORIZATION.workspaceId,
+        profileAuthorization: proxy,
+      }),
+    ).toThrow(/invalid/i);
+    expect(reads).toBe(0);
+  });
+
+  it("keeps same-host tabs with identical local IDs isolated across organizations", () => {
+    const registry = new PaseoBrowserWebviewRegistry();
+    const otherOrganization = {
+      ...ENTERPRISE_AUTHORIZATION,
+      organizationId: "org_2222222222222222",
+    };
+    registry.registerWebContents({
+      webContentsId: 7,
+      browserId: "browser-organization-a",
+      hostWebContentsId: 101,
+      workspaceId: ENTERPRISE_AUTHORIZATION.workspaceId,
+      profileAuthorization: ENTERPRISE_AUTHORIZATION,
+    });
+    registry.registerWebContents({
+      webContentsId: 8,
+      browserId: "browser-organization-b",
+      hostWebContentsId: 101,
+      workspaceId: otherOrganization.workspaceId,
+      profileAuthorization: otherOrganization,
+    });
+
+    expect(
+      registry.listBrowserIdsForProfile({
+        hostWebContentsId: 101,
+        authorization: ENTERPRISE_AUTHORIZATION,
+      }),
+    ).toEqual(["browser-organization-a"]);
+    expect(
+      registry.listBrowserIdsForProfile({
+        hostWebContentsId: 101,
+        authorization: otherOrganization,
+      }),
+    ).toEqual(["browser-organization-b"]);
+  });
+
+  it("does not reuse a tab registered under an old binding revision", () => {
+    const registry = new PaseoBrowserWebviewRegistry();
+    registry.registerWebContents({
+      webContentsId: 7,
+      browserId: "browser-old-binding",
+      hostWebContentsId: 101,
+      workspaceId: ENTERPRISE_AUTHORIZATION.workspaceId,
+      profileAuthorization: ENTERPRISE_AUTHORIZATION,
+    });
+    const rebound = {
+      ...ENTERPRISE_AUTHORIZATION,
+      bindingRevision: "binding-rebound",
+    };
+
+    expect(
+      registry.getWebContentsIdForBrowserProfile({
+        hostWebContentsId: 101,
+        browserId: "browser-old-binding",
+        authorization: rebound,
+      }),
+    ).toBeNull();
+    expect(
+      registry.listBrowserIdsForProfile({ hostWebContentsId: 101, authorization: rebound }),
+    ).toEqual([]);
+  });
+
   it("keeps one authoritative webContents target per host and browser", () => {
     const registry = new PaseoBrowserWebviewRegistry();
 
@@ -27,6 +160,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
     expect(registry.getRegistrationForWebContents(2)).toEqual({
       browserId: "browser-a",
       hostWebContentsId: 101,
+      registrationRevision: 2,
     });
     expect(registry.getWebContentsIdForBrowserInHostWindow(101, "browser-a")).toBe(2);
     expect(registry.getWorkspaceId("browser-a")).toBe("workspace-a");
@@ -201,6 +335,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
     expect(registry.getRegistrationForWebContents(22)).toEqual({
       browserId: "browser-a",
       hostWebContentsId: 202,
+      registrationRevision: 2,
     });
     expect(registry.getWebContentsIdForBrowserInHostWindow(202, "browser-a")).toBe(22);
   });

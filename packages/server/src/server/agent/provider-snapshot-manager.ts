@@ -26,6 +26,7 @@ import {
 import type { ManagedAgent } from "./agent-manager.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { ManagedProcessRegistry } from "../managed-processes/managed-processes.js";
+import type { ManagedRuntimeBindings } from "../managed-runtimes/managed-provider-binary.js";
 import type { OpenCodeBridge } from "./providers/opencode/bridge.js";
 import type {
   AgentProviderRuntimeSettingsMap,
@@ -116,6 +117,7 @@ export interface ProviderSnapshotManagerOptions {
   providerOverrides?: Record<string, ProviderOverride>;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   managedProcesses?: ManagedProcessRegistry;
+  managedRuntimes?: ManagedRuntimeBindings;
   isDev?: boolean;
   extraClients?: Partial<Record<AgentProvider, AgentClient>>;
   refreshTimeoutMs?: number;
@@ -191,6 +193,7 @@ export interface AgentManagerProviderState {
     >
   >;
   clients: Partial<Record<AgentProvider, AgentClient>>;
+  retiredProviders?: readonly AgentProvider[];
 }
 
 interface ProviderLoadOptions {
@@ -244,6 +247,7 @@ export class ProviderSnapshotManager {
   private readonly logger: Logger;
   private readonly workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   private readonly managedProcesses?: ManagedProcessRegistry;
+  private readonly managedRuntimes?: ManagedRuntimeBindings;
   private readonly openCodeBridge?: OpenCodeBridge;
   private readonly isDev: boolean;
   private readonly extraClients: Partial<Record<AgentProvider, AgentClient>>;
@@ -262,6 +266,7 @@ export class ProviderSnapshotManager {
     );
     this.workspaceGitService = options.workspaceGitService;
     this.managedProcesses = options.managedProcesses;
+    this.managedRuntimes = options.managedRuntimes;
     this.openCodeBridge = options.openCodeBridge;
     this.isDev = options.isDev === true;
     this.extraClients = options.extraClients ?? {};
@@ -402,6 +407,9 @@ export class ProviderSnapshotManager {
     this.createAgentManagerState(this.generation.definitions, clients);
     this.pluginProviders.replace(registrations);
     const plugins = this.pluginProviders.definitions();
+    const retiredProviders = Object.keys(previousPlugins).filter(
+      (provider) => previousPlugins[provider] !== plugins[provider],
+    );
     const definitions = { ...this.generation.definitions };
     const changed = new Set<AgentProvider>();
     for (const provider of new Set([...Object.keys(previousPlugins), ...Object.keys(plugins)])) {
@@ -415,7 +423,7 @@ export class ProviderSnapshotManager {
     const generation = this.createGeneration(definitions, this.providerOverrides);
     const state = this.createAgentManagerState(definitions, clients);
     this.installGeneration(generation, clients, changed);
-    return state;
+    return { ...state, retiredProviders };
   }
 
   private ensureClient(
@@ -686,6 +694,7 @@ export class ProviderSnapshotManager {
       providerOverrides,
       workspaceGitService: this.workspaceGitService,
       managedProcesses: this.managedProcesses,
+      managedRuntimes: this.managedRuntimes,
       openCodeBridge: this.openCodeBridge,
       isDev: this.isDev,
     });

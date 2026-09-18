@@ -1,4 +1,5 @@
 import type { AgentSessionConfig, McpServerConfig } from "./agent-sdk-types.js";
+import { AGENT_MCP_CALLER_HEADER } from "./mcp-caller-token.js";
 
 const PASEO_MCP_SERVER_NAME = "paseo";
 const PASEO_MCP_PATHNAME = "/mcp/agents";
@@ -28,7 +29,6 @@ export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSe
 
 export function withRuntimePaseoMcpServer(params: {
   config: AgentSessionConfig;
-  agentId: string;
   mcpBaseUrl: string | null;
   /**
    * Capability token authenticating the injected connection to the daemon's
@@ -36,6 +36,11 @@ export function withRuntimePaseoMcpServer(params: {
    * this header the agent's MCP requests are rejected when a password is set.
    */
   mcpAuthToken: string | null;
+  /**
+   * Per-Agent caller capability (ADR-0043). The route identifies the calling Agent only from this
+   * header, never from the URL.
+   */
+  mcpCallerToken: string | null;
 }): AgentSessionConfig {
   const storedConfig = stripInternalPaseoMcpServer(params.config);
   if (!params.mcpBaseUrl || storedConfig.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
@@ -47,14 +52,26 @@ export function withRuntimePaseoMcpServer(params: {
     mcpServers: {
       [PASEO_MCP_SERVER_NAME]: {
         type: "http",
-        url: `${params.mcpBaseUrl}?callerAgentId=${params.agentId}`,
-        ...(params.mcpAuthToken
-          ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } }
-          : {}),
+        url: params.mcpBaseUrl,
+        ...runtimePaseoMcpHeaders(params),
       },
       ...storedConfig.mcpServers,
     },
   };
+}
+
+function runtimePaseoMcpHeaders(params: {
+  mcpAuthToken: string | null;
+  mcpCallerToken: string | null;
+}): { headers?: Record<string, string> } {
+  const headers: Record<string, string> = {};
+  if (params.mcpAuthToken) {
+    headers.Authorization = `Bearer ${params.mcpAuthToken}`;
+  }
+  if (params.mcpCallerToken) {
+    headers[AGENT_MCP_CALLER_HEADER] = params.mcpCallerToken;
+  }
+  return Object.keys(headers).length > 0 ? { headers } : {};
 }
 
 function isInternalPaseoMcpServer(config: McpServerConfig): boolean {

@@ -11,6 +11,8 @@ import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
 import { getInitDeferred, getInitKey, rejectInitDeferred } from "@/utils/agent-initialization";
 import { reduceTurnLiveness, type TurnLivenessTransition } from "@/timeline/turn-liveness";
+import { useCreateFlowStore } from "@/stores/create-flow-store";
+import { invalidateProviderSubagentParent } from "@/subagents/provider-store";
 
 function mergeSnapshotTurn(previous: Agent | undefined, incoming: Agent): Agent {
   if (!previous) return incoming;
@@ -150,6 +152,8 @@ export class AgentStoreProjection {
       return next;
     };
     clearArchiveAgentPending({ queryClient, serverId: this.serverId, agentId });
+    useCreateFlowStore.getState().clearByAgent({ serverId: this.serverId, agentId });
+    invalidateProviderSubagentParent(this.serverId, agentId);
     store.setAgents(this.serverId, removeKey);
     store.setAgentDetails(this.serverId, removeKey);
     store.setQueuedMessages(this.serverId, removeKey);

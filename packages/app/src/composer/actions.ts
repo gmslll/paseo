@@ -54,6 +54,13 @@ export interface ComposerSendClient {
       attachments: ReturnType<typeof splitComposerAttachmentsForSubmit>["attachments"];
     },
   ) => Promise<void>;
+  sendCollabTurn?: (input: {
+    workspaceId: string;
+    agentId: string;
+    text: string;
+    messageId?: string;
+    sharedTurnPolicy?: "queue" | "interrupt";
+  }) => Promise<{ accepted: boolean; error?: string }>;
   uploadFile: (input: { fileName: string; mimeType: string; bytes: Uint8Array }) => Promise<{
     requestId: string;
     file: {
@@ -70,6 +77,10 @@ export interface ComposerSendClient {
 
 export interface ComposerCancelClient {
   cancelAgent: (agentId: string) => Promise<void> | void;
+  cancelCollabTurn?: (input: { workspaceId: string; agentId: string }) => Promise<{
+    accepted: boolean;
+    error?: string;
+  }>;
 }
 
 export interface MessageSubmissionWriter {
@@ -156,13 +167,25 @@ export interface CancelComposerAgentInput {
   isAgentRunning: boolean;
   isCancellingAgent: boolean;
   isConnected: boolean;
+  workspaceId?: string | null;
+  usePlaneTurn?: boolean;
 }
 
 export function cancelComposerAgent(input: CancelComposerAgentInput): Promise<void> | null {
   if (!input.isAgentRunning || input.isCancellingAgent) return null;
   if (!input.isConnected || !input.client) return null;
+  const client = input.client;
+  const workspaceId = input.workspaceId;
+  if (input.usePlaneTurn === true && workspaceId && client.cancelCollabTurn) {
+    return client.cancelCollabTurn({ workspaceId, agentId: input.agentId }).then((result) => {
+      if (result.accepted === false) {
+        throw new Error(result.error ?? "Collaborative cancel was not accepted");
+      }
+      return undefined;
+    });
+  }
   try {
-    return Promise.resolve(input.client.cancelAgent(input.agentId));
+    return Promise.resolve(client.cancelAgent(input.agentId));
   } catch (error) {
     return Promise.reject(error);
   }
@@ -180,6 +203,8 @@ export interface DispatchComposerAgentMessageInput {
   submission: MessageSubmissionWriter;
   activeTurnBehavior?: ActiveTurnBehavior;
   activeTurnId?: string;
+  workspaceId?: string | null;
+  usePlaneTurn?: boolean;
 }
 
 export async function dispatchComposerAgentMessage(
@@ -202,12 +227,31 @@ export async function dispatchComposerAgentMessage(
   input.submission.begin(input.agentId, userMessage);
   try {
     const imagesData = await input.encodeImages(wirePayload.images);
-    await input.client.sendAgentMessage(input.agentId, input.text, {
-      messageId: clientMessageId,
-      ...(input.activeTurnBehavior ? { activeTurnBehavior: input.activeTurnBehavior } : {}),
-      images: imagesData ?? [],
-      attachments: wirePayload.attachments,
-    });
+    const planeTurn =
+      input.usePlaneTurn === true &&
+      Boolean(input.workspaceId) &&
+      Boolean(input.client.sendCollabTurn) &&
+      wirePayload.images.length === 0 &&
+      wirePayload.attachments.length === 0;
+    if (planeTurn && input.workspaceId && input.client.sendCollabTurn) {
+      const result = await input.client.sendCollabTurn({
+        workspaceId: input.workspaceId,
+        agentId: input.agentId,
+        text: input.text,
+        messageId: clientMessageId,
+        sharedTurnPolicy: input.activeTurnBehavior === "interrupt" ? "interrupt" : "queue",
+      });
+      if (result.accepted === false) {
+        throw new Error(result.error ?? "Collaborative turn was not accepted");
+      }
+    } else {
+      await input.client.sendAgentMessage(input.agentId, input.text, {
+        messageId: clientMessageId,
+        ...(input.activeTurnBehavior ? { activeTurnBehavior: input.activeTurnBehavior } : {}),
+        images: imagesData ?? [],
+        attachments: wirePayload.attachments,
+      });
+    }
     input.submission.accept(input.agentId, clientMessageId);
   } catch (error) {
     input.submission.reject(input.agentId, clientMessageId);

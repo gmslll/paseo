@@ -107,6 +107,40 @@ describe("buildReviewDraftKey", () => {
       }),
     ).toBe("review:server=local:cwd=%2Frepo:mode=base:base=main:ignoreWhitespace=false");
   });
+
+  it("scopes turn-mode drafts by turn id so two turns do not share comments", () => {
+    expect(
+      buildReviewDraftKey({
+        serverId: "local",
+        workspaceId: "workspace-1",
+        cwd: "/repo",
+        mode: "turn",
+        turnId: "turn-1",
+        ignoreWhitespace: false,
+      }),
+    ).toBe(
+      "review:server=local:workspace=workspace-1:mode=turn:turn=turn-1:base=:ignoreWhitespace=false",
+    );
+    expect(
+      buildReviewDraftKey({
+        serverId: "local",
+        workspaceId: "workspace-1",
+        cwd: "/repo",
+        mode: "turn",
+        turnId: "turn-2",
+        ignoreWhitespace: false,
+      }),
+    ).not.toBe(
+      buildReviewDraftKey({
+        serverId: "local",
+        workspaceId: "workspace-1",
+        cwd: "/repo",
+        mode: "turn",
+        turnId: "turn-1",
+        ignoreWhitespace: false,
+      }),
+    );
+  });
 });
 
 describe("normalizePersistedState", () => {

@@ -3,6 +3,7 @@ export { createPaseoDaemon, type PaseoDaemon, type PaseoDaemonConfig } from "./b
 export { loadConfig, type CliConfigOverrides } from "./config.js";
 export { resolvePaseoHome } from "./paseo-home.js";
 export { getOrCreateServerId } from "./server-id.js";
+export { resolveDaemonVersion } from "./daemon-version.js";
 export { createRootLogger, type LogLevel, type LogFormat } from "./logger.js";
 export {
   loadPersistedConfig,
@@ -10,6 +11,22 @@ export {
   type PersistedConfig,
 } from "./persisted-config.js";
 export { hashDaemonPassword, isBearerTokenValid } from "./auth.js";
+export {
+  provisionProductionEnterpriseInitialAdmin,
+  createProductionEnterpriseProvisioningPorts,
+  type ProductionEnterpriseProvisioningPorts,
+  type ProductionInitialCredential,
+} from "./enterprise/production-provisioning.js";
+export {
+  provisionProductionEnterpriseInitialAdminFromHome,
+  type ProductionEnterpriseInitialAdminInput,
+  type ProductionEnterpriseInitialAdminDependencies,
+} from "./enterprise/production-runtime-factory.js";
+export {
+  enrollManagedNode,
+  type ManagedNodeRelationship,
+} from "./enterprise/managed-node/index.js";
+export { defaultManagedNodeCapacity } from "./enterprise/managed-node/lifecycle.js";
 export { generateLocalPairingOffer, type LocalPairingOffer } from "./pairing-offer.js";
 export {
   ConnectionOfferSchema,
@@ -54,6 +71,15 @@ export {
   type ProviderProfileModel,
 } from "./agent/provider-launch-config.js";
 export { findExecutable } from "../executable-resolution/executable-resolution.js";
+// Reading a running daemon's local planes from another process (ADR-0038): the CLI and the desktop
+// app share these instead of each learning the layout of `run/`.
+export {
+  describeLocalPlanes,
+  parseProbeState,
+  readLiveDaemonManifest,
+  readLocalProbeState,
+} from "./local-planes/local-plane-readers.js";
+export { getPidLockInfo, type PidLockInfo } from "./pid-lock.js";
 export { execCommand, spawnProcess } from "../utils/spawn.js";
 
 // Provider manifest (source of truth for provider definitions)

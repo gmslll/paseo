@@ -142,9 +142,28 @@ export interface DesktopAttachedBrowserRegistration {
   browserId: string;
   workspaceId: string;
   webContentsId: number;
+  profile?: DesktopBrowserProfileRuntimeAuthorization;
+}
+
+export interface DesktopBrowserProfileRuntimeAuthorization {
+  organizationId: string;
+  homeNodeId: string;
+  workspaceId: string;
+  browserProfileId: string;
+  bindingRevision: string;
+  lifecycleGeneration: string;
 }
 
 export interface DesktopBrowserBridge {
+  hydrateBrowserProfileAuthorizations?: (input: {
+    homeNodeId: string;
+    authorizations: readonly DesktopBrowserProfileRuntimeAuthorization[];
+    lifecycleGeneration: string;
+  }) => Promise<void>;
+  revokeBrowserProfileGeneration?: (input: {
+    homeNodeId: string;
+    lifecycleGeneration: string;
+  }) => Promise<void>;
   setShortcutPolicy?: (input: BrowserKeyboardPolicy) => Promise<void>;
   readonly profilePartition?: string;
   registerAttachedBrowser?: (input: DesktopAttachedBrowserRegistration) => Promise<void>;

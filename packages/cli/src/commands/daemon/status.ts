@@ -5,6 +5,7 @@ import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema } from "../../output/index.js";
 import { resolveLocalDaemonState } from "./local-daemon.js";
 import { resolveNodePathFromPid } from "./runtime-toolchain.js";
+import { describeLocalPlanes, readLocalProbeState } from "../../utils/local-control-plane.js";
 
 const DAEMON_STATUS_PROBE_TIMEOUT_MS = 1500;
 
@@ -22,6 +23,7 @@ interface DaemonStatus {
   home: string;
   listen: string;
   relay: string;
+  localPlanes: string;
   hostname: string | null;
   pid: number | null;
   startedAt: string | null;
@@ -120,6 +122,7 @@ function toStatusRows(status: DaemonStatus): StatusRow[] {
     { key: "Home", value: status.home },
     { key: "Listen", value: status.listen },
     { key: "Relay", value: status.relay },
+    { key: "Local Planes", value: status.localPlanes },
     { key: "Hostname", value: status.hostname ?? "-" },
     { key: "PID", value: status.pid === null ? "-" : String(status.pid) },
     { key: "Started", value: status.startedAt ?? "-" },
@@ -434,6 +437,9 @@ export async function runStatusCommand(
   }
 
   const providers = daemonProviders ?? (await checkProviderBinaries());
+  const localPlanes = describeLocalPlanes(
+    await readLocalProbeState(state.home, DAEMON_STATUS_PROBE_TIMEOUT_MS),
+  );
 
   const daemonStatus: DaemonStatus = {
     serverId,
@@ -442,6 +448,7 @@ export async function runStatusCommand(
     home: state.home,
     listen: state.listen,
     relay: relayStatus,
+    localPlanes,
     hostname: state.pidInfo?.hostname ?? null,
     pid: state.pidInfo?.pid ?? null,
     startedAt: state.pidInfo?.startedAt ?? null,

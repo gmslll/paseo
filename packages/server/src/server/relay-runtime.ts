@@ -1,10 +1,12 @@
 import type pino from "pino";
 import type { KeyPair } from "@getpaseo/relay/e2ee";
 import type { ExternalSocketMetadata } from "./websocket-server.js";
+import type { EnterpriseAdmissionAuthenticationEvidence } from "./enterprise/identity/admission-authorization.js";
 import {
   startRelayTransport,
   type RelaySocketLike,
   type RelayTransportController,
+  type RelayTransportOptions,
 } from "./relay-transport.js";
 
 export interface RelayRuntimeConfig {
@@ -18,14 +20,26 @@ export interface RelayRuntimeConfig {
 interface RelayRuntimeOptions {
   config: RelayRuntimeConfig;
   logger: pino.Logger;
-  attachSocket(ws: RelaySocketLike, metadata?: ExternalSocketMetadata): Promise<void>;
+  attachSocket(
+    ws: RelaySocketLike,
+    metadata?: ExternalSocketMetadata,
+    evidence?: EnterpriseAdmissionAuthenticationEvidence,
+  ): Promise<void>;
   serverId: string;
   daemonKeyPair: KeyPair;
-  startTransport?: typeof startRelayTransport;
+  startTransport?: (
+    options: RelayTransportOptions<EnterpriseAdmissionAuthenticationEvidence>,
+  ) => RelayTransportController;
+  authenticateEnterprise?: (input: {
+    token: string;
+    challenge: string;
+  }) => Promise<EnterpriseAdmissionAuthenticationEvidence | null>;
+  requireEnterpriseAuth?: boolean;
 }
 
 export interface RelayRuntime {
   getConfig(): RelayRuntimeConfig;
+  isConnected(): boolean;
   setEnabled(enabled: boolean): void;
   stop(): Promise<void>;
 }
@@ -37,6 +51,9 @@ export function createRelayRuntime(options: RelayRuntimeOptions): RelayRuntime {
 
   function start(): void {
     if (transport) return;
+    if (options.requireEnterpriseAuth && !options.authenticateEnterprise) {
+      throw new Error("enterprise relay authentication verifier required");
+    }
     transport = startTransport({
       logger: options.logger,
       attachSocket: options.attachSocket,
@@ -44,6 +61,7 @@ export function createRelayRuntime(options: RelayRuntimeOptions): RelayRuntime {
       relayUseTls: config.useTls,
       serverId: options.serverId,
       daemonKeyPair: options.daemonKeyPair,
+      authenticateEnterprise: options.authenticateEnterprise,
     });
   }
 
@@ -72,6 +90,7 @@ export function createRelayRuntime(options: RelayRuntimeOptions): RelayRuntime {
 
   return {
     getConfig: () => config,
+    isConnected: () => transport?.isConnected?.() ?? false,
     setEnabled,
     stop,
   };

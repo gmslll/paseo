@@ -5,7 +5,7 @@ import type {
   ProviderOptions,
   ToolPolicy,
 } from "@getpaseo/protocol/agent-types";
-import type { AgentAttachment } from "@getpaseo/protocol/messages";
+import type { AgentAttachment, SharedTurnPolicy } from "@getpaseo/protocol/messages";
 import type { PaseoToolCatalog } from "./tools/types.js";
 
 export type { AgentProviderNotice, AgentTaskItem };
@@ -214,6 +214,18 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /**
+   * Who is sending, when an authenticated Principal is (ADR-0034). Carried here rather than derived
+   * later because the author of a turn's first message is its controller, and by the time the
+   * timeline row exists the caller is gone. AgentSteerOptions extends this, so a steer carries it
+   * too.
+   */
+  author?: { principalId: string; displayName?: string };
+  /**
+   * What the sender asked for when a turn is already running (ADR-0034). Advisory: the manager
+   * resolves the effective behaviour from the Principal, and this can only ask for less.
+   */
+  sharedTurnPolicy?: SharedTurnPolicy;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {
@@ -402,7 +414,18 @@ export interface PluginTimelineItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      /**
+       * Who sent it, when the daemon knows (ADR-0034). Absent for a single-user daemon and for
+       * prompts the daemon injects itself, present for an authenticated Principal — which is what
+       * makes the author of a turn's first message its controller.
+       */
+      author?: { principalId: string; displayName?: string };
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
@@ -476,6 +499,39 @@ export type AgentStreamEvent =
 
 export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined {
   return "turnId" in event ? event.turnId : undefined;
+}
+
+/**
+ * Whether this event ends a turn, however it ended.
+ *
+ * Here rather than beside one caller because three already ask it: the manager decides a run is
+ * over, the session projector makes streamed text final, and the plugin lifecycle reports the turn.
+ * A rule spelled out separately in each is a rule that can drift in one of them.
+ */
+export function isTurnTerminalStreamEvent(event: AgentStreamEvent): boolean {
+  return (
+    event.type === "turn_completed" ||
+    event.type === "turn_failed" ||
+    event.type === "turn_canceled"
+  );
+}
+
+/**
+ * A send that was queued rather than started hands back a run that produces nothing (ADR-0034).
+ * The fact travels on the stream itself: an empty run is otherwise indistinguishable from a turn
+ * that started and said nothing, and reading it back off the Agent would mean trusting two
+ * snapshots taken around the call.
+ */
+const QUEUED_AGENT_RUN: unique symbol = Symbol.for("paseo.agent.queued-run");
+
+export function markQueuedAgentRun(
+  stream: AsyncGenerator<AgentStreamEvent>,
+): AsyncGenerator<AgentStreamEvent> {
+  return Object.assign(stream, { [QUEUED_AGENT_RUN]: true });
+}
+
+export function isQueuedAgentRun(stream: AsyncGenerator<AgentStreamEvent>): boolean {
+  return (stream as { [QUEUED_AGENT_RUN]?: boolean })[QUEUED_AGENT_RUN] === true;
 }
 
 export type AgentPermissionRequestKind = "tool" | "plan" | "question" | "mode" | "other";

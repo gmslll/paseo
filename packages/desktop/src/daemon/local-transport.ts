@@ -27,7 +27,7 @@ export interface TransportEventPayload {
   sessionId: string;
   kind: "open" | "message" | "close" | "error";
   text?: string | null;
-  binaryBase64?: string | null;
+  bytes?: Uint8Array | null;
   code?: number | null;
   reason?: string | null;
   error?: string | null;
@@ -73,7 +73,7 @@ export interface LocalTransportManagerDependencies {
 
 export interface LocalTransportManager {
   open(rawInput: unknown): void;
-  send(input: { sessionId: string; text?: string; binaryBase64?: string }): Promise<void>;
+  send(input: { sessionId: string; text?: string; bytes?: Uint8Array }): Promise<void>;
   close(sessionId: string): void;
   closeAll(): void;
 }
@@ -275,13 +275,13 @@ async function resolveTransportEndpoint(target: TransportTarget): Promise<Transp
   };
 }
 
-function decodeTransportMessage(input: { text?: string; binaryBase64?: string }): string | Buffer {
+function decodeTransportMessage(input: { text?: string; bytes?: Uint8Array }): string | Buffer {
   if (typeof input.text === "string") {
     return input.text;
   }
 
-  if (typeof input.binaryBase64 === "string") {
-    return Buffer.from(input.binaryBase64, "base64");
+  if (input.bytes) {
+    return Buffer.from(input.bytes.buffer, input.bytes.byteOffset, input.bytes.byteLength);
   }
 
   throw new Error("Local transport send requires text or binary payload.");
@@ -416,7 +416,7 @@ export function createLocalTransportManager(
         emitEvent({
           sessionId: session.id,
           kind: "message",
-          binaryBase64: buf.toString("base64"),
+          bytes: new Uint8Array(buf),
         });
         return;
       }
@@ -496,7 +496,7 @@ export function createLocalTransportManager(
   async function send(input: {
     sessionId: string;
     text?: string;
-    binaryBase64?: string;
+    bytes?: Uint8Array;
   }): Promise<void> {
     const session = sessions.get(input.sessionId);
     if (!session) {
@@ -558,7 +558,7 @@ export function openLocalTransportSession(rawInput: unknown): void {
 export async function sendLocalTransportMessage(input: {
   sessionId: string;
   text?: string;
-  binaryBase64?: string;
+  bytes?: Uint8Array;
 }): Promise<void> {
   await localTransportManager.send(input);
 }

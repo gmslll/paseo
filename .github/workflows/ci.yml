@@ -30,6 +30,7 @@ jobs:
       quality: ${{ steps.filter.outputs.quality }}
       hub: ${{ steps.filter.outputs.hub }}
       server: ${{ steps.filter.outputs.server }}
+      enterprise: ${{ steps.filter.outputs.enterprise }}
       desktop: ${{ steps.filter.outputs.desktop }}
       app: ${{ steps.filter.outputs.app }}
       sdk: ${{ steps.filter.outputs.sdk }}
@@ -173,6 +174,31 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
     runs-on: windows-latest
     steps: *server_test_steps
+
+  enterprise-management-tests:
+    name: enterprise management tests
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.enterprise != 'false') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: node scripts/npm-retry.mjs ci
+
+      - name: Build protocol declarations
+        run: npm run build --workspace=@getpaseo/protocol
+
+      - name: Run management plane tests
+        run: npm run test --workspace=@getpaseo/enterprise-management
+
+      - name: Build standalone management plane
+        run: npm run bundle --workspace=@getpaseo/enterprise-management
 
   desktop-tests-ubuntu:
     name: desktop-tests (ubuntu-latest)

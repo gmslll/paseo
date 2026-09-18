@@ -4,6 +4,12 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { PASEO_BROWSER_PROFILE_PARTITION } from "./features/browser-profile.js";
+import {
+  BROWSER_PAGE_IDENTITY_TRANSPORT_DISPOSE_CHANNEL,
+  BROWSER_PAGE_IDENTITY_TRANSPORT_MOUNT_CHANNEL,
+  BROWSER_PAGE_IDENTITY_TRANSPORT_REQUEST_CHANNEL,
+  BROWSER_PAGE_IDENTITY_TRANSPORT_RESPONSE_CHANNEL,
+} from "./features/browser-webviews/page-identity-transport.js";
 
 // The preload runs inside Electron's sandbox and is tsc-compiled (not bundled), so at
 // runtime it may only load Electron's sandbox allowlist. Any other module (local or
@@ -78,6 +84,37 @@ function runtimeModuleSpecifiers(source: string): string[] {
   return specifiers;
 }
 
+function objectLiteralKeys(source: string, propertyName: string): string[] | null {
+  const sourceFile = ts.createSourceFile(
+    "preload.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+  );
+  let result: string[] | null = null;
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isPropertyAssignment(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === propertyName &&
+      ts.isObjectLiteralExpression(node.initializer)
+    ) {
+      result = node.initializer.properties.flatMap((property) => {
+        if (
+          (ts.isPropertyAssignment(property) || ts.isMethodDeclaration(property)) &&
+          (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))
+        ) {
+          return [property.name.text];
+        }
+        return [];
+      });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return result;
+}
+
 describe("preload sandbox safety", () => {
   it("only loads Electron's sandbox allowlist at runtime", () => {
     const source = readFileSync(preloadPath, "utf8");
@@ -95,5 +132,39 @@ describe("preload sandbox safety", () => {
       "PASEO_BROWSER_PROFILE_PARTITION not found as a double-quoted string literal in preload.ts",
     ).not.toBeNull();
     expect(match![1]).toBe(PASEO_BROWSER_PROFILE_PARTITION);
+  });
+
+  it("keeps page-identity IPC channels synchronized with the main transport", () => {
+    const source = readFileSync(preloadPath, "utf8");
+    for (const [name, channel] of [
+      [
+        "BROWSER_PAGE_IDENTITY_TRANSPORT_MOUNT_CHANNEL",
+        BROWSER_PAGE_IDENTITY_TRANSPORT_MOUNT_CHANNEL,
+      ],
+      [
+        "BROWSER_PAGE_IDENTITY_TRANSPORT_DISPOSE_CHANNEL",
+        BROWSER_PAGE_IDENTITY_TRANSPORT_DISPOSE_CHANNEL,
+      ],
+      [
+        "BROWSER_PAGE_IDENTITY_TRANSPORT_REQUEST_CHANNEL",
+        BROWSER_PAGE_IDENTITY_TRANSPORT_REQUEST_CHANNEL,
+      ],
+      [
+        "BROWSER_PAGE_IDENTITY_TRANSPORT_RESPONSE_CHANNEL",
+        BROWSER_PAGE_IDENTITY_TRANSPORT_RESPONSE_CHANNEL,
+      ],
+    ] as const) {
+      const match = source.match(new RegExp(`const\\s+${name}\\s*=\\s*"([^"]+)"`));
+      expect(match?.[1], `${name} missing from preload.ts`).toBe(channel);
+    }
+  });
+
+  it("exposes only mount, dispose, and response controls for page identity", () => {
+    const source = readFileSync(preloadPath, "utf8");
+    expect(objectLiteralKeys(source, "pageIdentityTransport")?.sort()).toEqual([
+      "dispose",
+      "mount",
+      "respond",
+    ]);
   });
 });

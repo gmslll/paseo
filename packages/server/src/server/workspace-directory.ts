@@ -575,11 +575,12 @@ export class WorkspaceDirectory {
       }));
   }
 
-  async listDescriptors(): Promise<WorkspaceDescriptorPayload[]> {
+  async listDescriptors(workspaceIds?: ReadonlySet<string>): Promise<WorkspaceDescriptorPayload[]> {
     return Array.from(
       (
         await this.buildDescriptorMap({
           includeGitData: true,
+          workspaceIds,
         })
       ).values(),
     );
@@ -611,14 +612,17 @@ export class WorkspaceDirectory {
     return true;
   }
 
-  async listFetchEntries(request: FetchWorkspacesRequestMessage): Promise<{
+  async listFetchEntries(
+    request: FetchWorkspacesRequestMessage,
+    workspaceIds?: ReadonlySet<string>,
+  ): Promise<{
     entries: FetchWorkspacesResponseEntry[];
     emptyProjects: WorkspaceProjectDescriptor[];
     pageInfo: FetchWorkspacesResponsePageInfo;
   }> {
     const filter = request.filter;
     const sort = this.pager.normalizeSort(request.sort);
-    let entries = await this.listDescriptors();
+    let entries = await this.listDescriptors(workspaceIds);
     const listedCount = entries.length;
     entries = entries.filter((workspace) => this.matchesFilter({ workspace, filter }));
     const filteredCount = entries.length;
@@ -643,11 +647,12 @@ export class WorkspaceDirectory {
     // Project parents with no active workspaces ride only on the first page so
     // the sidebar can render them without duplicating them across pagination.
     const projectIdFilter = filter?.projectId?.trim();
-    const emptyProjects = cursorToken
-      ? []
-      : (await this.listEmptyProjects()).filter(
-          (project) => !projectIdFilter || project.projectId === projectIdFilter,
-        );
+    const emptyProjects =
+      cursorToken || workspaceIds
+        ? []
+        : (await this.listEmptyProjects()).filter(
+            (project) => !projectIdFilter || project.projectId === projectIdFilter,
+          );
 
     this.deps.logger.debug(
       {

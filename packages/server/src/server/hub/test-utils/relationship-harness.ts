@@ -738,9 +738,14 @@ export class HubRelationshipHarness {
     return socket.messageFor(message.requestId);
   }
 
-  sendHubRequestOnLatest(message: unknown): SessionOutboundMessage[] {
+  async sendHubRequestOnLatest(message: {
+    type: string;
+    requestId: string;
+    [key: string]: unknown;
+  }): Promise<SessionOutboundMessage[]> {
     const socket = this.latestSocket().socket;
     socket.receive(message);
+    await socket.messageFor(message.requestId);
     return socket.sent.slice();
   }
 

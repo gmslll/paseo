@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>transport bench</title>
+  </head>
+  <body>
+    <script>
+      // The main world does the work the shipped renderer does: turn the payload into real bytes,
+      // touch them so nothing is optimized away, then acknowledge.
+      let sink = 0;
+
+      function decodeBase64(value) {
+        const binary = atob(value);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      }
+
+      window.bench.onFrame((payload) => {
+        const bytes = payload.mode === "base64" ? decodeBase64(payload.data) : payload.data;
+        if (!bytes || bytes.byteLength === 0) {
+          throw new Error(`empty frame for mode ${payload.mode}`);
+        }
+        // Touch both ends so the buffer cannot be elided, and keep the result reachable.
+        sink = (sink + bytes[0] + bytes[bytes.byteLength - 1]) & 0xff;
+        window.bench.ack(payload.id);
+      });
+
+      window.bench.ready();
+    </script>
+  </body>
+</html>

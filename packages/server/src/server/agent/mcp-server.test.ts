@@ -508,6 +508,7 @@ function createManagedAgent(overrides: Partial<ManagedAgent> = {}): ManagedAgent
     persistence: null,
     labels: {},
     attention: { requiresAttention: false },
+    queuedTurns: [],
     ...overrides,
   } as ManagedAgent;
 }

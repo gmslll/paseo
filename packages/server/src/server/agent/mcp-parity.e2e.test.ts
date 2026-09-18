@@ -55,13 +55,24 @@ function formatHostForHttpUrl(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
-function buildExpectedAgentMcpUrl(params: { host: string; port: number; agentId: string }): string {
-  const baseUrl = new URL(
+function buildExpectedAgentMcpUrl(params: { host: string; port: number }): string {
+  return new URL(
     "/mcp/agents",
     `http://${formatHostForHttpUrl(params.host)}:${params.port}`,
-  );
-  baseUrl.searchParams.set("callerAgentId", params.agentId);
-  return baseUrl.toString();
+  ).toString();
+}
+
+// The daemon identifies an Agent caller only from the token it injected into that Agent's launch.
+function callerHeadersForLaunch(cwd: string): Record<string, string> {
+  const paseo = Object.values(launchConfigsByProvider)
+    .flat()
+    .toReversed()
+    .find((config) => config.cwd === cwd)?.mcpServers?.paseo;
+  const callerToken = paseo?.type === "http" ? paseo.headers?.["x-paseo-agent-caller"] : undefined;
+  if (!callerToken) {
+    throw new Error(`No injected MCP caller token for the Agent launched in ${cwd}`);
+  }
+  return { "x-paseo-agent-caller": callerToken };
 }
 
 function getStructuredContent(result: McpToolResult): StructuredContent | null {
@@ -80,8 +91,11 @@ function getStructuredContent(result: McpToolResult): StructuredContent | null {
   return null;
 }
 
-async function createMcpClient(url: string): Promise<McpClient> {
-  const transport = new StreamableHTTPClientTransport(new URL(url));
+async function createMcpClient(url: string, headers?: Record<string, string>): Promise<McpClient> {
+  const transport = new StreamableHTTPClientTransport(
+    new URL(url),
+    headers ? { requestInit: { headers } } : undefined,
+  );
   const rawClient = await experimental_createMCPClient({ transport });
   const boundCallTool: McpClient["callTool"] = Reflect.get(rawClient, "callTool").bind(rawClient);
   return { callTool: boundCallTool, close: () => rawClient.close() };
@@ -312,7 +326,8 @@ beforeAll(async () => {
   parentAgentId = str(parentPayload.agentId);
 
   agentScopedClient = await createMcpClient(
-    `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${parentAgentId}`,
+    `http://127.0.0.1:${daemonHandle.port}/mcp/agents`,
+    callerHeadersForLaunch(parentAgentCwd),
   );
 
   execSync("git init -b main", { cwd: worktreeRepoCwd, stdio: "pipe" });
@@ -385,7 +400,6 @@ describe("Suite A: Core Fixes", () => {
       const expectedUrl = buildExpectedAgentMcpUrl({
         host: listenTarget!.host,
         port: listenTarget!.port,
-        agentId,
       });
 
       const launchConfig = launchConfigsByProvider.claude
@@ -395,6 +409,7 @@ describe("Suite A: Core Fixes", () => {
         paseo: {
           type: "http",
           url: expectedUrl,
+          headers: { "x-paseo-agent-caller": expect.any(String) },
         },
       });
       expect(snapshot.config.mcpServers?.paseo).toBeUndefined();
@@ -935,9 +950,8 @@ describe("Suite E: Worktree Tools", () => {
         title: "Worktree scoped parity agent",
       });
       worktreeScopedClient = await createMcpClient(
-        `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${encodeURIComponent(
-          worktreeAgentId,
-        )}`,
+        `http://127.0.0.1:${daemonHandle.port}/mcp/agents`,
+        callerHeadersForLaunch(worktreePath),
       );
 
       const archived = await callToolStructured(worktreeScopedClient, "archive_worktree", {

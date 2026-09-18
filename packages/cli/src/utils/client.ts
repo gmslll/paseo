@@ -18,6 +18,10 @@ import { WebSocket } from "ws";
 import { getOrCreateCliClientId } from "./client-id.js";
 import { resolveCliVersion } from "../version.js";
 import { createSshTunnel } from "../ssh/ssh-tunnel.js";
+import {
+  createControlPlaneTransportFactory,
+  findLocalControlPlane,
+} from "./local-control-plane.js";
 
 export interface ConnectOptions {
   host?: string;
@@ -353,6 +357,36 @@ async function connectViaRelayOffer(
   }
 }
 
+/**
+ * Connects over the local control plane of the daemon that owns `paseoHome`, or returns null when it
+ * has none or refuses the connection.
+ */
+export async function connectToLocalControlPlane(options: {
+  paseoHome: string;
+  clientId: string;
+  timeout: number;
+}): Promise<DaemonClient | null> {
+  const plane = findLocalControlPlane(options.paseoHome);
+  if (!plane) return null;
+  const client = new DaemonClient({
+    // The control plane transport ignores the URL; the client still requires one.
+    url: "ws://localhost/ws",
+    clientId: options.clientId,
+    clientType: "cli",
+    appVersion: resolveCliVersion(),
+    connectTimeoutMs: options.timeout,
+    transportFactory: createControlPlaneTransportFactory(plane),
+    reconnect: { enabled: false },
+  });
+  try {
+    await client.connect();
+    return client;
+  } catch {
+    await client.close().catch(() => {});
+    return null;
+  }
+}
+
 function parseHostOfferOrNull(host: string | undefined): ConnectionOffer | null {
   if (!host) return null;
   try {
@@ -390,6 +424,17 @@ export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonC
   const offer = parseHostOfferOrNull(explicitHost);
   if (offer) {
     return connectViaRelayOffer(offer, clientId, timeout, nodeWebSocketFactory);
+  }
+
+  // Without an explicit target, the local control plane reaches this user's daemon even when its
+  // WebSocket listener is elsewhere; any failure falls back to the WebSocket candidates.
+  if (!explicitHost) {
+    const local = await connectToLocalControlPlane({
+      paseoHome: resolvePaseoHome(process.env),
+      clientId,
+      timeout,
+    });
+    if (local) return local;
   }
 
   const hosts = resolveDaemonHostCandidates(options);

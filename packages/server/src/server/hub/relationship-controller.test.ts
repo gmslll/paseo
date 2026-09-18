@@ -104,7 +104,7 @@ describe("Hub relationship", () => {
 
     await relationship.beginConnect("registered-token", "https://hub.example", false).result;
     relationship.connectLatestSocket();
-    const responses = relationship.sendHubRequestOnLatest({
+    const responses = await relationship.sendHubRequestOnLatest({
       type: "hub.execution.agent.create.request",
       requestId: "registered-execution",
       executionId: "execution-1",
@@ -133,7 +133,7 @@ describe("Hub relationship", () => {
 
     await relationship.revokePermission("hub.execute");
     expect(relationship.relationshipFile()?.relationship.permissions).toEqual([]);
-    const revokedResponses = relationship.sendHubRequestOnLatest({
+    const revokedResponses = await relationship.sendHubRequestOnLatest({
       type: "hub.execution.agent.create.request",
       requestId: "revoked-execution",
       executionId: "execution-after-revoke",
@@ -665,7 +665,7 @@ describe("Hub relationship", () => {
 
     relationship.connectSocket(0);
     relationship.closeSocket(0, 1000);
-    const messages = relationship.sendHubRequestOnLatest({
+    const messages = await relationship.sendHubRequestOnLatest({
       type: "daemon.get_status.request",
       requestId: "still-current",
     });

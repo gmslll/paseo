@@ -138,6 +138,126 @@ describe("EncryptedChannel", () => {
     expect(daemonChannel.isOpen()).toBe(true);
   });
 
+  it("holds client open until encrypted auth_ok and sends the token once", async () => {
+    const [daemonTransport, clientTransport] = createMockTransportPair();
+    const daemonKeyPair = generateKeyPair();
+    const challenge = arrayBufferToBase64(new Uint8Array(32).buffer);
+    const daemonMessages: (string | ArrayBuffer)[] = [];
+    let opened = 0;
+    const daemonChannelPromise = createDaemonChannel(
+      daemonTransport,
+      daemonKeyPair,
+      { onmessage: (data) => daemonMessages.push(data) },
+      { authPreface: { challenge } },
+    );
+    const getToken = vi.fn(() => "pat-secret");
+    const clientChannel = await createClientChannel(
+      clientTransport,
+      exportPublicKey(daemonKeyPair.publicKey),
+      { onopen: () => opened++ },
+      { authPreface: { getToken } },
+    );
+    const daemonChannel = await daemonChannelPromise;
+    await waitForAsyncDelivery();
+    expect(opened).toBe(0);
+    expect(getToken).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() =>
+      expect(daemonMessages).toEqual([
+        JSON.stringify({ type: "encrypted_auth_preface_v1", challenge, token: "pat-secret" }),
+      ]),
+    );
+    await expect(clientChannel.send("queued-before-auth-ok")).resolves.toBeUndefined();
+    expect(daemonMessages).toHaveLength(1);
+    await daemonChannel.send(JSON.stringify({ type: "auth_ok", challenge }));
+    await waitForAsyncDelivery();
+    expect(opened).toBe(1);
+    expect(clientChannel.isOpen()).toBe(true);
+    await vi.waitFor(() => expect(daemonMessages).toContain("queued-before-auth-ok"));
+  });
+
+  it("fails closed when an accepted auth_ok is replayed", async () => {
+    const [daemonTransport, clientTransport] = createMockTransportPair();
+    const daemonKeyPair = generateKeyPair();
+    const challenge = arrayBufferToBase64(new Uint8Array(32).buffer);
+    const onopen = vi.fn();
+    const onerror = vi.fn();
+    const daemonChannelPromise = createDaemonChannel(
+      daemonTransport,
+      daemonKeyPair,
+      {},
+      { authPreface: { challenge } },
+    );
+    const clientChannel = await createClientChannel(
+      clientTransport,
+      exportPublicKey(daemonKeyPair.publicKey),
+      { onopen, onerror },
+      { authPreface: { getToken: () => "pat-secret" } },
+    );
+    const daemonChannel = await daemonChannelPromise;
+    await daemonChannel.send(JSON.stringify({ type: "auth_ok", challenge }));
+    await vi.waitFor(() => expect(onopen).toHaveBeenCalledTimes(1));
+    expect(clientChannel.isOpen()).toBe(true);
+
+    await daemonChannel.send(JSON.stringify({ type: "auth_ok", challenge }));
+    await waitForAsyncDelivery();
+    expect(onerror).toHaveBeenCalledTimes(1);
+    expect(clientChannel.isOpen()).toBe(false);
+  });
+
+  it("fails closed when auth preface capability or auth_ok challenge is invalid", async () => {
+    const daemonKeyPair = generateKeyPair();
+    const transport: Transport = {
+      send: vi.fn(),
+      close: vi.fn(),
+      onmessage: null,
+      onclose: null,
+      onerror: null,
+    };
+    const onopen = vi.fn();
+    const onerror = vi.fn();
+    await createClientChannel(
+      transport,
+      exportPublicKey(daemonKeyPair.publicKey),
+      { onopen, onerror },
+      { authPreface: { getToken: () => "pat-secret" } },
+    );
+    transport.onmessage?.({
+      data: JSON.stringify({ type: "e2ee_ready", capabilities: {} }),
+      isBinary: false,
+    });
+    await waitForAsyncDelivery();
+    expect(onopen).not.toHaveBeenCalled();
+    expect(onerror).toHaveBeenCalledTimes(1);
+    expect(transport.close).toHaveBeenCalled();
+  });
+
+  it("rejects a wrong encrypted auth_ok and never flushes pending messages", async () => {
+    const [daemonTransport, clientTransport] = createMockTransportPair();
+    const daemonKeyPair = generateKeyPair();
+    const challenge = arrayBufferToBase64(new Uint8Array(32).buffer);
+    const onopen = vi.fn();
+    const onerror = vi.fn();
+    const daemonChannelPromise = createDaemonChannel(
+      daemonTransport,
+      daemonKeyPair,
+      {},
+      { authPreface: { challenge } },
+    );
+    const clientChannel = await createClientChannel(
+      clientTransport,
+      exportPublicKey(daemonKeyPair.publicKey),
+      { onopen, onerror },
+      { authPreface: { getToken: () => "pat-secret" } },
+    );
+    const daemonChannel = await daemonChannelPromise;
+    await clientChannel.send("must-wait");
+    await daemonChannel.send(JSON.stringify({ type: "auth_ok", challenge: `${challenge}x` }));
+    await waitForAsyncDelivery();
+    expect(onopen).not.toHaveBeenCalled();
+    expect(onerror).toHaveBeenCalledTimes(1);
+    expect(clientChannel.isOpen()).toBe(false);
+  });
+
   it("exchanges encrypted messages bidirectionally", async () => {
     const [daemonTransport, clientTransport] = createMockTransportPair();
 

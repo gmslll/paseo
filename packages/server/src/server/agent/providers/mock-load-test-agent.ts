@@ -652,7 +652,10 @@ export class MockLoadTestAgentClient implements AgentClient {
   readonly provider: AgentProvider = MOCK_LOAD_TEST_PROVIDER_ID;
   readonly capabilities = CAPABILITIES;
 
-  constructor(private readonly logger?: Logger) {}
+  constructor(
+    private readonly logger?: Logger,
+    private readonly options: { readonly retainHistory?: boolean } = {},
+  ) {}
 
   async createSession(
     config: AgentSessionConfig,
@@ -662,6 +665,7 @@ export class MockLoadTestAgentClient implements AgentClient {
       config,
       sessionId: randomUUID(),
       logger: this.logger,
+      retainHistory: this.options.retainHistory !== false,
     });
   }
 
@@ -680,6 +684,7 @@ export class MockLoadTestAgentClient implements AgentClient {
       },
       sessionId: handle.sessionId,
       logger: this.logger,
+      retainHistory: this.options.retainHistory !== false,
     });
   }
 
@@ -722,6 +727,7 @@ export class MockLoadTestAgentSession implements AgentSession {
   private readonly listeners = new Set<(event: AgentStreamEvent) => void>();
   private readonly history: AgentStreamEvent[] = [];
   private readonly logger?: Logger;
+  private readonly retainHistory: boolean;
   private activeTurn: ActiveTurn | null = null;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private modeId: string | null;
@@ -733,9 +739,15 @@ export class MockLoadTestAgentSession implements AgentSession {
   private remainingPromptRejections: number;
   private remainingSteerFailures: number;
 
-  constructor(options: { config: AgentSessionConfig; sessionId: string; logger?: Logger }) {
+  constructor(options: {
+    config: AgentSessionConfig;
+    sessionId: string;
+    logger?: Logger;
+    retainHistory?: boolean;
+  }) {
     this.id = options.sessionId;
     this.logger = options.logger;
+    this.retainHistory = options.retainHistory !== false;
     this.modeId = options.config.modeId ?? MOCK_LOAD_TEST_MODE_ID;
     this.modelId = options.config.model ?? MOCK_LOAD_TEST_DEFAULT_MODEL_ID;
     this.assistantResponse =
@@ -1610,6 +1622,7 @@ export class MockLoadTestAgentSession implements AgentSession {
   }
 
   private remember(event: AgentStreamEvent): void {
+    if (!this.retainHistory) return;
     this.history.push(event);
   }
 

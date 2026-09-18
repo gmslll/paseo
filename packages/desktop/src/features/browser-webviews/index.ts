@@ -1,5 +1,9 @@
 import { webContents as allWebContents, type WebContents } from "electron";
-import { PASEO_BROWSER_PROFILE_PARTITION } from "../browser-profile.js";
+import {
+  getEnterpriseBrowserProfilePartition,
+  PASEO_BROWSER_PROFILE_PARTITION,
+  type BrowserProfileRuntimeAuthorization,
+} from "../browser-profile.js";
 import {
   BROWSER_NEW_TAB_REQUEST_EVENT,
   decideBrowserWindowOpenRequest,
@@ -7,21 +11,44 @@ import {
   PendingBrowserWindowOpenRequests,
 } from "./window-open.js";
 import { PaseoBrowserWebviewRegistry } from "./registry.js";
+import type {
+  BrowserPageIdentityExecutionHandle,
+  BrowserPageIdentityWebContents,
+} from "./page-identity-publisher.js";
+import {
+  isBrowserPageIdentityPublisherRegistry,
+  type BrowserPageIdentityPublisherRegistry,
+} from "./page-identity-publisher-registry.js";
 
 export {
   BROWSER_NEW_TAB_REQUEST_EVENT,
   decideBrowserWindowOpenRequest,
   PendingBrowserWindowOpenRequests,
 };
+export {
+  createBrowserPageIdentityTransportPublisherPorts,
+  createBrowserPageIdentityTransportRouteLifecyclePort,
+  installBrowserPageIdentityTransportRoutes,
+  type BrowserPageIdentityTransportController,
+  type BrowserPageIdentityTransportRoute,
+  type BrowserPageIdentityTransportRouteLifecyclePort,
+} from "./page-identity-transport.js";
+export {
+  createBrowserPageIdentityPublisherRegistry,
+  type BrowserPageIdentityPublisherRegistry,
+} from "./page-identity-publisher-registry.js";
 
 const browserRegistry = new PaseoBrowserWebviewRegistry();
+let pageIdentityPublisher: BrowserPageIdentityPublisherRegistry | null = null;
+const pageIdentityLifecycleQueues = new Map<number, Promise<void>>();
 
 interface BrowserWebContentsIdentity {
   readonly id: number;
   isDestroyed(): boolean;
 }
 
-interface RegisteredBrowserWebContents extends BrowserWebContentsIdentity {
+interface RegisteredBrowserWebContents
+  extends BrowserWebContentsIdentity, BrowserPageIdentityWebContents {
   readonly hostWebContents: BrowserWebContentsIdentity | null;
   readonly session: object;
   setBackgroundThrottling(allowed: boolean): void;
@@ -32,6 +59,7 @@ interface AttachedBrowserRegistration {
   browserId: string;
   workspaceId: string;
   webContentsId: number;
+  profileAuthorization?: BrowserProfileRuntimeAuthorization;
 }
 
 interface RegisterAttachedBrowserInput extends AttachedBrowserRegistration {
@@ -40,9 +68,17 @@ interface RegisterAttachedBrowserInput extends AttachedBrowserRegistration {
   findWebContents(webContentsId: number): RegisteredBrowserWebContents | null;
 }
 
-export function isPaseoBrowserWebviewAttach(input: { src?: string; partition?: string }): boolean {
+export function isPaseoBrowserWebviewAttach(input: {
+  src?: string;
+  partition?: string;
+  profileAuthorization?: BrowserProfileRuntimeAuthorization;
+}): boolean {
   return (
-    isAllowedBrowserWebviewUrl(input.src) && input.partition === PASEO_BROWSER_PROFILE_PARTITION
+    isAllowedBrowserWebviewUrl(input.src) &&
+    (input.profileAuthorization
+      ? input.partition ===
+        getEnterpriseBrowserProfilePartition(input.profileAuthorization.browserProfileId)
+      : input.partition === PASEO_BROWSER_PROFILE_PARTITION)
   );
 }
 
@@ -54,35 +90,110 @@ export function getPaseoBrowserWebviewRegistry(): PaseoBrowserWebviewRegistry {
   return browserRegistry;
 }
 
+/** Root installs one registry with the transport controller; renderer routes mount into it. */
+export async function installPaseoBrowserPageIdentityPublisher(
+  publisher: BrowserPageIdentityPublisherRegistry,
+): Promise<() => Promise<void>> {
+  if (!isBrowserPageIdentityPublisherRegistry(publisher)) {
+    throw new Error("Invalid Browser page identity publisher registry.");
+  }
+  const previous = pageIdentityPublisher;
+  pageIdentityPublisher = null;
+  if (previous) await previous.close();
+  await drainPageIdentityLifecycleQueues();
+  pageIdentityPublisher = publisher;
+  return async () => {
+    if (pageIdentityPublisher !== publisher) return;
+    pageIdentityPublisher = null;
+    await publisher.close();
+    await drainPageIdentityLifecycleQueues();
+  };
+}
+
 export function preparePaseoBrowserWebContents(contents: RegisteredBrowserWebContents): void {
   const webContentsId = contents.id;
   contents.setBackgroundThrottling(false);
+  pageIdentityPublisher?.track(contents);
   contents.once("destroyed", () => {
-    browserRegistry.unregisterWebContents(webContentsId);
+    void invalidateWebContentsBeforeRelease(webContentsId).catch(() => {});
   });
 }
 
 export function registerAttachedPaseoBrowser(input: RegisterAttachedBrowserInput): boolean {
-  const guest = input.findWebContents(input.webContentsId);
-  if (
-    !guest ||
-    guest.isDestroyed() ||
-    guest.hostWebContents !== input.sender ||
-    guest.session !== input.profileSession
-  ) {
-    return false;
+  if (pageIdentityPublisher && input.profileAuthorization) {
+    throw new Error(
+      "Enterprise Browser registration requires the awaitable page-identity barrier.",
+    );
   }
+  return registerAttachedPaseoBrowserNow(input);
+}
 
+/** Root awaits this path once the page-identity publisher registry is installed. */
+export async function registerAttachedPaseoBrowserAfterPageIdentityBarrier(
+  input: RegisterAttachedBrowserInput,
+): Promise<boolean> {
+  const guest = input.findWebContents(input.webContentsId);
+  if (!isAttachedBrowserGuestCurrent(input, guest)) return false;
+  const publisher = pageIdentityPublisher;
+  if (!publisher) return registerAttachedPaseoBrowserNow(input);
+
+  const replacedWebContentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+    input.sender.id,
+    input.browserId,
+  );
+  const invalidatedWebContentsIds = new Set([input.webContentsId]);
+  if (replacedWebContentsId !== null) invalidatedWebContentsIds.add(replacedWebContentsId);
+  const invalidation = Promise.all(
+    [...invalidatedWebContentsIds].map((webContentsId) =>
+      publisher.invalidateWebContents(webContentsId),
+    ),
+  );
+  return enqueuePageIdentityLifecycle(input.sender.id, async () => {
+    await invalidation;
+    if (pageIdentityPublisher !== publisher) return false;
+    const currentGuest = input.findWebContents(input.webContentsId);
+    if (!isAttachedBrowserGuestCurrent(input, currentGuest)) return false;
+    browserRegistry.registerWebContents({
+      webContentsId: input.webContentsId,
+      browserId: input.browserId,
+      hostWebContentsId: input.sender.id,
+      workspaceId: input.workspaceId,
+      ...(input.profileAuthorization ? { profileAuthorization: input.profileAuthorization } : {}),
+    });
+    publisher.track(currentGuest);
+    try {
+      await publisher.publishCurrent(currentGuest);
+    } catch (error) {
+      browserRegistry.unregisterWebContents(input.webContentsId);
+      throw error;
+    }
+    return true;
+  });
+}
+
+function registerAttachedPaseoBrowserNow(input: RegisterAttachedBrowserInput): boolean {
+  const guest = input.findWebContents(input.webContentsId);
+  if (!isAttachedBrowserGuestCurrent(input, guest)) return false;
   browserRegistry.registerWebContents({
     webContentsId: input.webContentsId,
     browserId: input.browserId,
     hostWebContentsId: input.sender.id,
-  });
-  browserRegistry.registerWorkspace({
-    browserId: input.browserId,
     workspaceId: input.workspaceId,
+    ...(input.profileAuthorization ? { profileAuthorization: input.profileAuthorization } : {}),
   });
   return true;
+}
+
+function isAttachedBrowserGuestCurrent(
+  input: RegisterAttachedBrowserInput,
+  guest: RegisteredBrowserWebContents | null,
+): guest is RegisteredBrowserWebContents {
+  return Boolean(
+    guest &&
+    !guest.isDestroyed() &&
+    guest.hostWebContents === input.sender &&
+    guest.session === input.profileSession,
+  );
 }
 
 export function getPaseoBrowserIdForWebContents(
@@ -94,16 +205,60 @@ export function getPaseoBrowserIdForWebContents(
   return browserRegistry.getBrowserIdForWebContents(contents.id);
 }
 
-export function unregisterPaseoBrowser(browserId: string): void {
-  browserRegistry.unregisterBrowser(browserId);
+export function getPaseoBrowserProfileAuthorizationForWebContents(
+  contents: BrowserWebContentsIdentity | null,
+): BrowserProfileRuntimeAuthorization | null {
+  if (!contents || contents.isDestroyed()) {
+    return null;
+  }
+  return browserRegistry.getRegistrationForWebContents(contents.id)?.profileAuthorization ?? null;
 }
 
-export function unregisterPaseoBrowserFromHost(hostWebContentsId: number, browserId: string): void {
-  browserRegistry.unregisterBrowserFromHost(hostWebContentsId, browserId);
+export function unregisterPaseoBrowser(browserId: string): Promise<void> {
+  const publisher = pageIdentityPublisher;
+  if (!publisher) {
+    browserRegistry.unregisterBrowser(browserId);
+    return Promise.resolve();
+  }
+  const invalidation = publisher.invalidateBrowser(browserId);
+  return invalidation.then(() => {
+    browserRegistry.unregisterBrowser(browserId);
+    return undefined;
+  });
 }
 
-export function unregisterPaseoBrowserHost(hostWebContentsId: number): void {
-  browserRegistry.unregisterHostWebContents(hostWebContentsId);
+export function unregisterPaseoBrowserFromHost(
+  hostWebContentsId: number,
+  browserId: string,
+): Promise<void> {
+  const publisher = pageIdentityPublisher;
+  if (!publisher) {
+    browserRegistry.unregisterBrowserFromHost(hostWebContentsId, browserId);
+    return Promise.resolve();
+  }
+  const webContentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+    hostWebContentsId,
+    browserId,
+  );
+  const invalidation =
+    webContentsId === null ? Promise.resolve() : publisher.invalidateWebContents(webContentsId);
+  return enqueuePageIdentityLifecycle(hostWebContentsId, async () => {
+    await invalidation;
+    browserRegistry.unregisterBrowserFromHost(hostWebContentsId, browserId);
+  });
+}
+
+export function unregisterPaseoBrowserHost(hostWebContentsId: number): Promise<void> {
+  const publisher = pageIdentityPublisher;
+  if (!publisher) {
+    browserRegistry.unregisterHostWebContents(hostWebContentsId);
+    return Promise.resolve();
+  }
+  const invalidation = publisher.invalidateHost(hostWebContentsId);
+  return enqueuePageIdentityLifecycle(hostWebContentsId, async () => {
+    await invalidation;
+    browserRegistry.unregisterHostWebContents(hostWebContentsId);
+  });
 }
 
 export function getPaseoBrowserWorkspaceId(browserId: string): string | null {
@@ -112,6 +267,85 @@ export function getPaseoBrowserWorkspaceId(browserId: string): string | null {
 
 export function listRegisteredPaseoBrowserIdsForWorkspace(workspaceId: string): string[] {
   return browserRegistry.listBrowserIdsForWorkspace(workspaceId);
+}
+
+export function listRegisteredPaseoBrowserIdsForProfile(input: {
+  hostWebContentsId: number;
+  authorization: BrowserProfileRuntimeAuthorization;
+}): string[] {
+  return browserRegistry.listBrowserIdsForProfile(input);
+}
+
+export function unregisterPaseoBrowserProfile(input: {
+  hostWebContentsId: number;
+  authorization: BrowserProfileRuntimeAuthorization;
+}): Promise<number[]> {
+  const browserIds = browserRegistry.listBrowserIdsForProfile(input);
+  const publisher = pageIdentityPublisher;
+  if (!publisher) return Promise.resolve(browserRegistry.unregisterProfile(input));
+  const invalidation = Promise.all(
+    browserIds.map((browserId) => {
+      const webContentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+        input.hostWebContentsId,
+        browserId,
+      );
+      return webContentsId === null
+        ? Promise.resolve()
+        : publisher.invalidateWebContents(webContentsId);
+    }),
+  );
+  return enqueuePageIdentityLifecycle(input.hostWebContentsId, async () => {
+    await invalidation;
+    return browserRegistry.unregisterProfile(input);
+  });
+}
+
+function isPageIdentityExecutionAllowed(webContentsId: number): boolean {
+  const registration = browserRegistry.getRegistrationForWebContents(webContentsId);
+  if (!registration?.profileAuthorization) return true;
+  return pageIdentityPublisher?.isExecutionAllowed(webContentsId) === true;
+}
+
+function invalidateWebContentsBeforeRelease(webContentsId: number): Promise<void> {
+  const publisher = pageIdentityPublisher;
+  if (!publisher) {
+    browserRegistry.unregisterWebContents(webContentsId);
+    return Promise.resolve();
+  }
+  const invalidation = publisher.invalidateWebContents(webContentsId);
+  const hostWebContentsId =
+    browserRegistry.getRegistrationForWebContents(webContentsId)?.hostWebContentsId;
+  if (hostWebContentsId === undefined) return invalidation;
+  return enqueuePageIdentityLifecycle(hostWebContentsId, async () => {
+    await invalidation;
+    browserRegistry.unregisterWebContents(webContentsId);
+  });
+}
+
+function enqueuePageIdentityLifecycle<T>(
+  hostWebContentsId: number,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = pageIdentityLifecycleQueues.get(hostWebContentsId) ?? Promise.resolve();
+  const result = previous.then(operation);
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  pageIdentityLifecycleQueues.set(hostWebContentsId, settled);
+  void settled.then(() => {
+    if (pageIdentityLifecycleQueues.get(hostWebContentsId) === settled) {
+      pageIdentityLifecycleQueues.delete(hostWebContentsId);
+    }
+    return undefined;
+  });
+  return result;
+}
+
+async function drainPageIdentityLifecycleQueues(): Promise<void> {
+  while (pageIdentityLifecycleQueues.size > 0) {
+    await Promise.all(pageIdentityLifecycleQueues.values());
+  }
 }
 
 export function setWorkspaceActivePaseoBrowserId(input: {
@@ -146,9 +380,30 @@ export function getPaseoBrowserWebContentsForHostWindow(
   }
   const contents = allWebContents.fromId(contentsId);
   if (contents && !contents.isDestroyed()) {
-    return contents;
+    return guardPageIdentityExecution(contentsId, contents);
   }
-  browserRegistry.unregisterWebContents(contentsId);
+  if (!contents || contents.isDestroyed()) {
+    void invalidateWebContentsBeforeRelease(contentsId).catch(() => {});
+  }
+  return null;
+}
+
+export function getPaseoBrowserWebContentsForProfile(input: {
+  browserId: string;
+  hostWebContentsId: number;
+  authorization: BrowserProfileRuntimeAuthorization;
+}): WebContents | null {
+  const contentsId = browserRegistry.getWebContentsIdForBrowserProfile(input);
+  if (contentsId === null) {
+    return null;
+  }
+  const contents = allWebContents.fromId(contentsId);
+  if (contents && !contents.isDestroyed()) {
+    return guardPageIdentityExecution(contentsId, contents);
+  }
+  if (!contents || contents.isDestroyed()) {
+    void invalidateWebContentsBeforeRelease(contentsId).catch(() => {});
+  }
   return null;
 }
 
@@ -168,10 +423,95 @@ export function getActivePaseoBrowserWebContentsForHostWindow(
   }
   const contents = allWebContents.fromId(contentsId);
   if (contents && !contents.isDestroyed()) {
+    return guardPageIdentityExecution(contentsId, contents);
+  }
+  if (!contents || contents.isDestroyed()) {
+    void invalidateWebContentsBeforeRelease(contentsId).catch(() => {});
+  }
+  return null;
+}
+
+/**
+ * Bootstrap-only view used by list_tabs/new_tab discovery. An enterprise guest remains hidden
+ * until its server observation is acknowledged, but this view intentionally carries no action
+ * handle. W1 must not use it for any other Browser command.
+ */
+export function getPaseoBrowserWebContentsForBootstrapDiscovery(
+  browserId: string,
+  hostWebContentsId: number,
+): WebContents | null {
+  const contentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+    hostWebContentsId,
+    browserId,
+  );
+  if (contentsId === null) return null;
+  const contents = allWebContents.fromId(contentsId);
+  if (contents && !contents.isDestroyed() && isPageIdentityExecutionAllowed(contentsId)) {
     return contents;
   }
-  browserRegistry.unregisterWebContents(contentsId);
+  if (!contents || contents.isDestroyed()) {
+    void invalidateWebContentsBeforeRelease(contentsId).catch(() => {});
+  }
   return null;
+}
+
+const guardedWebContentsMethods = new Set<PropertyKey>([
+  "canGoBack",
+  "canGoForward",
+  "capturePage",
+  "executeJavaScript",
+  "focus",
+  "getTitle",
+  "getURL",
+  "goBack",
+  "goForward",
+  "invalidate",
+  "isLoading",
+  "loadURL",
+  "openDevTools",
+  "reload",
+  "sendInputEvent",
+]);
+
+function guardPageIdentityExecution(
+  webContentsId: number,
+  contents: WebContents,
+): WebContents | null {
+  const registration = browserRegistry.getRegistrationForWebContents(webContentsId);
+  if (!registration?.profileAuthorization) return contents;
+  const publisher = pageIdentityPublisher;
+  const handle = publisher?.createExecutionHandle(webContentsId);
+  if (!publisher || !handle) return null;
+  return createGuardedWebContents(contents, publisher, handle);
+}
+
+function createGuardedWebContents(
+  contents: WebContents,
+  publisher: BrowserPageIdentityPublisherRegistry,
+  handle: BrowserPageIdentityExecutionHandle,
+): WebContents {
+  const guardedDebugger = new Proxy(contents.debugger, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property !== "sendCommand" || typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        publisher.assertExecutionCurrent(handle);
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+  return new Proxy(contents, {
+    get(target, property) {
+      if (property === "debugger") return guardedDebugger;
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (!guardedWebContentsMethods.has(property)) return value.bind(target);
+      return (...args: unknown[]) => {
+        publisher.assertExecutionCurrent(handle);
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
 }
 
 function preventUnsafeBrowserWebviewNavigation(

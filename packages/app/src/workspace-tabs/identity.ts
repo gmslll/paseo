@@ -67,6 +67,20 @@ function normalizeSimpleWorkspaceTabTarget(value: WorkspaceTabTarget): Workspace
       const sha = trimNonEmpty(value.sha);
       return sha ? { kind: "commit_diff", sha } : null;
     }
+    case "turn_diff": {
+      const turnId = trimNonEmpty(value.turnId);
+      const agentId = trimNonEmpty(value.agentId);
+      if (!turnId || !agentId) return null;
+      return {
+        kind: "turn_diff",
+        turnId,
+        agentId,
+        ...(trimNonEmpty(value.focusPath) ? { focusPath: value.focusPath } : {}),
+        ...(typeof value.focusRequestId === "number"
+          ? { focusRequestId: value.focusRequestId }
+          : {}),
+      };
+    }
     default:
       return null;
   }
@@ -137,9 +151,6 @@ function secondaryWorkspaceTabTargetsEqual(
   if (left.kind === "file" && right.kind === "file") {
     return workspaceFileLocationsEqual(left, right);
   }
-  if (left.kind === "working_diff" && right.kind === "working_diff") {
-    return left.focusPath === right.focusPath && left.focusRequestId === right.focusRequestId;
-  }
   if (left.kind === "files" && right.kind === "files") {
     return true;
   }
@@ -152,8 +163,26 @@ function secondaryWorkspaceTabTargetsEqual(
   if (left.kind === "setup" && right.kind === "setup") {
     return left.workspaceId === right.workspaceId;
   }
+  return diffWorkspaceTabTargetsEqual(left, right);
+}
+
+function diffWorkspaceTabTargetsEqual(
+  left: WorkspaceTabTarget,
+  right: WorkspaceTabTarget,
+): boolean {
+  if (left.kind === "working_diff" && right.kind === "working_diff") {
+    return left.focusPath === right.focusPath && left.focusRequestId === right.focusRequestId;
+  }
   if (left.kind === "commit_diff" && right.kind === "commit_diff") {
     return left.sha === right.sha;
+  }
+  if (left.kind === "turn_diff" && right.kind === "turn_diff") {
+    return (
+      left.turnId === right.turnId &&
+      left.agentId === right.agentId &&
+      left.focusPath === right.focusPath &&
+      left.focusRequestId === right.focusRequestId
+    );
   }
   return false;
 }
@@ -215,6 +244,9 @@ export function buildDeterministicWorkspaceTabId(target: WorkspaceTabTarget): st
   }
   if (target.kind === "commit_diff") {
     return `commit_diff_${target.sha}`;
+  }
+  if (target.kind === "turn_diff") {
+    return `turn_diff_${target.agentId.length}_${target.agentId}_${target.turnId.length}_${target.turnId}`;
   }
   if (target.kind === "working_diff") {
     return "working_diff";

@@ -51,6 +51,7 @@ const CLOSED_PARENT: ManagedAgent = {
   activeTurnId: null,
   activeTurnStartedAt: null,
   attention: { requiresAttention: false },
+  queuedTurns: [],
   foregroundTurnWaiters: new Set(),
   finalizedForegroundTurnIds: new Set(),
   unsubscribeSession: null,
@@ -2281,6 +2282,7 @@ describe("ProviderSnapshotManager cwd routing", () => {
       const withoutPlugin = manager.replacePluginProviders([]);
       expect(manager.hasProvider(registration.id)).toBe(false);
       expect(withoutPlugin.clients[registration.id]).toBeUndefined();
+      expect(withoutPlugin.retiredProviders).toEqual([registration.id]);
     } finally {
       await manager.shutdown();
       manager.destroy();

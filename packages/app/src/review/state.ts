@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export type ReviewDraftMode = "uncommitted" | "base";
+export type ReviewDraftMode = "uncommitted" | "base" | "turn";
 export type ReviewDraftSide = "old" | "new";
 
 export interface ReviewDraftComment {
@@ -37,7 +37,7 @@ export const SerializedReviewDraftStateSchema: z.ZodType<SerializedReviewDraftSt
   z.strictObject({
     drafts: z.record(z.string(), z.array(ReviewDraftCommentSchema)),
     // COMPAT(reviewDraftModes): v1 persisted this field; v2 discards it during migration.
-    activeModesByScope: z.record(z.string(), z.enum(["uncommitted", "base"])).optional(),
+    activeModesByScope: z.record(z.string(), z.enum(["uncommitted", "base", "turn"])).optional(),
   });
 
 export function addCommentToState(

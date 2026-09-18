@@ -82,6 +82,7 @@ export function DraggableList<T>({
   }, []);
 
   const showRefreshControl = Boolean(onRefresh) && (!isDragging || Boolean(refreshing));
+  const dragGestureHostPresented = gestureHostPresented ?? false;
   const resolvedContainerStyle =
     containerStyle ?? (scrollEnabled ? SCROLL_ENABLED_FLEX_STYLE : undefined);
   const shouldShowRefreshControl = showRefreshControl && !nestable;
@@ -119,7 +120,7 @@ export function DraggableList<T>({
       scrollEnabled={scrollEnabled}
       extraData={extraData}
       simultaneousHandlers={simultaneousHandlers}
-      dragGestureHostPresented={gestureHostPresented}
+      dragGestureHostPresented={dragGestureHostPresented}
       // Higher activation distance reduces accidental drag capture while nested
       // lists are inside a scroll container.
       activationDistance={20}

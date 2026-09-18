@@ -8,10 +8,21 @@ import {
 import {
   DAEMON_PERMISSIONS,
   OWNER_PERMISSIONS,
+  deriveEnterpriseSessionPermissions,
   SessionAuthorization,
+  closeActiveDaemonPermission,
+  consumeCurrentInboundDaemonAuthorizationDecision,
+  consumeInboundDaemonAuthorizationDecision,
+  isActiveDaemonPermissionCurrent,
+  issueActiveDaemonPermission,
   permissionsForLegacyHubScopes,
   parseDaemonPermissions,
 } from "./index.js";
+import {
+  type PermissionRequirement,
+  requiredPermissionForInbound,
+  requiredPermissionForOutbound,
+} from "./operation-permissions.js";
 
 function inboundOperationTypes(): SessionInboundMessage["type"][] {
   return SessionInboundMessageSchema.options.map((option) => option.shape.type.value);
@@ -35,6 +46,132 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
 }
 
 describe("SessionAuthorization", () => {
+  test("derives identity management without global permissions", () => {
+    const base = {
+      organizationId: "org_0123456789abcdef",
+      credentialId: "cred_0123456789abcdef",
+      grantVersion: "v1",
+    };
+    const human = {
+      ...base,
+      principalType: "human" as const,
+      principalId: "usr_0123456789abcdef",
+      grants: [
+        {
+          action: "identity.manage" as const,
+          selector: { kind: "organization" as const, organizationId: base.organizationId },
+        },
+      ],
+    };
+    const permissions = deriveEnterpriseSessionPermissions(human);
+    expect(permissions).toEqual(["workspace.read", "workspace.write"]);
+    expect(Object.isFrozen(permissions)).toBe(true);
+    expect(permissions).not.toContain("daemon.read");
+    const none = deriveEnterpriseSessionPermissions({ ...human, grants: [] });
+    expect(none).toEqual([]);
+    const owner = deriveEnterpriseSessionPermissions({
+      ...base,
+      principalType: "break_glass_owner",
+      principalId: "owner",
+      grants: [],
+    });
+    expect(Object.isFrozen(OWNER_PERMISSIONS)).toBe(true);
+    expect(Object.isFrozen(owner)).toBe(true);
+    expect(owner).toEqual(OWNER_PERMISSIONS);
+  });
+  test("enterprise operations have explicit coarse permission requirements", () => {
+    const inboundRequirements = {
+      "enterprise.access.list_grants.request": "workspace.read",
+      "enterprise.access.update_grants.request": "workspace.write",
+      "enterprise.audit.list_events.request": "workspace.read",
+      "enterprise.browser.bind_profile.request": "workspace.write",
+      "enterprise.browser.list_profiles.request": "workspace.read",
+      "enterprise.identity.get_current.request": null,
+      "enterprise.identity.list_principals.request": "workspace.read",
+      "enterprise.identity.logout_all.request": null,
+      "enterprise.node.list_nodes.request": "daemon.read",
+      "enterprise.node.set_drain.request": "daemon.manage",
+      "enterprise.organization.list_resources.request": "workspace.read",
+      "enterprise.placement.resolve_workspace.request": "workspace.read",
+      "enterprise.resource.acquire_lease.request": "workspace.write",
+      "enterprise.resource.release_lease.request": "workspace.write",
+      "enterprise.resource.renew_lease.request": "workspace.write",
+      "enterprise.resource.ownership.transfer.request": "workspace.manage",
+    } as const satisfies Partial<Record<SessionInboundMessage["type"], PermissionRequirement>>;
+    const outboundRequirements = {
+      "enterprise.access.list_grants.response": "workspace.read",
+      "enterprise.access.update_grants.response": "workspace.write",
+      "enterprise.audit.list_events.response": "workspace.read",
+      "enterprise.browser.bind_profile.response": "workspace.write",
+      "enterprise.browser.list_profiles.response": "workspace.read",
+      "enterprise.identity.credential_revoked": null,
+      "enterprise.identity.get_current.response": null,
+      "enterprise.identity.list_principals.response": "workspace.read",
+      "enterprise.identity.logout_all.response": null,
+      "enterprise.identity.scope_refreshed": null,
+      "enterprise.node.list_nodes.response": "daemon.read",
+      "enterprise.node.set_drain.response": "daemon.manage",
+      "enterprise.organization.list_resources.response": "workspace.read",
+      "enterprise.placement.resolve_workspace.response": "workspace.read",
+      "enterprise.resource.acquire_lease.response": "workspace.write",
+      "enterprise.resource.release_lease.response": "workspace.write",
+      "enterprise.resource.renew_lease.response": "workspace.write",
+      "enterprise.resource.ownership.transfer.response": "workspace.manage",
+      "enterprise.workspace.ownership.transfer.tombstone": null,
+      "enterprise.resource.status": "workspace.read",
+      "enterprise.resource.waiting": "workspace.read",
+    } as const satisfies Partial<Record<SessionOutboundMessage["type"], PermissionRequirement>>;
+
+    for (const [operation, requirement] of Object.entries(inboundRequirements)) {
+      expect(requiredPermissionForInbound(operation as SessionInboundMessage["type"])).toEqual(
+        requirement,
+      );
+    }
+    for (const [operation, requirement] of Object.entries(outboundRequirements)) {
+      expect(
+        requiredPermissionForOutbound(outboundMessage(operation as SessionOutboundMessage["type"])),
+      ).toEqual(requirement);
+    }
+  });
+
+  test("authenticated sessions retain identity self-control after all coarse permissions are removed", () => {
+    const authorization = new SessionAuthorization([]);
+
+    expect(
+      authorization.allowsInbound(inboundMessage("enterprise.identity.get_current.request")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.get_current.response")),
+    ).toBe(true);
+    expect(
+      authorization.allowsInbound(inboundMessage("enterprise.identity.logout_all.request")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.logout_all.response")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.scope_refreshed")),
+    ).toBe(true);
+    expect(
+      authorization.allowsOutbound(outboundMessage("enterprise.identity.credential_revoked")),
+    ).toBe(true);
+  });
+
+  test("does not coarse-filter Workspace transfer tombstones from read-only old Sessions", () => {
+    const authorization = new SessionAuthorization(["workspace.read"]);
+
+    expect(
+      authorization.allowsOutbound(
+        outboundMessage("enterprise.workspace.ownership.transfer.tombstone"),
+      ),
+    ).toBe(true);
+    expect(
+      requiredPermissionForOutbound(
+        outboundMessage("enterprise.workspace.ownership.transfer.tombstone"),
+      ),
+    ).toBeNull();
+  });
+
   test("owner authority covers every session operation", () => {
     const authorization = new SessionAuthorization(OWNER_PERMISSIONS);
 
@@ -135,5 +272,100 @@ describe("SessionAuthorization", () => {
   test("permission parsing validates against the shared registry and removes duplicates", () => {
     expect(parseDaemonPermissions(["hub.execute", "hub.execute"])).toEqual(["hub.execute"]);
     expect(() => parseDaemonPermissions(["hub.execution.*"])).toThrow("Invalid daemon permission");
+  });
+
+  test("issues an opaque exact-message decision when any required daemon permission succeeds", () => {
+    const authorization = new SessionAuthorization(["hub.execute"]);
+    const allowed = inboundMessage("create_agent_request");
+
+    const decision = authorization.authorizeInbound(allowed);
+
+    expect(decision).not.toBeNull();
+    expect(Object.keys(decision!)).toEqual([]);
+    expect(Object.isFrozen(decision)).toBe(true);
+    expect(authorization.authorizeInbound(inboundMessage("restart_server_request"))).toBeNull();
+    expect(new SessionAuthorization([]).authorizeInbound(allowed)).toBeNull();
+  });
+
+  test("consumes a daemon decision once for its exact message and permission generation", () => {
+    const authorization = new SessionAuthorization(["hub.execute"]);
+    const message = inboundMessage("create_agent_request");
+    const wrongMessageDecision = authorization.authorizeInbound(message)!;
+
+    expect(
+      consumeInboundDaemonAuthorizationDecision(
+        authorization,
+        inboundMessage("create_agent_request"),
+        wrongMessageDecision,
+      ),
+    ).toBeNull();
+    expect(
+      consumeInboundDaemonAuthorizationDecision(authorization, message, wrongMessageDecision),
+    ).toBeNull();
+
+    const replacedDecision = authorization.authorizeInbound(message)!;
+    authorization.replacePermissions(["hub.execute"]);
+    expect(
+      consumeInboundDaemonAuthorizationDecision(authorization, message, replacedDecision),
+    ).toBeNull();
+
+    const currentDecision = authorization.authorizeInbound(message)!;
+    const consumed = consumeInboundDaemonAuthorizationDecision(
+      authorization,
+      message,
+      currentDecision,
+    );
+    expect(consumed).toEqual({
+      requestType: "create_agent_request",
+      daemonPermission: ["workspace.write", "hub.execute"],
+    });
+    expect(Object.isFrozen(consumed)).toBe(true);
+    expect(Object.isFrozen(consumed?.daemonPermission)).toBe(true);
+    expect(
+      consumeCurrentInboundDaemonAuthorizationDecision(
+        authorization,
+        message,
+        message.type,
+        consumed!,
+      ),
+    ).toBe(true);
+    expect(
+      consumeCurrentInboundDaemonAuthorizationDecision(
+        authorization,
+        message,
+        message.type,
+        consumed!,
+      ),
+    ).toBe(false);
+    expect(
+      consumeInboundDaemonAuthorizationDecision(authorization, message, currentDecision),
+    ).toBeNull();
+  });
+
+  test("invalidates an opaque daemon permission handle on every permission replacement", () => {
+    const authorization = new SessionAuthorization(["workspace.read"]);
+    const handle = issueActiveDaemonPermission(authorization, "workspace.read");
+
+    expect(handle).not.toBeNull();
+    expect(Object.keys(handle!)).toEqual([]);
+    expect(Object.isFrozen(handle)).toBe(true);
+    expect(isActiveDaemonPermissionCurrent(authorization, handle!, "workspace.read")).toBe(true);
+    expect(isActiveDaemonPermissionCurrent(authorization, handle!, "workspace.write")).toBe(false);
+    expect(
+      isActiveDaemonPermissionCurrent(
+        new SessionAuthorization(["workspace.read"]),
+        handle!,
+        "workspace.read",
+      ),
+    ).toBe(false);
+
+    authorization.replacePermissions(["workspace.read"]);
+    expect(isActiveDaemonPermissionCurrent(authorization, handle!, "workspace.read")).toBe(false);
+
+    const current = issueActiveDaemonPermission(authorization, "workspace.read")!;
+    expect(closeActiveDaemonPermission(authorization, current)).toBe(true);
+    expect(closeActiveDaemonPermission(authorization, current)).toBe(false);
+    expect(isActiveDaemonPermissionCurrent(authorization, current, "workspace.read")).toBe(false);
+    expect(issueActiveDaemonPermission(authorization, "workspace.write")).toBeNull();
   });
 });

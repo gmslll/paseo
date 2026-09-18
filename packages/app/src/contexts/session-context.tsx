@@ -519,6 +519,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     const unsubAgentStream = client.on("agent_stream", (message) => {
       if (message.type !== "agent_stream") return;
       const { agentId, event, timestamp, seq, epoch } = message.payload;
+      if (getHostRuntimeStore().isAgentPublicationBlocked(serverId, agentId)) return;
       const parsedTimestamp = new Date(timestamp);
       const streamEvent = event;
       if (
@@ -555,12 +556,18 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     const unsubAgentTimeline = client.on("fetch_agent_timeline_response", (message) => {
       if (message.type !== "fetch_agent_timeline_response") return;
+      if (getHostRuntimeStore().isAgentPublicationBlocked(serverId, message.payload.agentId)) {
+        return;
+      }
       owner.flushStreamAgent(message.payload.agentId);
       applyTimelineResponse(message.payload);
     });
 
     const unsubTimelineReplacement = client.on("agent.timeline.replacement", (message) => {
       if (message.type !== "agent.timeline.replacement") return;
+      if (getHostRuntimeStore().isAgentPublicationBlocked(serverId, message.payload.agentId)) {
+        return;
+      }
       void requestTimelineReplacement(
         {
           fetchAgentTimeline: (agentId, request) =>
@@ -574,6 +581,11 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     const unsubProviderSubagentUpdate = client.on("agent.provider_subagents.update", (message) => {
       if (message.type !== "agent.provider_subagents.update") return;
+      const parentAgentId =
+        message.payload.kind === "upsert"
+          ? message.payload.subagent.parentAgentId
+          : message.payload.parentAgentId;
+      if (getHostRuntimeStore().isAgentPublicationBlocked(serverId, parentAgentId)) return;
       useProviderSubagentStore.getState().applyUpdate(serverId, message.payload);
     });
 

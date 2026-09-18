@@ -14,6 +14,68 @@ describe("server config", () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
+  test.each([
+    ["missing", undefined],
+    ["disabled", { enabled: false }],
+  ])("resolves enterprise feature %s", (label, value) => {
+    const persisted = { features: { enterpriseMultiUser: value } } as never;
+    const resolved = resolveConfigFromPersisted("/tmp/paseo", persisted, { env: {} });
+    if (label === "missing") expect(resolved.enterpriseMultiUser).toBeUndefined();
+    else {
+      expect(resolved.enterpriseMultiUser).toEqual({ enabled: false });
+      expect(Object.isFrozen(resolved.enterpriseMultiUser)).toBe(true);
+    }
+  });
+
+  test("resolves enabled enterprise feature as a frozen snapshot", () => {
+    const enterpriseMultiUser = {
+      enabled: true as const,
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      managementMode: "standalone" as const,
+      legacyRecords: "owner_only" as const,
+    };
+    const persisted = { features: { enterpriseMultiUser } } as never;
+    const resolved = resolveConfigFromPersisted("/tmp/paseo", persisted, { env: {} });
+    enterpriseMultiUser.organizationId = "org_aaaaaaaaaaaaaaaa";
+    enterpriseMultiUser.nodeId = "nod_aaaaaaaaaaaaaaaa";
+    enterpriseMultiUser.managementMode = "managed" as never;
+    enterpriseMultiUser.legacyRecords = "all" as never;
+    expect(resolved.enterpriseMultiUser).toEqual({
+      enabled: true,
+      organizationId: "org_0123456789abcdef",
+      nodeId: "nod_0123456789abcdef",
+      managementMode: "standalone",
+      legacyRecords: "owner_only",
+    });
+    expect(Object.isFrozen(resolved.enterpriseMultiUser)).toBe(true);
+  });
+
+  test.each([
+    {
+      enabled: true,
+      organizationId: "bad",
+      nodeId: "nod_0123456789abcdef",
+      managementMode: "standalone",
+      legacyRecords: "owner_only",
+    },
+    {
+      enabled: true,
+      organizationId: "org_0123456789abcdef",
+      nodeId: "bad",
+      managementMode: "standalone",
+      legacyRecords: "owner_only",
+    },
+  ])("rejects invalid enterprise config through resolve path", (value) => {
+    expect(() =>
+      resolveConfigFromPersisted(
+        "/tmp/paseo",
+        { features: { enterpriseMultiUser: value } } as never,
+        { env: {} },
+      ),
+    ).toThrow();
+  });
+
   test("records when the daemon is managed by Paseo Desktop", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-desktop-managed-"));
     roots.push(paseoHome);

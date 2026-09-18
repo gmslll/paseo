@@ -57,6 +57,7 @@ import {
 import type { ImageAttachment, MessagePayload, TextReplacement } from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandConfig } from "@/hooks/use-agent-commands-query";
+import { useCollabWorkspaceAccess } from "@/collab/use-collab-workspace-access";
 import { encodeImages } from "@/utils/encode-images";
 import { focusWithRetries } from "@/utils/web-focus";
 import {
@@ -1278,6 +1279,9 @@ function ComposerContentImpl({
     workspaceId,
     agentId,
   });
+  const collabAccess = useCollabWorkspaceAccess(serverId, workspaceId);
+  const usePlaneTurn = collabAccess.collaborationEnabled;
+  const isCollabReadOnly = readOnly || collabAccess.readOnly;
   const isComposerLocked = resolveIsComposerLocked(submitBehavior, isSubmitLoading);
   const keyboardHandlerIdRef = useRef(
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
@@ -1493,10 +1497,21 @@ function ComposerContentImpl({
                 targetAgentId,
               ).turnId ?? undefined)
             : undefined,
+        workspaceId,
+        usePlaneTurn,
       });
       onAttentionPromptSend?.();
     };
-  }, [appSettings.sendBehavior, client, onAttentionPromptSend, serverId, supportsForgeSearch, t]);
+  }, [
+    appSettings.sendBehavior,
+    client,
+    onAttentionPromptSend,
+    serverId,
+    supportsForgeSearch,
+    t,
+    usePlaneTurn,
+    workspaceId,
+  ]);
 
   useEffect(() => {
     onSubmitMessageRef.current = onSubmitMessage;
@@ -1811,6 +1826,8 @@ function ComposerContentImpl({
       isAgentRunning,
       isCancellingAgent,
       isConnected,
+      workspaceId,
+      usePlaneTurn,
     });
     if (!cancellation) return;
     const requestId = getHostRuntimeStore().beginAgentCancellation(serverId, targetAgentId);
@@ -1825,7 +1842,7 @@ function ComposerContentImpl({
         getHostRuntimeStore().settleAgentCancellation(serverId, targetAgentId, requestId);
       });
     messageInputRef.current?.focus();
-  }, [client, isAgentRunning, isCancellingAgent, isConnected, serverId]);
+  }, [client, isAgentRunning, isCancellingAgent, isConnected, serverId, usePlaneTurn, workspaceId]);
 
   const focusMessageInputForKeyboardAction = useCallback(() => {
     focusMessageInputWithPlatformStrategy(messageInputRef);
@@ -2260,7 +2277,9 @@ function ComposerContentImpl({
   const isSubmitLoadingVisible =
     isProcessing || isSubmitLoading || isUploadingFile || pendingNativeImagePastes > 0;
   const isSubmitDisabled =
-    isSubmitLoadingVisible || (waitForForgeAutoAttachOnSubmit && forgeAutoAttach.isResolving);
+    isSubmitLoadingVisible ||
+    isCollabReadOnly ||
+    (waitForForgeAutoAttachOnSubmit && forgeAutoAttach.isResolving);
 
   // Disable drops while submitting/uploading: the submit path clears and restores attachments,
   // so a drop in that window would be lost or land on a locked draft. `disabled` hides the
@@ -2370,7 +2389,7 @@ function ComposerContentImpl({
                   inputWrapperStyle={inputWrapperStyle}
                   attachmentSlot={attachmentTray}
                   inputMode={inputMode}
-                  readOnly={readOnly}
+                  readOnly={isCollabReadOnly}
                   textReplacement={textReplacement}
                   submitLabel={submitLabel}
                 />

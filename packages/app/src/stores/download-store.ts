@@ -37,6 +37,12 @@ interface DownloadState {
     fileName: string;
     path: string;
     daemonProfile: HostProfile | undefined;
+    enterpriseFileDownload?: (input: {
+      readonly workspaceId: string;
+      readonly relativePath: string;
+      readonly scopeGeneration: string;
+    }) => Promise<Response>;
+    enterpriseScopeGeneration?: string;
     requestFileDownloadToken: (path: string) => Promise<{
       token: string | null;
       fileName: string | null;
@@ -56,6 +62,43 @@ function generateDownloadId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+async function completeEnterpriseDownload(input: {
+  request: (input: {
+    readonly workspaceId: string;
+    readonly relativePath: string;
+    readonly scopeGeneration: string;
+  }) => Promise<Response>;
+  workspaceId: string;
+  relativePath: string;
+  scopeGeneration: string;
+  fileName: string;
+}): Promise<void> {
+  const response = await input.request({
+    workspaceId: input.workspaceId,
+    relativePath: input.relativePath,
+    scopeGeneration: input.scopeGeneration,
+  });
+  if (!response.ok) {
+    throw new Error(i18n.t("downloads.failed"));
+  }
+  if (isWeb) {
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    triggerBrowserDownload(objectUrl, input.fileName);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+    return;
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const targetFile = resolveDownloadTargetFile(input.fileName);
+  targetFile.write(bytes);
+  if (await Sharing.isAvailableAsync()) {
+    await Sharing.shareAsync(targetFile.uri, {
+      mimeType: response.headers.get("content-type") ?? undefined,
+      dialogTitle: i18n.t("downloads.shareFileNamed", { fileName: input.fileName }),
+    });
+  }
+}
+
 export const useDownloadStore = create<DownloadState>()((set, get) => ({
   downloads: new Map(),
   activeDownloadId: null,
@@ -66,6 +109,8 @@ export const useDownloadStore = create<DownloadState>()((set, get) => ({
     fileName,
     path,
     daemonProfile,
+    enterpriseFileDownload,
+    enterpriseScopeGeneration,
     requestFileDownloadToken,
   }) => {
     const id = generateDownloadId();
@@ -84,6 +129,20 @@ export const useDownloadStore = create<DownloadState>()((set, get) => ({
     }));
 
     try {
+      if (enterpriseFileDownload) {
+        if (!enterpriseScopeGeneration || !scopeId) {
+          throw new Error(i18n.t("downloads.hostUnavailable"));
+        }
+        await completeEnterpriseDownload({
+          request: enterpriseFileDownload,
+          workspaceId: scopeId,
+          relativePath: path,
+          scopeGeneration: enterpriseScopeGeneration,
+          fileName,
+        });
+        get().completeDownload(id);
+        return;
+      }
       const tokenResponse = await requestFileDownloadToken(path);
       if (tokenResponse.error || !tokenResponse.token) {
         throw new Error(tokenResponse.error ?? i18n.t("downloads.requestTokenFailed"));

@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import { BrowserToolsBroker } from "./browser-tools/broker.js";
+import { createAuthenticatedBrowserHostSession } from "./browser-tools/page-identity-registry.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { DaemonConfigStore } from "./daemon-config-store.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
@@ -76,6 +77,37 @@ function createWorkspaceAutoNameStub(): WorkspaceAutoName {
 }
 
 describe("WebSocketServer browser tools wiring", () => {
+  it("keeps same-client generations isolated by transport route", () => {
+    const broker = createBroker();
+    const first = createAuthenticatedBrowserHostSession({
+      clientId: "usr_1111111111111111",
+      homeNodeId: "nod_1111111111111111",
+      sessionBindingGeneration: "generation-1",
+    });
+    const second = createAuthenticatedBrowserHostSession({
+      clientId: first.clientId,
+      homeNodeId: first.homeNodeId,
+      sessionBindingGeneration: "generation-2",
+    });
+    const register = (routeId: string, session: typeof first) =>
+      broker.registerClient({
+        id: routeId,
+        hostKind: "desktop app",
+        supportedCommands: BROWSER_AUTOMATION_COMMAND_NAMES,
+        enterpriseProfiles: { version: 1 },
+        homeNodeId: session.homeNodeId,
+        authenticatedSession: session,
+        sendBrowserAutomationRequest: () => {},
+      });
+    const unregisterFirst = register("route-first", first);
+    const unregisterSecond = register("route-second", second);
+    expect(broker.getRegisteredClientCount()).toBe(2);
+    unregisterFirst();
+    expect(broker.getRegisteredClientCount()).toBe(1);
+    unregisterSecond();
+    expect(broker.getRegisteredClientCount()).toBe(0);
+  });
+
   it("registers capable clients and dispatches broker requests over the real WebSocket path", async () => {
     const harness = await startBrowserToolsDaemonHarness();
     const browserHost = await harness.connectBrowserHostClient();

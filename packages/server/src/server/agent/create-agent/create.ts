@@ -79,6 +79,10 @@ export interface CreateAgentFromSessionInput {
 
 export interface CreateAgentFromMcpInput {
   kind: "mcp";
+  /** Pre-assigned Agent ID. The delegation outbox assigns it so a retry never creates a second Agent. */
+  agentId?: string;
+  /** Recorded on the first prompt so its timeline row can be matched later. */
+  clientMessageId?: string;
   provider: string;
   title: string;
   initialPrompt?: string;
@@ -182,7 +186,7 @@ export async function createAgentCommand(
 
   const snapshot = await dependencies.agentManager.createAgent(
     resolved.config,
-    input.kind === "session" ? input.agentId : undefined,
+    input.agentId,
     resolved.createOptions,
   );
 
@@ -361,6 +365,7 @@ async function resolveMcpCreateAgent(
       env: input.env,
     },
     prompt: trimmedPrompt ? trimmedPrompt : undefined,
+    runOptions: input.clientMessageId ? { clientMessageId: input.clientMessageId } : undefined,
     setupContinuation,
     createdWorktree,
     background: input.background,
